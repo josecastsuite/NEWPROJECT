@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+data/
+sample_results/
+*.step
+*.stp
+*.pdf
+*.png
+*.jpg
+.DS_Store

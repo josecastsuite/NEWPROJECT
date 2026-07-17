@@ -1,0 +1,26 @@
+[project]
+name = "josecast-analyzer"
+version = "5.0.0"
+description = "Geometric casting analysis engine using SDF and voxelization."
+requires-python = ">=3.10"
+dependencies = [
+    "cadquery>=2.7.0",
+    "trimesh>=4.10.0",
+    "numpy>=2.0.0",
+    "scipy>=1.10.0",
+    "pyvista>=0.48.0",
+    "pyvistaqt>=0.12.0",
+    "PyQt6>=6.5.0",
+    "fpdf2>=2.7.0",
+    "pypdf>=4.0.0",
+    "Pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+josecast = "main:main"
