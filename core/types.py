@@ -8,6 +8,22 @@ import numpy as np
 import trimesh
 
 
+@dataclass
+class CastingParameters:
+    """User-editable process and material overrides for a single run."""
+    t_pour_c: float = 1600.0
+    t_liquidus_c: float = 1510.0
+    t_solidus_c: float = 1410.0
+    t_mold_c: float = 25.0
+    t_fill_s: float = 10.0
+    rho_liquid_kg_m3: float = 7000.0
+    viscosity_pa_s: float = 0.006
+
+    @property
+    def superheat_c(self) -> float:
+        return max(self.t_pour_c - self.t_liquidus_c, 0.0)
+
+
 class BodyType(IntEnum):
     """Material / role identifier stored in the voxel grid."""
     EMPTY = 0
@@ -67,6 +83,9 @@ class HotSpot:
     m_uncertainty_mm: float = 0.0
     niyama_ensemble: float = 0.0
     niyama_variants: Dict[str, float] = field(default_factory=dict)
+    # v8.0
+    heuvers_ok: bool = True
+    feeding_cost: float = 0.0
 
 
 @dataclass
@@ -111,6 +130,12 @@ class GateResult:
     head_loss_mm: float = 0.0
     effective_head_mm: float = 0.0
     required_sprue_area_with_losses_cm2: float = 0.0
+    # v8.0 flow
+    ingate_velocity_m_s: float = 0.0
+    ingate_max_velocity_m_s: float = 1.0
+    reynolds: float = 0.0
+    froude: float = 0.0
+    turbulent: bool = False
 
 
 @dataclass
@@ -167,5 +192,7 @@ class AnalysisResult:
     m_skewness: float = 0.0
     niyama_variants: Dict[str, np.ndarray] = field(default_factory=dict)
     elapsed_s: float = 0.0
+    casting_params: Optional[CastingParameters] = None
+    thermal_divergence: np.ndarray = field(default_factory=lambda: np.array([]))
     # metadata
     bbox_size_mm: np.ndarray = field(default_factory=lambda: np.zeros(3))

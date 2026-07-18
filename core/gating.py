@@ -1,5 +1,6 @@
-"""Ingate / runner / sprue geometric gating calculations - JoseCast v7.2."""
+"""Ingate / runner / sprue geometric gating calculations - JoseCast v8.0."""
 
+from dataclasses import replace
 from typing import Optional, Tuple
 
 import numpy as np
@@ -205,14 +206,29 @@ def _count_elbows_along_path(
 
 def analyze_gating(
     result: AnalysisResult,
-    fill_time_s: float = 10.0,
+    fill_time_s: Optional[float] = None,
     discharge_coeff: float = 0.8,
+    casting_params=None,
 ) -> Optional[GateResult]:
-    """Compute gate/sprue/runner checks including Bernoulli elbow losses."""
+    """Compute gate/sprue/runner checks including Bernoulli elbow losses and ingate velocity/Re/Fr."""
+    from core.types import CastingParameters
+
     grid = result.grid
     sdf = result.sdf
     dx = result.dx_mm
     alloy = get_alloy(result.alloy_key)
+    if casting_params is not None and isinstance(casting_params, CastingParameters):
+        fill_time_s = casting_params.t_fill_s
+        alloy = replace(
+            alloy,
+            t_pour_c=casting_params.t_pour_c,
+            t_liquidus_c=casting_params.t_liquidus_c,
+            t_solidus_c=casting_params.t_solidus_c,
+            rho_kg_m3=casting_params.rho_liquid_kg_m3,
+            viscosity_pa_s=casting_params.viscosity_pa_s,
+        )
+    if fill_time_s is None:
+        fill_time_s = 10.0
 
     part_mask = grid == BodyType.PART
     ingate = grid == BodyType.INGATE
@@ -325,6 +341,30 @@ def analyze_gating(
     final_sprue_required_cm2 = max(as_req_cm2, required_sprue_area_with_losses_cm2)
     final_bernoulli_ok = sprue_base_cm2 >= final_sprue_required_cm2
 
+    # v8.0: ingate velocity, Reynolds and Froude checks
+    ingate_velocity_m_s = 0.0
+    reynolds = 0.0
+    froude = 0.0
+    turbulent = False
+    if ag_total_mm2 > 0 and fill_time_s > 0:
+        part_volume_mm3 = float(part_mask.sum()) * (dx ** 3)
+        Q_m3_s = (part_volume_mm3 / 1e9) / fill_time_s
+        ag_m2 = ag_total_mm2 / 1e6
+        ingate_velocity_m_s = Q_m3_s / ag_m2 if ag_m2 > 0 else 0.0
+
+    # Alloy-specific maximum ingate velocity (Campbell rule)
+    max_ingate_velocity = 0.5 if alloy.key in ("AlSi7",) else 1.0
+    # Characteristic hydraulic diameter D ≈ 2*mean_wall_thickness of ingate
+    D = max(ingate_thickness_mm / 1000.0, 1e-6)
+    g = 9.81
+    rho = alloy.rho_kg_m3
+    mu = max(alloy.viscosity_pa_s, 1e-6)
+    if ingate_velocity_m_s > 0:
+        reynolds = rho * ingate_velocity_m_s * D / mu
+        froude = ingate_velocity_m_s / np.sqrt(g * D)
+        # Turbulence if Re > 20000 or Fr > 1 or above alloy-specific ingate velocity
+        turbulent = (reynolds > 20000.0) or (froude > 1.0) or (ingate_velocity_m_s > max_ingate_velocity)
+
     return GateResult(
         total_ingate_contact_area_cm2=ag_total_cm2,
         runner_min_area_cm2=runner_min_area_cm2,
@@ -345,4 +385,9 @@ def analyze_gating(
         head_loss_mm=head_loss_cm * 10.0,
         effective_head_mm=effective_head_cm * 10.0,
         required_sprue_area_with_losses_cm2=required_sprue_area_with_losses_cm2,
+        ingate_velocity_m_s=ingate_velocity_m_s,
+        ingate_max_velocity_m_s=max_ingate_velocity,
+        reynolds=reynolds,
+        froude=froude,
+        turbulent=turbulent,
     )

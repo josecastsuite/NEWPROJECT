@@ -1,4 +1,4 @@
-"""HTML->PDF Turkish report generator for JoseCast v7.2."""
+"""Turkish engineering report generator for JoseCast v8.0."""
 
 import base64
 import os
@@ -20,19 +20,14 @@ def _html_escape(text: str) -> str:
     )
 
 
-def generate_report(
-    result: AnalysisResult,
-    output_path: str,
-    screenshot_path: Optional[str] = None,
-) -> str:
-    """Render a Turkish engineering report as HTML and convert to PDF with WeasyPrint."""
-    rows_hotspot = []
+def _format_hotspot_table(result: AnalysisResult) -> str:
+    rows = []
     if result.hotspots:
         for i, hs in enumerate(result.hotspots, 1):
             pos = ",".join(f"{v:.1f}" for v in hs.position_mm)
             status = "OK" if hs.feed_ok else "UZAK/DARALMA"
             niy = ", ".join(f"{k}={v:.2f}" for k, v in hs.niyama_variants.items())
-            rows_hotspot.append(
+            rows.append(
                 f"<tr>"
                 f"<td>{i}</td>"
                 f"<td>({pos})</td>"
@@ -40,22 +35,25 @@ def generate_report(
                 f"<td>{hs.t_section_mm:.2f}</td>"
                 f"<td>{hs.dist_to_riser_mm:.1f}</td>"
                 f"<td>{hs.max_feeding_distance_mm:.1f}</td>"
+                f"<td>{hs.feeding_cost:.2f}</td>"
                 f"<td>{hs.niyama_ensemble:.2f}</td>"
                 f"<td>{hs.darcy_resistance:.2f}</td>"
                 f"<td>{hs.curvature_mean:.2f}</td>"
                 f"<td>{hs.shape_factor:.4f}</td>"
+                f"<td>{'Evet' if hs.heuvers_ok else 'Hayır'}</td>"
                 f"<td>{status}</td>"
                 f"</tr>"
             )
     else:
-        rows_hotspot.append(
-            '<tr><td colspan="11">Tespit edilmedi.</td></tr>'
-        )
+        rows.append('<tr><td colspan="13">Tespit edilmedi.</td></tr>')
+    return "".join(rows)
 
-    rows_riser = []
+
+def _format_riser_table(result: AnalysisResult) -> str:
+    rows = []
     if result.riser_results:
         for rr in result.riser_results:
-            rows_riser.append(
+            rows.append(
                 f"<tr>"
                 f"<td>{_html_escape(rr.name)}</td>"
                 f"<td>{rr.volume_cm3:.2f}</td>"
@@ -67,39 +65,52 @@ def generate_report(
                 f"</tr>"
             )
     else:
-        rows_riser.append('<tr><td colspan="7">Besleyici body atanmamış.</td></tr>')
+        rows.append('<tr><td colspan="7">Besleyici body atanmamış.</td></tr>')
+    return "".join(rows)
 
-    gate_rows = ""
-    if result.gate_result:
-        gr = result.gate_result
-        gate_rows = f"""
-        <h3>Meme / Yolluk / Döküm Ağzı</h3>
-        <table>
-            <tr><th>Parametre</th><th>Değer</th><th>Durum / Gerekli</th></tr>
-            <tr><td>Toplam meme temas alanı (Ag)</td><td>{gr.total_ingate_contact_area_cm2:.2f} cm²</td><td>min {gr.required_ingate_area_cm2:.2f} cm²</td></tr>
-            <tr><td>Yolluk min kesit alanı (Ar)</td><td>{gr.runner_min_area_cm2:.2f} cm²</td><td>min {gr.required_runner_area_cm2:.2f} cm²</td></tr>
-            <tr><td>Döküm ağzı taban alanı (As)</td><td>{gr.sprue_base_area_cm2:.2f} cm²</td><td>gerekli {gr.required_sprue_area_cm2:.2f} cm²</td></tr>
-            <tr><td>Campbell (Ag/Ar) kontrolü</td><td>{'Geçer' if gr.campbell_ok else 'Geçersiz'}</td><td>Ag/Ar &lt; 1.5</td></tr>
-            <tr><td>Bernoulli döküm ağzı kontrolü</td><td>{'Geçer' if gr.bernoulli_ok else 'Geçersiz'}</td><td>As ≥ gerekli</td></tr>
-            <tr><td>Dirsek kaybı (K·v²/2g)</td><td>{gr.elbow_count} dirsek, {gr.head_loss_mm:.1f} mm kayıp</td><td>efektif H={gr.effective_head_mm:.1f} mm</td></tr>
-            <tr><td>Meme kalın bölgede</td><td>{'Evet' if gr.ingate_on_thick_region else 'Hayır'} (ortalama M={gr.ingate_avg_m_mm:.2f} mm)</td><td>Hayır olmalı</td></tr>
-            <tr><td>Meme kalınlığı</td><td>{gr.ingate_thickness_mm:.2f} mm</td><td>-</td></tr>
-            <tr><td>Yolluk kalınlığı</td><td>{gr.runner_thickness_mm:.2f} mm</td><td>-</td></tr>
-        </table>
-        """
 
+def _format_gate_table(result: AnalysisResult) -> str:
+    if result.gate_result is None:
+        return "<p>Meme/yolluk/döküm ağzı body atanmamış.</p>"
+    gr = result.gate_result
+    return f"""
+    <table>
+        <tr><th>Parametre</th><th>Değer</th><th>Durum / Gerekli</th></tr>
+        <tr><td>Toplam meme temas alanı (Ag)</td><td>{gr.total_ingate_contact_area_cm2:.2f} cm²</td><td>min {gr.required_ingate_area_cm2:.2f} cm²</td></tr>
+        <tr><td>Meme hızı v (m/s)</td><td>{gr.ingate_velocity_m_s:.2f}</td><td>max {gr.ingate_max_velocity_m_s:.2f} m/s</td></tr>
+        <tr><td>Reynolds / Froude</td><td>Re={gr.reynolds:.0f}, Fr={gr.froude:.2f}</td><td>Türbülans: {'Evet' if gr.turbulent else 'Hayır'}</td></tr>
+        <tr><td>Yolluk min kesit alanı (Ar)</td><td>{gr.runner_min_area_cm2:.2f} cm²</td><td>min {gr.required_runner_area_cm2:.2f} cm²</td></tr>
+        <tr><td>Döküm ağzı taban alanı (As)</td><td>{gr.sprue_base_area_cm2:.2f} cm²</td><td>gerekli {gr.required_sprue_area_cm2:.2f} cm²</td></tr>
+        <tr><td>Campbell (Ag/Ar) kontrolü</td><td>{'Geçer' if gr.campbell_ok else 'Geçersiz'}</td><td>Ag/Ar &lt; 1.5</td></tr>
+        <tr><td>Bernoulli döküm ağzı kontrolü</td><td>{'Geçer' if gr.bernoulli_ok else 'Geçersiz'}</td><td>As ≥ gerekli</td></tr>
+        <tr><td>Dirsek kaybı (K·v²/2g)</td><td>{gr.elbow_count} dirsek, {gr.head_loss_mm:.1f} mm kayıp</td><td>efektif H={gr.effective_head_mm:.1f} mm</td></tr>
+        <tr><td>Meme kalın bölgede</td><td>{'Evet' if gr.ingate_on_thick_region else 'Hayır'} (ortalama M={gr.ingate_avg_m_mm:.2f} mm)</td><td>Hayır olmalı</td></tr>
+        <tr><td>Meme kalınlığı</td><td>{gr.ingate_thickness_mm:.2f} mm</td><td>-</td></tr>
+        <tr><td>Yolluk kalınlığı</td><td>{gr.runner_thickness_mm:.2f} mm</td><td>-</td></tr>
+    </table>
+    """
+
+
+def _format_niyama_table(result: AnalysisResult) -> str:
+    if not result.niyama_variants:
+        return ""
+    rows = []
+    for k, v in result.niyama_variants.items():
+        mask = result.is_metal if result.is_metal.size > 0 else np.ones(v.shape, dtype=bool)
+        rows.append(
+            f"<tr><td>{k}</td><td>{np.percentile(v[mask], 5):.3f}</td>"
+            f"<td>{np.percentile(v[mask], 50):.3f}</td><td>{np.percentile(v[mask], 95):.3f}</td></tr>"
+        )
+    return "".join(rows)
+
+
+def _render_html(result: AnalysisResult, screenshot_path: Optional[str] = None) -> str:
+    """Render the v8.0 Turkish report as a self-contained HTML string."""
     recs = ""
     if result.recommendations:
         recs = "<ul>" + "".join(f"<li>{_html_escape(r)}</li>" for r in result.recommendations) + "</ul>"
     else:
         recs = "<p>Öneri üretilemedi.</p>"
-
-    niyama_rows = ""
-    if result.niyama_variants:
-        niyama_rows = "".join(
-            f"<tr><td>{k}</td><td>{np.percentile(v[result.is_metal], 5):.3f}</td><td>{np.percentile(v[result.is_metal], 50):.3f}</td><td>{np.percentile(v[result.is_metal], 95):.3f}</td></tr>"
-            for k, v in result.niyama_variants.items()
-        )
 
     screenshot_html = ""
     if screenshot_path and os.path.exists(screenshot_path):
@@ -111,11 +122,28 @@ def generate_report(
         <img class="screenshot" src="data:image/png;base64,{img_b64}" />
         """
 
+    params = result.casting_params
+    params_html = ""
+    if params is not None:
+        params_html = f"""
+        <table>
+            <tr><th>Parametre</th><th>Değer</th></tr>
+            <tr><td>Döküm sıcaklığı T_pour</td><td>{params.t_pour_c:.1f} °C</td></tr>
+            <tr><td>Liquidus T_liq</td><td>{params.t_liquidus_c:.1f} °C</td></tr>
+            <tr><td>Solidus T_sol</td><td>{params.t_solidus_c:.1f} °C</td></tr>
+            <tr><td>Kalıp sıcaklığı T_mold</td><td>{params.t_mold_c:.1f} °C</td></tr>
+            <tr><td>Döküm süresi t_fill</td><td>{params.t_fill_s:.1f} s</td></tr>
+            <tr><td>Sıvı yoğunluk ρ</td><td>{params.rho_liquid_kg_m3:.1f} kg/m³</td></tr>
+            <tr><td>Viskozite μ</td><td>{params.viscosity_pa_s:.4f} Pa·s</td></tr>
+            <tr><td>Süperheat</td><td>{params.superheat_c:.1f} °C</td></tr>
+        </table>
+        """
+
     html = f"""<!DOCTYPE html>
 <html lang="tr">
 <head>
     <meta charset="UTF-8">
-    <title>JoseCast Analyzer v7.2 Titan - Rapor</title>
+    <title>JoseCast Analyzer v8.0 Titan - Rapor</title>
     <style>
         @page {{ size: A4; margin: 18mm; }}
         body {{ font-family: DejaVu Sans, Arial, sans-serif; font-size: 10pt; color: #222; }}
@@ -133,7 +161,7 @@ def generate_report(
     </style>
 </head>
 <body>
-    <h1>JoseCast Analyzer v7.2 Titan – Geometrik Analiz Raporu</h1>
+    <h1>JoseCast Analyzer v8.0 Titan – Geometrik Analiz Raporu</h1>
     <div class="meta">
         Tarih: {datetime.now().strftime('%Y-%m-%d %H:%M')} |
         Alaşım: {result.alloy_name} | Kalıp: {result.mold_name} |
@@ -143,6 +171,9 @@ def generate_report(
         Metal voxel: {int(result.is_metal.sum())} |
         Süre: {result.elapsed_s:.1f} sn
     </div>
+
+    <h2>Döküm Parametreleri</h2>
+    {params_html}
 
     <h2>Voxel Grid ve İstatistik</h2>
     <table>
@@ -164,24 +195,25 @@ def generate_report(
     <table>
         <tr>
             <th>#</th><th>Konum (mm)</th><th>M ± hata (mm)</th><th>t (mm)</th>
-            <th>Besleme mesafesi (mm)</th><th>Limit (mm)</th>
-            <th>Niyama ensemble</th><th>Darcy</th><th>Mean curv</th><th>SF</th><th>Durum</th>
+            <th>Mesafe (mm)</th><th>Limit (mm)</th><th>Maliyet</th>
+            <th>Niyama ens.</th><th>Darcy</th><th>Mean curv</th><th>SF</th><th>Heuver</th><th>Durum</th>
         </tr>
-        {''.join(rows_hotspot)}
+        {_format_hotspot_table(result)}
     </table>
 
     <h2>Besleyici (Riser) Değerlendirmesi</h2>
     <table>
         <tr><th>İsim</th><th>Hacim (cm³)</th><th>Yüzey (cm²)</th><th>M (mm)</th><th>Gerekli M (mm)</th><th>Gerekli V (cm³)</th><th>Durum</th></tr>
-        {''.join(rows_riser)}
+        {_format_riser_table(result)}
     </table>
 
-    {gate_rows}
+    <h2>Meme / Yolluk / Döküm Ağzı</h2>
+    {_format_gate_table(result)}
 
     <h2>Niyama Varyantları (p5 / p50 / p95)</h2>
     <table>
         <tr><th>Varyant</th><th>p5</th><th>p50</th><th>p95</th></tr>
-        {niyama_rows}
+        {_format_niyama_table(result)}
     </table>
 
     <div class="page-break"></div>
@@ -192,12 +224,32 @@ def generate_report(
 </body>
 </html>
 """
+    return html
 
+
+def _generate_html(
+    result: AnalysisResult,
+    output_path: str,
+    screenshot_path: Optional[str] = None,
+) -> str:
+    """Write a self-contained HTML report to disk."""
+    html = _render_html(result, screenshot_path)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return output_path
+
+
+def generate_report(
+    result: AnalysisResult,
+    output_path: str,
+    screenshot_path: Optional[str] = None,
+) -> str:
+    """Render HTML and convert to PDF with WeasyPrint, falling back to fpdf2."""
+    html = _render_html(result, screenshot_path)
     try:
         from weasyprint import HTML
         HTML(string=html).write_pdf(output_path)
     except Exception:
-        # Fallback to fpdf2 if WeasyPrint fails or fonts are missing
         _generate_report_fpdf2(result, output_path, screenshot_path)
     return output_path
 
@@ -208,7 +260,6 @@ def _generate_report_fpdf2(
     screenshot_path: Optional[str] = None,
 ):
     from fpdf import FPDF
-    import numpy as np
 
     pdf = FPDF()
     font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
@@ -222,11 +273,20 @@ def _generate_report_fpdf2(
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.set_font(font, "", 18)
-    pdf.cell(0, 10, "JoseCast Analyzer v7.2 - Geometrik Analiz Raporu", ln=True, align="C")
+    pdf.cell(0, 10, "JoseCast Analyzer v8.0 - Geometrik Analiz Raporu", ln=True, align="C")
     pdf.set_font(font, "", 10)
     pdf.cell(0, 6, f"Tarih: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True, align="C")
     pdf.cell(0, 6, f"Alaşım: {result.alloy_name} | Kalıp: {result.mold_name} | C={result.chvorinov_c:.4f}", ln=True, align="C")
     pdf.ln(4)
+
+    if result.casting_params is not None:
+        cp = result.casting_params
+        pdf.set_font(font, "", 13)
+        pdf.cell(0, 8, "Döküm Parametreleri", ln=True)
+        pdf.set_font(font, "", 10)
+        pdf.cell(0, 6, f"T_pour={cp.t_pour_c:.1f}°C, T_liq={cp.t_liquidus_c:.1f}°C, T_sol={cp.t_solidus_c:.1f}°C", ln=True)
+        pdf.cell(0, 6, f"T_mold={cp.t_mold_c:.1f}°C, t_fill={cp.t_fill_s:.1f}s, rho={cp.rho_liquid_kg_m3:.1f} kg/m3, mu={cp.viscosity_pa_s:.4f} Pa.s", ln=True)
+        pdf.ln(2)
 
     pdf.set_font(font, "", 13)
     pdf.cell(0, 8, "Voxel Grid ve İstatistik", ln=True)
@@ -248,7 +308,7 @@ def _generate_report_fpdf2(
             status = "OK" if hs.feed_ok else "UZAK/DARALMA"
             pdf.cell(0, 6, f"{i}. Konum=({pos}) mm | M={hs.m_value_mm:.2f} ± {hs.m_uncertainty_mm:.2f} mm | "
                            f"t={hs.t_section_mm:.2f} mm | Besleme={hs.dist_to_riser_mm:.1f}/{hs.max_feeding_distance_mm:.1f} mm | "
-                           f"Niyama={hs.niyama_ensemble:.2f} | Darcy={hs.darcy_resistance:.2f} | {status}", ln=True)
+                           f"Niyama={hs.niyama_ensemble:.2f} | Darcy={hs.darcy_resistance:.2f} | Heuver={'OK' if hs.heuvers_ok else 'FAIL'} | {status}", ln=True)
     else:
         pdf.cell(0, 6, "Tespit edilmedi.", ln=True)
     pdf.ln(4)
@@ -270,11 +330,12 @@ def _generate_report_fpdf2(
         pdf.set_font(font, "", 13)
         pdf.cell(0, 8, "Meme / Yolluk / Döküm Ağzı", ln=True)
         pdf.set_font(font, "", 10)
+        pdf.cell(0, 6, f"Meme hızı: {gr.ingate_velocity_m_s:.2f} m/s (max {gr.ingate_max_velocity_m_s:.2f} m/s), Re={gr.reynolds:.0f}, Fr={gr.froude:.2f}", ln=True)
         pdf.cell(0, 6, f"Toplam meme temas alanı: {gr.total_ingate_contact_area_cm2:.2f} cm² (min {gr.required_ingate_area_cm2:.2f} cm²)", ln=True)
         pdf.cell(0, 6, f"Yolluk min kesit: {gr.runner_min_area_cm2:.2f} cm² (min {gr.required_runner_area_cm2:.2f} cm²)", ln=True)
         pdf.cell(0, 6, f"Döküm ağzı: {gr.sprue_base_area_cm2:.2f} cm² (gerekli {gr.required_sprue_area_cm2:.2f} cm²)", ln=True)
         pdf.cell(0, 6, f"Campbell: {'Geçer' if gr.campbell_ok else 'Geçersiz'}", ln=True)
-        pdf.cell(0, 6, f"Bernoulli: {'Geçer' if gr.bernoulli_ok else 'Geçersiz'} (dirkek kaybı: {gr.elbow_count}, {gr.head_loss_mm:.1f} mm)", ln=True)
+        pdf.cell(0, 6, f"Bernoulli: {'Geçer' if gr.bernoulli_ok else 'Geçersiz'} (dirsek kaybı: {gr.elbow_count}, {gr.head_loss_mm:.1f} mm)", ln=True)
         pdf.cell(0, 6, f"Meme kalın bölgede: {'Evet' if gr.ingate_on_thick_region else 'Hayır'} "
                        f"(ortalama M={gr.ingate_avg_m_mm:.2f} mm)", ln=True)
         pdf.ln(4)

@@ -1,4 +1,4 @@
-"""JoseCast Analyzer geometric + pseudo-thermal engine v7.2."""
+"""JoseCast Analyzer geometric + pseudo-thermal engine v8.0."""
 
 from core.gating import analyze_gating, ingate_contact_area_and_mask
 from core.materials import (
@@ -19,6 +19,7 @@ from core.types import (
     AnalysisResult,
     Body,
     BodyType,
+    CastingParameters,
     GateResult,
     HotSpot,
     RefinementRegion,
@@ -59,4 +60,5 @@ __all__ = [
     "RiserResult",
     "GateResult",
     "RefinementRegion",
+    "CastingParameters",
 ]

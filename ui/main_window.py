@@ -1,8 +1,10 @@
-"""Main PyQt6 application window for JoseCast Analyzer v7.1 Titan."""
+"""Main PyQt6 application window for JoseCast Analyzer v8.0 Titan."""
 
 import os
 import sys
 import time
+import webbrowser
+from dataclasses import replace
 from typing import List, Optional
 
 import pyvista as pv
@@ -23,7 +25,7 @@ from core import (
     load_step,
 )
 from core.materials import chvorinov_c_from_properties
-from core.types import Body, BodyType
+from core.types import Body, BodyType, CastingParameters
 from ui.viewer import Analyzer3DViewer
 
 
@@ -66,8 +68,8 @@ class CheckListItem(QtWidgets.QWidget):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("JoseCast Analyzer v7.1 Titan")
-        self.resize(1700, 1050)
+        self.setWindowTitle("JoseCast Analyzer v8.0 Titan")
+        self.resize(1800, 1100)
 
         self._bodies: List[Body] = []
         self._analysis = None
@@ -78,8 +80,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._build_ui()
         self._apply_dark_theme()
+        self._sync_casting_params_from_materials()
         self.aiLog(
-            "JOSECAST TITAN ENGINE v7.1 BOOTING... [2040-READY]",
+            "JOSECAST TITAN ENGINE v8.0 BOOTING... [2040-READY]",
             "info",
         )
         self.aiLog("Siyah AI terminal hazır. Gelecekte LLM bağlantı noktası.", "ok")
@@ -118,7 +121,7 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             QPushButton:hover { background: #00cc6a; }
             QPushButton:disabled { background: #3f3f46; color: #a1a1aa; }
-            QComboBox, QSpinBox, QLineEdit {
+            QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
                 background: #27272a; color: #f4f4f5; border: 1px solid #52525b;
                 border-radius: 5px; padding: 5px;
             }
@@ -137,6 +140,7 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             QCheckBox { color: #f4f4f5; }
             QCheckBox::indicator:checked { background: #00ff88; border: 1px solid #00ff88; }
+            QScrollArea { border: none; background: transparent; }
             """
         )
 
@@ -144,12 +148,16 @@ class MainWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         main_layout = QtWidgets.QHBoxLayout(central)
-        main_layout.setContentsMargins(12, 12, 12, 12)
-        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(6)
 
-        # ---------------- LEFT PANEL ----------------
+        # ---------------- LEFT PANEL (scrollable) ----------------
+        left_scroll = QtWidgets.QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setMinimumWidth(340)
+        left_scroll.setMaximumWidth(420)
         left_panel = QtWidgets.QWidget()
-        left_panel.setFixedWidth(360)
+        left_scroll.setWidget(left_panel)
         left_layout = QtWidgets.QVBoxLayout(left_panel)
         left_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         left_layout.setSpacing(10)
@@ -165,7 +173,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         file_layout.addWidget(QtWidgets.QLabel("Body Listesi (Tip Ata):"))
         self.body_list = QtWidgets.QListWidget()
-        self.body_list.setMinimumHeight(160)
+        self.body_list.setMinimumHeight(140)
         file_layout.addWidget(self.body_list)
         left_layout.addWidget(file_group)
 
@@ -193,29 +201,79 @@ class MainWindow(QtWidgets.QMainWindow):
         self.subvox_spin = QtWidgets.QSpinBox()
         self.subvox_spin.setRange(1, 3)
         self.subvox_spin.setValue(2)
-        self.subvox_spin.setToolTip("Kenar vokseli 0.5 gibi kısmi saymak için 2x upsample.")
+        self.subvox_spin.setToolTip("Kenar vokseli kısmi saymak için 2x/3x upsample.")
         settings_layout.addRow("Sub-voxel faktör:", self.subvox_spin)
 
         self.thermal_spin = QtWidgets.QSpinBox()
         self.thermal_spin.setRange(0, 2000)
         self.thermal_spin.setValue(100)
         self.thermal_spin.setSingleStep(50)
-        self.thermal_spin.setToolTip("Fourier ısı denklemi explicit adım sayısı (0=termal kapalı).")
+        self.thermal_spin.setToolTip("Fourier / entalpi ısı denklemi explicit adım sayısı (0=termal kapalı).")
         settings_layout.addRow("Isı adımı:", self.thermal_spin)
 
         self.alloy_combo = QtWidgets.QComboBox()
         for key, alloy in ALLOYS.items():
             self.alloy_combo.addItem(alloy.name, key)
+        self.alloy_combo.currentIndexChanged.connect(self._sync_casting_params_from_materials)
         settings_layout.addRow("Alaşım:", self.alloy_combo)
 
         self.mold_combo = QtWidgets.QComboBox()
         for key, mold in MOLDS.items():
             self.mold_combo.addItem(mold.name, key)
+        self.mold_combo.currentIndexChanged.connect(self._sync_casting_params_from_materials)
         settings_layout.addRow("Kalıp:", self.mold_combo)
         left_layout.addWidget(settings_group)
 
+        # Casting parameters group
+        params_group = QtWidgets.QGroupBox("3. Döküm Parametreleri")
+        params_layout = QtWidgets.QFormLayout(params_group)
+
+        self.t_pour_spin = QtWidgets.QDoubleSpinBox()
+        self.t_pour_spin.setRange(0, 2000)
+        self.t_pour_spin.setDecimals(1)
+        self.t_pour_spin.setValue(1600.0)
+        params_layout.addRow("Döküm sıcaklığı T_pour (°C):", self.t_pour_spin)
+
+        self.t_liq_spin = QtWidgets.QDoubleSpinBox()
+        self.t_liq_spin.setRange(0, 2000)
+        self.t_liq_spin.setDecimals(1)
+        self.t_liq_spin.setValue(1510.0)
+        params_layout.addRow("Liquidus T_liq (°C):", self.t_liq_spin)
+
+        self.t_sol_spin = QtWidgets.QDoubleSpinBox()
+        self.t_sol_spin.setRange(0, 2000)
+        self.t_sol_spin.setDecimals(1)
+        self.t_sol_spin.setValue(1410.0)
+        params_layout.addRow("Solidus T_sol (°C):", self.t_sol_spin)
+
+        self.t_mold_spin = QtWidgets.QDoubleSpinBox()
+        self.t_mold_spin.setRange(-50, 500)
+        self.t_mold_spin.setDecimals(1)
+        self.t_mold_spin.setValue(25.0)
+        params_layout.addRow("Kalıp sıcaklığı T_mold (°C):", self.t_mold_spin)
+
+        self.t_fill_spin = QtWidgets.QDoubleSpinBox()
+        self.t_fill_spin.setRange(0.1, 300.0)
+        self.t_fill_spin.setDecimals(1)
+        self.t_fill_spin.setValue(10.0)
+        params_layout.addRow("Döküm süresi t_fill (s):", self.t_fill_spin)
+
+        self.rho_spin = QtWidgets.QDoubleSpinBox()
+        self.rho_spin.setRange(100, 20000)
+        self.rho_spin.setDecimals(1)
+        self.rho_spin.setValue(7000.0)
+        self.rho_spin.setSingleStep(100)
+        params_layout.addRow("Sıvı yoğunluk ρ (kg/m³):", self.rho_spin)
+
+        self.visc_spin = QtWidgets.QDoubleSpinBox()
+        self.visc_spin.setRange(0.0001, 10.0)
+        self.visc_spin.setDecimals(4)
+        self.visc_spin.setValue(0.0060)
+        params_layout.addRow("Viskozite μ (Pa·s):", self.visc_spin)
+        left_layout.addWidget(params_group)
+
         # Actions group
-        actions_group = QtWidgets.QGroupBox("3. Motor")
+        actions_group = QtWidgets.QGroupBox("4. Motor")
         actions_layout = QtWidgets.QVBoxLayout(actions_group)
 
         self.voxelize_btn = QtWidgets.QPushButton("Mesh Ata (Voxelize)")
@@ -243,7 +301,7 @@ class MainWindow(QtWidgets.QMainWindow):
         terminal_layout = QtWidgets.QVBoxLayout(terminal_group)
         self.ai_terminal = QtWidgets.QTextEdit()
         self.ai_terminal.setReadOnly(True)
-        self.ai_terminal.setMinimumHeight(220)
+        self.ai_terminal.setMinimumHeight(200)
         self.ai_terminal.setStyleSheet(
             "QTextEdit { background-color: #050505; color: #00ff88; "
             "font-family: Consolas, monospace; font-size: 11px; "
@@ -258,17 +316,18 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         terminal_layout.addWidget(self.ai_input)
         left_layout.addWidget(terminal_group)
-
         left_layout.addStretch()
-        main_layout.addWidget(left_panel)
 
         # ---------------- CENTER 3D VIEWER ----------------
         self.viewer = Analyzer3DViewer()
-        main_layout.addWidget(self.viewer, stretch=1)
 
-        # ---------------- RIGHT PANEL ----------------
+        # ---------------- RIGHT PANEL (scrollable) ----------------
+        right_scroll = QtWidgets.QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setMinimumWidth(360)
+        right_scroll.setMaximumWidth(480)
         right_panel = QtWidgets.QWidget()
-        right_panel.setFixedWidth(420)
+        right_scroll.setWidget(right_panel)
         right_layout = QtWidgets.QVBoxLayout(right_panel)
         right_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         right_layout.setSpacing(10)
@@ -283,7 +342,7 @@ class MainWindow(QtWidgets.QMainWindow):
         rec_inner = QtWidgets.QVBoxLayout(rec_group)
         self.rec_text = QtWidgets.QTextEdit()
         self.rec_text.setReadOnly(True)
-        self.rec_text.setMinimumHeight(180)
+        self.rec_text.setMinimumHeight(160)
         rec_inner.addWidget(self.rec_text)
         right_layout.addWidget(rec_group)
 
@@ -323,13 +382,52 @@ class MainWindow(QtWidgets.QMainWindow):
         vis_layout.addLayout(slice_layout)
         right_layout.addWidget(vis_group)
 
-        self.export_btn = QtWidgets.QPushButton("PDF Raporu Export Et")
+        export_group = QtWidgets.QGroupBox("Rapor")
+        export_layout = QtWidgets.QVBoxLayout(export_group)
+        self.export_btn = QtWidgets.QPushButton("PDF Raporu Kaydet")
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self.on_export_pdf)
-        right_layout.addWidget(self.export_btn)
+        export_layout.addWidget(self.export_btn)
 
+        self.html_btn = QtWidgets.QPushButton("HTML Raporu Tarayıcıda Aç")
+        self.html_btn.setEnabled(False)
+        self.html_btn.clicked.connect(self.on_view_html_report)
+        export_layout.addWidget(self.html_btn)
+        right_layout.addWidget(export_group)
         right_layout.addStretch()
-        main_layout.addWidget(right_panel)
+
+        # Splitter to avoid overlaps and allow resizing
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        splitter.addWidget(left_scroll)
+        splitter.addWidget(self.viewer)
+        splitter.addWidget(right_scroll)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([380, 900, 400])
+        main_layout.addWidget(splitter)
+
+    def _sync_casting_params_from_materials(self):
+        """Set parameter defaults from the selected alloy and mould."""
+        alloy = get_alloy(self.alloy_combo.currentData())
+        mold = get_mold(self.mold_combo.currentData())
+        self.t_pour_spin.setValue(alloy.t_pour_c)
+        self.t_liq_spin.setValue(alloy.t_liquidus_c)
+        self.t_sol_spin.setValue(alloy.t_solidus_c)
+        self.t_mold_spin.setValue(mold.t0_c)
+        self.rho_spin.setValue(alloy.rho_kg_m3)
+        self.visc_spin.setValue(alloy.viscosity_pa_s)
+
+    def _casting_params_from_ui(self) -> CastingParameters:
+        return CastingParameters(
+            t_pour_c=self.t_pour_spin.value(),
+            t_liquidus_c=self.t_liq_spin.value(),
+            t_solidus_c=self.t_sol_spin.value(),
+            t_mold_c=self.t_mold_spin.value(),
+            t_fill_s=self.t_fill_spin.value(),
+            rho_liquid_kg_m3=self.rho_spin.value(),
+            viscosity_pa_s=self.visc_spin.value(),
+        )
 
     def aiLog(self, msg: str, type_: str = "info"):
         """Print a line to the black AI terminal."""
@@ -471,7 +569,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             self.status_label.setText("Titan motoru çalışıyor, 2-3 dk sürebilir...")
-            self.aiLog("AŞAMA 2/6: SDF + Chvorinov katılaşma zamanı hesaplanıyor...", "info")
+            self.aiLog("AŞAMA 2/6: SDF + Chvorinov + eğrilik + iskelet hesaplanıyor...", "info")
             self.progress.setValue(0)
             t0 = time.time()
 
@@ -481,12 +579,14 @@ class MainWindow(QtWidgets.QMainWindow):
             refine_local = self.refine_check.isChecked()
             sub_voxel = self.subvox_spin.value()
             n_thermal_steps = self.thermal_spin.value()
+            casting_params = self._casting_params_from_ui()
 
             alloy = get_alloy(alloy_key)
             mold = get_mold(mold_key)
             chvorinov_c = chvorinov_c_from_properties(alloy, mold)
             self.aiLog(
-                f"Alaşım: {alloy.name} | Kalıp: {mold.name} | C={chvorinov_c:.3f} s/mm²",
+                f"Alaşım: {alloy.name} | Kalıp: {mold.name} | C={chvorinov_c:.4f} s/mm² | "
+                f"Superheat={casting_params.superheat_c:.1f}°C",
                 "info",
             )
 
@@ -502,11 +602,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 refine_local=refine_local,
                 sub_voxel=sub_voxel,
                 n_thermal_steps=n_thermal_steps,
+                casting_params=casting_params,
                 progress_callback=self._set_progress,
             )
+            self._analysis.casting_params = casting_params
 
             self.aiLog("AŞAMA 5/6: Meme / yolluk / döküm ağzı kontrolleri yapılıyor...", "info")
-            gate_result = analyze_gating(self._analysis, fill_time_s=10.0)
+            gate_result = analyze_gating(self._analysis, casting_params=casting_params)
             self._analysis.gate_result = gate_result
             self._analysis.recommendations.extend(self._gating_recommendations(gate_result))
 
@@ -518,6 +620,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Analiz tamamlandı ({elapsed:.1f} sn). {len(self._analysis.hotspots)} hot spot."
             )
             self.export_btn.setEnabled(True)
+            self.html_btn.setEnabled(True)
             self._update_checklist()
             self._update_recommendations()
             self.viewer.show_hotspots(self._analysis)
@@ -532,9 +635,9 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
     def _gating_recommendations(self, gr) -> List[str]:
-        recs = []
         if gr is None:
-            return recs
+            return []
+        recs = []
         if not gr.runner_ok:
             short_pct = 0
             if gr.required_runner_area_cm2 > 0:
@@ -543,26 +646,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             recs.append(
                 f"Yolluk (runner) kesiti küçük: {gr.runner_min_area_cm2:.2f} cm², "
-                f"gerekli {gr.required_runner_area_cm2:.2f} cm². "
-                f"Yol kesitini %{short_pct} büyüt veya 1:{1.5:.1f} Campbell oranını sağla."
+                f"gerekli {gr.required_runner_area_cm2:.2f} cm². Yol kesitini %{short_pct} büyüt."
             )
         if not gr.bernoulli_ok:
             recs.append(
                 f"Döküm ağzı (sprue) taban alanı {gr.sprue_base_area_cm2:.2f} cm² < gerekli {gr.required_sprue_area_cm2:.2f} cm². "
-                f"Döküm ağzını büyüt."
+                f"Döküm ağzını büyüt (dirsek kaybı {gr.head_loss_mm:.1f} mm dikkate alınarak)."
             )
         if gr.ingate_on_thick_region:
             recs.append(
-                f"Meme kalın bölgede (ortalama M={gr.ingate_avg_m_mm:.2f} mm). "
-                f"İnce kesite veya sıcak nokta etrafına taşıyın."
+                f"Meme kalın bölgede (ortalama M={gr.ingate_avg_m_mm:.2f} mm). İnce kesite taşıyın."
             )
         if not gr.ingate_ok and not gr.ingate_on_thick_region:
             recs.append(
                 f"Meme toplam temas alanı {gr.total_ingate_contact_area_cm2:.2f} cm², "
                 f"minimum {gr.required_ingate_area_cm2:.2f} cm² önerilir."
             )
-        if gr.runner_ok and gr.bernoulli_ok and not gr.ingate_on_thick_region:
-            recs.append("Meme ve yolluk geometrisi Campbell / Bernoulli kurallarına uygun.")
+        if hasattr(gr, "turbulent") and gr.turbulent:
+            recs.append(
+                f"Meme hızı {gr.ingate_velocity_m_s:.2f} m/s ile yüksek; Re={gr.reynolds:.0f}, Fr={gr.froude:.2f}. "
+                f"Türbülans / hava kaçırma riski. Meme alanını büyüt veya döküm süresini artırın."
+            )
         return recs
 
     def _clear_checklist(self):
@@ -577,11 +681,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         for hs in self._analysis.hotspots:
-            status = "OK" if hs.feed_ok else "FAIL"
+            status = "OK" if hs.feed_ok else "DARALMA/UZAK"
             text = (
                 f"Hot spot M={hs.m_value_mm:.1f} mm, t={hs.t_section_mm:.1f} mm, "
                 f"mesafe {hs.dist_to_riser_mm:.1f} mm / limit {hs.max_feeding_distance_mm:.1f} mm, "
-                f"Niyama={hs.niyama_min:.2f}, yön={status}"
+                f"Niyama={hs.niyama_ensemble:.2f}"
             )
             self.checklist_layout.addWidget(CheckListItem(text, hs.feed_ok))
 
@@ -612,6 +716,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     not gr.ingate_on_thick_region,
                 )
             )
+            if hasattr(gr, "turbulent"):
+                self.checklist_layout.addWidget(
+                    CheckListItem(
+                        f"Meme akış (Re={gr.reynolds:.0f}, Fr={gr.froude:.2f})",
+                        not gr.turbulent,
+                    )
+                )
 
     def _update_recommendations(self):
         if self._analysis and self._analysis.recommendations:
@@ -655,6 +766,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._analysis and self.local_toggle.isChecked():
             self.viewer.show_local_regions(self._analysis, self.slice_field.currentData())
 
+    def _generate_report_html(self, path: str):
+        """Generate a self-contained HTML report (no PDF conversion)."""
+        screenshot = path.replace(".html", ".png")
+        self.viewer.save_screenshot(screenshot)
+        from core.reporter import generate_report
+        generate_report(self._analysis, path.replace(".html", ".pdf"), screenshot)
+
     def on_export_pdf(self):
         if self._analysis is None:
             return
@@ -664,8 +782,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         try:
-            screenshot = os.path.join(os.path.dirname(path), "_josecast_view.png")
+            screenshot = os.path.splitext(path)[0] + ".png"
             self.viewer.save_screenshot(screenshot)
+            from core.reporter import generate_report
             generate_report(self._analysis, path, screenshot)
             self.status_label.setText(f"Rapor kaydedildi: {path}")
             self.aiLog(f"PDF raporu kaydedildi: {path}", "ok")
@@ -674,6 +793,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self.aiLog(f"PDF hatası: {e}", "crit")
             QtWidgets.QMessageBox.critical(
                 self, "Export Hatası", f"{e}\n{traceback.format_exc()}"
+            )
+
+    def on_view_html_report(self):
+        if self._analysis is None:
+            return
+        try:
+            path = os.path.join(os.path.expanduser("~"), "josecast_rapor.html")
+            screenshot = path.replace(".html", ".png")
+            self.viewer.save_screenshot(screenshot)
+            from core.reporter import _generate_html
+            _generate_html(self._analysis, path, screenshot)
+            webbrowser.open(f"file://{path}")
+            self.status_label.setText(f"HTML rapor açıldı: {path}")
+            self.aiLog(f"HTML rapor tarayıcıda açıldı: {path}", "ok")
+        except Exception as e:
+            import traceback
+            self.aiLog(f"HTML rapor hatası: {e}", "crit")
+            QtWidgets.QMessageBox.critical(
+                self, "Rapor Hatası", f"{e}\n{traceback.format_exc()}"
             )
 
 
