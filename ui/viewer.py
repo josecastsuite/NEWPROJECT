@@ -1,6 +1,6 @@
-"""PyVistaQt 3D viewer wrapper for JoseCast Analyzer v8.2."""
+"""PyVistaQt 3D viewer wrapper for JoseCast Analyzer v8.x."""
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pyvista as pv
@@ -20,8 +20,6 @@ BODY_COLORS = {
     BodyType.CORE: "#795548",
 }
 
-# PART is transparent so internal porosity/hot-spots are visible;
-# feeders / sprue / runner / riser / core remain opaque.
 BODY_OPACITY = {
     BodyType.PART: 0.35,
     BodyType.RISER: 1.0,
@@ -32,17 +30,19 @@ BODY_OPACITY = {
 }
 
 
-SCALAR_BAR_ARGS = {
-    "color": "#00ffff",
-    "title_font_size": 12,
-    "label_font_size": 10,
-    "fmt": "%.2f",
-    "vertical": False,
-    "position_x": 0.82,
-    "position_y": 0.02,
-    "width": 0.15,
-    "height": 0.08,
-}
+def _scalar_bar_args(title: str, pos: Tuple[float, float]) -> dict:
+    return {
+        "color": "#00ffff",
+        "title_font_size": 12,
+        "label_font_size": 10,
+        "fmt": "%.2f",
+        "vertical": False,
+        "position_x": pos[0],
+        "position_y": pos[1],
+        "width": 0.15,
+        "height": 0.08,
+        "title": title,
+    }
 
 
 class Analyzer3DViewer(QtInteractor):
@@ -52,9 +52,8 @@ class Analyzer3DViewer(QtInteractor):
         super().__init__(parent=parent, off_screen=off_screen)
         self.set_background("#050505", top="#0a0a1a")
         self.add_axes(line_width=2, color="#00ffff")
-        # Add a bright fill light so colored bodies remain visible in the dark scene.
         try:
-            self.add_light(pv.Light(light_type='headlight'))
+            self.add_light(pv.Light(light_type="headlight"))
         except Exception:
             pass
         try:
@@ -65,31 +64,31 @@ class Analyzer3DViewer(QtInteractor):
         except Exception:
             pass
 
-        self._body_actors = []
-        self._hotspot_actors = []
-        self._label_actor = None
+        self._body_actors: List = []
+        self._hotspot_actors: List = []
+        self._hotspot_label_actor = None
         self._risk_actor = None
-        self._niyama_actor = None
         self._porosity_actor = None
-        self._path_actors = []
-        self._slice_actors = []
-        self._local_actors = []
+        self._niyama_actors: List = []
+        self._path_actors: List = []
+        self._slice_actors: List = []
+        self._local_actors: List = []
 
     def clear_scene(self):
         self.clear_actors()
         self.add_axes(line_width=2, color="#00ffff")
         self._body_actors.clear()
         self._hotspot_actors.clear()
-        self._label_actor = None
+        self._hotspot_label_actor = None
         self._risk_actor = None
-        self._niyama_actor = None
         self._porosity_actor = None
+        self._niyama_actors.clear()
         self._path_actors.clear()
         self._slice_actors.clear()
         self._local_actors.clear()
 
     def show_bodies(self, bodies: List[Body], reset_camera: bool = True):
-        """Display the original body meshes colored by type with transparency for the part."""
+        """Display original body meshes colored by type; part is semi-transparent."""
         for actor in self._body_actors:
             self.remove_actor(actor)
         self._body_actors.clear()
@@ -113,155 +112,190 @@ class Analyzer3DViewer(QtInteractor):
         if reset_camera:
             self.reset_camera()
 
-    def _make_image_data(self, result: AnalysisResult, scalar_field: np.ndarray, scalar_name: str):
+    def _remove_scalar_bar(self, title: str):
+        if title in self.scalar_bars:
+            try:
+                self.remove_scalar_bar(title)
+            except Exception:
+                pass
+
+    def _make_grid(self, result: AnalysisResult, scalars: np.ndarray, name: str) -> pv.ImageData:
+        """Build a PyVista ImageData (voxel grid) with point-centered scalars and a metal mask."""
         grid = pv.ImageData()
         grid.dimensions = np.array(result.grid.shape) + 1
         grid.origin = result.origin_mm
         grid.spacing = (result.dx_mm, result.dx_mm, result.dx_mm)
-        grid.cell_data[scalar_name] = scalar_field.flatten(order="F")
-        return grid
+        grid.cell_data[name] = np.asarray(scalars).ravel(order="F")
+        grid.cell_data["is_metal"] = result.is_metal.ravel(order="F").astype(np.float64)
+        # Contour / slice filters require point data; convert and keep both scalars.
+        return grid.cell_data_to_point_data()
+
+    def _metal_only(self, grid: pv.ImageData) -> pv.UnstructuredGrid:
+        """Return only fully-metal cells from a grid."""
+        return grid.threshold([1.0, 1.0], scalars="is_metal", all_scalars=True)
+
+    def _smooth_surface(self, grid: pv.DataSet) -> pv.PolyData:
+        try:
+            surf = grid.extract_surface(algorithm="dataset_surface")
+            return surf.smooth(n_iter=10, feature_angle=45.0, boundary_smoothing=False)
+        except Exception:
+            try:
+                return grid.extract_surface(algorithm="dataset_surface")
+            except Exception:
+                return pv.PolyData()
 
     def show_hotspots(self, result: Optional[AnalysisResult]):
         for actor in self._hotspot_actors:
             self.remove_actor(actor)
         self._hotspot_actors.clear()
-        if self._label_actor is not None:
-            self.remove_actor(self._label_actor)
-            self._label_actor = None
+        if self._hotspot_label_actor is not None:
+            self.remove_actor(self._hotspot_label_actor)
+            self._hotspot_label_actor = None
         if result is None or not result.hotspots:
             return
 
+        alloy = get_alloy(result.alloy_key)
+        bbox_min = np.min(result.bbox_size_mm) if result.bbox_size_mm.any() else 100.0
         centers = []
         labels = []
-        alloy = get_alloy(result.alloy_key)
         for hs in result.hotspots:
-            radius = max(3.0, hs.m_value_mm * 2.0)
-            sphere = pv.Sphere(radius=radius, center=hs.position_mm, theta_resolution=24, phi_resolution=24)
-            if not hs.feed_ok:
-                color = "#ff3333"
-            elif hs.niyama_ensemble < alloy.niyama_macro:
+            # Radius proportional to local wall thickness, clamped to a sensible fraction of the part size.
+            radius = max(1.2, min(hs.t_section_mm * 0.15, bbox_min * 0.02, 6.0))
+            sphere = pv.Sphere(
+                radius=radius,
+                center=hs.position_mm,
+                theta_resolution=24,
+                phi_resolution=24,
+            )
+            if not hs.feed_ok or hs.niyama_ensemble < alloy.niyama_macro:
                 color = "#ff3333"
             elif hs.niyama_ensemble < alloy.niyama_shrinkage:
                 color = "#ffaa00"
             else:
                 color = "#00ff88"
-            actor = self.add_mesh(sphere, color=color, opacity=1.0, lighting=False, ambient=1.0)
+            actor = self.add_mesh(
+                sphere,
+                color=color,
+                opacity=0.9,
+                ambient=1.0,
+                diffuse=0.2,
+                lighting=False,
+                show_edges=False,
+            )
             self._hotspot_actors.append(actor)
 
-            centers.append(hs.position_mm + np.array([0, 0, radius + 1.0]))
+            label_pos = hs.position_mm + np.array([0.0, 0.0, radius * 1.4])
+            centers.append(label_pos)
             labels.append(
-                f"M={hs.m_value_mm:.1f}mm\nD={hs.dist_to_riser_mm:.0f}mm\nN={hs.niyama_ensemble:.2f}"
+                f"M={hs.m_value_mm:.1f}mm | D={hs.dist_to_riser_mm:.0f}mm | N={hs.niyama_ensemble:.2f}"
             )
 
         if centers:
-            self._label_actor = self.add_point_labels(
+            self._hotspot_label_actor = self.add_point_labels(
                 np.array(centers),
                 labels,
                 text_color="#00ffff",
-                font_size=10,
-                shape=None,
+                font_size=11,
+                shape="rounded_rect",
+                background_color="black",
+                background_opacity=1.0,
                 show_points=False,
                 always_visible=True,
             )
 
-    def show_risk(self, result: Optional[AnalysisResult], threshold: float = 0.7, max_points: int = 3000):
+    def show_risk(self, result: Optional[AnalysisResult]):
+        """Show risk isosurfaces (0.70 and 0.85) colored by risk value."""
         if self._risk_actor is not None:
             self.remove_actor(self._risk_actor)
             self._risk_actor = None
+        self._remove_scalar_bar("Risk")
         if result is None:
             return
 
-        grid = self._make_image_data(result, result.risk, "risk")
-        thresh = grid.threshold([threshold, 1.0])
-        if thresh.n_cells == 0:
+        grid = self._make_grid(result, result.risk, "risk")
+        metal = self._metal_only(grid)
+        if metal.n_cells == 0:
             return
-
-        cloud = thresh.cell_centers()
-        if cloud.n_points > max_points:
-            idx = np.random.choice(cloud.n_points, max_points, replace=False)
-            points = cloud.points[idx]
-            scalars = cloud["risk"][idx]
-            cloud = pv.PolyData(points)
-            cloud["risk"] = scalars
-
+        iso = metal.contour([0.70, 0.85], scalars="risk")
+        if iso.n_points == 0:
+            return
         self._risk_actor = self.add_mesh(
-            cloud,
+            iso,
             scalars="risk",
             cmap="hot",
-            style="points",
-            point_size=1,
-            render_points_as_spheres=False,
-            opacity=0.15,
+            opacity=0.65,
+            clim=[0.0, 1.0],
             show_scalar_bar=True,
-            scalar_bar_args={**SCALAR_BAR_ARGS, "title": "Shrinkage Risk"},
+            scalar_bar_args=_scalar_bar_args("Risk", (0.82, 0.02)),
+            smooth_shading=True,
         )
-    def show_porosity_cloud(self, result: Optional[AnalysisResult], threshold: float = 0.85, max_points: int = 5000):
-        """High-risk porosity point cloud (sampled so bodies stay visible)."""
+
+    def show_porosity_cloud(self, result: Optional[AnalysisResult], threshold: float = 0.90, max_points: int = 1500):
+        """High-risk porosity as bright point markers inside the part."""
         if self._porosity_actor is not None:
             self.remove_actor(self._porosity_actor)
             self._porosity_actor = None
         if result is None:
             return
 
-        grid = self._make_image_data(result, result.risk, "risk")
-        thresh = grid.threshold([threshold, 1.0])
-        if thresh.n_cells == 0:
+        grid = self._make_grid(result, result.risk, "risk")
+        metal = self._metal_only(grid)
+        if metal.n_cells == 0:
+            return
+        high = metal.threshold([threshold, 1.0], scalars="risk")
+        if high.n_cells == 0:
             return
 
-        cloud = thresh.cell_centers()
+        cloud = high.cell_centers()
         if cloud.n_points > max_points:
             idx = np.random.choice(cloud.n_points, max_points, replace=False)
             points = cloud.points[idx]
-            scalars = cloud["risk"][idx]
             cloud = pv.PolyData(points)
-            cloud["risk"] = scalars
 
         self._porosity_actor = self.add_mesh(
             cloud,
-            scalars="risk",
-            cmap="hot",
+            color="#ff0000",
             style="points",
-            point_size=5,
+            point_size=4,
             render_points_as_spheres=True,
-            opacity=0.85,
+            opacity=0.9,
             emissive=True,
-            show_scalar_bar=True,
-            scalar_bar_args={**SCALAR_BAR_ARGS, "title": "Porozite Riski"},
+            show_scalar_bar=False,
         )
 
     def show_niyama_isosurfaces(self, result: Optional[AnalysisResult]):
-        """Niyama point cloud for the macro-shrinkage / micro-porosity band."""
-        if self._niyama_actor is not None:
-            self.remove_actor(self._niyama_actor)
-            self._niyama_actor = None
+        """Show Niyama isosurfaces (real surfaces) colored by Niyama value inside the part."""
+        for actor in self._niyama_actors:
+            self.remove_actor(actor)
+        self._niyama_actors.clear()
+        self._remove_scalar_bar("Niyama")
         if result is None:
             return
 
         alloy = get_alloy(result.alloy_key)
-        grid = self._make_image_data(result, result.niyama, "niyama")
-        band = grid.threshold([0.0, alloy.niyama_shrinkage])
-        if band.n_cells == 0:
+        grid = self._make_grid(result, result.niyama, "niyama")
+        metal = self._metal_only(grid)
+        if metal.n_cells == 0:
             return
 
-        cloud = band.cell_centers()
-        if cloud.n_points > 4000:
-            idx = np.random.choice(cloud.n_points, 4000, replace=False)
-            points = cloud.points[idx]
-            scalars = cloud["niyama"][idx]
-            cloud = pv.PolyData(points)
-            cloud["niyama"] = scalars
-
-        self._niyama_actor = self.add_mesh(
-            cloud,
+        iso = metal.contour(
+            [alloy.niyama_macro, alloy.niyama_shrinkage],
             scalars="niyama",
-            cmap="plasma",
-            style="points",
-            point_size=3,
-            render_points_as_spheres=False,
-            opacity=0.35,
-            show_scalar_bar=True,
-            scalar_bar_args={**SCALAR_BAR_ARGS, "title": "Niyama"},
         )
+        if iso.n_points == 0:
+            return
+
+        actor = self.add_mesh(
+            iso,
+            scalars="niyama",
+            cmap="jet",
+            opacity=0.8,
+            clim=[0.0, alloy.niyama_shrinkage * 2.0],
+            show_scalar_bar=True,
+            scalar_bar_args=_scalar_bar_args("Niyama", (0.82, 0.16)),
+            smooth_shading=True,
+        )
+        self._niyama_actors.append(actor)
 
     def show_feeding_paths(self, result: Optional[AnalysisResult]):
         for actor in self._path_actors:
@@ -273,7 +307,11 @@ class Analyzer3DViewer(QtInteractor):
         part_mask = result.grid == BodyType.PART
         for hs in result.hotspots:
             vox = np.round((hs.position_mm - result.origin_mm) / result.dx_mm).astype(int)
-            if not (0 <= vox[0] < part_mask.shape[0] and 0 <= vox[1] < part_mask.shape[1] and 0 <= vox[2] < part_mask.shape[2]):
+            if not (
+                0 <= vox[0] < part_mask.shape[0]
+                and 0 <= vox[1] < part_mask.shape[1]
+                and 0 <= vox[2] < part_mask.shape[2]
+            ):
                 continue
             if not part_mask[vox[0], vox[1], vox[2]]:
                 continue
@@ -281,22 +319,28 @@ class Analyzer3DViewer(QtInteractor):
             if len(path) < 2:
                 continue
             pts = np.array(path) * result.dx_mm + result.origin_mm
-            if len(pts) < 2:
-                continue
             poly = pv.PolyData()
             poly.points = pts
             poly.lines = np.hstack([[len(pts)], np.arange(len(pts))]).astype(np.int64)
-            radius = max(1.0, result.dx_mm * 0.8)
+            radius = max(2.0, result.dx_mm * 2.0)
             try:
                 tube = poly.tube(radius=radius)
             except Exception:
                 tube = poly
-            color = "#00ff88" if hs.feed_ok else "#ff3333"
-            actor = self.add_mesh(tube, color=color, opacity=0.9, smooth_shading=True, lighting=False)
+            # Cyan tubes are visible against red/yellow risk surfaces.
+            color = "#00ff88" if hs.feed_ok else "#00ffff"
+            actor = self.add_mesh(
+                tube,
+                color=color,
+                opacity=0.9,
+                smooth_shading=True,
+                lighting=False,
+                show_scalar_bar=False,
+            )
             self._path_actors.append(actor)
 
     def show_slices(self, result: Optional[AnalysisResult], field: str = "sdf"):
-        """Add three orthogonal slices through the center for the selected scalar field."""
+        """Add three orthogonal slices through the part for the selected scalar field."""
         for actor in self._slice_actors:
             self.remove_actor(actor)
         self._slice_actors.clear()
@@ -308,24 +352,39 @@ class Analyzer3DViewer(QtInteractor):
             "risk": (result.risk, "Risk", "hot"),
             "niyama": (result.niyama, "Niyama", "plasma"),
             "mat_id": (result.grid.astype(np.float64), "Mat ID", "tab10"),
-            "temperature": (result.temperature if result.temperature.size > 0 else result.sdf, "T (°C)", "coolwarm"),
+            "temperature": (
+                result.temperature if result.temperature.size > 0 else result.sdf,
+                "T (°C)",
+                "coolwarm",
+            ),
         }
         if field not in field_map:
             return
         data, title, cmap = field_map[field]
-        grid = self._make_image_data(result, data, field)
-        origin = grid.center
+
+        grid = self._make_grid(result, data, field)
+        metal = self._metal_only(grid)
+        if metal.n_cells == 0:
+            return
+
+        self._remove_scalar_bar(title)
+        origin = np.array(metal.center)
+        first_bar = True
         for normal in [(1, 0, 0), (0, 1, 0), (0, 0, 1)]:
-            slice_mesh = grid.slice(normal=normal, origin=origin)
+            slc = metal.slice(normal=normal, origin=origin)
+            if slc.n_points == 0:
+                continue
             actor = self.add_mesh(
-                slice_mesh,
+                slc,
                 scalars=field,
                 cmap=cmap,
-                opacity=0.9,
-                show_scalar_bar=True,
-                scalar_bar_args={**SCALAR_BAR_ARGS, "title": title},
+                opacity=0.95,
+                show_scalar_bar=first_bar,
+                scalar_bar_args=_scalar_bar_args(title, (0.82, 0.18)),
+                clim=[0.0, 1.0] if field == "risk" else None,
             )
             self._slice_actors.append(actor)
+            first_bar = False
 
     def show_local_regions(self, result: Optional[AnalysisResult], field: str = "risk"):
         for actor in self._local_actors:
@@ -356,12 +415,15 @@ class Analyzer3DViewer(QtInteractor):
             )
             self._local_actors.append(actor)
 
+    # ---------------- toggles ----------------
     def toggle_risk(self, result: AnalysisResult, checked: bool):
         if checked:
             self.show_risk(result)
-        elif self._risk_actor is not None:
-            self.remove_actor(self._risk_actor)
-            self._risk_actor = None
+        else:
+            if self._risk_actor is not None:
+                self.remove_actor(self._risk_actor)
+                self._risk_actor = None
+            self._remove_scalar_bar("Risk")
 
     def toggle_hotspots(self, result: AnalysisResult, checked: bool):
         if checked:
@@ -370,23 +432,26 @@ class Analyzer3DViewer(QtInteractor):
             for actor in self._hotspot_actors:
                 self.remove_actor(actor)
             self._hotspot_actors.clear()
-            if self._label_actor is not None:
-                self.remove_actor(self._label_actor)
-                self._label_actor = None
+            if self._hotspot_label_actor is not None:
+                self.remove_actor(self._hotspot_label_actor)
+                self._hotspot_label_actor = None
 
     def toggle_porosity(self, result: AnalysisResult, checked: bool):
         if checked:
             self.show_porosity_cloud(result)
-        elif self._porosity_actor is not None:
-            self.remove_actor(self._porosity_actor)
-            self._porosity_actor = None
+        else:
+            if self._porosity_actor is not None:
+                self.remove_actor(self._porosity_actor)
+                self._porosity_actor = None
 
     def toggle_niyama(self, result: AnalysisResult, checked: bool):
         if checked:
             self.show_niyama_isosurfaces(result)
-        elif self._niyama_actor is not None:
-            self.remove_actor(self._niyama_actor)
-            self._niyama_actor = None
+        else:
+            for actor in self._niyama_actors:
+                self.remove_actor(actor)
+            self._niyama_actors.clear()
+            self._remove_scalar_bar("Niyama")
 
     def toggle_feeding_paths(self, result: AnalysisResult, checked: bool):
         if checked:
@@ -403,6 +468,9 @@ class Analyzer3DViewer(QtInteractor):
             for actor in self._slice_actors:
                 self.remove_actor(actor)
             self._slice_actors.clear()
+            # Remove any slice scalar bar to avoid overlap when switching fields.
+            for title in ["SDF (mm)", "Risk", "Niyama", "Mat ID", "T (°C)"]:
+                self._remove_scalar_bar(title)
 
     def save_screenshot(self, path: str) -> str:
         """Save a PNG screenshot of the current 3D view."""

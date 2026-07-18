@@ -957,8 +957,9 @@ def _refine_region(
 
     niyama_risk = np.clip(1.0 - niyama / alloy.niyama_shrinkage, 0.0, 1.0)
     FD_field = alloy.feed_k1 * (2.0 * M_mod)
-    # no global dist_feed here, use a conservative isolation term from local SDF
-    feed_risk = np.clip(sdf / np.maximum(FD_field, 1.0), 0.0, 1.0)
+    # Smooth local feeding risk: 0 when local thickness << FD, 0.5 at equality, -> 1 when much thicker than FD
+    feed_risk = sdf / (sdf + np.maximum(FD_field, 1.0))
+    feed_risk = np.clip(feed_risk, 0.0, 1.0)
     risk = 1.0 - (1.0 - niyama_risk) * (1.0 - feed_risk)
     risk = np.where(is_metal, risk, 0.0)
     risk = np.nan_to_num(risk, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1268,7 +1269,9 @@ def analyze(
     with np.errstate(divide="ignore", invalid="ignore"):
         niyama_risk = np.clip(1.0 - niyama / alloy.niyama_shrinkage, 0.0, 1.0)
         FD_field = alloy.feed_k1 * (2.0 * M_mod)
-        feed_risk = np.clip(dist_feed / np.maximum(FD_field, 1.0), 0.0, 1.0)
+        # Smooth feeding risk: 0 when dist << FD, 0.5 at dist == FD, -> 1 when dist >> FD
+        feed_risk = dist_feed / (dist_feed + np.maximum(FD_field, 1.0))
+        feed_risk = np.clip(feed_risk, 0.0, 1.0)
         risk = 1.0 - (1.0 - niyama_risk) * (1.0 - feed_risk)
         risk = np.where(is_metal, risk, 0.0)
         risk = np.nan_to_num(risk, nan=0.0, posinf=0.0, neginf=0.0)
