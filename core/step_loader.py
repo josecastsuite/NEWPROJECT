@@ -1,7 +1,7 @@
 """STEP file loader based on CadQuery + Trimesh."""
 
 import os
-from typing import List
+from typing import List, Optional
 
 import cadquery as cq
 import numpy as np
@@ -10,8 +10,17 @@ import trimesh
 from core.types import Body
 
 
-def load_step(path: str, target_triangles: int = 8000) -> List[Body]:
-    """Return a list of Body objects, one per solid in the STEP file."""
+def load_step(path: str, tolerance: Optional[float] = None, angular_tolerance: float = 0.1) -> List[Body]:
+    """Return a list of Body objects, one per solid in the STEP file.
+
+    Parameters
+    ----------
+    tolerance : float | None
+        Linear deflection for tessellation. If None, it is chosen as 0.1% of
+        the solid diagonal, clamped between 0.05 and 2.0 mm. Smaller = finer.
+    angular_tolerance : float
+        Angular deflection for tessellation (default 0.1 rad).
+    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"STEP dosyası bulunamadı: {path}")
 
@@ -34,11 +43,22 @@ def load_step(path: str, target_triangles: int = 8000) -> List[Body]:
     for i, solid in enumerate(solids):
         if solid is None:
             continue
+
+        # Choose a tessellation tolerance that is 0.1% of the solid size.
+        tol = tolerance
+        if tol is None:
+            try:
+                bb = solid.BoundingBox()
+                diag = max(bb.xmax - bb.xmin, bb.ymax - bb.ymin, bb.zmax - bb.zmin)
+                tol = max(0.05, min(diag * 0.001, 2.0))
+            except Exception:
+                tol = 0.5
+
         try:
-            vertices, triangles = solid.tessellate(target_triangles)
+            vertices, triangles = solid.tessellate(tol, angular_tolerance)
         except Exception:
             # If a compound is passed, it may not support tessellate directly
-            vertices, triangles = solid.toTris().tessellate(target_triangles)
+            vertices, triangles = solid.toTris().tessellate(tol, angular_tolerance)
 
         if len(triangles) == 0:
             continue

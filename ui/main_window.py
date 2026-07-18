@@ -713,6 +713,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.html_btn.setEnabled(True)
             self._update_checklist()
             self._update_recommendations()
+            # Opaque/translucent bodies first; markers are drawn afterwards so
+            # porosity, paths and hot-spots are visible inside the transparent part.
+            self.viewer.show_bodies(self._bodies, reset_camera=True)
             if self.risk_toggle.isChecked():
                 self.viewer.show_risk(self._analysis)
             if self.porosity_toggle.isChecked():
@@ -723,9 +726,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.viewer.show_feeding_paths(self._analysis)
             if self.local_toggle.isChecked():
                 self.viewer.show_local_regions(self._analysis, self.slice_field.currentData())
-            # Draw bodies on top of translucent point clouds so body-type colors remain readable.
-            self.viewer.show_bodies(self._bodies, reset_camera=False)
-            # Hot-spot spheres are drawn last so they are not hidden inside the opaque part.
             self.viewer.show_hotspots(self._analysis)
         except Exception as e:
             import traceback

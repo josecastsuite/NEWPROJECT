@@ -19,6 +19,17 @@ BODY_COLORS = {
     BodyType.CORE: "#795548",
 }
 
+# PART is transparent so internal porosity/hot-spots are visible;
+# feeders / sprue / runner / riser / core remain opaque.
+BODY_OPACITY = {
+    BodyType.PART: 0.35,
+    BodyType.RISER: 1.0,
+    BodyType.INGATE: 1.0,
+    BodyType.RUNNER: 1.0,
+    BodyType.SPRUE: 1.0,
+    BodyType.CORE: 1.0,
+}
+
 
 SCALAR_BAR_ARGS = {
     "color": "#00ffff",
@@ -43,6 +54,13 @@ class Analyzer3DViewer(QtInteractor):
         # Add a bright fill light so colored bodies remain visible in the dark scene.
         try:
             self.add_light(pv.Light(light_type='headlight'))
+        except Exception:
+            pass
+        try:
+            self.enable_depth_peeling(number_of_peels=32, occlusion_ratio=0.0)
+            if self.ren_win is not None:
+                self.ren_win.SetMultiSamples(0)
+                self.ren_win.SetAlphaBitPlanes(1)
         except Exception:
             pass
 
@@ -70,7 +88,7 @@ class Analyzer3DViewer(QtInteractor):
         self._local_actors.clear()
 
     def show_bodies(self, bodies: List[Body], reset_camera: bool = True):
-        """Display the original body meshes colored by type with flat body-type colors."""
+        """Display the original body meshes colored by type with transparency for the part."""
         for actor in self._body_actors:
             self.remove_actor(actor)
         self._body_actors.clear()
@@ -81,10 +99,11 @@ class Analyzer3DViewer(QtInteractor):
             faces = np.c_[np.full(len(body.faces), 3, dtype=np.int64), body.faces].ravel()
             mesh = pv.PolyData(body.vertices, faces)
             color = BODY_COLORS.get(body.body_type, "#E0E0E0")
+            opacity = BODY_OPACITY.get(body.body_type, 1.0)
             actor = self.add_mesh(
                 mesh,
                 color=color,
-                opacity=1.0,
+                opacity=opacity,
                 show_edges=False,
                 smooth_shading=True,
                 pickable=False,
@@ -198,9 +217,10 @@ class Analyzer3DViewer(QtInteractor):
             scalars="risk",
             cmap="hot",
             style="points",
-            point_size=2,
+            point_size=5,
             render_points_as_spheres=True,
-            opacity=0.30,
+            opacity=0.85,
+            emissive=True,
             show_scalar_bar=True,
             scalar_bar_args={**SCALAR_BAR_ARGS, "title": "Porozite Riski"},
         )
@@ -256,11 +276,18 @@ class Analyzer3DViewer(QtInteractor):
             if len(path) < 2:
                 continue
             pts = np.array(path) * result.dx_mm + result.origin_mm
+            if len(pts) < 2:
+                continue
             poly = pv.PolyData()
             poly.points = pts
             poly.lines = np.hstack([[len(pts)], np.arange(len(pts))]).astype(np.int64)
+            radius = max(1.0, result.dx_mm * 0.8)
+            try:
+                tube = poly.tube(radius=radius)
+            except Exception:
+                tube = poly
             color = "#00ff88" if hs.feed_ok else "#ff3333"
-            actor = self.add_mesh(poly, color=color, line_width=3, opacity=0.9)
+            actor = self.add_mesh(tube, color=color, opacity=0.9, smooth_shading=True, lighting=False)
             self._path_actors.append(actor)
 
     def show_slices(self, result: Optional[AnalysisResult], field: str = "sdf"):
