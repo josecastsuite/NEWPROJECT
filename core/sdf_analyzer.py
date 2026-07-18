@@ -1,7 +1,7 @@
 """SDF-based geometric + pseudo-thermal casting analyzer - JoseCast v8.0."""
 
 from dataclasses import replace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import trimesh
@@ -168,24 +168,26 @@ def _scheil_fs(T_arr, t_liq, t_sol, k):
 
 
 def _temperature_from_erf(
-    sdf: np.ndarray, t: float, alloy: Alloy, mold: MoldMaterial
+    sdf: np.ndarray, t: Union[float, np.ndarray], alloy: Alloy, mold: MoldMaterial
 ) -> np.ndarray:
     """1-D semi-infinite solution of the Fourier heat equation in the normal direction."""
     alpha = mold.diffusivity_mm2_s
-    if t <= 0 or alpha <= 0:
+    if alpha <= 0:
         return np.full_like(sdf, alloy.t_pour_c)
+    t = np.maximum(np.asarray(t, dtype=np.float64), 1e-9)
     arg = sdf / (2.0 * np.sqrt(alpha * t))
     T = mold.t0_c + (alloy.t_pour_c - mold.t0_c) * erf(arg)
     return np.clip(T, mold.t0_c, alloy.t_pour_c)
 
 
 def _cooling_rate_from_erf(
-    sdf: np.ndarray, t: float, alloy: Alloy, mold: MoldMaterial
+    sdf: np.ndarray, t: Union[float, np.ndarray], alloy: Alloy, mold: MoldMaterial
 ) -> np.ndarray:
     """Time derivative dT/dt of the erf solution (always <= 0 for cooling)."""
     alpha = mold.diffusivity_mm2_s
-    if t <= 0 or alpha <= 0:
+    if alpha <= 0:
         return np.zeros_like(sdf)
+    t = np.maximum(np.asarray(t, dtype=np.float64), 1e-9)
     sqrt_term = np.sqrt(alpha * t)
     arg = sdf / (2.0 * sqrt_term)
     exp = np.exp(-(arg * arg))
@@ -204,20 +206,24 @@ def compute_thermal_field(
     n_steps: int = 100,
     progress_callback: Optional[callable] = None,
     sdf: Optional[np.ndarray] = None,
+    M_mod: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Analytical thermal field from the 1-D heat equation normal to the surface:
-        T(x,t) = T0 + (T_pour - T0) * erf( x / (2 sqrt(alpha*t)) )
+    Analytical 1-D thermal field at the local Chvorinov solidification time:
+        T(x,t_s) = T0 + (T_pour - T0) * erf( x / (2 sqrt(alpha*t_s)) )
     x is the signed distance to the nearest surface (SDF). Latent heat enters
     through the Scheil solid fraction. Returns (T, dT/dt, fs, div(∇T)).
     """
     if sdf is None:
         sdf = compute_subvoxel_sdf(is_metal, dx, sub=1)
     C = chvorinov_c_from_properties(alloy, mold)
-    M_med = float(np.median(sdf[is_metal])) if is_metal.any() else 0.0
-    t_eval = max(0.5 * C * M_med ** 2, 1e-6)
-    T = _temperature_from_erf(sdf, t_eval, alloy, mold)
-    cooling_rate = -_cooling_rate_from_erf(sdf, t_eval, alloy, mold)
+    if M_mod is None:
+        M_field = sdf
+    else:
+        M_field = M_mod
+    t_s_field = np.maximum(compute_chvorinov_t(M_field, C), 1e-9)
+    T = _temperature_from_erf(sdf, t_s_field, alloy, mold)
+    cooling_rate = -_cooling_rate_from_erf(sdf, t_s_field, alloy, mold)
     solid_fraction = _scheil_fs(
         T, alloy.t_liquidus_c, alloy.t_solidus_c, alloy.partition_coefficient
     )
@@ -236,24 +242,43 @@ def compute_chvorinov_t(M_field: np.ndarray, C: float) -> np.ndarray:
 def compute_niyama(
     sdf: np.ndarray,
     M_mod: np.ndarray,
-    t_s: np.ndarray,
     alloy: Alloy,
+    mold: MoldMaterial,
+    dx: float,
     is_metal: Optional[np.ndarray] = None,
+    temperature: Optional[np.ndarray] = None,
+    cooling_rate: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Physically-based Niyama criterion N = G / sqrt(R) [K s^0.5 / mm].
-    G is estimated from the Stefan velocity of the solidification front,
-    R = ΔT_solid / t_s is the Chvorinov cooling rate. The result is weighted
-    by the local shape factor f = M_mod/sdf (sphere f=1/3, plate f≈1).
+    Physically-based Niyama criterion N = G / sqrt(R)  [K s^0.5 / mm].
+    G is the metal-side temperature gradient required to remove latent +
+    superheat, estimated from the Stefan velocity v = M_mod / t_s.  R is the
+    Chvorinov cooling rate ΔT_solid / t_s.  The result is weighted by
+    f = M_mod / sdf so that bulky, sphere-like regions (f < 1) report lower
+    Niyama (higher shrinkage risk) than plates (f ≈ 1).
     """
+    C = chvorinov_c_from_properties(alloy, mold)
+    t_s = np.maximum(compute_chvorinov_t(M_mod, C), 1e-9)
+    # Stefan velocity based on the local shape-corrected modulus [mm/s]
+    v_solid = M_mod / t_s
     l_eff = alloy.latent_heat_j_kg + alloy.cp_j_kgk * max(
         alloy.t_pour_c - alloy.t_liquidus_c, 0.0
     )
-    v_solid = sdf / (2.0 * np.maximum(t_s, 1e-12))
-    G = alloy.rho_kg_m3 * l_eff * v_solid / (alloy.k_w_mk * 1e6)
-    R = (alloy.t_liquidus_c - alloy.t_solidus_c) / np.maximum(t_s, 1e-12)
+    # Metal-side gradient required to carry away latent + superheat [K/mm]
+    G = np.where(
+        sdf > 0,
+        alloy.rho_kg_m3 * l_eff * v_solid / (alloy.k_w_mk * 1e6),
+        0.0,
+    )
+    # Cooling rate from Chvorinov [K/s]
+    R = np.where(
+        sdf > 0,
+        (alloy.t_liquidus_c - alloy.t_solidus_c) / t_s,
+        0.0,
+    )
     with np.errstate(divide="ignore", invalid="ignore"):
         niyama = G / np.sqrt(np.maximum(R, 1e-12))
+    # Shape correction: sphere-like regions (f < 1) get lower Niyama
     shape_factor = M_mod / np.maximum(sdf, 1e-6)
     niyama = niyama * shape_factor
     niyama = np.nan_to_num(niyama, nan=0.0, posinf=0.0, neginf=0.0)
@@ -367,23 +392,32 @@ def find_hotspots(
     min_size_mm: float = 2.0,
     cluster_eps_mm: float = 10.0,
 ) -> List[HotSpot]:
-    """Detect SDF local maxima on the medial axis and cluster with DBSCAN."""
+    """Detect M_mod local maxima on the medial axis and cluster with DBSCAN."""
+    # Shape-corrected modulus: bulky regions (κ < 0, sphere-like) get larger f
+    if curvature is not None:
+        shape_factor_field = np.clip(
+            1.0 + np.maximum(-curvature * sdf, 0.0), 1.0, 3.0
+        )
+    else:
+        shape_factor_field = np.ones_like(sdf)
+    M_mod = sdf / shape_factor_field
+
     if use_skeleton:
         try:
             skeleton = skeletonize(part_mask)
-            search_mask = skeleton & (sdf > min_size_mm)
+            search_mask = skeleton & (M_mod > min_size_mm)
             if not search_mask.any():
-                search_mask = part_mask & (sdf > min_size_mm)
+                search_mask = part_mask & (M_mod > min_size_mm)
         except Exception:
-            search_mask = part_mask & (sdf > min_size_mm)
+            search_mask = part_mask & (M_mod > min_size_mm)
     else:
-        search_mask = part_mask & (sdf > min_size_mm)
+        search_mask = part_mask & (M_mod > min_size_mm)
 
     if not search_mask.any():
         return []
 
     size_vox = max(1, int(5.0 / dx))
-    local_max = sdf == ndimage.maximum_filter(sdf, size=size_vox, mode="constant")
+    local_max = M_mod == ndimage.maximum_filter(M_mod, size=size_vox, mode="constant")
     candidates = np.argwhere(local_max & search_mask)
     if len(candidates) == 0:
         candidates = np.argwhere(search_mask)
@@ -391,7 +425,7 @@ def find_hotspots(
     # Combine curvature (sharp corners) as additional candidates.
     if curvature is not None:
         high_curv = (np.abs(curvature) > np.percentile(np.abs(curvature[part_mask]), 95)) & part_mask
-        extra = np.argwhere(high_curv & (sdf > min_size_mm))
+        extra = np.argwhere(high_curv & (M_mod > min_size_mm))
         if len(extra):
             candidates = np.vstack([candidates, extra]) if len(candidates) else extra
 
@@ -406,17 +440,11 @@ def find_hotspots(
         if lbl == -1:
             continue
         pts = candidates[labels == lbl]
-        vals = sdf[pts[:, 0], pts[:, 1], pts[:, 2]]
+        vals = M_mod[pts[:, 0], pts[:, 1], pts[:, 2]]
         idx = int(np.argmax(vals))
         pos_vox = pts[idx]
-        sdf_val = float(vals[idx])
-        # local shape factor from mean curvature: sphere -> f=3, plate -> f=1
-        shape_factor = 1.0
-        if curvature is not None:
-            kappa = float(curvature[pos_vox[0], pos_vox[1], pos_vox[2]])
-            shape_factor = 1.0 + max(0.0, -kappa * sdf_val)
-            shape_factor = min(max(shape_factor, 1.0), 3.0)
-        m_value = sdf_val / shape_factor
+        m_value = float(vals[idx])
+        sdf_val = float(sdf[pos_vox[0], pos_vox[1], pos_vox[2]])
         position_mm = origin_mm + pos_vox * dx
         hotspots.append(
             HotSpot(
@@ -723,7 +751,8 @@ def _path_darcy_and_directional(
             P_head = alloy.rho_kg_m3 * 9.81 * (dz_mm / 1000.0)
 
     # Feeding shrinkage demand: shrinkage of the last-liquid pocket at the hot spot
-    V_hotspot_mm3 = (4.0 / 3.0) * np.pi * max(hot_sdf, 1e-3) ** 3
+    hot_M = M_mod[start_vox[0], start_vox[1], start_vox[2]]
+    V_hotspot_mm3 = (4.0 / 3.0) * np.pi * max(hot_M, 1e-3) ** 3
     V_shrink_mm3 = alloy.shrinkage_factor * V_hotspot_mm3
     Q_mm3_s = V_shrink_mm3 / max(t_s_hot, 1e-9)
 
@@ -731,25 +760,26 @@ def _path_darcy_and_directional(
     darcy = 0.0
     mu = max(alloy.viscosity_pa_s, 1e-6)
     d_dend = max(alloy.dendrite_spacing_mm, 0.01)
+    f_l_stop = 0.10  # end of mass feeding / interdendritic flow
     feed_stopped = False
     for vox in path[:-1]:
         sdf_i = max(float(sdf[vox[0], vox[1], vox[2]]), 0.5)
+        M_i = max(float(M_mod[vox[0], vox[1], vox[2]]), 0.5)
         f_l = _liquid_fraction_at_time(sdf_i, t_s_hot, alloy, mold)
-        if f_l <= 0.20:
+        if f_l <= f_l_stop:
             feed_stopped = True
             break
         # Kozeny-Carman permeability in the mushy zone [mm²]
         fl_c = max(min(f_l, 0.97), 0.05)
         K_mm2 = (d_dend ** 2 / 180.0) * (fl_c ** 3) / ((1.0 - fl_c) ** 2)
-        # Cross-section approximated as a disk of the local inscribed radius
-        A_mm2 = np.pi * sdf_i * sdf_i
+        # Cross-section approximated as a disk of the local modulus
+        A_mm2 = np.pi * M_i * M_i
         v_mms = Q_mm3_s / max(A_mm2, 1e-6)
         v_ms = v_mms / 1000.0
         darcy += mu * v_ms * (dx / 1000.0) / max(K_mm2 / 1e6, 1e-15)
 
-    if feed_stopped:
-        darcy = 1e9
-    darcy_ok = (not feed_stopped) and (darcy < max(P_head, 1.0))
+    # Minimum driving head: 1000 Pa ≈ 0.01 atm / ~13 mm metal head
+    darcy_ok = (not feed_stopped) and (darcy < max(P_head, 1000.0))
 
     # Heuver / directional checks on the PART portion of the path
     part_path = [v for v in path if part_mask[v[0], v[1], v[2]]]
@@ -903,7 +933,13 @@ def _refine_region(
     )
     M_mod = sdf / shape_factor_field
     t_s = compute_chvorinov_t(M_mod, C)
-    G, R, niyama = compute_niyama(sdf, M_mod, t_s, alloy, is_metal=is_metal)
+    T, R, fs, _ = compute_thermal_field(
+        grid, is_metal, alloy, mold, dx, sdf=sdf, M_mod=M_mod
+    )
+    G, R, niyama = compute_niyama(
+        sdf, M_mod, alloy, mold, dx, is_metal=is_metal,
+        temperature=T, cooling_rate=R,
+    )
 
     niyama_risk = np.clip(1.0 - niyama / alloy.niyama_shrinkage, 0.0, 1.0)
     FD_field = alloy.feed_k1 * (2.0 * M_mod)
@@ -1011,17 +1047,20 @@ def analyze(
     if progress_callback:
         progress_callback(28)
 
-    # AŞAMA 3: Thermal field (1-D erf solution of Fourier equation + Scheil)
+    # AŞAMA 3: Thermal field at local solidification time (1-D erf + Scheil)
+    t_s = compute_chvorinov_t(M_mod, chvorinov_c)
     temperature, cooling_rate, solid_fraction, thermal_divergence = compute_thermal_field(
         grid, is_metal, alloy, mold, dx, n_steps=n_thermal_steps,
-        progress_callback=progress_callback, sdf=sdf,
+        progress_callback=progress_callback, sdf=sdf, M_mod=M_mod,
     )
     if progress_callback:
         progress_callback(50)
 
-    # AŞAMA 4: Chvorinov + physical Niyama family
-    t_s = compute_chvorinov_t(M_mod, chvorinov_c)
-    G, R, niyama = compute_niyama(sdf, M_mod, t_s, alloy, is_metal=is_metal)
+    # AŞAMA 4: Niyama from 3-D thermal gradient and local cooling rate
+    G, R, niyama = compute_niyama(
+        sdf, M_mod, alloy, mold, dx, is_metal=is_metal,
+        temperature=temperature, cooling_rate=cooling_rate,
+    )
     niyama_variants = compute_niyama_variants(niyama, G, R, t_s, alloy)
     niyama = compute_niyama_ensemble(niyama)
     if progress_callback:

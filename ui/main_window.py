@@ -259,6 +259,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mold_combo.currentIndexChanged.connect(self._sync_casting_params_from_materials)
         _settings_labeled(self.mold_combo, "Kalıp:")
 
+        # Set defaults after both combos exist; block signals to avoid partial sync.
+        self.alloy_combo.blockSignals(True)
+        self.mold_combo.blockSignals(True)
+        self.alloy_combo.setCurrentIndex(list(ALLOYS.keys()).index("42CrMo4"))
+        self.mold_combo.setCurrentIndex(list(MOLDS.keys()).index("sand"))
+        self.alloy_combo.blockSignals(False)
+        self.mold_combo.blockSignals(False)
+
         left_layout.addWidget(settings_group)
 
         # Casting parameters group
@@ -332,6 +340,9 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         left_layout.addWidget(params_group)
+
+        # Sync casting parameter defaults now that all parameter spin boxes exist.
+        self._sync_casting_params_from_materials()
 
         # Actions group
         actions_group = QtWidgets.QGroupBox("4. Motor")
