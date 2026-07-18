@@ -39,28 +39,40 @@ def _apply_edge_mask(arr, di, dj, dk):
     return arr
 
 
-def ingate_contact_area_and_mask(grid: np.ndarray, dx: float) -> tuple:
-    """Return (total ingate-part contact face area in mm2, ingate voxels touching part)."""
+def _gate_source_mask(grid: np.ndarray) -> np.ndarray:
+    """Prefer INGATE; if none, use RUNNER or SPRUE as the metal entry source."""
     ingate = grid == BodyType.INGATE
+    if ingate.any():
+        return ingate
+    runner = grid == BodyType.RUNNER
+    if runner.any():
+        return runner
+    sprue = grid == BodyType.SPRUE
+    return sprue
+
+
+def ingate_contact_area_and_mask(grid: np.ndarray, dx: float) -> tuple:
+    """Return (total ingate-part contact face area in mm2, source voxels touching part)."""
+    source = _gate_source_mask(grid)
     part = grid == BodyType.PART
-    contact_ingate = np.zeros_like(ingate)
+    contact_source = np.zeros_like(source)
     face_count = 0
     for di, dj, dk in _neighbor_offsets_6():
         rolled = np.roll(part, (di, dj, dk), axis=(0, 1, 2))
         _apply_edge_mask(rolled, di, dj, dk)
-        faces = ingate & rolled
-        contact_ingate |= faces
+        faces = source & rolled
+        contact_source |= faces
         face_count += int(faces.sum())
-    return face_count * dx * dx, contact_ingate
+    return face_count * dx * dx, contact_source
 
 
 def _part_touching_ingate_mask(grid: np.ndarray) -> np.ndarray:
-    """Return part voxels that have at least one ingate neighbor."""
-    ingate = grid == BodyType.INGATE
+    """Return part voxels that have at least one gate-source (ingate/runner/sprue) neighbor."""
+    source = _gate_source_mask(grid)
     part = grid == BodyType.PART
     touch = np.zeros_like(part)
     for di, dj, dk in _neighbor_offsets_6():
-        rolled = np.roll(ingate, (di, dj, dk), axis=(0, 1, 2))
+        rolled = np.roll(source, (di, dj, dk), axis=(0, 1, 2))
         _apply_edge_mask(rolled, di, dj, dk)
         touch |= rolled & part
     return touch
@@ -78,13 +90,25 @@ def _minimum_cross_section_area(mask: np.ndarray, dx: float) -> float:
     principal = principal / (np.linalg.norm(principal) + 1e-12)
     proj = centered @ principal
     slices = np.round(proj).astype(int)
-    min_area = float("inf")
+    counts = []
     for s in np.unique(slices):
-        count = np.sum(slices == s)
+        counts.append((s, np.sum(slices == s)))
+    if not counts:
+        return 0.0
+    max_count = max(c for _, c in counts)
+    min_area = float("inf")
+    for s, count in counts:
+        # Ignore end slices that contain only a few voxels; they are not a real cross-section.
+        if count < max(3, max_count * 0.05):
+            continue
         area = count * dx * dx
         if area < min_area:
             min_area = area
-    return min_area if min_area != float("inf") else 0.0
+    if min_area == float("inf"):
+        # Fallback: use the largest slice if all were tiny.
+        s, c = max(counts, key=lambda x: x[1])
+        min_area = c * dx * dx
+    return min_area
 
 
 def _sprue_base_area(sprue_mask: np.ndarray, dx: float) -> float:
@@ -234,6 +258,8 @@ def analyze_gating(
     ingate = grid == BodyType.INGATE
     runner = grid == BodyType.RUNNER
     sprue = grid == BodyType.SPRUE
+    source = _gate_source_mask(grid)
+    has_ingate = ingate.any()
 
     ag_total_mm2, _ = ingate_contact_area_and_mask(grid, dx)
     ag_total_cm2 = ag_total_mm2 / 100.0
@@ -242,10 +268,10 @@ def analyze_gating(
     runner_min_area_cm2 = runner_min_area_mm2 / 100.0
     runner_thickness_mm = _mean_thickness(runner, dx)
 
-    sprue_base_mm2 = _sprue_base_area(sprue, dx)
+    sprue_base_mm2 = _minimum_cross_section_area(sprue, dx) if sprue.any() else 0.0
     sprue_base_cm2 = sprue_base_mm2 / 100.0
 
-    ingate_thickness_mm = _mean_thickness(ingate, dx)
+    ingate_thickness_mm = _mean_thickness(source, dx)
 
     # Part weight for Bernoulli
     part_volume_mm3 = float(part_mask.sum()) * (dx ** 3)

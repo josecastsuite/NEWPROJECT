@@ -814,9 +814,9 @@ def _refine_region(
     max_size = float(local_size.max())
 
     desired_dx = max_size / max_res
-    # Cap local dense grid to 384³ to avoid RAM explosion while still giving
-    # the user a 2040-ready resolution dial for future sparse implementations.
-    max_local_dim = min(max_res, 384)
+    # v8.2: dense local refine above ~96³ is too heavy for normal RAM budgets;
+    # keep the 2040 dial for future sparse octree implementations.
+    max_local_dim = min(max_res, 96)
     dx_fine = max(desired_dx, max_size / max_local_dim)
 
     cropped_bodies: List[Body] = []
@@ -939,8 +939,24 @@ def analyze(
             "Model çok küçük. Çözünürlüğü artırın veya modelin mm biriminde olduğundan emin olun."
         )
 
+    # v8.2 memory guard: very large grids at sub>1 explode RAM; fall back to sub=1.
+    if grid.size > 2_000_000 and sub_voxel > 1:
+        sub_voxel = 1
+
     part_mask = grid == BodyType.PART
     riser_mask = grid == BodyType.RISER
+
+    # v8.2: If there is no separate riser, use the gating system (sprue/runner/ingate)
+    # as the feeding source for distance/path calculations.
+    if riser_mask.any():
+        feeder_mask = riser_mask
+        no_riser = False
+    else:
+        feeder_mask = np.isin(
+            grid,
+            [BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE],
+        )
+        no_riser = True
 
     # AŞAMA 2: SDF (sub-voxel) + histogram + curvature + shape factor
     sdf = compute_subvoxel_sdf(is_metal, dx, sub=sub_voxel)
@@ -980,20 +996,23 @@ def analyze(
         progress_callback(65)
 
     # AŞAMA 5: Hot spot detection (medial axis + DBSCAN + curvature)
+    max_part_sdf = float(sdf[part_mask].max()) if part_mask.any() else 0.0
+    hotspot_min_size_mm = min(2.0, max(0.5, 0.5 * max_part_sdf))
     hotspots = find_hotspots(
-        sdf, part_mask, dx, origin_mm, curvature=mean_curv, use_skeleton=True
+        sdf, part_mask, dx, origin_mm, curvature=mean_curv, use_skeleton=True,
+        min_size_mm=hotspot_min_size_mm,
     )
     if progress_callback:
         progress_callback(75)
 
     # AŞAMA 6: 26-neighbor Dijkstra feeding distance and lowest-resistance cost path
-    dist_feed = feeding_distance_dijkstra(is_metal, riser_mask, dx)
-    cost_feed, cost_pred, _ = feeding_cost_dijkstra(is_metal, riser_mask, sdf, dx)
+    dist_feed = feeding_distance_dijkstra(is_metal, feeder_mask, dx)
+    cost_feed, cost_pred, _ = feeding_cost_dijkstra(is_metal, feeder_mask, sdf, dx)
     if progress_callback:
         progress_callback(82)
 
     # AŞAMA 7: Hot-spot physics
-    riser_voxels = np.argwhere(riser_mask)
+    feeder_voxels = np.argwhere(feeder_mask)
     for hs in hotspots:
         vox = np.round((hs.position_mm - origin_mm) / dx).astype(int)
         if 0 <= vox[0] < grid.shape[0] and 0 <= vox[1] < grid.shape[1] and 0 <= vox[2] < grid.shape[2]:
@@ -1035,13 +1054,13 @@ def analyze(
                 dx,
             )
 
-            if len(riser_voxels) > 0:
-                riser_positions_mm = riser_voxels * dx + origin_mm
-                dz = riser_positions_mm[:, 2] - hs.position_mm[2]
-                closest_riser_idx = int(
-                    np.argmin(np.linalg.norm(riser_positions_mm - hs.position_mm, axis=1))
+            if len(feeder_voxels) > 0:
+                feeder_positions_mm = feeder_voxels * dx + origin_mm
+                dz = feeder_positions_mm[:, 2] - hs.position_mm[2]
+                closest_feeder_idx = int(
+                    np.argmin(np.linalg.norm(feeder_positions_mm - hs.position_mm, axis=1))
                 )
-                dz_closest = dz[closest_riser_idx]
+                dz_closest = dz[closest_feeder_idx]
                 hs.gravity_factor = 1.0 + 0.3 * max(
                     0.0, dz_closest / max(hs.dist_to_riser_mm, 1.0)
                 )
@@ -1242,6 +1261,14 @@ def _build_recommendations(
 ) -> List[str]:
     recs: List[str] = []
 
+    has_riser = (result.grid == BodyType.RISER).any()
+    if not has_riser:
+        recs.append(
+            "Ayrı besleyici (riser) atanmamış; döküm ağzı / yolluk / meme kaynağından "
+            "besleme mesafesi ve yol maliyeti hesaplandı. Soğuk birleşme ve çekinti riski "
+            "daha yüksek olabilir; kritik bölgeler için besleyici eklenmesi önerilir."
+        )
+
     superheat_c = max(alloy.t_pour_c - alloy.t_liquidus_c, 0.0)
     fluidity_length_mm = 50.0 * superheat_c / max(alloy.t_liquidus_c - mold.t0_c, 1.0)
     max_dim_mm = float(result.bbox_size_mm.max())
@@ -1335,11 +1362,16 @@ def _build_recommendations(
                 f"En az {short:.2f} cm³ daha hacim ekleyin."
             )
 
-    if all(hs.feed_ok for hs in result.hotspots) and all(
-        rr.large_enough for rr in result.riser_results
-    ):
-        recs.append(
-            "Tüm sıcak noktalar besleyici menzili içinde ve besleyici boyutları yeterli görünüyor."
-        )
+    all_feed_ok = all(hs.feed_ok for hs in result.hotspots)
+    if all_feed_ok and all(rr.large_enough for rr in result.riser_results):
+        if has_riser:
+            recs.append(
+                "Tüm sıcak noktalar besleyici menzili içinde ve besleyici boyutları yeterli görünüyor."
+            )
+        else:
+            recs.append(
+                "Tüm sıcak noktalar gating kaynağı menzili içinde, ancak ayrı besleyici olmadan "
+                "shrinkage riski tamamen giderilemeyebilir."
+            )
 
     return recs

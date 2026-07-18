@@ -398,9 +398,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.risk_toggle = QtWidgets.QCheckBox("Risk Bulutu")
         self.risk_toggle.setToolTip("Porozite risk bulutunu göster/gizle")
-        self.risk_toggle.setChecked(True)
+        self.risk_toggle.setChecked(False)
         self.risk_toggle.toggled.connect(self.on_toggle_risk)
         vis_layout.addWidget(self.risk_toggle)
+
+        self.porosity_toggle = QtWidgets.QCheckBox("Porozite Bulutu")
+        self.porosity_toggle.setToolTip("Yüksek porozite riski hacimsel bulut")
+        self.porosity_toggle.setChecked(True)
+        self.porosity_toggle.toggled.connect(self.on_toggle_porosity)
+        vis_layout.addWidget(self.porosity_toggle)
+
+        self.niyama_toggle = QtWidgets.QCheckBox("Niyama İzosurface")
+        self.niyama_toggle.setToolTip("Niyama 0.775 / 1.5 izoyüzeyleri")
+        self.niyama_toggle.setChecked(False)
+        self.niyama_toggle.toggled.connect(self.on_toggle_niyama)
+        vis_layout.addWidget(self.niyama_toggle)
+
+        self.path_toggle = QtWidgets.QCheckBox("Besleme Yolları")
+        self.path_toggle.setToolTip("Hot spot'tan besleyiciye/gating'e giden yol")
+        self.path_toggle.setChecked(True)
+        self.path_toggle.toggled.connect(self.on_toggle_feeding_paths)
+        vis_layout.addWidget(self.path_toggle)
 
         self.local_toggle = QtWidgets.QCheckBox("Yerel Refine")
         self.local_toggle.setToolTip("Yerel adaptive refine bölgelerini göster/gizle")
@@ -619,6 +637,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._origin = origin
             self._dx = dx
             self._bodies = bodies
+            self.viewer.show_bodies(self._bodies)
             self.progress.setValue(100)
             self.status_label.setText(
                 f"Voxel grid hazır: {grid.shape} (dx={dx:.3f} mm)"
@@ -694,10 +713,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.html_btn.setEnabled(True)
             self._update_checklist()
             self._update_recommendations()
-            self.viewer.show_hotspots(self._analysis)
-            self.viewer.show_risk(self._analysis)
+            if self.risk_toggle.isChecked():
+                self.viewer.show_risk(self._analysis)
+            if self.porosity_toggle.isChecked():
+                self.viewer.show_porosity_cloud(self._analysis)
+            if self.niyama_toggle.isChecked():
+                self.viewer.show_niyama_isosurfaces(self._analysis)
+            if self.path_toggle.isChecked():
+                self.viewer.show_feeding_paths(self._analysis)
             if self.local_toggle.isChecked():
                 self.viewer.show_local_regions(self._analysis, self.slice_field.currentData())
+            # Draw bodies on top of translucent point clouds so body-type colors remain readable.
+            self.viewer.show_bodies(self._bodies, reset_camera=False)
+            # Hot-spot spheres are drawn last so they are not hidden inside the opaque part.
+            self.viewer.show_hotspots(self._analysis)
         except Exception as e:
             import traceback
             self.aiLog(f"Analiz hatası: {e}", "crit")
@@ -836,6 +865,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_toggle_risk(self, checked: bool):
         if self._analysis:
             self.viewer.toggle_risk(self._analysis, checked)
+
+    def on_toggle_porosity(self, checked: bool):
+        if self._analysis:
+            self.viewer.toggle_porosity(self._analysis, checked)
+
+    def on_toggle_niyama(self, checked: bool):
+        if self._analysis:
+            self.viewer.toggle_niyama(self._analysis, checked)
+
+    def on_toggle_feeding_paths(self, checked: bool):
+        if self._analysis:
+            self.viewer.toggle_feeding_paths(self._analysis, checked)
 
     def on_toggle_local(self, checked: bool):
         if self._analysis:
