@@ -86,7 +86,7 @@ class Analyzer3DViewer(QtInteractor):
         if result is None:
             return
 
-        grid = pv.UniformGrid()
+        grid = pv.ImageData()
         grid.dimensions = np.array(result.grid.shape) + 1
         grid.origin = result.origin_mm
         grid.spacing = (result.dx_mm, result.dx_mm, result.dx_mm)
@@ -108,7 +108,7 @@ class Analyzer3DViewer(QtInteractor):
     def show_sdf_slice(self, result: Optional[AnalysisResult], normal: str = "z", index: Optional[int] = None):
         if result is None:
             return
-        grid = pv.UniformGrid()
+        grid = pv.ImageData()
         grid.dimensions = np.array(result.grid.shape) + 1
         grid.origin = result.origin_mm
         grid.spacing = (result.dx_mm, result.dx_mm, result.dx_mm)

@@ -1,6 +1,6 @@
 """SDF-based geometric casting analyzer."""
 
-import heapq
+from collections import deque
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -16,22 +16,7 @@ from core.types import (
 )
 
 
-def _make_neighbors_26() -> Tuple[np.ndarray, np.ndarray]:
-    """Return (di,dj,dk) and cost arrays for 26-neighbor Dijkstra in mm."""
-    neigh = []
-    costs = []
-    for di in (-1, 0, 1):
-        for dj in (-1, 0, 1):
-            for dk in (-1, 0, 1):
-                if di == dj == dk == 0:
-                    continue
-                d = np.sqrt(di * di + dj * dj + dk * dk)
-                neigh.append((di, dj, dk))
-                costs.append(d)
-    return np.array(neigh, dtype=np.int32), np.array(costs, dtype=np.float64)
-
-
-NEIGH_26, COST_26 = _make_neighbors_26()
+NEIGH_6 = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
 
 
 def compute_sdf(is_metal: np.ndarray) -> np.ndarray:
@@ -102,40 +87,36 @@ def find_hotspots(
     return hotspots
 
 
-def feeding_distance_dijkstra(
+def feeding_distance_bfs(
     is_metal: np.ndarray, riser_mask: np.ndarray, dx: float
 ) -> np.ndarray:
     """
     Geodesic distance (within metal) from every metal voxel to the nearest riser.
-    26-neighbor weighted Dijkstra.
+    6-neighbor BFS as described in the JoseCast spec.
     """
     dist = np.full(is_metal.shape, np.inf, dtype=np.float64)
     sources = np.argwhere(riser_mask & is_metal)
     if len(sources) == 0:
         return dist
 
-    source_set = set(map(tuple, sources.tolist()))
-    heap = []
+    q = deque()
     for s in sources:
-        d = 0.0
-        dist[s[0], s[1], s[2]] = d
-        heapq.heappush(heap, (d, s[0], s[1], s[2]))
+        dist[s[0], s[1], s[2]] = 0.0
+        q.append((s[0], s[1], s[2]))
 
     shape = is_metal.shape
-    while heap:
-        d, i, j, k = heapq.heappop(heap)
-        if d > dist[i, j, k]:
-            continue
-        for (di, dj, dk), c in zip(NEIGH_26, COST_26):
+    while q:
+        i, j, k = q.popleft()
+        nd = dist[i, j, k] + dx
+        for di, dj, dk in NEIGH_6:
             ni, nj, nk = i + di, j + dj, k + dk
             if not (0 <= ni < shape[0] and 0 <= nj < shape[1] and 0 <= nk < shape[2]):
                 continue
             if not is_metal[ni, nj, nk]:
                 continue
-            nd = d + c * dx
             if nd < dist[ni, nj, nk]:
                 dist[ni, nj, nk] = nd
-                heapq.heappush(heap, (nd, ni, nj, nk))
+                q.append((ni, nj, nk))
 
     return dist
 
@@ -183,7 +164,7 @@ def analyze(
         progress_callback(75)
 
     # AŞAMA 4: Feeding distance
-    dist_feed = feeding_distance_dijkstra(is_metal, riser_mask, dx)
+    dist_feed = feeding_distance_bfs(is_metal, riser_mask, dx)
 
     if progress_callback:
         progress_callback(85)
