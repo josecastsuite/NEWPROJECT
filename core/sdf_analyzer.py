@@ -9,8 +9,10 @@ from scipy import ndimage, sparse
 from scipy.sparse import csgraph
 from scipy.spatial import cKDTree
 from scipy.special import erf
+from skimage.feature import peak_local_max
 from skimage.measure import marching_cubes
 from skimage.morphology import skeletonize
+from skimage.segmentation import watershed
 from sklearn.cluster import DBSCAN
 
 from core.materials import (
@@ -401,9 +403,22 @@ def find_hotspots(
     use_skeleton: bool = True,
     min_size_mm: float = 2.0,
     cluster_eps_mm: float = 10.0,
+    riser_mask: Optional[np.ndarray] = None,
+    is_metal: Optional[np.ndarray] = None,
+    feeder_mask: Optional[np.ndarray] = None,
+    chvorinov_c: Optional[float] = None,
+    n_time_steps: int = 40,
 ) -> List[HotSpot]:
-    """Detect M_mod local maxima on the medial axis and cluster with DBSCAN."""
-    # Shape-corrected modulus: bulky regions (κ < 0, sphere-like) get larger f
+    """Detect hot spots by pseudo-thermal solidification + CCL (Method 2).
+
+    The metal is solidified in Chvorinov time layers.  At each layer, the
+    remaining liquid metal is labelled with 26-connectivity.  Liquid pockets
+    that are not connected to a feeder (riser / gating) are isolated; the last
+    points to become isolated are the true hot spots.  A feeder/riser neck
+    naturally solidifies earlier and breaks the connection, so the region under
+    a riser is not reported as a part hot spot.
+    """
+    # Shape-corrected modulus
     if curvature is not None:
         shape_factor_field = np.clip(
             1.0 + np.maximum(-curvature * sdf, 0.0), 1.0, 3.0
@@ -412,49 +427,106 @@ def find_hotspots(
         shape_factor_field = np.ones_like(sdf)
     M_mod = sdf / shape_factor_field
 
-    if use_skeleton:
-        try:
-            skeleton = skeletonize(part_mask)
-            search_mask = skeleton & (M_mod > min_size_mm)
-            if not search_mask.any():
-                search_mask = part_mask & (M_mod > min_size_mm)
-        except Exception:
-            search_mask = part_mask & (M_mod > min_size_mm)
-    else:
-        search_mask = part_mask & (M_mod > min_size_mm)
+    if is_metal is None:
+        is_metal = part_mask
+    if feeder_mask is None:
+        feeder_mask = riser_mask if riser_mask is not None else np.zeros_like(is_metal)
+    if chvorinov_c is None or chvorinov_c <= 0:
+        chvorinov_c = 1.0
 
-    if not search_mask.any():
+    # Solidification time from shape-corrected modulus (Chvorinov)
+    t_solid = chvorinov_c * M_mod * M_mod
+    t_solid = np.nan_to_num(t_solid, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Time horizon: use the part, fall back to all metal
+    if part_mask.any():
+        max_t = float(np.percentile(t_solid[part_mask], 99.9))
+    else:
+        max_t = float(np.percentile(t_solid[is_metal], 99.9))
+    if max_t <= 0:
         return []
 
-    size_vox = max(1, int(5.0 / dx))
-    local_max = M_mod == ndimage.maximum_filter(M_mod, size=size_vox, mode="constant")
-    candidates = np.argwhere(local_max & search_mask)
-    if len(candidates) == 0:
-        candidates = np.argwhere(search_mask)
+    # Quadratic time steps: denser near the end of solidification where pockets
+    # shrink and disconnect.
+    thresholds = max_t * (np.linspace(0.0, 1.0, n_time_steps + 1)[1:] ** 2)
+    isolation_time = np.zeros_like(t_solid, dtype=np.float64)
+    structure = np.ones((3, 3, 3), dtype=bool)
 
-    # Combine curvature (sharp corners) as additional candidates.
-    if curvature is not None:
-        high_curv = (np.abs(curvature) > np.percentile(np.abs(curvature[part_mask]), 95)) & part_mask
-        extra = np.argwhere(high_curv & (M_mod > min_size_mm))
-        if len(extra):
-            candidates = np.vstack([candidates, extra]) if len(candidates) else extra
-
-    eps_vox = max(1.0, cluster_eps_mm / dx)
-    clustering = DBSCAN(eps=eps_vox, min_samples=1, metric="euclidean").fit(
-        candidates.astype(np.float64)
-    )
-    labels = clustering.labels_
-
-    hotspots: List[HotSpot] = []
-    for lbl in set(labels):
-        if lbl == -1:
+    for t in thresholds:
+        liquid = is_metal & (t_solid > t)
+        labeled, n = ndimage.label(liquid, structure=structure)
+        if n == 0:
             continue
-        pts = candidates[labels == lbl]
-        vals = M_mod[pts[:, 0], pts[:, 1], pts[:, 2]]
-        idx = int(np.argmax(vals))
-        pos_vox = pts[idx]
-        m_value = float(vals[idx])
-        sdf_val = float(sdf[pos_vox[0], pos_vox[1], pos_vox[2]])
+        # Labels that touch a feeder are considered fed, not isolated
+        if feeder_mask.any():
+            touch = np.unique(labeled[feeder_mask])
+        else:
+            touch = np.array([0], dtype=labeled.dtype)
+        touch = set(int(x) for x in touch)
+        isolated_labels = np.setdiff1d(np.arange(1, n + 1), list(touch), assume_unique=True)
+        if isolated_labels.size == 0:
+            continue
+        isolated_mask = np.isin(labeled, isolated_labels)
+        update = isolated_mask & (t > isolation_time)
+        isolation_time[update] = t
+
+    candidate_mask = part_mask & (isolation_time > 0.0)
+    if not candidate_mask.any():
+        return []
+
+    # Each topologically distinct slow-solidifying pocket is segmented from the
+    # isolation-time field.  Regional maxima separated by at least cluster_eps_mm
+    # are used as watershed markers, so close local peaks in the same pocket are
+    # merged while distinct pockets remain separate.  Gaussian smoothing breaks
+    # the discrete threshold plateaus into natural peaks.
+    min_vox = int(np.ceil((min_size_mm / max(dx, 0.01)) ** 3))
+    size_vox = max(1, int(cluster_eps_mm / dx))
+    sigma = max(0.8, size_vox / 3.0)
+    iso_smooth = ndimage.gaussian_filter(isolation_time.astype(np.float64), sigma=sigma)
+    regional_max = candidate_mask & (
+        iso_smooth == ndimage.maximum_filter(iso_smooth, size=size_vox, mode="constant")
+    )
+    markers, n_markers = ndimage.label(regional_max, structure=structure)
+    if n_markers == 0:
+        # fallback: use the single highest-isolation voxel
+        pos_vox = np.argwhere(isolation_time == isolation_time[candidate_mask].max())[0]
+        m_value = float(M_mod[pos_vox[0], pos_vox[1], pos_vox[2]])
+        return [
+            HotSpot(
+                position_mm=origin_mm + pos_vox * dx,
+                m_value_mm=m_value,
+                dist_to_riser_mm=np.inf,
+                feed_ok=False,
+                max_feeding_distance_mm=0.0,
+            )
+        ]
+
+    # Watershed on the negative isolation time gives a basin for each pocket.
+    labels = watershed(
+        -iso_smooth,
+        markers,
+        mask=candidate_mask,
+        connectivity=structure,
+    )
+
+    max_iso = float(isolation_time[candidate_mask].max())
+    iso_threshold = 0.2 * max_iso
+    hotspots: List[HotSpot] = []
+    for lbl in range(1, n_markers + 1):
+        mask = (labels == lbl) & candidate_mask
+        voxel_count = int(mask.sum())
+        if voxel_count < min_vox:
+            continue
+        comp_iso = isolation_time[mask]
+        comp_max_iso = float(comp_iso.max())
+        if comp_max_iso < iso_threshold:
+            continue
+        cand = np.argwhere(mask)
+        vals = comp_iso
+        m_vals = M_mod[cand[:, 0], cand[:, 1], cand[:, 2]]
+        best_idx = int(np.argmax(vals * 1000.0 + m_vals))
+        pos_vox = cand[best_idx]
+        m_value = float(M_mod[pos_vox[0], pos_vox[1], pos_vox[2]])
         position_mm = origin_mm + pos_vox * dx
         hotspots.append(
             HotSpot(
@@ -465,6 +537,22 @@ def find_hotspots(
                 max_feeding_distance_mm=0.0,
             )
         )
+
+    # Final cleanup: merge hot spots that are close enough to be fed by one riser.
+    if len(hotspots) > 1:
+        positions = np.array([hs.position_mm for hs in hotspots], dtype=np.float64)
+        clustering = DBSCAN(eps=cluster_eps_mm, min_samples=1, metric="euclidean").fit(
+            positions
+        )
+        merged: List[HotSpot] = []
+        for lbl in set(clustering.labels_):
+            if lbl == -1:
+                continue
+            group = [hs for i, hs in enumerate(hotspots) if clustering.labels_[i] == lbl]
+            group.sort(key=lambda h: h.m_value_mm, reverse=True)
+            merged.append(group[0])
+        hotspots = merged
+
     return hotspots
 
 
@@ -1101,9 +1189,14 @@ def analyze(
     # AŞAMA 5: Hot spot detection (medial axis + DBSCAN + curvature)
     max_part_sdf = float(sdf[part_mask].max()) if part_mask.any() else 0.0
     hotspot_min_size_mm = min(2.0, max(0.5, 0.5 * max_part_sdf))
+    hotspot_cluster_mm = max(12.0, 2.0 * dx)
     hotspots = find_hotspots(
         sdf, part_mask, dx, origin_mm, curvature=mean_curv, use_skeleton=True,
         min_size_mm=hotspot_min_size_mm,
+        cluster_eps_mm=hotspot_cluster_mm,
+        is_metal=is_metal,
+        feeder_mask=feeder_mask,
+        chvorinov_c=chvorinov_c,
     )
     if progress_callback:
         progress_callback(75)
@@ -1113,6 +1206,26 @@ def analyze(
     cost_feed, cost_pred, _ = feeding_cost_dijkstra(is_metal, feeder_mask, M_mod, dx)
     if progress_callback:
         progress_callback(82)
+
+    # v8.7: part voxels immediately adjacent to a feeder are fed by that feeder
+    # and should not be reported as part hot spots (e.g., directly under a riser).
+    if feeder_mask.any():
+        max_feeder_m = float(M_mod[feeder_mask & (M_mod > 0)].max()) if (feeder_mask & (M_mod > 0)).any() else 0.0
+        influence_mm = max(2.0 * dx, 0.3 * max_feeder_m, 2.0)
+        influence_vox = int(np.ceil(influence_mm / dx))
+        dilated_feeder = ndimage.binary_dilation(feeder_mask, iterations=influence_vox)
+        fed_zone = dilated_feeder & part_mask
+        filtered_hotspots: List[HotSpot] = []
+        for hs in hotspots:
+            vox = np.round((hs.position_mm - origin_mm) / dx).astype(int)
+            if (
+                0 <= vox[0] < grid.shape[0]
+                and 0 <= vox[1] < grid.shape[1]
+                and 0 <= vox[2] < grid.shape[2]
+                and not fed_zone[vox[0], vox[1], vox[2]]
+            ):
+                filtered_hotspots.append(hs)
+        hotspots = filtered_hotspots
 
     # AŞAMA 7: Hot-spot physics
     feeder_voxels = np.argwhere(feeder_mask)
