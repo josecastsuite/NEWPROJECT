@@ -252,6 +252,37 @@ def analyze_gating(
     part_volume_cm3 = part_volume_mm3 / 1000.0
     part_weight_g = part_volume_cm3 * alloy.density_g_cm3
 
+    # v8.1: ingate velocity (user override or auto from V_part / t_fill)
+    user_v = 0.0
+    if casting_params is not None and isinstance(casting_params, CastingParameters):
+        user_v = float(getattr(casting_params, "ingate_velocity_m_s", 0.0))
+
+    ag_m2 = ag_total_mm2 / 1e6
+    part_volume_m3 = part_volume_mm3 / 1e9
+    ingate_velocity_m_s = 0.0
+    ingate_flow_rate_m3_s = 0.0
+    ingate_fill_time_s = 0.0
+    velocity_fill_time_match_ok = True
+    required_ingate_area_for_velocity_m2 = 0.0
+    velocity_area_ok = True
+
+    if ag_m2 > 0 and part_volume_m3 > 0:
+        if user_v > 0:
+            ingate_velocity_m_s = user_v
+            ingate_flow_rate_m3_s = user_v * ag_m2
+            ingate_fill_time_s = part_volume_m3 / ingate_flow_rate_m3_s
+            if fill_time_s > 0:
+                tolerance = 0.15 * fill_time_s
+                velocity_fill_time_match_ok = abs(ingate_fill_time_s - fill_time_s) <= tolerance
+                # Area required to hit both target velocity and target fill time
+                required_Q_m3_s = part_volume_m3 / fill_time_s
+                required_ingate_area_for_velocity_m2 = required_Q_m3_s / user_v
+                velocity_area_ok = ag_m2 >= required_ingate_area_for_velocity_m2 * 0.95
+        elif fill_time_s > 0:
+            ingate_flow_rate_m3_s = part_volume_m3 / fill_time_s
+            ingate_velocity_m_s = ingate_flow_rate_m3_s / ag_m2
+            ingate_fill_time_s = fill_time_s
+
     # Sprue height H in cm; fallback to total metal height
     metal_mask = result.is_metal
     metal_pts = np.argwhere(metal_mask)
@@ -336,21 +367,13 @@ def analyze_gating(
     # A reasonable minimum ingate contact area: based on runner capacity
     required_ingate_area_cm2 = required_runner_area_cm2 / 1.5
     ingate_ok = (ag_total_cm2 >= required_ingate_area_cm2) and (not ingate_on_thick)
+    # v8.1: if user specifies ingate velocity, area must be enough to satisfy both v and t_fill
+    if user_v > 0:
+        ingate_ok = ingate_ok and velocity_area_ok
 
     # Prefer Bernoulli check that accounts for losses
     final_sprue_required_cm2 = max(as_req_cm2, required_sprue_area_with_losses_cm2)
     final_bernoulli_ok = sprue_base_cm2 >= final_sprue_required_cm2
-
-    # v8.0: ingate velocity, Reynolds and Froude checks
-    ingate_velocity_m_s = 0.0
-    reynolds = 0.0
-    froude = 0.0
-    turbulent = False
-    if ag_total_mm2 > 0 and fill_time_s > 0:
-        part_volume_mm3 = float(part_mask.sum()) * (dx ** 3)
-        Q_m3_s = (part_volume_mm3 / 1e9) / fill_time_s
-        ag_m2 = ag_total_mm2 / 1e6
-        ingate_velocity_m_s = Q_m3_s / ag_m2 if ag_m2 > 0 else 0.0
 
     # Alloy-specific maximum ingate velocity (Campbell rule)
     max_ingate_velocity = 0.5 if alloy.key in ("AlSi7",) else 1.0
@@ -359,6 +382,9 @@ def analyze_gating(
     g = 9.81
     rho = alloy.rho_kg_m3
     mu = max(alloy.viscosity_pa_s, 1e-6)
+    reynolds = 0.0
+    froude = 0.0
+    turbulent = False
     if ingate_velocity_m_s > 0:
         reynolds = rho * ingate_velocity_m_s * D / mu
         froude = ingate_velocity_m_s / np.sqrt(g * D)
@@ -390,4 +416,9 @@ def analyze_gating(
         reynolds=reynolds,
         froude=froude,
         turbulent=turbulent,
+        ingate_flow_rate_m3_s=ingate_flow_rate_m3_s,
+        ingate_fill_time_s=ingate_fill_time_s,
+        velocity_fill_time_match_ok=velocity_fill_time_match_ok,
+        required_ingate_area_for_velocity_cm2=required_ingate_area_for_velocity_m2 * 1e4,
+        velocity_area_ok=velocity_area_ok,
     )

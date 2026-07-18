@@ -18,6 +18,8 @@ class CastingParameters:
     t_fill_s: float = 10.0
     rho_liquid_kg_m3: float = 7000.0
     viscosity_pa_s: float = 0.006
+    # v8.1: user-specified ingate velocity (0 = auto from V_part / t_fill)
+    ingate_velocity_m_s: float = 0.0
 
     @property
     def superheat_c(self) -> float:
@@ -136,6 +138,12 @@ class GateResult:
     reynolds: float = 0.0
     froude: float = 0.0
     turbulent: bool = False
+    # v8.1
+    ingate_flow_rate_m3_s: float = 0.0
+    ingate_fill_time_s: float = 0.0
+    velocity_fill_time_match_ok: bool = True
+    required_ingate_area_for_velocity_cm2: float = 0.0
+    velocity_area_ok: bool = True
 
 
 @dataclass

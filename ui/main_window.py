@@ -60,7 +60,7 @@ class CheckListItem(QtWidgets.QWidget):
         color = "#00ff88" if ok else "#ff4444"
         self.label = QtWidgets.QLabel(
             f'<span style="color:{color};font-weight:bold;font-size:14px">{icon}</span> '
-            f'<span style="color:#f4f4f5">{_escape_html(text)}</span>'
+            f'<span style="color:#00ffff;font-weight:bold;">{_escape_html(text)}</span>'
         )
         self.label.setWordWrap(True)
         self.label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.MinimumExpanding)
@@ -94,58 +94,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setStyle(QtWidgets.QStyleFactory.create("Fusion"))
         palette = QtGui.QPalette()
         palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor("#18181b"))
-        palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("#f4f4f5"))
+        palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("#00ffff"))
         palette.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor("#09090b"))
         palette.setColor(QtGui.QPalette.ColorRole.AlternateBase, QtGui.QColor("#27272a"))
-        palette.setColor(QtGui.QPalette.ColorRole.ToolTipBase, QtGui.QColor("#f4f4f5"))
-        palette.setColor(QtGui.QPalette.ColorRole.ToolTipText, QtGui.QColor("#f4f4f5"))
-        palette.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor("#f4f4f5"))
+        palette.setColor(QtGui.QPalette.ColorRole.ToolTipBase, QtGui.QColor("#18181b"))
+        palette.setColor(QtGui.QPalette.ColorRole.ToolTipText, QtGui.QColor("#00ffff"))
+        palette.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor("#00ffff"))
         palette.setColor(QtGui.QPalette.ColorRole.Button, QtGui.QColor("#3f3f46"))
-        palette.setColor(QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor("#f4f4f5"))
+        palette.setColor(QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor("#000000"))
         palette.setColor(QtGui.QPalette.ColorRole.BrightText, QtGui.QColor("#ff4444"))
         palette.setColor(QtGui.QPalette.ColorRole.Highlight, QtGui.QColor("#00ff88"))
         palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#000000"))
         self.setPalette(palette)
+        
         self.setStyleSheet(
             """
             QMainWindow { background: #18181b; }
             QGroupBox {
-                color: #f4f4f5;
-                font-weight: normal;
+                color: #00ffff;
+                font-weight: bold;
+                font-size: 12px;
                 border: 1px solid #3f3f46;
                 border-radius: 8px;
-                margin-top: 10px;
-                padding: 6px;
+                margin-top: 18px; 
+                padding-top: 18px; 
+                padding-left: 8px;
+                padding-right: 8px;
+                padding-bottom: 8px;
             }
             QGroupBox::title {
-                subcontrol-origin: margin; left: 12px; top: -8px;
-                color: #00ff88; font-weight: bold;
+                subcontrol-origin: margin; 
+                subcontrol-position: top left;
+                left: 12px; 
+                top: 0px;
+                color: #00ff88; 
+                font-weight: bold;
             }
             QPushButton {
                 background: #00ff88; color: #000000; border: none;
-                border-radius: 6px; padding: 10px 16px; font-weight: bold;
+                border-radius: 6px; padding: 10px 16px; font-weight: bold; font-size: 12px;
             }
             QPushButton:hover { background: #00cc6a; }
-            QPushButton:disabled { background: #3f3f46; color: #a1a1aa; }
+            QPushButton:disabled { background: #27272a; color: #55aa88; }
             QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
-                background: #27272a; color: #f4f4f5; border: 1px solid #52525b;
-                border-radius: 5px; padding: 5px;
+                background: #27272a; color: #00ffff; border: 1px solid #52525b;
+                border-radius: 5px; padding: 5px; min-height: 20px; font-weight: bold;
+            }
+            QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QLineEdit:disabled {
+                background: #18181b; color: #55aa88; border: 1px solid #3f3f46;
             }
             QProgressBar {
                 background: #27272a; border: 1px solid #52525b; border-radius: 5px;
-                text-align: center; color: #f4f4f5;
+                text-align: center; color: #00ffff; font-weight: bold;
             }
             QProgressBar::chunk { background: #00ff88; border-radius: 4px; }
-            QLabel { color: #f4f4f5; font-weight: normal; }
+            QLabel { color: #00ffff; font-weight: 800; font-size: 13px; }
             QListWidget {
                 background: #09090b; border: 1px solid #3f3f46; border-radius: 6px;
-                color: #f4f4f5;
+                color: #00ffff; font-weight: bold;
             }
             QTextEdit {
-                background: #09090b; border: 1px solid #3f3f46; border-radius: 6px;
-                color: #f4f4f5;
+                background: #000000; border: 2px solid #00ff88; border-radius: 6px;
+                color: #00ff88; font-weight: 800; font-size: 12px;
             }
-            QCheckBox { color: #f4f4f5; spacing: 6px; }
+            QCheckBox { color: #00ffff; spacing: 6px; font-weight: bold; font-size: 12px; }
             QCheckBox::indicator { width: 16px; height: 16px; }
             QCheckBox::indicator:checked { background: #00ff88; border: 1px solid #00ff88; }
             QScrollArea { border: none; background: transparent; }
@@ -157,15 +169,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_ui(self):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        main_layout = QtWidgets.QHBoxLayout(central)
-        main_layout.setContentsMargins(8, 8, 8, 8)
-        main_layout.setSpacing(6)
+        
+        main_vbox = QtWidgets.QVBoxLayout(central)
+        main_vbox.setContentsMargins(8, 8, 8, 8)
+        main_vbox.setSpacing(6)
+
+        # ---------------- TOP AREA (Splitter) ----------------
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
 
         # ---------------- LEFT PANEL (scrollable) ----------------
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidgetResizable(True)
-        left_scroll.setMinimumWidth(400)
-        left_scroll.setMaximumWidth(480)
+        left_scroll.setMinimumWidth(380) 
+        
         left_panel = QtWidgets.QWidget()
         left_scroll.setWidget(left_panel)
         left_layout = QtWidgets.QVBoxLayout(left_panel)
@@ -197,6 +213,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def _settings_labeled(widget, label_text, tooltip=None):
             lbl = QtWidgets.QLabel(label_text)
             lbl.setWordWrap(True)
+            lbl.setMinimumHeight(20) 
             lbl.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
             settings_layout.addWidget(lbl)
             if tooltip:
@@ -253,6 +270,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def _params_labeled(widget, label_text, tooltip=None):
             lbl = QtWidgets.QLabel(label_text)
             lbl.setWordWrap(True)
+            lbl.setMinimumHeight(20) 
             lbl.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
             params_layout.addWidget(lbl)
             if tooltip:
@@ -302,6 +320,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.visc_spin.setValue(0.0060)
         _params_labeled(self.visc_spin, "Viskozite μ (Pa·s):")
 
+        self.v_ingate_spin = QtWidgets.QDoubleSpinBox()
+        self.v_ingate_spin.setRange(0.0, 20.0)
+        self.v_ingate_spin.setDecimals(2)
+        self.v_ingate_spin.setValue(0.0)
+        self.v_ingate_spin.setSingleStep(0.1)
+        _params_labeled(
+            self.v_ingate_spin,
+            "Meme giriş hızı v_ingate (m/s):",
+            "0 = otomatik (Q = V_parça / t_fill). >0 kullanıcı girişi; Re/Fr/türbülans buna göre hesaplanır.",
+        )
+
         left_layout.addWidget(params_group)
 
         # Actions group
@@ -325,29 +354,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.status_label = QtWidgets.QLabel("Hazır. STEP dosyası yükleyin.")
         self.status_label.setWordWrap(True)
+        self.status_label.setMinimumHeight(40) 
         actions_layout.addWidget(self.status_label)
         left_layout.addWidget(actions_group)
-
-        # AI Terminal group
-        terminal_group = QtWidgets.QGroupBox("BLACK AI TERMINAL")
-        terminal_layout = QtWidgets.QVBoxLayout(terminal_group)
-        self.ai_terminal = QtWidgets.QTextEdit()
-        self.ai_terminal.setReadOnly(True)
-        self.ai_terminal.setMinimumHeight(200)
-        self.ai_terminal.setStyleSheet(
-            "QTextEdit { background-color: #050505; color: #00ff88; "
-            "font-family: Consolas, monospace; font-size: 11px; "
-            "border: 1px solid #00ff88; border-radius: 8px; padding: 6px; }"
-        )
-        terminal_layout.addWidget(self.ai_terminal)
-        self.ai_input = QtWidgets.QLineEdit()
-        self.ai_input.setPlaceholderText("> Gelecekte AI komut girişi (şu an devre dışı)")
-        self.ai_input.setEnabled(False)
-        self.ai_input.setStyleSheet(
-            "QLineEdit { background-color: #050505; color: #aaffcc; border: 1px solid #00ff88; }"
-        )
-        terminal_layout.addWidget(self.ai_input)
-        left_layout.addWidget(terminal_group)
         left_layout.addStretch()
 
         # ---------------- CENTER 3D VIEWER ----------------
@@ -356,8 +365,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ---------------- RIGHT PANEL (scrollable) ----------------
         right_scroll = QtWidgets.QScrollArea()
         right_scroll.setWidgetResizable(True)
-        right_scroll.setMinimumWidth(520)
-        right_scroll.setMaximumWidth(720)
+        right_scroll.setMinimumWidth(380) 
         right_panel = QtWidgets.QWidget()
         right_scroll.setWidget(right_panel)
         right_layout = QtWidgets.QVBoxLayout(right_panel)
@@ -434,16 +442,40 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout.addWidget(export_group)
         right_layout.addStretch()
 
-        # Splitter to avoid overlaps and allow resizing
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        # Add to splitter
         splitter.addWidget(left_scroll)
         splitter.addWidget(self.viewer)
         splitter.addWidget(right_scroll)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([520, 560, 520])
-        main_layout.addWidget(splitter)
+        splitter.setSizes([450, 700, 450]) 
+        
+        # Add splitter to main VBox
+        main_vbox.addWidget(splitter, stretch=1)
+
+        # ---------------- BOTTOM AREA: AI TERMINAL ----------------
+        terminal_group = QtWidgets.QGroupBox("AI ASİSTAN (Yapay Zeka)")
+        terminal_group.setStyleSheet("QGroupBox { color: #00ff88; font-weight: bold; border: 2px solid #00ff88; }")
+        terminal_layout = QtWidgets.QVBoxLayout(terminal_group)
+        
+        self.ai_terminal = QtWidgets.QTextEdit()
+        self.ai_terminal.setReadOnly(True)
+        self.ai_terminal.setMaximumHeight(90)
+        self.ai_terminal.setStyleSheet(
+            "QTextEdit { background-color: #000000; color: #00ffff; "
+            "font-family: 'Consolas', monospace; font-weight: 800; border: none;}"
+        )
+        terminal_layout.addWidget(self.ai_terminal)
+        
+        self.ai_input = QtWidgets.QLineEdit()
+        self.ai_input.setPlaceholderText("> Komut girişi yapın...")
+        self.ai_input.setStyleSheet(
+            "QLineEdit { background-color: #18181b; color: #00ff88; border: 1px solid #00ff88; font-weight: 800;}"
+        )
+        terminal_layout.addWidget(self.ai_input)
+        
+        main_vbox.addWidget(terminal_group, stretch=0)
 
     def _sync_casting_params_from_materials(self):
         """Set parameter defaults from the selected alloy and mould."""
@@ -465,6 +497,7 @@ class MainWindow(QtWidgets.QMainWindow):
             t_fill_s=self.t_fill_spin.value(),
             rho_liquid_kg_m3=self.rho_spin.value(),
             viscosity_pa_s=self.visc_spin.value(),
+            ingate_velocity_m_s=self.v_ingate_spin.value(),
         )
 
     def aiLog(self, msg: str, type_: str = "info"):
@@ -472,9 +505,9 @@ class MainWindow(QtWidgets.QMainWindow):
         color = {
             "crit": "#ff4444",
             "ok": "#00ff88",
-            "info": "#aaffcc",
+            "info": "#00ffff",
             "warn": "#ffaa00",
-        }.get(type_, "#aaffcc")
+        }.get(type_, "#00ffff")
         line = (
             f'<span style="color:{color};margin:2px 0;font-family:Consolas,monospace;"'
             f'>&gt; {_escape_html(msg)}</span>'
@@ -705,6 +738,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Meme hızı {gr.ingate_velocity_m_s:.2f} m/s ile yüksek; Re={gr.reynolds:.0f}, Fr={gr.froude:.2f}. "
                 f"Türbülans / hava kaçırma riski. Meme alanını büyüt veya döküm süresini artırın."
             )
+        if hasattr(gr, "velocity_fill_time_match_ok") and not gr.velocity_fill_time_match_ok:
+            t_fill = self._analysis.casting_params.t_fill_s if self._analysis and self._analysis.casting_params else 0.0
+            compatible_v = 0.0
+            if t_fill > 0:
+                compatible_v = gr.ingate_velocity_m_s * gr.ingate_fill_time_s / t_fill
+            recs.append(
+                f"Girilen meme hızı ({gr.ingate_velocity_m_s:.2f} m/s) ile döküm süresi ({gr.ingate_fill_time_s:.1f}s) tutarsız. "
+                f"t_fill ile uyumlu hız: {compatible_v:.2f} m/s, gerekli meme alanı {gr.required_ingate_area_for_velocity_cm2:.2f} cm². "
+                "Meme alanını veya döküm süresini ayarlayın."
+            )
+        if gr.ingate_velocity_m_s > 0:
+            recs.append(
+                f"Meme debisi Q={gr.ingate_flow_rate_m3_s*1e3:.2f} L/s, doldurma süresi={gr.ingate_fill_time_s:.2f}s. "
+                f"Max güvenli hız={gr.ingate_max_velocity_m_s:.2f} m/s."
+            )
         return recs
 
     def _clear_checklist(self):
@@ -761,12 +809,21 @@ class MainWindow(QtWidgets.QMainWindow):
                         not gr.turbulent,
                     )
                 )
+            if hasattr(gr, "velocity_fill_time_match_ok"):
+                velocity_ok = gr.velocity_fill_time_match_ok and getattr(gr, "velocity_area_ok", True) and not gr.turbulent
+                vtext = (
+                    f"Meme hızı {gr.ingate_velocity_m_s:.2f} m/s, "
+                    f"doldurma {gr.ingate_fill_time_s:.2f}s, Q={gr.ingate_flow_rate_m3_s*1e3:.2f} L/s"
+                )
+                self.checklist_layout.addWidget(
+                    CheckListItem(vtext, velocity_ok)
+                )
 
     def _update_recommendations(self):
         if self._analysis and self._analysis.recommendations:
-            html = "<ul style='margin:0;padding-left:16px;color:#aaffcc;'>"
+            html = "<ul style='margin:0;padding-left:16px;color:#00ffff;'>"
             for r in self._analysis.recommendations:
-                html += f"<li style='margin:4px 0'>{_escape_html(r)}</li>"
+                html += f"<li style='margin:4px 0'><b>{_escape_html(r)}</b></li>"
             html += "</ul>"
             self.rec_text.setHtml(html)
         else:
