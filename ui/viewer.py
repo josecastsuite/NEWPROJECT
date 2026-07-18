@@ -18,6 +18,9 @@ BODY_COLORS = {
     BodyType.RUNNER: "#FF9800",
     BodyType.SPRUE: "#9C27B0",
     BodyType.CORE: "#795548",
+    BodyType.COOLING_SPRUE: "#00BCD4",
+    BodyType.FILTER: "#607D8B",
+    BodyType.POURING_BASIN: "#3F51B5",
 }
 
 BODY_OPACITY = {
@@ -27,6 +30,9 @@ BODY_OPACITY = {
     BodyType.RUNNER: 1.0,
     BodyType.SPRUE: 1.0,
     BodyType.CORE: 1.0,
+    BodyType.COOLING_SPRUE: 1.0,
+    BodyType.FILTER: 1.0,
+    BodyType.POURING_BASIN: 1.0,
 }
 
 

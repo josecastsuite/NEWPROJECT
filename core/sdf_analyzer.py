@@ -23,6 +23,8 @@ from core.materials import (
 from core.riser_designer import propose_risers
 from core.thermal_solver import solve_3d_thermal
 from core.types import (
+    BODY_FEEDER_TYPES,
+    BODY_METAL_TYPES,
     AnalysisResult,
     Body,
     BodyType,
@@ -935,10 +937,7 @@ def _refine_region(
         target_dim=target_dim,
         progress_callback=progress_callback,
     )
-    is_metal = np.isin(
-        grid,
-        [BodyType.PART, BodyType.RISER, BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE],
-    )
+    is_metal = np.isin(grid, BODY_METAL_TYPES)
     sdf = compute_sdf(is_metal, dx)
     C = chvorinov_c_from_properties(alloy, mold)
     mean_curv, _ = compute_curvature(sdf, dx)
@@ -1014,10 +1013,7 @@ def analyze(
     chvorinov_c = chvorinov_c_from_properties(alloy, mold)
     bbox_size = np.array(grid.shape) * dx
 
-    is_metal = np.isin(
-        grid,
-        [BodyType.PART, BodyType.RISER, BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE],
-    )
+    is_metal = np.isin(grid, BODY_METAL_TYPES)
     if is_metal.sum() < 1000:
         raise ValueError(
             "Model çok küçük. Çözünürlüğü artırın veya modelin mm biriminde olduğundan emin olun."
@@ -1036,10 +1032,7 @@ def analyze(
         feeder_mask = riser_mask
         no_riser = False
     else:
-        feeder_mask = np.isin(
-            grid,
-            [BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE],
-        )
+        feeder_mask = np.isin(grid, BODY_FEEDER_TYPES)
         no_riser = True
 
     # AŞAMA 2: SDF (sub-voxel) + histogram + curvature + shape factor

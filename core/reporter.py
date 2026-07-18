@@ -91,21 +91,45 @@ def _format_riser_proposal_table(result: AnalysisResult) -> str:
     return "".join(rows)
 
 
+def _section_flow_rows(gr) -> str:
+    rows = []
+    section_names = {
+        "INGATE": "Meme",
+        "RUNNER": "Yolluk",
+        "SPRUE_THROAT": "Döküm ağzı boğazı",
+        "SPRUE_BASE": "Döküm ağzı tabanı",
+    }
+    for key, sf in getattr(gr, "section_flows", {}).items():
+        if sf.area_cm2 <= 0:
+            continue
+        name = section_names.get(key, key)
+        rows.append(
+            f"<tr><td>{name}: v / Re / Fr</td>"
+            f"<td>{sf.velocity_m_s:.2f} m/s</td>"
+            f"<td>Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, A={sf.area_cm2:.2f} cm², türbülans={'Evet' if sf.turbulent else 'Hayır'}</td></tr>"
+        )
+    return "".join(rows)
+
+
 def _format_gate_table(result: AnalysisResult) -> str:
     if result.gate_result is None:
         return "<p>Meme/yolluk/döküm ağzı body atanmamış.</p>"
     gr = result.gate_result
+    selected_section = getattr(gr, "selected_section_key", "INGATE")
+    selected_sf = getattr(gr, "section_flows", {}).get(selected_section)
+    selected_area = selected_sf.area_cm2 if selected_sf else 0.0
     return f"""
     <table>
         <tr><th>Parametre</th><th>Değer</th><th>Durum / Gerekli</th></tr>
+        <tr><td>Seçili giriş kesiti</td><td>{selected_section}</td><td>v = {gr.ingate_velocity_m_s:.2f} m/s</td></tr>
         <tr><td>Toplam meme temas alanı (Ag)</td><td>{gr.total_ingate_contact_area_cm2:.2f} cm²</td><td>min {gr.required_ingate_area_cm2:.2f} cm²</td></tr>
-        <tr><td>Meme hızı v (m/s)</td><td>{gr.ingate_velocity_m_s:.2f}</td><td>max {gr.ingate_max_velocity_m_s:.2f} m/s</td></tr>
-        <tr><td>Meme debisi Q</td><td>{gr.ingate_flow_rate_m3_s*1e3:.2f} L/s</td><td>doldurma süresi {gr.ingate_fill_time_s:.2f} s</td></tr>
-        <tr><td>Akışkanlık uzunluğu Lf</td><td>{gr.fluidity_length_mm:.1f} mm</td><td>parça boyutu ≤ Lf</td></tr>
-        <tr><td>Hız için gerekli meme alanı</td><td>{gr.required_ingate_area_for_velocity_cm2:.2f} cm²</td><td>mevcut {gr.total_ingate_contact_area_cm2:.2f} cm²</td></tr>
-        <tr><td>Reynolds / Froude</td><td>Re={gr.reynolds:.0f}, Fr={gr.froude:.2f}</td><td>Türbülans: {'Evet' if gr.turbulent else 'Hayır'}</td></tr>
         <tr><td>Yolluk min kesit alanı (Ar)</td><td>{gr.runner_min_area_cm2:.2f} cm²</td><td>min {gr.required_runner_area_cm2:.2f} cm²</td></tr>
-        <tr><td>Döküm ağzı taban alanı (As)</td><td>{gr.sprue_base_area_cm2:.2f} cm²</td><td>gerekli {gr.required_sprue_area_cm2:.2f} cm²</td></tr>
+        <tr><td>Döküm ağzı boğaz alanı (As)</td><td>{gr.sprue_throat_area_cm2:.2f} cm²</td><td>gerekli {gr.required_sprue_area_cm2:.2f} cm²</td></tr>
+        <tr><td>Döküm ağzı taban alanı</td><td>{gr.sprue_base_area_cm2:.2f} cm²</td><td>-</td></tr>
+        {_section_flow_rows(gr)}
+        <tr><td>Toplam debi Q</td><td>{gr.ingate_flow_rate_m3_s*1e3:.2f} L/s</td><td>doldurma süresi {gr.ingate_fill_time_s:.2f} s</td></tr>
+        <tr><td>Akışkanlık uzunluğu Lf</td><td>{gr.fluidity_length_mm:.1f} mm</td><td>parça boyutu ≤ Lf</td></tr>
+        <tr><td>Hız için gerekli seçili kesit alanı</td><td>{gr.required_ingate_area_for_velocity_cm2:.2f} cm²</td><td>mevcut {selected_area:.2f} cm²</td></tr>
         <tr><td>Campbell (Ag/Ar) kontrolü</td><td>{'Geçer' if gr.campbell_ok else 'Geçersiz'}</td><td>Ag/Ar &lt; 1.5</td></tr>
         <tr><td>Bernoulli döküm ağzı kontrolü</td><td>{'Geçer' if gr.bernoulli_ok else 'Geçersiz'}</td><td>As ≥ gerekli</td></tr>
         <tr><td>Dirsek kaybı (K·v²/2g)</td><td>{gr.elbow_count} dirsek, {gr.head_loss_mm:.1f} mm kayıp</td><td>efektif H={gr.effective_head_mm:.1f} mm</td></tr>
@@ -160,7 +184,8 @@ def _render_html(result: AnalysisResult, screenshot_path: Optional[str] = None) 
             <tr><td>Döküm süresi t_fill</td><td>{params.t_fill_s:.1f} s</td></tr>
             <tr><td>Sıvı yoğunluk ρ</td><td>{params.rho_liquid_kg_m3:.1f} kg/m³</td></tr>
             <tr><td>Viskozite μ</td><td>{params.viscosity_pa_s:.4f} Pa·s</td></tr>
-            <tr><td>Meme giriş hızı v_ingate</td><td>{params.ingate_velocity_m_s:.2f} m/s (0 = otomatik)</td></tr>
+            <tr><td>Giriş hızı kesiti</td><td>{params.velocity_section_key}</td></tr>
+            <tr><td>Giriş hızı v</td><td>{params.ingate_velocity_m_s:.2f} m/s (0 = otomatik)</td></tr>
             <tr><td>Süperheat</td><td>{params.superheat_c:.1f} °C</td></tr>
         </table>
         """
@@ -370,18 +395,29 @@ def _generate_report_fpdf2(
 
     if result.gate_result:
         gr = result.gate_result
+        section_names = {
+            "INGATE": "Meme",
+            "RUNNER": "Yolluk",
+            "SPRUE_THROAT": "D.AgzI bogazi",
+            "SPRUE_BASE": "D.AgzI tabani",
+        }
         pdf.set_font(font, "", 13)
         pdf.cell(0, 8, "Meme / Yolluk / Döküm Ağzı", ln=True)
         pdf.set_font(font, "", 10)
-        pdf.cell(0, 6, f"Meme hızı: {gr.ingate_velocity_m_s:.2f} m/s (max {gr.ingate_max_velocity_m_s:.2f} m/s), Re={gr.reynolds:.0f}, Fr={gr.froude:.2f}", ln=True)
-        pdf.cell(0, 6, f"Meme debisi: {gr.ingate_flow_rate_m3_s*1e3:.2f} L/s, doldurma süresi: {gr.ingate_fill_time_s:.2f} s", ln=True)
-        pdf.cell(0, 6, f"Akışkanlık uzunluğu Lf: {gr.fluidity_length_mm:.1f} mm", ln=True)
-        pdf.cell(0, 6, f"Hız icin gerekli meme alani: {gr.required_ingate_area_for_velocity_cm2:.2f} cm² (mevcut {gr.total_ingate_contact_area_cm2:.2f} cm²)", ln=True)
-        pdf.cell(0, 6, f"Toplam meme temas alanı: {gr.total_ingate_contact_area_cm2:.2f} cm² (min {gr.required_ingate_area_cm2:.2f} cm²)", ln=True)
+        pdf.cell(0, 6, f"Secili giris kesiti: {getattr(gr, 'selected_section_key', 'INGATE')}, v={gr.ingate_velocity_m_s:.2f} m/s", ln=True)
+        pdf.cell(0, 6, f"Toplam debi Q: {gr.ingate_flow_rate_m3_s*1e3:.2f} L/s, doldurma suresi: {gr.ingate_fill_time_s:.2f} s", ln=True)
+        pdf.cell(0, 6, f"Akiskanlik uzunlugu Lf: {gr.fluidity_length_mm:.1f} mm", ln=True)
+        pdf.cell(0, 6, f"Meme temas alani: {gr.total_ingate_contact_area_cm2:.2f} cm² (min {gr.required_ingate_area_cm2:.2f} cm²)", ln=True)
         pdf.cell(0, 6, f"Yolluk min kesit: {gr.runner_min_area_cm2:.2f} cm² (min {gr.required_runner_area_cm2:.2f} cm²)", ln=True)
-        pdf.cell(0, 6, f"Döküm ağzı: {gr.sprue_base_area_cm2:.2f} cm² (gerekli {gr.required_sprue_area_cm2:.2f} cm²)", ln=True)
+        pdf.cell(0, 6, f"Döküm ağzı boğazı: {gr.sprue_throat_area_cm2:.2f} cm² (gerekli {gr.required_sprue_area_cm2:.2f} cm²)", ln=True)
+        pdf.cell(0, 6, f"Döküm ağzı tabanı: {gr.sprue_base_area_cm2:.2f} cm²", ln=True)
+        for key, sf in getattr(gr, "section_flows", {}).items():
+            if sf.area_cm2 <= 0:
+                continue
+            name = section_names.get(key, key)
+            pdf.cell(0, 6, f"{name}: v={sf.velocity_m_s:.2f} m/s, Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, A={sf.area_cm2:.2f} cm2, turb={sf.turbulent}", ln=True)
         pdf.cell(0, 6, f"Campbell: {'Geçer' if gr.campbell_ok else 'Geçersiz'}", ln=True)
-        pdf.cell(0, 6, f"Bernoulli: {'Geçer' if gr.bernoulli_ok else 'Geçersiz'} (dirsek kaybı: {gr.elbow_count}, {gr.head_loss_mm:.1f} mm)", ln=True)
+        pdf.cell(0, 6, f"Bernoulli: {'Geçer' if gr.bernoulli_ok else 'Geçersiz'} (dirsek kaybi: {gr.elbow_count}, {gr.head_loss_mm:.1f} mm)", ln=True)
         pdf.cell(0, 6, f"Meme kalın bölgede: {'Evet' if gr.ingate_on_thick_region else 'Hayır'} "
                        f"(ortalama M={gr.ingate_avg_m_mm:.2f} mm)", ln=True)
         pdf.ln(4)

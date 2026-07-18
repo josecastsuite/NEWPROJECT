@@ -18,8 +18,10 @@ class CastingParameters:
     t_fill_s: float = 10.0
     rho_liquid_kg_m3: float = 7000.0
     viscosity_pa_s: float = 0.006
-    # v8.1: user-specified ingate velocity (0 = auto from V_part / t_fill)
+    # v8.1: user-specified inlet velocity (0 = auto from V_part / t_fill)
     ingate_velocity_m_s: float = 0.0
+    # v8.3: which gating section the velocity above refers to
+    velocity_section_key: str = "INGATE"
 
     @property
     def superheat_c(self) -> float:
@@ -35,6 +37,9 @@ class BodyType(IntEnum):
     RUNNER = 6
     SPRUE = 7
     CORE = 9
+    COOLING_SPRUE = 11
+    FILTER = 13
+    POURING_BASIN = 15
 
 
 BODY_TYPE_LABELS = {
@@ -44,7 +49,31 @@ BODY_TYPE_LABELS = {
     BodyType.RUNNER: "YOLLUK",
     BodyType.SPRUE: "DÖKÜM AĞZI",
     BodyType.CORE: "MAÇA",
+    BodyType.COOLING_SPRUE: "SOĞUTUCU DÖKÜM AĞZI",
+    BodyType.FILTER: "FİLTRE",
+    BodyType.POURING_BASIN: "DÖKÜM HAVZASI",
 }
+
+# Body types that contain liquid metal (CORE and FILTER are non-metal).
+BODY_METAL_TYPES = [
+    BodyType.PART,
+    BodyType.RISER,
+    BodyType.INGATE,
+    BodyType.RUNNER,
+    BodyType.SPRUE,
+    BodyType.COOLING_SPRUE,
+    BodyType.POURING_BASIN,
+]
+
+# Body types that can act as a feeding source if no separate riser exists.
+BODY_FEEDER_TYPES = [
+    BodyType.RISER,
+    BodyType.INGATE,
+    BodyType.RUNNER,
+    BodyType.SPRUE,
+    BodyType.COOLING_SPRUE,
+    BodyType.POURING_BASIN,
+]
 
 
 @dataclass
@@ -126,6 +155,18 @@ class RiserProposal:
 
 
 @dataclass
+class SectionFlow:
+    """Flow velocity and Re/Fr at one gating section."""
+    velocity_m_s: float = 0.0
+    area_cm2: float = 0.0
+    thickness_mm: float = 0.0
+    reynolds: float = 0.0
+    froude: float = 0.0
+    turbulent: bool = False
+    max_velocity_m_s: float = 1.0
+
+
+@dataclass
 class GateResult:
     total_ingate_contact_area_cm2: float
     runner_min_area_cm2: float
@@ -161,6 +202,13 @@ class GateResult:
     required_ingate_area_for_velocity_cm2: float = 0.0
     velocity_area_ok: bool = True
     fluidity_length_mm: float = 0.0
+    # v8.3: separate sprue throat (minimum) and sprue base (bottom) areas + per-section flows
+    sprue_throat_area_cm2: float = 0.0
+    sprue_base_bottom_area_cm2: float = 0.0
+    sprue_thickness_mm: float = 0.0
+    selected_section_key: str = "INGATE"
+    selected_velocity_m_s: float = 0.0
+    section_flows: Dict[str, SectionFlow] = field(default_factory=dict)
 
 
 @dataclass

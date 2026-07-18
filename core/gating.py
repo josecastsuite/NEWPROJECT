@@ -1,7 +1,7 @@
 """Ingate / runner / sprue geometric gating calculations - JoseCast v8.0."""
 
 from dataclasses import replace
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 from scipy import ndimage
@@ -9,7 +9,14 @@ from scipy.sparse import coo_matrix, csgraph
 
 from core.materials import get_alloy, get_mold, chvorinov_c_from_properties
 from core.sdf_analyzer import COST_26, NEIGH_26
-from core.types import AnalysisResult, BodyType, GateResult
+from core.types import (
+    BODY_FEEDER_TYPES,
+    BODY_METAL_TYPES,
+    AnalysisResult,
+    BodyType,
+    GateResult,
+    SectionFlow,
+)
 
 
 def _neighbor_offsets_6():
@@ -40,15 +47,11 @@ def _apply_edge_mask(arr, di, dj, dk):
 
 
 def _gate_source_mask(grid: np.ndarray) -> np.ndarray:
-    """Prefer INGATE; if none, use RUNNER or SPRUE as the metal entry source."""
-    ingate = grid == BodyType.INGATE
-    if ingate.any():
-        return ingate
-    runner = grid == BodyType.RUNNER
-    if runner.any():
-        return runner
-    sprue = grid == BodyType.SPRUE
-    return sprue
+    """Return gating bodies that can feed metal into the part."""
+    return np.isin(
+        grid,
+        [BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE, BodyType.COOLING_SPRUE, BodyType.POURING_BASIN],
+    )
 
 
 def ingate_contact_area_and_mask(grid: np.ndarray, dx: float) -> tuple:
@@ -228,13 +231,52 @@ def _count_elbows_along_path(
     return elbows
 
 
+def _compute_section_flow(
+    section_key: str,
+    area_cm2: float,
+    thickness_mm: float,
+    Q_m3_s: float,
+    rho: float,
+    mu: float,
+    g: float,
+    max_velocity_m_s: float,
+) -> SectionFlow:
+    """Velocity, Reynolds, Froude and turbulence flag for one gating section."""
+    area_m2 = area_cm2 / 1e4
+    if area_m2 > 0 and Q_m3_s > 0:
+        velocity = Q_m3_s / area_m2
+    else:
+        velocity = 0.0
+    D = max(thickness_mm / 1000.0, 1e-6)
+    reynolds = 0.0
+    froude = 0.0
+    turbulent = False
+    if velocity > 0:
+        reynolds = rho * velocity * D / mu
+        froude = velocity / np.sqrt(g * D)
+        # Ingate also checked against Campbell max velocity; other sections rely on Re/Fr.
+        if section_key == "INGATE":
+            turbulent = (reynolds > 20000.0) or (froude > 1.0) or (velocity > max_velocity_m_s)
+        else:
+            turbulent = (reynolds > 20000.0) or (froude > 1.0)
+    return SectionFlow(
+        velocity_m_s=velocity,
+        area_cm2=area_cm2,
+        thickness_mm=thickness_mm,
+        reynolds=reynolds,
+        froude=froude,
+        turbulent=turbulent,
+        max_velocity_m_s=max_velocity_m_s,
+    )
+
+
 def analyze_gating(
     result: AnalysisResult,
     fill_time_s: Optional[float] = None,
     discharge_coeff: float = 0.8,
     casting_params=None,
 ) -> Optional[GateResult]:
-    """Compute gate/sprue/runner checks including Bernoulli elbow losses and ingate velocity/Re/Fr."""
+    """Compute gate/sprue/runner checks including Bernoulli elbow losses and all section velocities/Re/Fr."""
     from core.types import CastingParameters
 
     grid = result.grid
@@ -242,8 +284,10 @@ def analyze_gating(
     dx = result.dx_mm
     alloy = get_alloy(result.alloy_key)
     mold = get_mold(result.mold_key)
+    velocity_section_key = "INGATE"
     if casting_params is not None and isinstance(casting_params, CastingParameters):
         fill_time_s = casting_params.t_fill_s
+        velocity_section_key = getattr(casting_params, "velocity_section_key", "INGATE") or "INGATE"
         alloy = replace(
             alloy,
             t_pour_c=casting_params.t_pour_c,
@@ -262,57 +306,95 @@ def analyze_gating(
     source = _gate_source_mask(grid)
     has_ingate = ingate.any()
 
+    # Contact/cross-sectional areas of each gating section
     ag_total_mm2, _ = ingate_contact_area_and_mask(grid, dx)
     ag_total_cm2 = ag_total_mm2 / 100.0
 
     runner_min_area_mm2 = _minimum_cross_section_area(runner, dx)
     runner_min_area_cm2 = runner_min_area_mm2 / 100.0
+
+    sprue_throat_mm2 = _minimum_cross_section_area(sprue, dx) if sprue.any() else 0.0
+    sprue_throat_cm2 = sprue_throat_mm2 / 100.0
+    sprue_base_bottom_mm2 = _sprue_base_area(sprue, dx) if sprue.any() else 0.0
+    sprue_base_bottom_cm2 = sprue_base_bottom_mm2 / 100.0
+
+    # Legacy field: sprue_base_area_cm2 is the bottom area.
+    sprue_base_cm2 = sprue_base_bottom_cm2
+
     runner_thickness_mm = _mean_thickness(runner, dx)
-
-    sprue_base_mm2 = _minimum_cross_section_area(sprue, dx) if sprue.any() else 0.0
-    sprue_base_cm2 = sprue_base_mm2 / 100.0
-
+    sprue_thickness_mm = _mean_thickness(sprue, dx)
     ingate_thickness_mm = _mean_thickness(source, dx)
 
     # Part weight for Bernoulli
     part_volume_mm3 = float(part_mask.sum()) * (dx ** 3)
     part_volume_cm3 = part_volume_mm3 / 1000.0
     part_weight_g = part_volume_cm3 * alloy.density_g_cm3
+    part_volume_m3 = part_volume_mm3 / 1e9
 
-    # v8.1: ingate velocity (user override or auto from V_part / t_fill)
+    # Section area map for velocity calculations
+    section_area_cm2 = {
+        "INGATE": ag_total_cm2,
+        "RUNNER": runner_min_area_cm2,
+        "SPRUE_THROAT": sprue_throat_cm2,
+        "SPRUE_BASE": sprue_base_bottom_cm2,
+    }
+    selected_area_cm2 = section_area_cm2.get(velocity_section_key, ag_total_cm2)
+    selected_area_m2 = selected_area_cm2 / 1e4
+
+    # v8.3: user-specified inlet velocity for the selected section (0 = auto Q = V_part / t_fill)
     user_v = 0.0
     if casting_params is not None and isinstance(casting_params, CastingParameters):
         user_v = float(getattr(casting_params, "ingate_velocity_m_s", 0.0))
 
-    ag_m2 = ag_total_mm2 / 1e6
-    part_volume_m3 = part_volume_mm3 / 1e9
-    ingate_velocity_m_s = 0.0
-    ingate_flow_rate_m3_s = 0.0
-    ingate_fill_time_s = 0.0
+    Q_m3_s = 0.0
+    t_fill_computed_s = fill_time_s
     velocity_fill_time_match_ok = True
-    required_ingate_area_for_velocity_m2 = 0.0
+    required_selected_area_for_velocity_m2 = 0.0
     velocity_area_ok = True
 
-    if ag_m2 > 0 and part_volume_m3 > 0:
+    if selected_area_m2 > 0 and part_volume_m3 > 0:
         if user_v > 0:
-            ingate_velocity_m_s = user_v
-            ingate_flow_rate_m3_s = user_v * ag_m2
-            ingate_fill_time_s = part_volume_m3 / ingate_flow_rate_m3_s
+            Q_m3_s = user_v * selected_area_m2
+            t_fill_computed_s = part_volume_m3 / Q_m3_s
             if fill_time_s > 0:
                 tolerance = 0.15 * fill_time_s
-                velocity_fill_time_match_ok = abs(ingate_fill_time_s - fill_time_s) <= tolerance
-                # Area required to hit both target velocity and target fill time
+                velocity_fill_time_match_ok = abs(t_fill_computed_s - fill_time_s) <= tolerance
                 required_Q_m3_s = part_volume_m3 / fill_time_s
-                required_ingate_area_for_velocity_m2 = required_Q_m3_s / user_v
-                velocity_area_ok = ag_m2 >= required_ingate_area_for_velocity_m2 * 0.95
+                required_selected_area_for_velocity_m2 = required_Q_m3_s / user_v
+                velocity_area_ok = selected_area_m2 >= required_selected_area_for_velocity_m2 * 0.95
         elif fill_time_s > 0:
-            ingate_flow_rate_m3_s = part_volume_m3 / fill_time_s
-            ingate_velocity_m_s = ingate_flow_rate_m3_s / ag_m2
-            ingate_fill_time_s = fill_time_s
+            Q_m3_s = part_volume_m3 / fill_time_s
+            t_fill_computed_s = fill_time_s
+
+    # Compute per-section velocities and Re/Fr
+    g_m_s2 = 9.81
+    rho = alloy.rho_kg_m3
+    mu = max(alloy.viscosity_pa_s, 1e-6)
+    max_ingate_velocity = 0.5 if alloy.key in ("AlSi7",) else 1.0
+
+    section_flows: Dict[str, SectionFlow] = {}
+    for key, area_cm2 in section_area_cm2.items():
+        thickness = {
+            "INGATE": ingate_thickness_mm,
+            "RUNNER": runner_thickness_mm,
+            "SPRUE_THROAT": sprue_thickness_mm,
+            "SPRUE_BASE": sprue_thickness_mm,
+        }.get(key, ingate_thickness_mm)
+        max_v = max_ingate_velocity if key == "INGATE" else 2.0
+        section_flows[key] = _compute_section_flow(
+            key, area_cm2, thickness, Q_m3_s, rho, mu, g_m_s2, max_v
+        )
+
+    ingate_flow = section_flows.get("INGATE", SectionFlow())
+    ingate_velocity_m_s = ingate_flow.velocity_m_s
+    ingate_flow_rate_m3_s = Q_m3_s
+    ingate_fill_time_s = t_fill_computed_s
+    reynolds = ingate_flow.reynolds
+    froude = ingate_flow.froude
+    turbulent = ingate_flow.turbulent
 
     # Sprue height H in cm; fallback to total metal height
-    metal_mask = result.is_metal
-    metal_pts = np.argwhere(metal_mask)
+    metal_pts = np.argwhere(result.is_metal)
     if len(metal_pts) > 0:
         height_mm = float((metal_pts[:, 2].max() - metal_pts[:, 2].min()) * dx)
     else:
@@ -320,7 +402,6 @@ def analyze_gating(
     height_cm = height_mm / 10.0
 
     g_cgs = 981.0  # cm/s^2
-    # Base Bernoulli velocity without losses
     if height_cm > 0 and fill_time_s > 0:
         velocity = np.sqrt(2.0 * g_cgs * height_cm)
         as_req_cm2 = part_weight_g / (
@@ -330,8 +411,11 @@ def analyze_gating(
         as_req_cm2 = 0.0
         velocity = 0.0
 
-    # Bernoulli with elbow losses along runner/sprue channel
-    channel_mask = runner | ingate | sprue
+    # Bernoulli with elbow losses along the gating channel
+    channel_mask = np.isin(
+        grid,
+        [BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE, BodyType.COOLING_SPRUE, BodyType.POURING_BASIN],
+    )
     sprue_mask = sprue & channel_mask
     effective_head_cm = height_cm
     elbow_count = 0
@@ -340,7 +424,6 @@ def analyze_gating(
     if channel_mask.any() and sprue_mask.any() and ingate.any():
         dist_to_sprue = _distance_to_sprue_26(channel_mask, sprue_mask, dx)
         ingate_vox = np.argwhere(ingate)
-        # Sample up to 20 ingate voxels to estimate elbow count
         sample = ingate_vox[
             np.linspace(0, len(ingate_vox) - 1, min(20, len(ingate_vox))).astype(int)
         ]
@@ -349,7 +432,7 @@ def analyze_gating(
             counts.append(_count_elbows_along_path(dist_to_sprue, channel_mask, tuple(v)))
         elbow_count = int(round(np.median(counts))) if counts else 0
         if velocity > 0:
-            v_loss_m_s = velocity / 100.0  # cm/s -> m/s for head-loss formula
+            v_loss_m_s = velocity / 100.0
             h_loss_per_elbow_m = alloy.elbow_loss_k * (v_loss_m_s ** 2) / (2.0 * 9.81)
             head_loss_cm = h_loss_per_elbow_m * 100.0 * elbow_count
             effective_head_cm = max(0.0, height_cm - head_loss_cm)
@@ -361,15 +444,15 @@ def analyze_gating(
             else:
                 required_sprue_area_with_losses_cm2 = float("inf")
 
-    bernoulli_ok = sprue_base_cm2 >= as_req_cm2
-    bernoulli_with_losses_ok = sprue_base_cm2 >= required_sprue_area_with_losses_cm2
+    # Bernoulli: controlling section is the sprue throat (minimum area)
+    final_sprue_required_cm2 = max(as_req_cm2, required_sprue_area_with_losses_cm2)
+    bernoulli_ok = sprue_throat_cm2 >= final_sprue_required_cm2
 
     # Campbell: total ingate area / runner area < 1.5
     if runner_min_area_cm2 > 0:
         gate_to_runner_ratio = ag_total_cm2 / runner_min_area_cm2
         campbell_ok = gate_to_runner_ratio <= 1.5
     else:
-        gate_to_runner_ratio = float("inf")
         campbell_ok = False
 
     required_runner_area_cm2 = ag_total_cm2 / 1.5 if ag_total_cm2 > 0 else 0.0
@@ -391,34 +474,12 @@ def analyze_gating(
     threshold = 0.8 * max_part_sdf
     ingate_on_thick = ingate_avg_m > threshold if max_part_sdf > 0 else False
 
-    # A reasonable minimum ingate contact area: based on runner capacity
     required_ingate_area_cm2 = required_runner_area_cm2 / 1.5
     ingate_ok = (ag_total_cm2 >= required_ingate_area_cm2) and (not ingate_on_thick)
-    # v8.1: if user specifies ingate velocity, area must be enough to satisfy both v and t_fill
     if user_v > 0:
         ingate_ok = ingate_ok and velocity_area_ok
 
-    # Prefer Bernoulli check that accounts for losses
-    final_sprue_required_cm2 = max(as_req_cm2, required_sprue_area_with_losses_cm2)
-    final_bernoulli_ok = sprue_base_cm2 >= final_sprue_required_cm2
-
-    # Alloy-specific maximum ingate velocity (Campbell rule)
-    max_ingate_velocity = 0.5 if alloy.key in ("AlSi7",) else 1.0
-    # Characteristic hydraulic diameter D ≈ 2*mean_wall_thickness of ingate
-    D = max(ingate_thickness_mm / 1000.0, 1e-6)
-    g = 9.81
-    rho = alloy.rho_kg_m3
-    mu = max(alloy.viscosity_pa_s, 1e-6)
-    reynolds = 0.0
-    froude = 0.0
-    turbulent = False
-    if ingate_velocity_m_s > 0:
-        reynolds = rho * ingate_velocity_m_s * D / mu
-        froude = ingate_velocity_m_s / np.sqrt(g * D)
-        # Turbulence if Re > 20000 or Fr > 1 or above alloy-specific ingate velocity
-        turbulent = (reynolds > 20000.0) or (froude > 1.0) or (ingate_velocity_m_s > max_ingate_velocity)
-
-    # Fluidity length: distance the metal can flow before superheat is lost
+    # Fluidity length uses the ingate velocity
     t_stream = max(ingate_thickness_mm, runner_thickness_mm, 2.0 * result.dominant_m_mm, 2.0)
     M_stream = t_stream / 2.0
     C = chvorinov_c_from_properties(alloy, mold)
@@ -446,13 +507,22 @@ def analyze_gating(
             f"Akışkanlık uzunluğu Lf = {fluidity_length_mm:.1f} mm, parça boyutu {max_dim_mm:.1f} mm -> yeterli."
         )
 
+    # Build a compact summary of all section velocities for recommendations
+    velocity_summary = " | ".join(
+        f"{k}: {sf.velocity_m_s:.2f}m/s (Re={sf.reynolds:.0f}, Fr={sf.froude:.2f})"
+        for k, sf in section_flows.items()
+        if sf.area_cm2 > 0
+    )
+    if velocity_summary:
+        result.recommendations.append(f"Kesit hızları -> {velocity_summary}")
+
     return GateResult(
         total_ingate_contact_area_cm2=ag_total_cm2,
         runner_min_area_cm2=runner_min_area_cm2,
         sprue_base_area_cm2=sprue_base_cm2,
         required_sprue_area_cm2=final_sprue_required_cm2,
         campbell_ok=campbell_ok,
-        bernoulli_ok=final_bernoulli_ok,
+        bernoulli_ok=bernoulli_ok,
         ingate_on_thick_region=ingate_on_thick,
         ingate_avg_m_mm=ingate_avg_m,
         ingate_max_m_mm=ingate_max_m,
@@ -474,7 +544,13 @@ def analyze_gating(
         ingate_flow_rate_m3_s=ingate_flow_rate_m3_s,
         ingate_fill_time_s=ingate_fill_time_s,
         velocity_fill_time_match_ok=velocity_fill_time_match_ok,
-        required_ingate_area_for_velocity_cm2=required_ingate_area_for_velocity_m2 * 1e4,
+        required_ingate_area_for_velocity_cm2=required_selected_area_for_velocity_m2 * 1e4,
         velocity_area_ok=velocity_area_ok,
         fluidity_length_mm=fluidity_length_mm,
+        sprue_throat_area_cm2=sprue_throat_cm2,
+        sprue_base_bottom_area_cm2=sprue_base_bottom_cm2,
+        sprue_thickness_mm=sprue_thickness_mm,
+        selected_section_key=velocity_section_key,
+        selected_velocity_m_s=user_v,
+        section_flows=section_flows,
     )

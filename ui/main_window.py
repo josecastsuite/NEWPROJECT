@@ -36,6 +36,9 @@ BODY_TYPE_NAMES = {
     BodyType.RUNNER: "YOLLUK",
     BodyType.SPRUE: "DÖKÜM AĞZI",
     BodyType.CORE: "MAÇA",
+    BodyType.COOLING_SPRUE: "SOĞUTUCU D.AĞZI",
+    BodyType.FILTER: "FİLTRE",
+    BodyType.POURING_BASIN: "DÖKÜM HAVZASI",
 }
 
 
@@ -328,6 +331,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.visc_spin.setValue(0.0060)
         _params_labeled(self.visc_spin, "Viskozite μ (Pa·s):")
 
+        self.velocity_section_combo = QtWidgets.QComboBox()
+        self.velocity_section_combo.addItem("Meme (ingate)", "INGATE")
+        self.velocity_section_combo.addItem("Yolluk (runner)", "RUNNER")
+        self.velocity_section_combo.addItem("Döküm ağzı boğazı (sprue throat)", "SPRUE_THROAT")
+        self.velocity_section_combo.addItem("Döküm ağzı tabanı (sprue base)", "SPRUE_BASE")
+        _params_labeled(self.velocity_section_combo, "Hız kesiti:", "Giriş hızının uygulanacağı kesit.")
+
         self.v_ingate_spin = QtWidgets.QDoubleSpinBox()
         self.v_ingate_spin.setRange(0.0, 20.0)
         self.v_ingate_spin.setDecimals(2)
@@ -335,8 +345,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.v_ingate_spin.setSingleStep(0.1)
         _params_labeled(
             self.v_ingate_spin,
-            "Meme giriş hızı v_ingate (m/s):",
-            "0 = otomatik (Q = V_parça / t_fill). >0 kullanıcı girişi; Re/Fr/türbülans buna göre hesaplanır.",
+            "Giriş hızı v (m/s):",
+            "0 = otomatik (Q = V_parça / t_fill). >0 kullanıcı girişi; seçili kesitte Re/Fr hesaplanır.",
         )
 
         left_layout.addWidget(params_group)
@@ -527,6 +537,7 @@ class MainWindow(QtWidgets.QMainWindow):
             rho_liquid_kg_m3=self.rho_spin.value(),
             viscosity_pa_s=self.visc_spin.value(),
             ingate_velocity_m_s=self.v_ingate_spin.value(),
+            velocity_section_key=self.velocity_section_combo.currentData(),
         )
 
     def aiLog(self, msg: str, type_: str = "info"):
@@ -566,6 +577,9 @@ class MainWindow(QtWidgets.QMainWindow):
             BodyType.INGATE,
             BodyType.RUNNER,
             BodyType.SPRUE,
+            BodyType.COOLING_SPRUE,
+            BodyType.FILTER,
+            BodyType.POURING_BASIN,
             BodyType.CORE,
         ):
             combo.addItem(BODY_TYPE_NAMES[bt], bt)
@@ -749,6 +763,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _gating_recommendations(self, gr) -> List[str]:
         if gr is None:
             return []
+        section_names = {
+            "INGATE": "Meme",
+            "RUNNER": "Yolluk",
+            "SPRUE_THROAT": "Döküm ağzı boğazı",
+            "SPRUE_BASE": "Döküm ağzı tabanı",
+        }
         recs = []
         if not gr.runner_ok:
             short_pct = 0
@@ -762,7 +782,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         if not gr.bernoulli_ok:
             recs.append(
-                f"Döküm ağzı (sprue) taban alanı {gr.sprue_base_area_cm2:.2f} cm² < gerekli {gr.required_sprue_area_cm2:.2f} cm². "
+                f"Döküm ağzı boğaz alanı {gr.sprue_throat_area_cm2:.2f} cm² < gerekli {gr.required_sprue_area_cm2:.2f} cm². "
                 f"Döküm ağzını büyüt (dirsek kaybı {gr.head_loss_mm:.1f} mm dikkate alınarak)."
             )
         if gr.ingate_on_thick_region:
@@ -774,25 +794,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Meme toplam temas alanı {gr.total_ingate_contact_area_cm2:.2f} cm², "
                 f"minimum {gr.required_ingate_area_cm2:.2f} cm² önerilir."
             )
-        if hasattr(gr, "turbulent") and gr.turbulent:
-            recs.append(
-                f"Meme hızı {gr.ingate_velocity_m_s:.2f} m/s ile yüksek; Re={gr.reynolds:.0f}, Fr={gr.froude:.2f}. "
-                f"Türbülans / hava kaçırma riski. Meme alanını büyüt veya döküm süresini artırın."
-            )
+        # v8.3: per-section velocity / Re / Fr report
+        for key, sf in getattr(gr, "section_flows", {}).items():
+            if sf.area_cm2 <= 0:
+                continue
+            name = section_names.get(key, key)
+            if sf.turbulent:
+                recs.append(
+                    f"{name} hızı {sf.velocity_m_s:.2f} m/s ile yüksek; Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}. "
+                    f"Türbülans / hava kaçırma riski. Kesit alanını büyüt veya döküm süresini artırın."
+                )
+            else:
+                recs.append(
+                    f"{name}: v={sf.velocity_m_s:.2f} m/s, Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, "
+                    f"A={sf.area_cm2:.2f} cm² -> türbülans yok."
+                )
         if hasattr(gr, "velocity_fill_time_match_ok") and not gr.velocity_fill_time_match_ok:
             t_fill = self._analysis.casting_params.t_fill_s if self._analysis and self._analysis.casting_params else 0.0
             compatible_v = 0.0
-            if t_fill > 0:
+            if t_fill > 0 and gr.ingate_fill_time_s > 0:
                 compatible_v = gr.ingate_velocity_m_s * gr.ingate_fill_time_s / t_fill
+            section_name = section_names.get(getattr(gr, "selected_section_key", "INGATE"), "Seçili kesit")
             recs.append(
-                f"Girilen meme hızı ({gr.ingate_velocity_m_s:.2f} m/s) ile döküm süresi ({gr.ingate_fill_time_s:.1f}s) tutarsız. "
-                f"t_fill ile uyumlu hız: {compatible_v:.2f} m/s, gerekli meme alanı {gr.required_ingate_area_for_velocity_cm2:.2f} cm². "
-                "Meme alanını veya döküm süresini ayarlayın."
+                f"Girilen {section_name} hızı ({gr.ingate_velocity_m_s:.2f} m/s) ile döküm süresi ({gr.ingate_fill_time_s:.1f}s) tutarsız. "
+                f"t_fill ile uyumlu hız: {compatible_v:.2f} m/s, gerekli seçili kesit alanı {gr.required_ingate_area_for_velocity_cm2:.2f} cm². "
+                "Kesit alanını veya döküm süresini ayarlayın."
             )
         if gr.ingate_velocity_m_s > 0:
             recs.append(
-                f"Meme debisi Q={gr.ingate_flow_rate_m3_s*1e3:.2f} L/s, doldurma süresi={gr.ingate_fill_time_s:.2f}s. "
-                f"Max güvenli hız={gr.ingate_max_velocity_m_s:.2f} m/s."
+                f"Toplam debi Q={gr.ingate_flow_rate_m3_s*1e3:.2f} L/s, doldurma süresi={gr.ingate_fill_time_s:.2f}s. "
+                f"Meme max güvenli hız={gr.ingate_max_velocity_m_s:.2f} m/s."
             )
         return recs
 
@@ -825,6 +856,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self._analysis.gate_result:
             gr = self._analysis.gate_result
+            section_names = {
+                "INGATE": "Meme",
+                "RUNNER": "Yolluk",
+                "SPRUE_THROAT": "D.Ağzı boğazı",
+                "SPRUE_BASE": "D.Ağzı tabanı",
+            }
             self.checklist_layout.addWidget(
                 CheckListItem(
                     f"Yolluk: {gr.runner_min_area_cm2:.2f} cm² (gerekli {gr.required_runner_area_cm2:.2f} cm²)",
@@ -833,7 +870,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self.checklist_layout.addWidget(
                 CheckListItem(
-                    f"Döküm ağzı: {gr.sprue_base_area_cm2:.2f} cm² (gerekli {gr.required_sprue_area_cm2:.2f} cm²)",
+                    f"Döküm ağzı boğazı: {gr.sprue_throat_area_cm2:.2f} cm² (gerekli {gr.required_sprue_area_cm2:.2f} cm²)",
                     gr.bernoulli_ok,
                 )
             )
@@ -843,17 +880,26 @@ class MainWindow(QtWidgets.QMainWindow):
                     not gr.ingate_on_thick_region,
                 )
             )
-            if hasattr(gr, "turbulent"):
+            # v8.3: per-section velocity / Re / Fr checklist items
+            for key, sf in getattr(gr, "section_flows", {}).items():
+                if sf.area_cm2 <= 0:
+                    continue
+                name = section_names.get(key, key)
                 self.checklist_layout.addWidget(
                     CheckListItem(
-                        f"Meme akış (Re={gr.reynolds:.0f}, Fr={gr.froude:.2f})",
-                        not gr.turbulent,
+                        f"{name}: v={sf.velocity_m_s:.2f} m/s, Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, A={sf.area_cm2:.2f} cm²",
+                        not sf.turbulent,
                     )
                 )
             if hasattr(gr, "velocity_fill_time_match_ok"):
-                velocity_ok = gr.velocity_fill_time_match_ok and getattr(gr, "velocity_area_ok", True) and not gr.turbulent
+                velocity_ok = (
+                    gr.velocity_fill_time_match_ok
+                    and getattr(gr, "velocity_area_ok", True)
+                    and not gr.turbulent
+                )
                 vtext = (
-                    f"Meme hızı {gr.ingate_velocity_m_s:.2f} m/s, "
+                    f"Seçili kesit: {section_names.get(getattr(gr, 'selected_section_key', 'INGATE'), 'Meme')} "
+                    f"v={gr.ingate_velocity_m_s:.2f} m/s, "
                     f"doldurma {gr.ingate_fill_time_s:.2f}s, Q={gr.ingate_flow_rate_m3_s*1e3:.2f} L/s"
                 )
                 self.checklist_layout.addWidget(
