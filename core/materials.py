@@ -50,9 +50,10 @@ class Alloy:
     # Flow / feeding coefficients
     viscosity_pa_s: float = 0.003
     particle_size_mm: float = 0.30
-    # Feeding distance FD = feed_k1 * t + feed_k2 * W
-    feed_k1: float = 3.0
-    feed_k2: float = 0.5
+    # Feeding distance FD = feed_k1 * t_section (t_section = 2 * local modulus)
+    # so feed_k1=4.5 gives the classic FD = 4.5 * wall_thickness for a plate.
+    feed_k1: float = 4.5
+    feed_k2: float = 0.0
     # Riser sizing
     riser_m_factor: float = 1.2
     riser_volume_factor: float = 0.3
@@ -63,6 +64,10 @@ class Alloy:
     elbow_loss_k: float = 0.9
     # Modulus resistance correction [mm per resistance unit]
     modulus_resistance_mm: float = 0.02
+    # Solidification shrinkage (volume fraction)
+    shrinkage_factor: float = 0.03
+    # Secondary dendrite arm spacing [mm] for interdendritic permeability
+    dendrite_spacing_mm: float = 0.12
 
     def __post_init__(self):
         if self.density_g_cm3 == 0.0:
@@ -126,8 +131,10 @@ ALLOYS: Dict[str, Alloy] = {
         partition_coefficient=0.12,
         viscosity_pa_s=0.0012,
         particle_size_mm=0.30,
-        feed_k1=2.5,
-        feed_k2=0.4,
+        shrinkage_factor=0.07,
+        dendrite_spacing_mm=0.08,
+        feed_k1=4.5,
+        feed_k2=0.0,
         niyama_macro=0.775,
         niyama_shrinkage=1.5,
     ),
@@ -145,8 +152,10 @@ ALLOYS: Dict[str, Alloy] = {
         partition_coefficient=0.35,
         viscosity_pa_s=0.006,
         particle_size_mm=0.30,
-        feed_k1=2.8,
-        feed_k2=0.45,
+        shrinkage_factor=0.02,
+        dendrite_spacing_mm=0.15,
+        feed_k1=4.5,
+        feed_k2=0.0,
         niyama_macro=0.775,
         niyama_shrinkage=1.5,
     ),
@@ -164,8 +173,10 @@ ALLOYS: Dict[str, Alloy] = {
         partition_coefficient=0.20,
         viscosity_pa_s=0.005,
         particle_size_mm=0.25,
-        feed_k1=3.0,
-        feed_k2=0.5,
+        shrinkage_factor=0.03,
+        dendrite_spacing_mm=0.12,
+        feed_k1=4.5,
+        feed_k2=0.0,
         niyama_macro=0.775,
         niyama_shrinkage=1.5,
     ),
@@ -183,8 +194,10 @@ ALLOYS: Dict[str, Alloy] = {
         partition_coefficient=0.25,
         viscosity_pa_s=0.004,
         particle_size_mm=0.30,
-        feed_k1=2.6,
-        feed_k2=0.42,
+        shrinkage_factor=0.06,
+        dendrite_spacing_mm=0.10,
+        feed_k1=4.5,
+        feed_k2=0.0,
         niyama_macro=0.775,
         niyama_shrinkage=1.5,
     ),
@@ -211,13 +224,19 @@ def get_material(key: str) -> Material:
 def chvorinov_c_from_properties(alloy: Alloy, mold: MoldMaterial) -> float:
     """
     Compute Chvorinov constant C in s/mm^2 from physical properties.
-    C = (rho_m * L / (T_m - T_0))^2 * (pi / (4 * k * rho * c))
+    C = (rho_m * L_eff / (T_m - T_0))^2 * (pi / (4 * k * rho * c))
+    L_eff includes the superheat that must also be removed:
+        L_eff = L + cp * (T_pour - T_liquidus)
     Returns a value in s/mm^2.
     """
     tm = (alloy.t_liquidus_c + alloy.t_solidus_c) / 2.0
     delta_t = max(tm - mold.t0_c, 1.0)
-    # rho_m * L / (T_m - T0)  [J/m^3 / K]
-    numerator = alloy.rho_kg_m3 * alloy.latent_heat_j_kg / delta_t
+    # Effective latent heat including superheat [J/kg]
+    l_eff = alloy.latent_heat_j_kg + alloy.cp_j_kgk * max(
+        alloy.t_pour_c - alloy.t_liquidus_c, 0.0
+    )
+    # rho_m * L_eff / (T_m - T0)  [J/m^3 / K]
+    numerator = alloy.rho_kg_m3 * l_eff / delta_t
     # k * rho * c  [W/mK * kg/m3 * J/kgK = W*J/(m^4 K^2)]
     denom = mold.k_w_mk * mold.rho_kg_m3 * mold.cp_j_kgk
     if denom <= 0:

@@ -88,6 +88,7 @@ class HotSpot:
     # v8.0
     heuvers_ok: bool = True
     feeding_cost: float = 0.0
+    darcy_ok: bool = True
 
 
 @dataclass
@@ -144,6 +145,7 @@ class GateResult:
     velocity_fill_time_match_ok: bool = True
     required_ingate_area_for_velocity_cm2: float = 0.0
     velocity_area_ok: bool = True
+    fluidity_length_mm: float = 0.0
 
 
 @dataclass

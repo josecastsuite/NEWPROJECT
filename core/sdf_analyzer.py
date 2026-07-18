@@ -8,6 +8,7 @@ import trimesh
 from scipy import ndimage, sparse
 from scipy.sparse import csgraph
 from scipy.spatial import cKDTree
+from scipy.special import erf
 from skimage.measure import marching_cubes
 from skimage.morphology import skeletonize
 from sklearn.cluster import DBSCAN
@@ -166,6 +167,34 @@ def _scheil_fs(T_arr, t_liq, t_sol, k):
     return fs
 
 
+def _temperature_from_erf(
+    sdf: np.ndarray, t: float, alloy: Alloy, mold: MoldMaterial
+) -> np.ndarray:
+    """1-D semi-infinite solution of the Fourier heat equation in the normal direction."""
+    alpha = mold.diffusivity_mm2_s
+    if t <= 0 or alpha <= 0:
+        return np.full_like(sdf, alloy.t_pour_c)
+    arg = sdf / (2.0 * np.sqrt(alpha * t))
+    T = mold.t0_c + (alloy.t_pour_c - mold.t0_c) * erf(arg)
+    return np.clip(T, mold.t0_c, alloy.t_pour_c)
+
+
+def _cooling_rate_from_erf(
+    sdf: np.ndarray, t: float, alloy: Alloy, mold: MoldMaterial
+) -> np.ndarray:
+    """Time derivative dT/dt of the erf solution (always <= 0 for cooling)."""
+    alpha = mold.diffusivity_mm2_s
+    if t <= 0 or alpha <= 0:
+        return np.zeros_like(sdf)
+    sqrt_term = np.sqrt(alpha * t)
+    arg = sdf / (2.0 * sqrt_term)
+    exp = np.exp(-(arg * arg))
+    denom = 2.0 * np.sqrt(np.pi * alpha) * (t ** 1.5)
+    denom = np.where(denom > 0, denom, 1e-30)
+    dTdt = - (alloy.t_pour_c - mold.t0_c) * sdf * exp / denom
+    return np.where(sdf > 0, dTdt, 0.0)
+
+
 def compute_thermal_field(
     grid: np.ndarray,
     is_metal: np.ndarray,
@@ -174,126 +203,86 @@ def compute_thermal_field(
     dx: float,
     n_steps: int = 100,
     progress_callback: Optional[callable] = None,
+    sdf: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Explicit pseudo-enthalpy solution of dH/dt = (k/rho) Laplace(T)
-    with H = cp*T + (1-fs)*L. Latent heat is incorporated through an
-    effective specific heat cp_eff = cp + L * |d(fs)/dT| in the mushy zone.
-    Metal starts at T_pour; mould/empty starts at T_mold.
-    Returns (T, cooling_rate, solid_fraction, divergence). divergence = Laplace(T).
+    Analytical thermal field from the 1-D heat equation normal to the surface:
+        T(x,t) = T0 + (T_pour - T0) * erf( x / (2 sqrt(alpha*t)) )
+    x is the signed distance to the nearest surface (SDF). Latent heat enters
+    through the Scheil solid fraction. Returns (T, dT/dt, fs, div(∇T)).
     """
-    # Conductivity per voxel
-    k_field = np.full(grid.shape, mold.k_w_mk, dtype=np.float64)
-    k_field[is_metal] = alloy.k_w_mk
-    rho_field = np.full(grid.shape, mold.rho_kg_m3, dtype=np.float64)
-    rho_field[is_metal] = alloy.rho_kg_m3
+    if sdf is None:
+        sdf = compute_subvoxel_sdf(is_metal, dx, sub=1)
+    C = chvorinov_c_from_properties(alloy, mold)
+    M_med = float(np.median(sdf[is_metal])) if is_metal.any() else 0.0
+    t_eval = max(0.5 * C * M_med ** 2, 1e-6)
+    T = _temperature_from_erf(sdf, t_eval, alloy, mold)
+    cooling_rate = -_cooling_rate_from_erf(sdf, t_eval, alloy, mold)
+    solid_fraction = _scheil_fs(
+        T, alloy.t_liquidus_c, alloy.t_solidus_c, alloy.partition_coefficient
+    )
+    thermal_divergence = ndimage.laplace(T) / (dx * dx)
+    return T, cooling_rate, solid_fraction, thermal_divergence
 
-    T = np.full(grid.shape, mold.t0_c, dtype=np.float64)
-    T[is_metal] = alloy.t_pour_c
 
-    boundary = np.zeros(grid.shape, dtype=bool)
-    boundary[0, :, :] = boundary[-1, :, :] = True
-    boundary[:, 0, :] = boundary[:, -1, :] = True
-    boundary[:, :, 0] = boundary[:, :, -1] = True
-    T[boundary] = mold.t0_c
+def compute_chvorinov_t(M_field: np.ndarray, C: float) -> np.ndarray:
+    """
+    Chvorinov solidification time: t_s = C * M^2  [s].
+    M is the local casting modulus (mm).
+    """
+    return C * np.maximum(M_field, 0.0) ** 2
 
-    T0 = T.copy()
 
-    def _laplace(u):
-        return (
-            u[:-2, 1:-1, 1:-1]
-            + u[2:, 1:-1, 1:-1]
-            + u[1:-1, :-2, 1:-1]
-            + u[1:-1, 2:, 1:-1]
-            + u[1:-1, 1:-1, :-2]
-            + u[1:-1, 1:-1, 2:]
-            - 6.0 * u[1:-1, 1:-1, 1:-1]
-        )
-
-    dt = None
-    # Run in two sub-cycles per step to keep explicit stability while handling
-    # the latent-heat spike.
-    for step in range(n_steps):
-        fs = _scheil_fs(T, alloy.t_liquidus_c, alloy.t_solidus_c, alloy.partition_coefficient)
-
-        # d(fs)/dT derivative in mushy zone, capped to avoid blow-up at liquidus
-        t_range = max(alloy.t_liquidus_c - alloy.t_solidus_c, 1.0)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            ratio = np.clip(
-                (alloy.t_liquidus_c - T) / t_range,
-                1e-6,
-                1.0,
-            )
-            beta = 1.0 / max(alloy.partition_coefficient - 1.0, -1.0 + 1e-6)
-            dfs_dT = np.abs(beta / t_range * np.power(ratio, beta - 1.0))
-        dfs_dT = np.where((T > alloy.t_solidus_c) & (T < alloy.t_liquidus_c), dfs_dT, 0.0)
-        # Cap latent contribution: release latent heat over ~10 K of the mushy range
-        dfs_dT = np.clip(dfs_dT, 0.0, 10.0 / t_range)
-
-        cp_field = np.full(grid.shape, mold.cp_j_kgk, dtype=np.float64)
-        cp_field[is_metal] = alloy.cp_j_kgk
-        cp_eff = cp_field + alloy.latent_heat_j_kg * dfs_dT
-        cp_eff = np.clip(cp_eff, cp_field * 0.5, cp_field + alloy.latent_heat_j_kg * 50.0 / t_range)
-
-        alpha = k_field / (rho_field * cp_eff) * 1e6  # mm²/s
-        max_alpha = float(np.max(alpha))
-        dt_step = 0.45 * (dx * dx) / (6.0 * max(max_alpha, 1e-9))
-        if dt is None:
-            dt = dt_step
-        # avoid increasing dt once it has been established (conservative)
-        dt = min(dt, dt_step)
-
-        T[1:-1, 1:-1, 1:-1] = (
-            T[1:-1, 1:-1, 1:-1]
-            + alpha[1:-1, 1:-1, 1:-1] * dt * _laplace(T)
-        )
-        T[boundary] = mold.t0_c
-        if progress_callback and step % 20 == 0:
-            progress_callback(int(50 + step / n_steps * 10))
-
-    if dt is None:
-        dt = 0.0
-    total_time = n_steps * dt
-    cooling_rate = np.zeros_like(T)
+def compute_niyama(
+    sdf: np.ndarray,
+    M_mod: np.ndarray,
+    t_s: np.ndarray,
+    alloy: Alloy,
+    is_metal: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Physically-based Niyama criterion N = G / sqrt(R) [K s^0.5 / mm].
+    G is estimated from the Stefan velocity of the solidification front,
+    R = ΔT_solid / t_s is the Chvorinov cooling rate. The result is weighted
+    by the local shape factor f = M_mod/sdf (sphere f=1/3, plate f≈1).
+    """
+    l_eff = alloy.latent_heat_j_kg + alloy.cp_j_kgk * max(
+        alloy.t_pour_c - alloy.t_liquidus_c, 0.0
+    )
+    v_solid = sdf / (2.0 * np.maximum(t_s, 1e-12))
+    G = alloy.rho_kg_m3 * l_eff * v_solid / (alloy.k_w_mk * 1e6)
+    R = (alloy.t_liquidus_c - alloy.t_solidus_c) / np.maximum(t_s, 1e-12)
     with np.errstate(divide="ignore", invalid="ignore"):
-        cooling_rate = np.where(total_time > 0, (T0 - T) / total_time, 0.0)
-        cooling_rate = np.nan_to_num(cooling_rate)
-
-    fs = _scheil_fs(T, alloy.t_liquidus_c, alloy.t_solidus_c, alloy.partition_coefficient)
-    divergence = _laplace(T)
-    # pad divergence to same shape as T
-    div_out = np.zeros_like(T)
-    div_out[1:-1, 1:-1, 1:-1] = divergence
-    return T, cooling_rate, fs, div_out
-
-
-def compute_chvorinov_t(sdf: np.ndarray, C: float, superheat_c: float = 0.0) -> np.ndarray:
-    """
-    Solidification time t_s = C * M^2 / max(ΔT_super, 1°C) (s).
-    Higher superheat increases local solidification time.
-    """
-    dt = max(superheat_c, 1.0)
-    return C * sdf * sdf / dt
+        niyama = G / np.sqrt(np.maximum(R, 1e-12))
+    shape_factor = M_mod / np.maximum(sdf, 1e-6)
+    niyama = niyama * shape_factor
+    niyama = np.nan_to_num(niyama, nan=0.0, posinf=0.0, neginf=0.0)
+    if is_metal is not None:
+        niyama = np.where(is_metal, niyama, 0.0)
+        G = np.where(is_metal, G, 0.0)
+        R = np.where(is_metal, R, 0.0)
+    return G, R, niyama
 
 
 def compute_niyama_variants(
-    G: np.ndarray, sdf: np.ndarray, R: np.ndarray, T: np.ndarray, t_s: np.ndarray
+    niyama: np.ndarray,
+    G: np.ndarray,
+    R: np.ndarray,
+    t_s: np.ndarray,
+    alloy: Alloy,
 ) -> Dict[str, np.ndarray]:
     """
-    Niyama family computed from thermal and geometric quantities.
-    R is cooling rate [K/s]; G is gradient magnitude [K/mm].
-    Variants:
-      classical = G / sqrt(R)
-      coarse      = G / (R**0.5 * T**0.5)
-      elbow       = G * sqrt(t_s)
-      lcc         = G / (R + 1e-9)
-    The raw fields are scaled to a 0..2 range using robust percentiles so that
-    the material-specific 0.775/1.5 thresholds become meaningful.
+    Four Niyama-related indicators. The physical classical Niyama is kept as-is;
+    the others are scaled to a 0..2 range for the report table only.
     """
-    eps = 1e-9
+    eps = 1e-12
+    T_ref = (alloy.t_liquidus_c + alloy.t_solidus_c) / 2.0
     raw = {
-        "classical": G / np.sqrt(np.maximum(R, eps)),
-        "coarse": G / (np.power(np.maximum(R, eps), 0.5) * np.sqrt(np.maximum(T, eps))),
+        "classical": niyama,
+        "coarse": G / (
+            np.power(np.maximum(R, eps), 0.5)
+            * np.sqrt(np.maximum(T_ref, 1.0) / 1000.0)
+        ),
         "elbow": G * np.sqrt(np.maximum(t_s, eps)),
         "lcc": G / (R + eps),
     }
@@ -309,9 +298,9 @@ def compute_niyama_variants(
     return scaled
 
 
-def compute_niyama_ensemble(niyama_variants: Dict[str, np.ndarray]) -> np.ndarray:
-    """Average of the four scaled Niyama variants."""
-    return np.mean(list(niyama_variants.values()), axis=0)
+def compute_niyama_ensemble(niyama: np.ndarray) -> np.ndarray:
+    """Return the physical classical Niyama used for decisions."""
+    return niyama
 
 
 def _sdf_histogram(sdf: np.ndarray, mask: np.ndarray, bins: int = 50):
@@ -420,7 +409,14 @@ def find_hotspots(
         vals = sdf[pts[:, 0], pts[:, 1], pts[:, 2]]
         idx = int(np.argmax(vals))
         pos_vox = pts[idx]
-        m_value = float(vals[idx])
+        sdf_val = float(vals[idx])
+        # local shape factor from mean curvature: sphere -> f=3, plate -> f=1
+        shape_factor = 1.0
+        if curvature is not None:
+            kappa = float(curvature[pos_vox[0], pos_vox[1], pos_vox[2]])
+            shape_factor = 1.0 + max(0.0, -kappa * sdf_val)
+            shape_factor = min(max(shape_factor, 1.0), 3.0)
+        m_value = sdf_val / shape_factor
         position_mm = origin_mm + pos_vox * dx
         hotspots.append(
             HotSpot(
@@ -493,7 +489,7 @@ def feeding_distance_dijkstra(
 def feeding_cost_dijkstra(
     is_metal: np.ndarray,
     riser_mask: np.ndarray,
-    sdf: np.ndarray,
+    modulus: np.ndarray,
     dx: float,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -534,7 +530,7 @@ def feeding_cost_dijkstra(
         if not valid.any():
             continue
         # cost of moving into neighbor
-        m_nb = np.clip(sdf[ni[mask][valid], nj[mask][valid], nk[mask][valid]], 0.1, None)
+        m_nb = np.clip(modulus[ni[mask][valid], nj[mask][valid], nk[mask][valid]], 0.1, None)
         rows.append(source_idx[valid])
         cols.append(neighbor_idx[valid])
         vals.append((c * dx / m_nb).astype(np.float32))
@@ -660,8 +656,33 @@ def trace_feeding_resistance(
     return resistance
 
 
+def _liquid_fraction_at_time(
+    sdf_i: float, t: float, alloy: Alloy, mold: MoldMaterial
+) -> float:
+    """Scheil liquid fraction at a point with signed distance sdf_i and time t."""
+    if t <= 0:
+        return 1.0
+    T = float(
+        _temperature_from_erf(
+            np.array([sdf_i]), t, alloy, mold
+        )[0]
+    )
+    if T >= alloy.t_liquidus_c:
+        return 1.0
+    if T <= alloy.t_solidus_c:
+        return 0.0
+    fs = _scheil_fs(
+        np.array([T]),
+        alloy.t_liquidus_c,
+        alloy.t_solidus_c,
+        alloy.partition_coefficient,
+    )[0]
+    return max(0.0, min(1.0, 1.0 - float(fs)))
+
+
 def _path_darcy_and_directional(
     sdf: np.ndarray,
+    M_mod: np.ndarray,
     cost_grid: np.ndarray,
     cost_pred: np.ndarray,
     part_mask: np.ndarray,
@@ -669,86 +690,96 @@ def _path_darcy_and_directional(
     dx: float,
     alloy: Alloy,
     mold: MoldMaterial,
+    feeder_voxels: Optional[np.ndarray] = None,
     temperature: Optional[np.ndarray] = None,
     solid_fraction: Optional[np.ndarray] = None,
-) -> Tuple[float, float, float, bool, bool, float]:
+) -> Tuple[float, float, float, bool, bool, float, bool]:
     """
     Walk the lowest-resistance feeding path from start_vox to a riser and compute:
-      * Darcy pressure drop (Kozeny-Carman + liquid fraction cutoff)
-      * minimum neck modulus
+      * Darcy pressure drop through the mushy zone (Kozeny-Carman)
+      * minimum neck modulus along the part path
       * t_s at the hot spot
       * directional solidification flag
-      * Heuver's circle flag (SDF should decrease toward the riser)
-      * total feeding cost from the Dijkstra cost field
-    Returns (darcy_resistance, min_neck_m, t_s_hot, directional_ok, heuvers_ok, feeding_cost).
+      * Heuver's circle flag
+      * total feeding cost
+      * darcy_ok flag
     """
     path = _trace_cost_path(start_vox, cost_pred, sdf.shape)
     if not path:
-        return 0.0, 0.0, 0.0, True, True, 0.0
+        return 0.0, 0.0, 0.0, True, True, 0.0, True
 
-    # path starts at the hot spot and ends at the riser
-    m_path = np.array([sdf[v] for v in path])
-    min_neck_m = float(m_path.min())
-    m_hot = float(m_path[0])
+    C = chvorinov_c_from_properties(alloy, mold)
+    m_hot = float(M_mod[start_vox[0], start_vox[1], start_vox[2]])
+    t_s_hot = C * m_hot * m_hot
+    hot_sdf = float(sdf[start_vox[0], start_vox[1], start_vox[2]])
 
-    # Heuver's circles: inscribed radius must decrease monotonically toward riser
-    heuvers_ok = True
-    if len(m_path) > 3:
-        tol = dx * 0.5
-        sdiff = np.diff(m_path)
-        # ignore the first part close to the hot spot, then any positive jump is bad
-        if np.any(sdiff[1:] > tol):
-            heuvers_ok = False
+    # Hydrostatic head from feeders above the hot spot (if any)
+    P_head = 0.0
+    if feeder_voxels is not None and len(feeder_voxels) > 0:
+        feeder_z = feeder_voxels[:, 2] * dx  # mm
+        hot_z = start_vox[2] * dx
+        dz_mm = np.max(feeder_z - hot_z)
+        if dz_mm > 0:
+            P_head = alloy.rho_kg_m3 * 9.81 * (dz_mm / 1000.0)
 
-    # Darcy pressure drop with local liquid fraction.
+    # Feeding shrinkage demand: shrinkage of the last-liquid pocket at the hot spot
+    V_hotspot_mm3 = (4.0 / 3.0) * np.pi * max(hot_sdf, 1e-3) ** 3
+    V_shrink_mm3 = alloy.shrinkage_factor * V_hotspot_mm3
+    Q_mm3_s = V_shrink_mm3 / max(t_s_hot, 1e-9)
+
+    # Darcy pressure drop along the full metal path (part + runner + sprue)
     darcy = 0.0
     mu = max(alloy.viscosity_pa_s, 1e-6)
-    d_pore = max(alloy.particle_size_mm, 0.01)
+    d_dend = max(alloy.dendrite_spacing_mm, 0.01)
     feed_stopped = False
-    for i in range(len(path) - 1):
-        m_i = max(m_path[i], 0.5)
-        if solid_fraction is not None:
-            f_s = float(solid_fraction[path[i]])
-            f_l = 1.0 - f_s
-            if f_s >= 0.6 or f_l <= 0.05:
-                darcy = 1e6
-                feed_stopped = True
-                break
-            K = (d_pore ** 2) * (f_l ** 3) / (150.0 * ((1.0 - f_l) ** 2) + 1e-9)
-        else:
-            K = (d_pore ** 2) / 50.0
-        darcy += mu * dx / (m_i * m_i * K)
+    for vox in path[:-1]:
+        sdf_i = max(float(sdf[vox[0], vox[1], vox[2]]), 0.5)
+        f_l = _liquid_fraction_at_time(sdf_i, t_s_hot, alloy, mold)
+        if f_l <= 0.20:
+            feed_stopped = True
+            break
+        # Kozeny-Carman permeability in the mushy zone [mm²]
+        fl_c = max(min(f_l, 0.97), 0.05)
+        K_mm2 = (d_dend ** 2 / 180.0) * (fl_c ** 3) / ((1.0 - fl_c) ** 2)
+        # Cross-section approximated as a disk of the local inscribed radius
+        A_mm2 = np.pi * sdf_i * sdf_i
+        v_mms = Q_mm3_s / max(A_mm2, 1e-6)
+        v_ms = v_mms / 1000.0
+        darcy += mu * v_ms * (dx / 1000.0) / max(K_mm2 / 1e6, 1e-15)
+
     if feed_stopped:
-        darcy = 1e6
+        darcy = 1e9
+    darcy_ok = (not feed_stopped) and (darcy < max(P_head, 1.0))
 
+    # Heuver / directional checks on the PART portion of the path
+    part_path = [v for v in path if part_mask[v[0], v[1], v[2]]]
+    if len(part_path) < 2:
+        part_path = path
+
+    m_part = np.array([M_mod[v[0], v[1], v[2]] for v in part_path])
+    min_neck_m = float(m_part.min()) if len(m_part) else m_hot
+
+    # Heuver: modulus must NOT decrease toward the feeder after the first step.
+    # The hot spot itself is a local maximum, so the initial drop is expected.
+    heuvers_ok = True
+    if len(m_part) > 4:
+        tol = max(dx * 0.5, 0.1)
+        if np.any(np.diff(m_part[1:]) < -tol):
+            heuvers_ok = False
+
+    # Directional solidification: T must increase (or stay) toward the feeder.
     directional_ok = True
-    if temperature is not None and len(path) > 3:
-        temps = np.array([temperature[v] for v in path])
-        diffs = np.diff(temps)
-        # Metal should get cooler toward the riser, so diffs (hot->riser) should be <= 0.
-        # Tolerance 0.5 K handles voxel noise.
-        if np.any(diffs < -0.5):
+    if len(part_path) > 4:
+        t_path = np.array(
+            [float(_temperature_from_erf(np.array([sdf[v[0], v[1], v[2]]]), t_s_hot, alloy, mold)[0])
+             for v in part_path]
+        )
+        # hot spot -> feeder, T should not drop after the first step
+        if np.any(np.diff(t_path[1:]) < -1.0):
             directional_ok = False
-    else:
-        # Fallback using SDF-based solidification time
-        t_path = m_path * m_path * mold.chvorinov_c
-        if len(t_path) > 3:
-            window = min(5, len(t_path) // 2 + 1)
-            if window > 1:
-                weights = np.ones(window) / window
-                t_smooth = np.convolve(t_path, weights, mode="same")
-            else:
-                t_smooth = t_path
-            max_t = float(t_smooth.max())
-            if max_t > 0:
-                cutoff = int(0.15 * len(t_smooth)) + 1
-                tail = t_smooth[cutoff:]
-                if len(tail) and float(tail.min()) < 0.55 * max_t:
-                    directional_ok = False
 
-    t_s_hot = m_hot * m_hot * mold.chvorinov_c
     feeding_cost = float(cost_grid[start_vox[0], start_vox[1], start_vox[2]])
-    return darcy, min_neck_m, t_s_hot, directional_ok, heuvers_ok, feeding_cost
+    return darcy, min_neck_m, t_s_hot, directional_ok, heuvers_ok, feeding_cost, darcy_ok
 
 
 def _sphere_mask(
@@ -866,20 +897,21 @@ def _refine_region(
     )
     sdf = compute_sdf(is_metal, dx)
     C = chvorinov_c_from_properties(alloy, mold)
-    t_s = compute_chvorinov_t(sdf, C)
-    gz, gy, gx = np.gradient(sdf, dx)
-    G = np.sqrt(gx * gx + gy * gy + gz * gz)
+    mean_curv, _ = compute_curvature(sdf, dx)
+    shape_factor_field = np.clip(
+        1.0 + np.maximum(-mean_curv * sdf, 0.0), 1.0, 3.0
+    )
+    M_mod = sdf / shape_factor_field
+    t_s = compute_chvorinov_t(M_mod, C)
+    G, R, niyama = compute_niyama(sdf, M_mod, t_s, alloy, is_metal=is_metal)
 
-    with np.errstate(divide="ignore", invalid="ignore"):
-        niyama = G * np.sqrt(np.maximum(sdf, 1e-12))
-        niyama = np.nan_to_num(niyama, nan=0.0, posinf=0.0, neginf=0.0)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        risk = 1.0 / (niyama + 0.2)
-        risk = np.nan_to_num(risk, nan=0.0, posinf=0.0, neginf=0.0)
-        rmin, rmax = risk.min(), risk.max()
-        if rmax > rmin:
-            risk = (risk - rmin) / (rmax - rmin)
+    niyama_risk = np.clip(1.0 - niyama / alloy.niyama_shrinkage, 0.0, 1.0)
+    FD_field = alloy.feed_k1 * (2.0 * M_mod)
+    # no global dist_feed here, use a conservative isolation term from local SDF
+    feed_risk = np.clip(sdf / np.maximum(FD_field, 1.0), 0.0, 1.0)
+    risk = 1.0 - (1.0 - niyama_risk) * (1.0 - feed_risk)
+    risk = np.where(is_metal, risk, 0.0)
+    risk = np.nan_to_num(risk, nan=0.0, posinf=0.0, neginf=0.0)
 
     return RefinementRegion(
         hotspot_index=hotspot_index,
@@ -963,35 +995,35 @@ def analyze(
     if progress_callback:
         progress_callback(18)
 
-    _, _, dominant_m = _sdf_histogram(sdf, part_mask, bins=50)
-    wall_thickness = 2.0 * dominant_m if dominant_m > 0 else 0.0
-    m_mean, m_std, m_skew = _histogram_stats(sdf, part_mask)
-    shape_factor_global = _shape_factor(part_mask, dx)
-
     mean_curv, gauss_curv = compute_curvature(sdf, dx)
+    # Shape factor from mean curvature: f=1 for plates, f≈2 for cylinders, f≈3 for spheres
+    shape_factor_field = np.clip(
+        1.0 + np.maximum(-mean_curv * sdf, 0.0), 1.0, 3.0
+    )
+    M_mod = sdf / shape_factor_field
+    if progress_callback:
+        progress_callback(25)
+
+    _, _, dominant_m = _sdf_histogram(M_mod, part_mask, bins=50)
+    wall_thickness = 2.0 * dominant_m if dominant_m > 0 else 0.0
+    m_mean, m_std, m_skew = _histogram_stats(M_mod, part_mask)
+    shape_factor_global = _shape_factor(part_mask, dx)
     if progress_callback:
         progress_callback(28)
 
-    # AŞAMA 3: Thermal field (pseudo-enthalpy Fourier PDE + Scheil)
+    # AŞAMA 3: Thermal field (1-D erf solution of Fourier equation + Scheil)
     temperature, cooling_rate, solid_fraction, thermal_divergence = compute_thermal_field(
-        grid, is_metal, alloy, mold, dx, n_steps=n_thermal_steps, progress_callback=progress_callback
+        grid, is_metal, alloy, mold, dx, n_steps=n_thermal_steps,
+        progress_callback=progress_callback, sdf=sdf,
     )
     if progress_callback:
         progress_callback(50)
 
-    # AŞAMA 4: Chvorinov + gradient + Niyama family
-    superheat_c = max(alloy.t_pour_c - alloy.t_liquidus_c, 0.0)
-    t_s = compute_chvorinov_t(sdf, chvorinov_c, superheat_c)
-    gz, gy, gx = np.gradient(sdf, dx)
-    G_sdf = np.sqrt(gx * gx + gy * gy + gz * gz)
-
-    Tz, Ty, Tx = np.gradient(temperature, dx)
-    G_thermal = np.sqrt(Tx * Tx + Ty * Ty + Tz * Tz)
-    # Use thermal gradient if meaningful, otherwise SDF gradient.
-    G = G_thermal if np.max(G_thermal) > 1e-3 else G_sdf
-
-    niyama_variants = compute_niyama_variants(G, sdf, cooling_rate, temperature, t_s)
-    niyama = compute_niyama_ensemble(niyama_variants)
+    # AŞAMA 4: Chvorinov + physical Niyama family
+    t_s = compute_chvorinov_t(M_mod, chvorinov_c)
+    G, R, niyama = compute_niyama(sdf, M_mod, t_s, alloy, is_metal=is_metal)
+    niyama_variants = compute_niyama_variants(niyama, G, R, t_s, alloy)
+    niyama = compute_niyama_ensemble(niyama)
     if progress_callback:
         progress_callback(65)
 
@@ -1007,7 +1039,7 @@ def analyze(
 
     # AŞAMA 6: 26-neighbor Dijkstra feeding distance and lowest-resistance cost path
     dist_feed = feeding_distance_dijkstra(is_metal, feeder_mask, dx)
-    cost_feed, cost_pred, _ = feeding_cost_dijkstra(is_metal, feeder_mask, sdf, dx)
+    cost_feed, cost_pred, _ = feeding_cost_dijkstra(is_metal, feeder_mask, M_mod, dx)
     if progress_callback:
         progress_callback(82)
 
@@ -1026,8 +1058,9 @@ def analyze(
             hs.m_uncertainty_mm = dx / 2.0
             hs.feeding_cost = float(cost_feed[vox[0], vox[1], vox[2]])
 
-            darcy, min_neck_m, t_hs, directional_ok, heuvers_ok, feeding_cost = _path_darcy_and_directional(
+            darcy, min_neck_m, t_hs, directional_ok, heuvers_ok, feeding_cost, darcy_ok = _path_darcy_and_directional(
                 sdf,
+                M_mod,
                 cost_feed,
                 cost_pred,
                 part_mask,
@@ -1035,20 +1068,19 @@ def analyze(
                 dx,
                 alloy,
                 mold,
-                temperature=temperature,
-                solid_fraction=solid_fraction,
+                feeder_voxels=feeder_voxels,
             )
             hs.darcy_resistance = darcy
-            hs.min_neck_m = min_neck_m
+            hs.min_neck_m_mm = min_neck_m
             hs.directional_ok = directional_ok
             hs.heuvers_ok = heuvers_ok
+            hs.darcy_ok = darcy_ok
             hs.curvature_mean = float(mean_curv[vox[0], vox[1], vox[2]])
             hs.curvature_gaussian = float(gauss_curv[vox[0], vox[1], vox[2]])
 
-            # Section thickness around the hot spot (not the ingate thickness)
-            t_section = _local_section_thickness(sdf, part_mask, vox, hs.m_value_mm, dx)
-            hs.t_section_mm = t_section
-            hs.width_mm = 2.0 * hs.m_value_mm
+            # Section thickness = 2 * local modulus (equivalent wall thickness)
+            hs.t_section_mm = 2.0 * hs.m_value_mm
+            hs.width_mm = 2.0 * hs.local_sdf_max
             hs.shape_factor = _shape_factor(
                 _sphere_mask(part_mask.shape, vox, max(3.0 * hs.m_value_mm / dx, 5.0)) & part_mask,
                 dx,
@@ -1068,18 +1100,17 @@ def analyze(
                 dz_closest = 0.0
                 hs.gravity_factor = 1.0
 
-            width = 2.0 * hs.m_value_mm
-            base_fd = alloy.feed_k1 * t_section + alloy.feed_k2 * width
+            # FD = feed_k1 * t_section (t_section = 2 * M_mod)
+            base_fd = alloy.feed_k1 * hs.t_section_mm
             hs.max_feeding_distance_mm = base_fd * hs.gravity_factor
-            # v8.0: feeding path cost threshold and Heuver's circle check
-            feed_cost_ok = hs.feeding_cost < 15.0
+            feed_cost_ok = hs.feeding_cost < 30.0
             hs.feed_ok = (
                 (not np.isinf(hs.dist_to_riser_mm))
                 and (hs.dist_to_riser_mm <= hs.max_feeding_distance_mm)
                 and hs.directional_ok
                 and hs.heuvers_ok
                 and feed_cost_ok
-                and (hs.darcy_resistance < 500.0)
+                and hs.darcy_ok
             )
         else:
             hs.feed_ok = False
@@ -1176,17 +1207,15 @@ def analyze(
     if progress_callback:
         progress_callback(92)
 
-    # AŞAMA 9: Risk map (ensemble of Niyama + feeding distance)
+    # AŞAMA 9: Risk map (probabilistic OR of Niyama risk and feeding distance risk)
     with np.errstate(divide="ignore", invalid="ignore"):
-        niyama_risk = 1.0 / (niyama + 0.2)
-        feed_risk = dist_feed / (sdf + 5.0)
-        risk = niyama_risk * (1.0 + feed_risk)
+        niyama_risk = np.clip(1.0 - niyama / alloy.niyama_shrinkage, 0.0, 1.0)
+        FD_field = alloy.feed_k1 * (2.0 * M_mod)
+        feed_risk = np.clip(dist_feed / np.maximum(FD_field, 1.0), 0.0, 1.0)
+        risk = 1.0 - (1.0 - niyama_risk) * (1.0 - feed_risk)
+        risk = np.where(is_metal, risk, 0.0)
         risk = np.nan_to_num(risk, nan=0.0, posinf=0.0, neginf=0.0)
-    rmin, rmax = risk.min(), risk.max()
-    if rmax > rmin:
-        risk_norm = (risk - rmin) / (rmax - rmin)
-    else:
-        risk_norm = risk
+    risk_norm = risk
 
     if progress_callback:
         progress_callback(95)
@@ -1269,26 +1298,13 @@ def _build_recommendations(
             "daha yüksek olabilir; kritik bölgeler için besleyici eklenmesi önerilir."
         )
 
-    superheat_c = max(alloy.t_pour_c - alloy.t_liquidus_c, 0.0)
-    fluidity_length_mm = 50.0 * superheat_c / max(alloy.t_liquidus_c - mold.t0_c, 1.0)
-    max_dim_mm = float(result.bbox_size_mm.max())
-    if max_dim_mm > fluidity_length_mm:
-        recs.append(
-            f"Sıvı akışkanlık uzunluğu Lf = {fluidity_length_mm:.1f} mm, parça boyutu {max_dim_mm:.1f} mm. "
-            f"Soğuk birleşme (cold shut) riski - döküm sıcaklığını artırın veya t_kalıp yükseltmeyin."
-        )
-    else:
-        recs.append(
-            f"Akışkanlık uzunluğu Lf = {fluidity_length_mm:.1f} mm, parça boyutu {max_dim_mm:.1f} mm -> yeterli."
-        )
-
     recs.append(
         f"Malzeme: {alloy.name} | Kalıp: {mold.name} | Chvorinov C = {result.chvorinov_c:.4f} s/mm² | "
         f"Baskın M = {result.dominant_m_mm:.2f} mm (t ≈ {result.wall_thickness_mm:.2f} mm) | "
         f"Şekil faktörü SF = {result.shape_factor_global:.6f}"
     )
     recs.append(
-        f"SDF istatistikleri: ortalama M = {result.m_mean_mm:.2f} mm, std = {result.m_std_mm:.2f} mm, "
+        f"Modül istatistikleri: ortalama M = {result.m_mean_mm:.2f} mm, std = {result.m_std_mm:.2f} mm, "
         f"çarpıklık = {result.m_skewness:.2f}. "
         + ("Parça duvar kalınlığı dengesiz." if abs(result.m_skewness) > 1.0 else "Kalınlık dağılımı nispeten dengeli.")
     )
@@ -1302,47 +1318,42 @@ def _build_recommendations(
     for hs in result.hotspots:
         t = hs.t_section_mm
         W = hs.width_mm
-        fd = alloy.feed_k1 * t + alloy.feed_k2 * W
+        fd = alloy.feed_k1 * t
         unc = hs.m_uncertainty_mm
         recs.append(
             f"Hot spot M = {hs.m_value_mm:.2f} ± {unc:.2f} mm, t = {t:.2f} mm, "
             f"W = {W:.2f} mm, şekil faktörü = {hs.shape_factor:.6f}"
         )
-        if not hs.feed_ok:
+        if hs.dist_to_riser_mm > hs.max_feeding_distance_mm:
             recs.append(
                 f"Hot spot: besleme mesafesi {hs.dist_to_riser_mm:.1f} mm > limit {hs.max_feeding_distance_mm:.1f} mm (FD={fd:.1f} mm). "
                 f"Besleyiciyi yakın taşı veya kesiti büyütün."
             )
         if not hs.directional_ok:
             recs.append(
-                f"Hot spot: yönlü katılaşma bozuk, yolda daralma (boyun M={hs.min_neck_m:.1f} mm). "
+                f"Hot spot: yönlü katılaşma bozuk, yolda daralma (boyun M={hs.min_neck_m_mm:.1f} mm). "
                 f"Meme/besleyici arasındaki geometriyi kalınlaştırın."
             )
         if not hs.heuvers_ok:
             recs.append(
-                "Hot spot: Heuver çemberi kuralı ihlali - besleme yolunda SDF artıyor, "
-                "ara bölge daha kalın/sıcak. Meme konumunu/kalınlığını gözden geçirin."
+                "Hot spot: Heuver çemberi kuralı ihlali - besleme yolunda kesit daralıyor, "
+                "ara bölge daha ince/sıcak. Meme konumunu/kalınlığını gözden geçirin."
             )
-        if hs.feeding_cost >= 15.0:
+        if not hs.darcy_ok:
             recs.append(
-                f"Hot spot: düşük dirençli besleme yolu maliyeti yüksek ({hs.feeding_cost:.1f}). "
-                f"Yol dar veya uzun; besleyiciyi yakın/merkezi konumlandırın."
-            )
-        if hs.darcy_resistance > 100.0:
-            recs.append(
-                f"Hot spot: Darcy basınç kaybı yüksek ({hs.darcy_resistance:.2f}). "
-                f"Meme/yol kesitini büyütün veya kısa yol seçin."
+                f"Hot spot: Darcy basınç kaybı ({hs.darcy_resistance:.2f} Pa) mevcut hidrostatik basıncı aşıyor. "
+                f"Mushy-zone geçirgenliği yetersiz; meme/yol kesitini büyütün veya kısa yol seçin."
             )
 
         niy = hs.niyama_ensemble
         if niy < alloy.niyama_macro:
             recs.append(
-                f"Hot spot: Niyama ensemble {niy:.2f} < {alloy.niyama_macro} -> "
+                f"Hot spot: Niyama {niy:.2f} < {alloy.niyama_macro} -> "
                 f"makro shrinkage / çekinti riski çok yüksek."
             )
         elif niy < alloy.niyama_shrinkage:
             recs.append(
-                f"Hot spot: Niyama ensemble {niy:.2f} < {alloy.niyama_shrinkage} -> "
+                f"Hot spot: Niyama {niy:.2f} < {alloy.niyama_shrinkage} -> "
                 f"mikro gözenek / shrinkage porozite riski."
             )
 

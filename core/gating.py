@@ -7,7 +7,7 @@ import numpy as np
 from scipy import ndimage
 from scipy.sparse import coo_matrix, csgraph
 
-from core.materials import get_alloy
+from core.materials import get_alloy, get_mold, chvorinov_c_from_properties
 from core.sdf_analyzer import COST_26, NEIGH_26
 from core.types import AnalysisResult, BodyType, GateResult
 
@@ -241,6 +241,7 @@ def analyze_gating(
     sdf = result.sdf
     dx = result.dx_mm
     alloy = get_alloy(result.alloy_key)
+    mold = get_mold(result.mold_key)
     if casting_params is not None and isinstance(casting_params, CastingParameters):
         fill_time_s = casting_params.t_fill_s
         alloy = replace(
@@ -417,6 +418,34 @@ def analyze_gating(
         # Turbulence if Re > 20000 or Fr > 1 or above alloy-specific ingate velocity
         turbulent = (reynolds > 20000.0) or (froude > 1.0) or (ingate_velocity_m_s > max_ingate_velocity)
 
+    # Fluidity length: distance the metal can flow before superheat is lost
+    t_stream = max(ingate_thickness_mm, runner_thickness_mm, 2.0 * result.dominant_m_mm, 2.0)
+    M_stream = t_stream / 2.0
+    C = chvorinov_c_from_properties(alloy, mold)
+    t_s_stream = C * M_stream ** 2
+    superheat = max(alloy.t_pour_c - alloy.t_liquidus_c, 0.0)
+    l_eff = alloy.latent_heat_j_kg + alloy.cp_j_kgk * superheat
+    superheat_ratio = max(alloy.cp_j_kgk * superheat / l_eff, 0.1) if l_eff > 0 else 0.1
+    t_superheat = t_s_stream * superheat_ratio
+    v_metal_m_s = ingate_velocity_m_s
+    if v_metal_m_s <= 0 and height_mm > 0:
+        v_metal_m_s = np.sqrt(2.0 * 9.81 * (height_mm / 1000.0))
+    fluidity_length_mm = v_metal_m_s * t_superheat * 1000.0
+
+    max_dim_mm = float(result.bbox_size_mm.max())
+    result.recommendations = [
+        r for r in result.recommendations if not r.startswith("Sıvı akışkanlık")
+    ]
+    if max_dim_mm > fluidity_length_mm:
+        result.recommendations.append(
+            f"Sıvı akışkanlık uzunluğu Lf = {fluidity_length_mm:.1f} mm, parça boyutu {max_dim_mm:.1f} mm. "
+            f"Soğuk birleşme (cold shut) riski - döküm sıcaklığını artırın, kalıp sıcaklığını yükseltmeyin veya giriş hızını artırın."
+        )
+    else:
+        result.recommendations.append(
+            f"Akışkanlık uzunluğu Lf = {fluidity_length_mm:.1f} mm, parça boyutu {max_dim_mm:.1f} mm -> yeterli."
+        )
+
     return GateResult(
         total_ingate_contact_area_cm2=ag_total_cm2,
         runner_min_area_cm2=runner_min_area_cm2,
@@ -447,4 +476,5 @@ def analyze_gating(
         velocity_fill_time_match_ok=velocity_fill_time_match_ok,
         required_ingate_area_for_velocity_cm2=required_ingate_area_for_velocity_m2 * 1e4,
         velocity_area_ok=velocity_area_ok,
+        fluidity_length_mm=fluidity_length_mm,
     )

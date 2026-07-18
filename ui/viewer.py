@@ -6,6 +6,7 @@ import numpy as np
 import pyvista as pv
 from pyvistaqt import QtInteractor
 
+from core.materials import get_alloy
 from core.sdf_analyzer import _trace_path_to_riser
 from core.types import AnalysisResult, Body, BodyType, RefinementRegion
 
@@ -132,12 +133,15 @@ class Analyzer3DViewer(QtInteractor):
 
         centers = []
         labels = []
+        alloy = get_alloy(result.alloy_key)
         for hs in result.hotspots:
             radius = max(3.0, hs.m_value_mm * 2.0)
             sphere = pv.Sphere(radius=radius, center=hs.position_mm, theta_resolution=24, phi_resolution=24)
             if not hs.feed_ok:
                 color = "#ff3333"
-            elif hs.niyama_ensemble < getattr(result, "alloy_niyama_shrinkage", 1.0):
+            elif hs.niyama_ensemble < alloy.niyama_macro:
+                color = "#ff3333"
+            elif hs.niyama_ensemble < alloy.niyama_shrinkage:
                 color = "#ffaa00"
             else:
                 color = "#00ff88"
@@ -233,8 +237,9 @@ class Analyzer3DViewer(QtInteractor):
         if result is None:
             return
 
+        alloy = get_alloy(result.alloy_key)
         grid = self._make_image_data(result, result.niyama, "niyama")
-        band = grid.threshold([0.0, 1.5])
+        band = grid.threshold([0.0, alloy.niyama_shrinkage])
         if band.n_cells == 0:
             return
 

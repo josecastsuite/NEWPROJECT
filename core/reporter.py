@@ -79,6 +79,7 @@ def _format_gate_table(result: AnalysisResult) -> str:
         <tr><td>Toplam meme temas alanı (Ag)</td><td>{gr.total_ingate_contact_area_cm2:.2f} cm²</td><td>min {gr.required_ingate_area_cm2:.2f} cm²</td></tr>
         <tr><td>Meme hızı v (m/s)</td><td>{gr.ingate_velocity_m_s:.2f}</td><td>max {gr.ingate_max_velocity_m_s:.2f} m/s</td></tr>
         <tr><td>Meme debisi Q</td><td>{gr.ingate_flow_rate_m3_s*1e3:.2f} L/s</td><td>doldurma süresi {gr.ingate_fill_time_s:.2f} s</td></tr>
+        <tr><td>Akışkanlık uzunluğu Lf</td><td>{gr.fluidity_length_mm:.1f} mm</td><td>parça boyutu ≤ Lf</td></tr>
         <tr><td>Hız için gerekli meme alanı</td><td>{gr.required_ingate_area_for_velocity_cm2:.2f} cm²</td><td>mevcut {gr.total_ingate_contact_area_cm2:.2f} cm²</td></tr>
         <tr><td>Reynolds / Froude</td><td>Re={gr.reynolds:.0f}, Fr={gr.froude:.2f}</td><td>Türbülans: {'Evet' if gr.turbulent else 'Hayır'}</td></tr>
         <tr><td>Yolluk min kesit alanı (Ar)</td><td>{gr.runner_min_area_cm2:.2f} cm²</td><td>min {gr.required_runner_area_cm2:.2f} cm²</td></tr>
@@ -335,6 +336,7 @@ def _generate_report_fpdf2(
         pdf.set_font(font, "", 10)
         pdf.cell(0, 6, f"Meme hızı: {gr.ingate_velocity_m_s:.2f} m/s (max {gr.ingate_max_velocity_m_s:.2f} m/s), Re={gr.reynolds:.0f}, Fr={gr.froude:.2f}", ln=True)
         pdf.cell(0, 6, f"Meme debisi: {gr.ingate_flow_rate_m3_s*1e3:.2f} L/s, doldurma süresi: {gr.ingate_fill_time_s:.2f} s", ln=True)
+        pdf.cell(0, 6, f"Akışkanlık uzunluğu Lf: {gr.fluidity_length_mm:.1f} mm", ln=True)
         pdf.cell(0, 6, f"Hız icin gerekli meme alani: {gr.required_ingate_area_for_velocity_cm2:.2f} cm² (mevcut {gr.total_ingate_contact_area_cm2:.2f} cm²)", ln=True)
         pdf.cell(0, 6, f"Toplam meme temas alanı: {gr.total_ingate_contact_area_cm2:.2f} cm² (min {gr.required_ingate_area_cm2:.2f} cm²)", ln=True)
         pdf.cell(0, 6, f"Yolluk min kesit: {gr.runner_min_area_cm2:.2f} cm² (min {gr.required_runner_area_cm2:.2f} cm²)", ln=True)
