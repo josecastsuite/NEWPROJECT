@@ -69,6 +69,28 @@ def _format_riser_table(result: AnalysisResult) -> str:
     return "".join(rows)
 
 
+def _format_riser_proposal_table(result: AnalysisResult) -> str:
+    rows = []
+    if result.riser_proposals:
+        for rp in result.riser_proposals:
+            pos = ",".join(f"{v:.1f}" for v in rp.placement_mm)
+            rows.append(
+                f"<tr>"
+                f"<td>{rp.target_hotspot_index + 1}</td>"
+                f"<td>{_html_escape(rp.shape)}</td>"
+                f"<td>({pos})</td>"
+                f"<td>{rp.diameter_mm:.1f}</td>"
+                f"<td>{rp.height_mm:.1f}</td>"
+                f"<td>{rp.volume_cm3:.2f}</td>"
+                f"<td>{rp.m_required_mm:.2f}</td>"
+                f"<td>{_html_escape(rp.reason)}</td>"
+                f"</tr>"
+            )
+    else:
+        rows.append('<tr><td colspan="8">Yeni besleyici önerisi yok.</td></tr>')
+    return "".join(rows)
+
+
 def _format_gate_table(result: AnalysisResult) -> str:
     if result.gate_result is None:
         return "<p>Meme/yolluk/döküm ağzı body atanmamış.</p>"
@@ -211,6 +233,12 @@ def _render_html(result: AnalysisResult, screenshot_path: Optional[str] = None) 
         {_format_riser_table(result)}
     </table>
 
+    <h2>Otomatik Besleyici Önerileri</h2>
+    <table>
+        <tr><th>Hot Spot</th><th>Şekil</th><th>Konum (mm)</th><th>Çap (mm)</th><th>Yükseklik (mm)</th><th>Hacim (cm³)</th><th>M (mm)</th><th>Neden</th></tr>
+        {_format_riser_proposal_table(result)}
+    </table>
+
     <h2>Meme / Yolluk / Döküm Ağzı</h2>
     {_format_gate_table(result)}
 
@@ -328,6 +356,17 @@ def _generate_report_fpdf2(
     else:
         pdf.cell(0, 6, "Besleyici body atanmamış.", ln=True)
     pdf.ln(4)
+
+    if result.riser_proposals:
+        pdf.set_font(font, "", 13)
+        pdf.cell(0, 8, "Otomatik Besleyici Onerileri", ln=True)
+        pdf.set_font(font, "", 10)
+        for i, rp in enumerate(result.riser_proposals, 1):
+            pos = ",".join(f"{v:.1f}" for v in rp.placement_mm)
+            pdf.cell(0, 6, f"{i}. {rp.shape}: cap={rp.diameter_mm:.1f} mm, yukseklik={rp.height_mm:.1f} mm, "
+                           f"V={rp.volume_cm3:.2f} cm3, M={rp.m_required_mm:.2f} mm, konum=({pos}) mm", ln=True)
+            pdf.cell(0, 6, f"   Neden: {_html_escape(rp.reason)}", ln=True)
+        pdf.ln(4)
 
     if result.gate_result:
         gr = result.gate_result

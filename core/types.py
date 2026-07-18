@@ -111,6 +111,21 @@ class RiserResult:
 
 
 @dataclass
+class RiserProposal:
+    target_hotspot_index: int
+    target_hotspot_position_mm: np.ndarray
+    placement_mm: np.ndarray
+    reason: str
+    m_required_mm: float
+    shape: str
+    diameter_mm: float
+    height_mm: float
+    volume_cm3: float
+    neck_diameter_mm: float = 0.0
+    neck_height_mm: float = 0.0
+
+
+@dataclass
 class GateResult:
     total_ingate_contact_area_cm2: float
     runner_min_area_cm2: float
@@ -204,5 +219,6 @@ class AnalysisResult:
     elapsed_s: float = 0.0
     casting_params: Optional[CastingParameters] = None
     thermal_divergence: np.ndarray = field(default_factory=lambda: np.array([]))
+    riser_proposals: List[RiserProposal] = field(default_factory=list)
     # metadata
     bbox_size_mm: np.ndarray = field(default_factory=lambda: np.zeros(3))

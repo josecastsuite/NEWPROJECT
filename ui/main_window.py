@@ -242,10 +242,10 @@ class MainWindow(QtWidgets.QMainWindow):
         _settings_labeled(self.subvox_spin, "Sub-voxel faktör:", "Kenar vokseli kısmi saymak için 2x/3x upsample.")
 
         self.thermal_spin = QtWidgets.QSpinBox()
-        self.thermal_spin.setRange(0, 2000)
-        self.thermal_spin.setValue(100)
+        self.thermal_spin.setRange(10, 2000)
+        self.thermal_spin.setValue(300)
         self.thermal_spin.setSingleStep(50)
-        _settings_labeled(self.thermal_spin, "Isı adımı:", "Fourier / entalpi ısı denklemi explicit adım sayısı (0=termal kapalı).")
+        _settings_labeled(self.thermal_spin, "Max soğuma süresi (sn):", "3-D transient entalpi çözücüsü için maksimum katılaşma süresi (sn).")
 
         self.alloy_combo = QtWidgets.QComboBox()
         for key, alloy in ALLOYS.items():
@@ -679,7 +679,7 @@ class MainWindow(QtWidgets.QMainWindow):
             max_res = self.res_spin.value()
             refine_local = self.refine_check.isChecked()
             sub_voxel = self.subvox_spin.value()
-            n_thermal_steps = self.thermal_spin.value()
+            thermal_max_time_s = self.thermal_spin.value()
             casting_params = self._casting_params_from_ui()
 
             alloy = get_alloy(alloy_key)
@@ -702,7 +702,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 max_res=max_res,
                 refine_local=refine_local,
                 sub_voxel=sub_voxel,
-                n_thermal_steps=n_thermal_steps,
+                thermal_max_time_s=thermal_max_time_s,
+                thermal_downsample=3,
                 casting_params=casting_params,
                 progress_callback=self._set_progress,
             )

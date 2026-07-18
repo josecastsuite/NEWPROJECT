@@ -48,8 +48,8 @@ SCALAR_BAR_ARGS = {
 class Analyzer3DViewer(QtInteractor):
     """Extended PyVistaQt interactor for casting analysis."""
 
-    def __init__(self, parent=None):
-        super().__init__(parent=parent)
+    def __init__(self, parent=None, off_screen: bool = False):
+        super().__init__(parent=parent, off_screen=off_screen)
         self.set_background("#050505", top="#0a0a1a")
         self.add_axes(line_width=2, color="#00ffff")
         # Add a bright fill light so colored bodies remain visible in the dark scene.

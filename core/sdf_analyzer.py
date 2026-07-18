@@ -20,6 +20,8 @@ from core.materials import (
     get_alloy,
     get_mold,
 )
+from core.riser_designer import propose_risers
+from core.thermal_solver import solve_3d_thermal
 from core.types import (
     AnalysisResult,
     Body,
@@ -719,15 +721,15 @@ def _path_darcy_and_directional(
     alloy: Alloy,
     mold: MoldMaterial,
     feeder_voxels: Optional[np.ndarray] = None,
-    temperature: Optional[np.ndarray] = None,
-    solid_fraction: Optional[np.ndarray] = None,
+    t_liq: Optional[np.ndarray] = None,
+    t_sol: Optional[np.ndarray] = None,
 ) -> Tuple[float, float, float, bool, bool, float, bool]:
     """
     Walk the lowest-resistance feeding path from start_vox to a riser and compute:
       * Darcy pressure drop through the mushy zone (Kozeny-Carman)
       * minimum neck modulus along the part path
       * t_s at the hot spot
-      * directional solidification flag
+      * directional solidification flag (using actual 3-D solidification times)
       * Heuver's circle flag
       * total feeding cost
       * darcy_ok flag
@@ -736,10 +738,13 @@ def _path_darcy_and_directional(
     if not path:
         return 0.0, 0.0, 0.0, True, True, 0.0, True
 
-    C = chvorinov_c_from_properties(alloy, mold)
     m_hot = float(M_mod[start_vox[0], start_vox[1], start_vox[2]])
-    t_s_hot = C * m_hot * m_hot
-    hot_sdf = float(sdf[start_vox[0], start_vox[1], start_vox[2]])
+    # Use the actual 3-D transient solidification time if available
+    if t_sol is not None and np.isfinite(t_sol[start_vox[0], start_vox[1], start_vox[2]]):
+        t_s_hot = float(t_sol[start_vox[0], start_vox[1], start_vox[2]])
+    else:
+        C = chvorinov_c_from_properties(alloy, mold)
+        t_s_hot = C * m_hot * m_hot
 
     # Hydrostatic head from feeders above the hot spot (if any)
     P_head = 0.0
@@ -762,10 +767,21 @@ def _path_darcy_and_directional(
     d_dend = max(alloy.dendrite_spacing_mm, 0.01)
     f_l_stop = 0.10  # end of mass feeding / interdendritic flow
     feed_stopped = False
+    has_thermal = t_liq is not None and t_sol is not None
     for vox in path[:-1]:
-        sdf_i = max(float(sdf[vox[0], vox[1], vox[2]]), 0.5)
         M_i = max(float(M_mod[vox[0], vox[1], vox[2]]), 0.5)
-        f_l = _liquid_fraction_at_time(sdf_i, t_s_hot, alloy, mold)
+        if has_thermal and np.isfinite(t_liq[vox[0], vox[1], vox[2]]):
+            t_li = float(t_liq[vox[0], vox[1], vox[2]])
+            t_si = float(t_sol[vox[0], vox[1], vox[2]])
+            if t_s_hot <= t_li:
+                f_l = 1.0
+            elif t_s_hot >= t_si:
+                f_l = 0.0
+            else:
+                f_l = max(0.0, min(1.0, (t_si - t_s_hot) / max(t_si - t_li, 1e-12)))
+        else:
+            sdf_i = max(float(sdf[vox[0], vox[1], vox[2]]), 0.5)
+            f_l = _liquid_fraction_at_time(sdf_i, t_s_hot, alloy, mold)
         if f_l <= f_l_stop:
             feed_stopped = True
             break
@@ -797,15 +813,13 @@ def _path_darcy_and_directional(
         if np.any(np.diff(m_part[1:]) < -tol):
             heuvers_ok = False
 
-    # Directional solidification: T must increase (or stay) toward the feeder.
+    # Directional solidification: solidification time must increase (or stay)
+    # toward the feeder.  A drop means a cold pocket blocking feeding.
     directional_ok = True
-    if len(part_path) > 4:
-        t_path = np.array(
-            [float(_temperature_from_erf(np.array([sdf[v[0], v[1], v[2]]]), t_s_hot, alloy, mold)[0])
-             for v in part_path]
-        )
-        # hot spot -> feeder, T should not drop after the first step
-        if np.any(np.diff(t_path[1:]) < -1.0):
+    if has_thermal and len(part_path) > 4:
+        t_path = np.array([float(t_sol[v[0], v[1], v[2]]) for v in part_path])
+        tol = max(0.05 * t_s_hot, 1.0)
+        if np.any(np.diff(t_path[1:]) < -tol):
             directional_ok = False
 
     feeding_cost = float(cost_grid[start_vox[0], start_vox[1], start_vox[2]])
@@ -971,11 +985,12 @@ def analyze(
     max_res: int = 2040,
     refine_local: bool = True,
     sub_voxel: int = 2,
-    n_thermal_steps: int = 100,
+    thermal_max_time_s: float = 600.0,
+    thermal_downsample: int = 2,
     casting_params: Optional[CastingParameters] = None,
     progress_callback: Optional[callable] = None,
 ) -> AnalysisResult:
-    """Run the full v8.0 geometric + pseudo-thermal analysis pipeline."""
+    """Run the full v8.0+ geometric + 3-D transient thermal analysis pipeline."""
     import time
 
     t_start = time.time()
@@ -1047,21 +1062,22 @@ def analyze(
     if progress_callback:
         progress_callback(28)
 
-    # AŞAMA 3: Thermal field at local solidification time (1-D erf + Scheil)
-    t_s = compute_chvorinov_t(M_mod, chvorinov_c)
-    temperature, cooling_rate, solid_fraction, thermal_divergence = compute_thermal_field(
-        grid, is_metal, alloy, mold, dx, n_steps=n_thermal_steps,
-        progress_callback=progress_callback, sdf=sdf, M_mod=M_mod,
-    )
+    # AŞAMA 3: Full 3-D transient enthalpy thermal solver (downsampled for speed)
     if progress_callback:
-        progress_callback(50)
-
-    # AŞAMA 4: Niyama from 3-D thermal gradient and local cooling rate
-    G, R, niyama = compute_niyama(
-        sdf, M_mod, alloy, mold, dx, is_metal=is_metal,
-        temperature=temperature, cooling_rate=cooling_rate,
+        progress_callback(30)
+        progress_callback(31)
+    temperature, solid_fraction, t_liq, t_s, G, cooling_rate, niyama = solve_3d_thermal(
+        grid, alloy, mold, dx,
+        max_time_s=thermal_max_time_s,
+        downsample=thermal_downsample,
+        progress_callback=progress_callback,
     )
-    niyama_variants = compute_niyama_variants(niyama, G, R, t_s, alloy)
+    thermal_divergence = ndimage.laplace(temperature) / (dx * dx)
+    if progress_callback:
+        progress_callback(60)
+
+    # AŞAMA 4: Niyama family from the 3-D thermal solution
+    niyama_variants = compute_niyama_variants(niyama, G, cooling_rate, t_s, alloy)
     niyama = compute_niyama_ensemble(niyama)
     if progress_callback:
         progress_callback(65)
@@ -1108,6 +1124,8 @@ def analyze(
                 alloy,
                 mold,
                 feeder_voxels=feeder_voxels,
+                t_liq=t_liq,
+                t_sol=t_s,
             )
             hs.darcy_resistance = darcy
             hs.min_neck_m_mm = min_neck_m
@@ -1320,6 +1338,7 @@ def analyze(
         bbox_size_mm=bbox_size,
     )
 
+    result.riser_proposals = propose_risers(result, alloy, existing_riser_count=len(riser_results))
     result.recommendations = _build_recommendations(result, alloy, mold)
     return result
 
@@ -1411,6 +1430,15 @@ def _build_recommendations(
                 f"{rr.name}: hacim yetersiz (V={rr.volume_cm3:.2f} cm³, gerekli {rr.required_volume_cm3:.2f} cm³). "
                 f"En az {short:.2f} cm³ daha hacim ekleyin."
             )
+
+    for idx, proposal in enumerate(result.riser_proposals):
+        recs.append(
+            f"ÖNERİ {idx + 1}: {proposal.shape} besleyici ekle -> "
+            f"çap={proposal.diameter_mm:.1f} mm, yükseklik={proposal.height_mm:.1f} mm, "
+            f"V={proposal.volume_cm3:.2f} cm³, M={proposal.m_required_mm:.2f} mm. "
+            f"Konum ({proposal.placement_mm[0]:.1f}, {proposal.placement_mm[1]:.1f}, "
+            f"{proposal.placement_mm[2]:.1f}) mm. Neden: {proposal.reason}."
+        )
 
     all_feed_ok = all(hs.feed_ok for hs in result.hotspots)
     if all_feed_ok and all(rr.large_enough for rr in result.riser_results):
