@@ -953,6 +953,7 @@ def _refine_region(
         sdf, M_mod, alloy, mold, dx, is_metal=is_metal,
         temperature=T, cooling_rate=R,
     )
+    niyama = np.where(grid == BodyType.PART, niyama, 0.0)
 
     niyama_risk = np.clip(1.0 - niyama / alloy.niyama_shrinkage, 0.0, 1.0)
     FD_field = alloy.feed_k1 * (2.0 * M_mod)
@@ -960,7 +961,8 @@ def _refine_region(
     feed_risk = sdf / (sdf + np.maximum(FD_field, 1.0))
     feed_risk = np.clip(feed_risk, 0.0, 1.0)
     risk = 1.0 - (1.0 - niyama_risk) * (1.0 - feed_risk)
-    risk = np.where(is_metal, risk, 0.0)
+    part_mask_local = grid == BodyType.PART
+    risk = np.where(part_mask_local, risk, 0.0)
     risk = np.nan_to_num(risk, nan=0.0, posinf=0.0, neginf=0.0)
 
     return RefinementRegion(
@@ -1073,6 +1075,11 @@ def analyze(
     # AŞAMA 4: Niyama family from the 3-D thermal solution
     niyama_variants = compute_niyama_variants(niyama, G, cooling_rate, t_s, alloy)
     niyama = compute_niyama_ensemble(niyama)
+    # v8.5: porosity / Niyama display should be restricted to the part,
+    # not to risers/gating, to avoid meaningless artifacts.
+    for k in list(niyama_variants.keys()):
+        niyama_variants[k] = np.where(part_mask, niyama_variants[k], 0.0)
+    niyama = np.where(part_mask, niyama, 0.0)
     if progress_callback:
         progress_callback(65)
 
@@ -1266,7 +1273,8 @@ def analyze(
         feed_risk = dist_feed / (dist_feed + np.maximum(FD_field, 1.0))
         feed_risk = np.clip(feed_risk, 0.0, 1.0)
         risk = 1.0 - (1.0 - niyama_risk) * (1.0 - feed_risk)
-        risk = np.where(is_metal, risk, 0.0)
+        # v8.5: risk belongs to the part only; risers/gating are not part porosity.
+        risk = np.where(part_mask, risk, 0.0)
         risk = np.nan_to_num(risk, nan=0.0, posinf=0.0, neginf=0.0)
     risk_norm = risk
 

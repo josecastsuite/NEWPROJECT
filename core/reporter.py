@@ -175,6 +175,12 @@ def _format_gate_table(result: AnalysisResult) -> str:
         <tr><td>Meme kalın bölgede</td><td>{'Evet' if gr.ingate_on_thick_region else 'Hayır'} (ortalama M={gr.ingate_avg_m_mm:.2f} mm)</td><td>Hayır olmalı</td></tr>
         <tr><td>Meme kalınlığı</td><td>{gr.ingate_thickness_mm:.2f} mm</td><td>-</td></tr>
         <tr><td>Yolluk kalınlığı</td><td>{gr.runner_thickness_mm:.2f} mm</td><td>-</td></tr>
+        <tr><td>Tavsiye edilen dolum süresi (Campbell)</td><td>{gr.recommended_fill_time_s:.2f} s</td><td>basis: {gr.fill_time_basis}</td></tr>
+        <tr><td>Toplam dökülen kütle / verim</td><td>{gr.total_poured_mass_kg:.3f} kg</td><td>% {gr.pouring_yield*100:.1f}</td></tr>
+        <tr><td>Teorik As (sprue taban)</td><td>{gr.design_sprue_base_area_cm2:.2f} cm²</td><td>gerçek {gr.sprue_base_area_cm2:.2f} cm²</td></tr>
+        <tr><td>Teorik Ar (yolluk)</td><td>{gr.design_runner_area_cm2:.2f} cm²</td><td>gerçek {gr.runner_min_area_cm2:.2f} cm²</td></tr>
+        <tr><td>Teorik Ag (meme toplam)</td><td>{gr.design_gate_total_area_cm2:.2f} cm²</td><td>gerçek {gr.total_ingate_contact_area_cm2:.2f} cm²</td></tr>
+        <tr><td>Teorik eşdeğer çaplar</td><td>sprue Ø {gr.design_sprue_diameter_mm:.1f} mm, gate Ø {gr.design_gate_diameter_mm:.1f} mm</td><td>choke v={gr.design_choke_velocity_m_s:.2f} m/s</td></tr>
     </table>
     """
 
@@ -183,11 +189,16 @@ def _format_niyama_table(result: AnalysisResult) -> str:
     if not result.niyama_variants:
         return ""
     rows = []
+    part_mask = result.grid == 1  # BodyType.PART == 1
     for k, v in result.niyama_variants.items():
-        mask = result.is_metal if result.is_metal.size > 0 else np.ones(v.shape, dtype=bool)
+        mask = part_mask if part_mask.size > 0 else np.ones(v.shape, dtype=bool)
+        if mask.size == v.size:
+            vals = v[mask]
+        else:
+            vals = v.ravel()
         rows.append(
-            f"<tr><td>{k}</td><td>{np.percentile(v[mask], 5):.3f}</td>"
-            f"<td>{np.percentile(v[mask], 50):.3f}</td><td>{np.percentile(v[mask], 95):.3f}</td></tr>"
+            f"<tr><td>{k}</td><td>{np.percentile(vals, 5):.3f}</td>"
+            f"<td>{np.percentile(vals, 50):.3f}</td><td>{np.percentile(vals, 95):.3f}</td></tr>"
         )
     return "".join(rows)
 
@@ -454,6 +465,10 @@ def _generate_report_fpdf2(
         pdf.cell(0, 6, f"Yolluk min kesit: {gr.runner_min_area_cm2:.2f} cm² (hedef {runner_flow.target_area_min_cm2:.2f}-{runner_flow.target_area_max_cm2:.2f})", ln=True)
         pdf.cell(0, 6, f"Döküm ağzı boğazı: {gr.sprue_throat_area_cm2:.2f} cm² (gerekli {gr.required_sprue_area_cm2:.2f} cm²)", ln=True)
         pdf.cell(0, 6, f"Döküm ağzı tabanı: {gr.sprue_base_area_cm2:.2f} cm²", ln=True)
+        pdf.cell(0, 6, f"Tavsiye edilen dolum suresi: {gr.recommended_fill_time_s:.2f} s ({gr.fill_time_basis}); girilen: {gr.ingate_fill_time_s:.2f} s", ln=True)
+        pdf.cell(0, 6, f"Toplam dokulen kutle: {gr.total_poured_mass_kg:.3f} kg, verim: {gr.pouring_yield*100:.1f}%", ln=True)
+        pdf.cell(0, 6, f"Teorik As: {gr.design_sprue_base_area_cm2:.2f} cm², Ar: {gr.design_runner_area_cm2:.2f} cm², Ag: {gr.design_gate_total_area_cm2:.2f} cm²", ln=True)
+        pdf.cell(0, 6, f"Teorik caplar: sprue Ø {gr.design_sprue_diameter_mm:.1f} mm, gate Ø {gr.design_gate_diameter_mm:.1f} mm, choke v={gr.design_choke_velocity_m_s:.2f} m/s", ln=True)
         for key, sf in getattr(gr, "section_flows", {}).items():
             if sf.area_cm2 <= 0:
                 continue

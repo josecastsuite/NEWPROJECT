@@ -939,6 +939,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.checklist_layout.addWidget(
                     CheckListItem(vtext, velocity_ok)
                 )
+            # v8.5: Campbell fill time and theoretical area cross-checks
+            if gr.recommended_fill_time_s > 0:
+                fill_ok = abs(gr.recommended_fill_time_s - gr.ingate_fill_time_s) <= 0.2 * gr.recommended_fill_time_s
+                self.checklist_layout.addWidget(
+                    CheckListItem(
+                        f"Campbell tavsiye dolum süresi: {gr.recommended_fill_time_s:.2f} s; girilen: {gr.ingate_fill_time_s:.2f} s",
+                        fill_ok,
+                    )
+                )
+            if gr.design_sprue_base_area_cm2 > 0:
+                self.checklist_layout.addWidget(
+                    CheckListItem(
+                        f"Sprue taban: gerçek {gr.sprue_base_area_cm2:.2f} cm² / teorik {gr.design_sprue_base_area_cm2:.2f} cm²",
+                        gr.sprue_design_ok,
+                    )
+                )
+            if gr.design_runner_area_cm2 > 0:
+                self.checklist_layout.addWidget(
+                    CheckListItem(
+                        f"Yolluk: gerçek {gr.runner_min_area_cm2:.2f} cm² / teorik {gr.design_runner_area_cm2:.2f} cm²",
+                        gr.runner_design_ok,
+                    )
+                )
+            if gr.design_gate_total_area_cm2 > 0:
+                self.checklist_layout.addWidget(
+                    CheckListItem(
+                        f"Gate toplam: gerçek {gr.total_ingate_contact_area_cm2:.2f} cm² / teorik {gr.design_gate_total_area_cm2:.2f} cm²",
+                        gr.gate_design_ok,
+                    )
+                )
 
     def _update_recommendations(self):
         if self._analysis and self._analysis.recommendations:

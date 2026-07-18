@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import trimesh
@@ -220,6 +220,23 @@ class GateResult:
     recommended_gating_system: str = ""
     wall_thickness_category: str = ""
     gating_system_reason: str = ""
+    # v8.5: mass/head/fill-time design cross-check (gating_calculator_tr.py)
+    recommended_fill_time_s: float = 0.0
+    fill_time_basis: str = ""
+    head_reduction_percent: float = 0.0
+    total_poured_mass_kg: float = 0.0
+    pouring_yield: float = 0.0
+    design_sprue_base_area_cm2: float = 0.0
+    design_runner_area_cm2: float = 0.0
+    design_gate_total_area_cm2: float = 0.0
+    design_gate_each_area_cm2: float = 0.0
+    design_sprue_diameter_mm: float = 0.0
+    design_gate_diameter_mm: float = 0.0
+    design_choke_velocity_m_s: float = 0.0
+    design_gating_ratio: Tuple[float, float, float] = field(default_factory=lambda: (1.0, 2.0, 1.0))
+    sprue_design_ok: bool = True
+    runner_design_ok: bool = True
+    gate_design_ok: bool = True
 
 
 @dataclass

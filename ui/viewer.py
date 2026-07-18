@@ -133,12 +133,17 @@ class Analyzer3DViewer(QtInteractor):
         grid.spacing = (result.dx_mm, result.dx_mm, result.dx_mm)
         grid.cell_data[name] = np.asarray(scalars).ravel(order="F")
         grid.cell_data["is_metal"] = result.is_metal.ravel(order="F").astype(np.float64)
+        grid.cell_data["part"] = (result.grid == BodyType.PART).ravel(order="F").astype(np.float64)
         # Contour / slice filters require point data; convert and keep both scalars.
         return grid.cell_data_to_point_data()
 
     def _metal_only(self, grid: pv.ImageData) -> pv.UnstructuredGrid:
         """Return only fully-metal cells from a grid."""
         return grid.threshold([1.0, 1.0], scalars="is_metal", all_scalars=True)
+
+    def _part_only(self, grid: pv.ImageData) -> pv.UnstructuredGrid:
+        """Return only part cells; porosity/Niyama belong to the casting, not risers/gating."""
+        return grid.threshold([1.0, 1.0], scalars="part", all_scalars=True)
 
     def _smooth_surface(self, grid: pv.DataSet) -> pv.PolyData:
         try:
@@ -197,17 +202,21 @@ class Analyzer3DViewer(QtInteractor):
             )
 
         if centers:
-            self._hotspot_label_actor = self.add_point_labels(
-                np.array(centers),
-                labels,
-                text_color="#00ffff",
-                font_size=11,
-                shape="rounded_rect",
-                background_color="black",
-                background_opacity=1.0,
-                show_points=False,
-                always_visible=True,
-            )
+            try:
+                self._hotspot_label_actor = self.add_point_labels(
+                    np.array(centers),
+                    labels,
+                    text_color="#00ffff",
+                    font_size=11,
+                    shape="rounded_rect",
+                    background_color="black",
+                    background_opacity=1.0,
+                    show_points=False,
+                    always_visible=True,
+                )
+            except Exception:
+                # Off-screen / OpenGL label rendering can be fragile; spheres alone are enough.
+                self._hotspot_label_actor = None
 
     def show_risk(self, result: Optional[AnalysisResult]):
         """Show risk isosurfaces (0.70 and 0.85) colored by risk value."""
@@ -219,10 +228,10 @@ class Analyzer3DViewer(QtInteractor):
             return
 
         grid = self._make_grid(result, result.risk, "risk")
-        metal = self._metal_only(grid)
-        if metal.n_cells == 0:
+        part = self._part_only(grid)
+        if part.n_cells == 0:
             return
-        iso = metal.contour([0.70, 0.85], scalars="risk")
+        iso = part.contour([0.70, 0.85], scalars="risk")
         if iso.n_points == 0:
             return
         self._risk_actor = self.add_mesh(
@@ -245,10 +254,10 @@ class Analyzer3DViewer(QtInteractor):
             return
 
         grid = self._make_grid(result, result.risk, "risk")
-        metal = self._metal_only(grid)
-        if metal.n_cells == 0:
+        part = self._part_only(grid)
+        if part.n_cells == 0:
             return
-        high = metal.threshold([threshold, 1.0], scalars="risk")
+        high = part.threshold([threshold, 1.0], scalars="risk")
         if high.n_cells == 0:
             return
 
@@ -280,11 +289,11 @@ class Analyzer3DViewer(QtInteractor):
 
         alloy = get_alloy(result.alloy_key)
         grid = self._make_grid(result, result.niyama, "niyama")
-        metal = self._metal_only(grid)
-        if metal.n_cells == 0:
+        part = self._part_only(grid)
+        if part.n_cells == 0:
             return
 
-        iso = metal.contour(
+        iso = part.contour(
             [alloy.niyama_macro, alloy.niyama_shrinkage],
             scalars="niyama",
         )
@@ -369,15 +378,15 @@ class Analyzer3DViewer(QtInteractor):
         data, title, cmap = field_map[field]
 
         grid = self._make_grid(result, data, field)
-        metal = self._metal_only(grid)
-        if metal.n_cells == 0:
+        domain = self._part_only(grid) if field in ("risk", "niyama") else self._metal_only(grid)
+        if domain.n_cells == 0:
             return
 
         self._remove_scalar_bar(title)
-        origin = np.array(metal.center)
+        origin = np.array(domain.center)
         first_bar = True
         for normal in [(1, 0, 0), (0, 1, 0), (0, 0, 1)]:
-            slc = metal.slice(normal=normal, origin=origin)
+            slc = domain.slice(normal=normal, origin=origin)
             if slc.n_points == 0:
                 continue
             actor = self.add_mesh(
