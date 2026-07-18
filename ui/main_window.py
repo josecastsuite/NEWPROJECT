@@ -794,11 +794,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Meme toplam temas alanı {gr.total_ingate_contact_area_cm2:.2f} cm², "
                 f"minimum {gr.required_ingate_area_cm2:.2f} cm² önerilir."
             )
+        # v8.4: gating system type and wall-thickness recommendation
+        if getattr(gr, "gating_system_reason", ""):
+            recs.append(gr.gating_system_reason)
+            if gr.detected_gating_system and gr.recommended_gating_system and gr.detected_gating_system != gr.recommended_gating_system:
+                recs.append(
+                    f"Sistem uyuşmazlığı: {gr.detected_gating_system} tespit edildi, "
+                    f"{gr.recommended_gating_system} önerilir."
+                )
         # v8.3: per-section velocity / Re / Fr report
         for key, sf in getattr(gr, "section_flows", {}).items():
             if sf.area_cm2 <= 0:
                 continue
             name = section_names.get(key, key)
+            if key == "INGATE" and gr.effective_gate_section.startswith("RUNNER"):
+                name = "Yolluk (meme yok)"
             if sf.turbulent:
                 recs.append(
                     f"{name} hızı {sf.velocity_m_s:.2f} m/s ile yüksek; Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}. "
@@ -880,11 +890,20 @@ class MainWindow(QtWidgets.QMainWindow):
                     not gr.ingate_on_thick_region,
                 )
             )
+            if gr.detected_gating_system:
+                self.checklist_layout.addWidget(
+                    CheckListItem(
+                        f"Sistem: {gr.detected_gating_system} | Önerilen: {gr.recommended_gating_system} | Cidar: {gr.wall_thickness_category}",
+                        gr.detected_gating_system == gr.recommended_gating_system,
+                    )
+                )
             # v8.3: per-section velocity / Re / Fr checklist items
             for key, sf in getattr(gr, "section_flows", {}).items():
                 if sf.area_cm2 <= 0:
                     continue
                 name = section_names.get(key, key)
+                if key == "INGATE" and gr.effective_gate_section.startswith("RUNNER"):
+                    name = "Yolluk (meme yok)"
                 self.checklist_layout.addWidget(
                     CheckListItem(
                         f"{name}: v={sf.velocity_m_s:.2f} m/s, Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, A={sf.area_cm2:.2f} cm²",

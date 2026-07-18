@@ -231,6 +231,89 @@ def _count_elbows_along_path(
     return elbows
 
 
+# Campbell-style velocity ranges for pressurized / unpressurized / semi-pressurized
+# gating systems (m/s).  Ref: Campbell casting practice / foundry design handbooks.
+_GATING_VELOCITY_TARGETS = {
+    "basınçlı (pressurized)": {
+        "sprue": (1.0, 1.2),
+        "runner": (1.2, 1.5),
+        "gate": (1.8, 2.5),
+    },
+    "basınçsız (unpressurized)": {
+        "sprue": (1.5, 2.0),
+        "runner": (0.8, 1.2),
+        "gate": (0.4, 0.7),
+    },
+    "yarı basınçlı (semi-pressurized)": {
+        "sprue": (1.2, 1.5),
+        "runner": (0.6, 1.0),
+        "gate": (0.9, 1.2),
+    },
+}
+
+
+def _normalized_distance_to_range(v: float, lo: float, hi: float) -> float:
+    if lo <= v <= hi:
+        return 0.0
+    width = max(hi - lo, 0.1)
+    if v < lo:
+        return (lo - v) / width
+    return (v - hi) / width
+
+
+def _classify_gating_system(v_sprue: float, v_runner: float, v_gate: float) -> str:
+    """Pick the closest gating-system type by velocity range and ordering."""
+    best = "belirsiz"
+    best_score = float("inf")
+    for name, targets in _GATING_VELOCITY_TARGETS.items():
+        score = 0.0
+        score += _normalized_distance_to_range(v_sprue, *targets["sprue"])
+        score += _normalized_distance_to_range(v_runner, *targets["runner"])
+        score += _normalized_distance_to_range(v_gate, *targets["gate"])
+        avg = max((v_sprue + v_runner + v_gate) / 3.0, 0.01)
+        # Ordering penalty
+        if name == "basınçlı (pressurized)":
+            score += (max(0.0, v_sprue - v_runner) + max(0.0, v_runner - v_gate)) / avg
+        elif name == "basınçsız (unpressurized)":
+            score += (max(0.0, v_runner - v_sprue) + max(0.0, v_gate - v_runner)) / avg
+        elif name == "yarı basınçlı (semi-pressurized)":
+            # Sprue >= runner, gate >= runner, sprue and gate similar magnitude
+            score += (max(0.0, v_runner - v_sprue) + max(0.0, v_runner - v_gate)) / avg
+            score += abs(v_sprue - v_gate) / avg * 0.5
+        if score < best_score:
+            best_score = score
+            best = name
+    return best
+
+
+def _wall_thickness_category(wall_thickness_mm: float) -> str:
+    if wall_thickness_mm < 6.0:
+        return "ince cidarlı"
+    if wall_thickness_mm <= 15.0:
+        return "orta cidarlı"
+    return "kalın cidarlı"
+
+
+def _recommend_gating_system(category: str) -> Tuple[str, str]:
+    """Return (recommended_system, reason) based on wall thickness."""
+    if category == "ince cidarlı":
+        return (
+            "basınçlı (pressurized)",
+            "İnce cidarlı parçada hızlı ve türbülanslı olmayan doldurma için yüksek gate hızı gerekir; "
+            "basınçlı sistemde gate hızı 1.8–2.5 m/s hedeflenir.",
+        )
+    if category == "kalın cidarlı":
+        return (
+            "basınçsız (unpressurized)",
+            "Kalın cidarlı parçada doldurma süresi daha uzun olabilir; türbülansı önlemek için "
+            "gate hızı 0.4–0.7 m/s olan basınçsız sistem tercih edilir.",
+        )
+    return (
+        "yarı basınçlı (semi-pressurized)",
+        "Orta cidarlı parçalar için sprue/runner/gate hızları dengeli olan yarı basınçlı sistem uygundur.",
+    )
+
+
 def _compute_section_flow(
     section_key: str,
     area_cm2: float,
@@ -386,12 +469,29 @@ def analyze_gating(
         )
 
     ingate_flow = section_flows.get("INGATE", SectionFlow())
+    runner_flow = section_flows.get("RUNNER", SectionFlow())
+    sprue_flow = section_flows.get("SPRUE_THROAT", SectionFlow())
     ingate_velocity_m_s = ingate_flow.velocity_m_s
     ingate_flow_rate_m3_s = Q_m3_s
     ingate_fill_time_s = t_fill_computed_s
     reynolds = ingate_flow.reynolds
     froude = ingate_flow.froude
     turbulent = ingate_flow.turbulent
+
+    # v8.4: classify gating system and recommend based on wall thickness
+    effective_gate_section = "INGATE" if has_ingate else "RUNNER (meme yok)"
+    v_sprue = sprue_flow.velocity_m_s
+    v_runner = runner_flow.velocity_m_s
+    v_gate = ingate_flow.velocity_m_s
+    detected_system = _classify_gating_system(v_sprue, v_runner, v_gate)
+    wall_thickness = getattr(result, "wall_thickness_mm", 0.0)
+    wall_cat = _wall_thickness_category(wall_thickness) if wall_thickness > 0 else "orta cidarlı"
+    recommended_system, system_reason = _recommend_gating_system(wall_cat)
+    gating_system_reason = (
+        f"Parça {wall_cat} (baskın duvar t≈{wall_thickness:.1f} mm). "
+        f"Tespit edilen sistem: {detected_system}. "
+        f"Önerilen sistem: {recommended_system}. {system_reason}"
+    )
 
     # Sprue height H in cm; fallback to total metal height
     metal_pts = np.argwhere(result.is_metal)
@@ -516,6 +616,15 @@ def analyze_gating(
     if velocity_summary:
         result.recommendations.append(f"Kesit hızları -> {velocity_summary}")
 
+    result.recommendations.append(gating_system_reason)
+    if detected_system != recommended_system and detected_system != "belirsiz":
+        result.recommendations.append(
+            f"Sistem uyuşmazlığı: parça {wall_cat} için {recommended_system} beklenirken {detected_system} davranışı görülüyor. "
+            f"Hedef hızlar: sprue={_GATING_VELOCITY_TARGETS[recommended_system]['sprue'][0]:.1f}-{_GATING_VELOCITY_TARGETS[recommended_system]['sprue'][1]:.1f}, "
+            f"runner={_GATING_VELOCITY_TARGETS[recommended_system]['runner'][0]:.1f}-{_GATING_VELOCITY_TARGETS[recommended_system]['runner'][1]:.1f}, "
+            f"gate={_GATING_VELOCITY_TARGETS[recommended_system]['gate'][0]:.1f}-{_GATING_VELOCITY_TARGETS[recommended_system]['gate'][1]:.1f} m/s."
+        )
+
     return GateResult(
         total_ingate_contact_area_cm2=ag_total_cm2,
         runner_min_area_cm2=runner_min_area_cm2,
@@ -553,4 +662,9 @@ def analyze_gating(
         selected_section_key=velocity_section_key,
         selected_velocity_m_s=user_v,
         section_flows=section_flows,
+        effective_gate_section=effective_gate_section,
+        detected_gating_system=detected_system,
+        recommended_gating_system=recommended_system,
+        wall_thickness_category=wall_cat,
+        gating_system_reason=gating_system_reason,
     )

@@ -209,6 +209,12 @@ class GateResult:
     selected_section_key: str = "INGATE"
     selected_velocity_m_s: float = 0.0
     section_flows: Dict[str, SectionFlow] = field(default_factory=dict)
+    # v8.4 gating system classification and wall-thickness recommendation
+    effective_gate_section: str = "INGATE"
+    detected_gating_system: str = ""
+    recommended_gating_system: str = ""
+    wall_thickness_category: str = ""
+    gating_system_reason: str = ""
 
 
 @dataclass

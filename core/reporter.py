@@ -103,6 +103,8 @@ def _section_flow_rows(gr) -> str:
         if sf.area_cm2 <= 0:
             continue
         name = section_names.get(key, key)
+        if key == "INGATE" and getattr(gr, "effective_gate_section", "INGATE").startswith("RUNNER"):
+            name = "Yolluk (meme yok)"
         rows.append(
             f"<tr><td>{name}: v / Re / Fr</td>"
             f"<td>{sf.velocity_m_s:.2f} m/s</td>"
@@ -118,10 +120,25 @@ def _format_gate_table(result: AnalysisResult) -> str:
     selected_section = getattr(gr, "selected_section_key", "INGATE")
     selected_sf = getattr(gr, "section_flows", {}).get(selected_section)
     selected_area = selected_sf.area_cm2 if selected_sf else 0.0
+    system_targets = {
+        "basınçlı (pressurized)": {"sprue": (1.0, 1.2), "runner": (1.2, 1.5), "gate": (1.8, 2.5)},
+        "basınçsız (unpressurized)": {"sprue": (1.5, 2.0), "runner": (0.8, 1.2), "gate": (0.4, 0.7)},
+        "yarı basınçlı (semi-pressurized)": {"sprue": (1.2, 1.5), "runner": (0.6, 1.0), "gate": (0.9, 1.2)},
+    }.get(gr.recommended_gating_system, {})
+    target_text = ""
+    if system_targets:
+        target_text = (
+            f"sprue={system_targets['sprue'][0]:.1f}-{system_targets['sprue'][1]:.1f}, "
+            f"runner={system_targets['runner'][0]:.1f}-{system_targets['runner'][1]:.1f}, "
+            f"gate={system_targets['gate'][0]:.1f}-{system_targets['gate'][1]:.1f} m/s"
+        )
     return f"""
     <table>
         <tr><th>Parametre</th><th>Değer</th><th>Durum / Gerekli</th></tr>
         <tr><td>Seçili giriş kesiti</td><td>{selected_section}</td><td>v = {gr.ingate_velocity_m_s:.2f} m/s</td></tr>
+        <tr><td>Efektif gate kesiti</td><td>{gr.effective_gate_section}</td><td>-</td></tr>
+        <tr><td>Tespit edilen / Önerilen sistem</td><td>{gr.detected_gating_system} / {gr.recommended_gating_system}</td><td>Cidar: {gr.wall_thickness_category}</td></tr>
+        <tr><td>Önerilen sistem hedef hızları</td><td>{target_text}</td><td>-</td></tr>
         <tr><td>Toplam meme temas alanı (Ag)</td><td>{gr.total_ingate_contact_area_cm2:.2f} cm²</td><td>min {gr.required_ingate_area_cm2:.2f} cm²</td></tr>
         <tr><td>Yolluk min kesit alanı (Ar)</td><td>{gr.runner_min_area_cm2:.2f} cm²</td><td>min {gr.required_runner_area_cm2:.2f} cm²</td></tr>
         <tr><td>Döküm ağzı boğaz alanı (As)</td><td>{gr.sprue_throat_area_cm2:.2f} cm²</td><td>gerekli {gr.required_sprue_area_cm2:.2f} cm²</td></tr>
@@ -405,6 +422,8 @@ def _generate_report_fpdf2(
         pdf.cell(0, 8, "Meme / Yolluk / Döküm Ağzı", ln=True)
         pdf.set_font(font, "", 10)
         pdf.cell(0, 6, f"Secili giris kesiti: {getattr(gr, 'selected_section_key', 'INGATE')}, v={gr.ingate_velocity_m_s:.2f} m/s", ln=True)
+        pdf.cell(0, 6, f"Efektif gate kesiti: {getattr(gr, 'effective_gate_section', 'INGATE')}", ln=True)
+        pdf.cell(0, 6, f"Tespit edilen / Onerilen sistem: {getattr(gr, 'detected_gating_system', '')} / {getattr(gr, 'recommended_gating_system', '')} (cidar: {getattr(gr, 'wall_thickness_category', '')})", ln=True)
         pdf.cell(0, 6, f"Toplam debi Q: {gr.ingate_flow_rate_m3_s*1e3:.2f} L/s, doldurma suresi: {gr.ingate_fill_time_s:.2f} s", ln=True)
         pdf.cell(0, 6, f"Akiskanlik uzunlugu Lf: {gr.fluidity_length_mm:.1f} mm", ln=True)
         pdf.cell(0, 6, f"Meme temas alani: {gr.total_ingate_contact_area_cm2:.2f} cm² (min {gr.required_ingate_area_cm2:.2f} cm²)", ln=True)
@@ -415,6 +434,8 @@ def _generate_report_fpdf2(
             if sf.area_cm2 <= 0:
                 continue
             name = section_names.get(key, key)
+            if key == "INGATE" and getattr(gr, "effective_gate_section", "INGATE").startswith("RUNNER"):
+                name = "Yolluk (meme yok)"
             pdf.cell(0, 6, f"{name}: v={sf.velocity_m_s:.2f} m/s, Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, A={sf.area_cm2:.2f} cm2, turb={sf.turbulent}", ln=True)
         pdf.cell(0, 6, f"Campbell: {'Geçer' if gr.campbell_ok else 'Geçersiz'}", ln=True)
         pdf.cell(0, 6, f"Bernoulli: {'Geçer' if gr.bernoulli_ok else 'Geçersiz'} (dirsek kaybi: {gr.elbow_count}, {gr.head_loss_mm:.1f} mm)", ln=True)
