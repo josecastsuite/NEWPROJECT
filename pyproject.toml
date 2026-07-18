@@ -1,7 +1,7 @@
 [project]
 name = "josecast-analyzer"
-version = "7.1.0"
-description = "Titan geometric casting analysis engine with alloy/mould database, Niyama, Darcy and adaptive 160-2040 voxel SDF physics."
+version = "7.2.0"
+description = "Titan geometric casting analysis engine with Fourier heat equation, Niyama family, Darcy, curvature and adaptive 160-2040 voxel SDF physics."
 requires-python = ">=3.10"
 dependencies = [
     "cadquery>=2.7.0",

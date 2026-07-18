@@ -1,4 +1,4 @@
-"""JoseCast Analyzer geometric engine v7.1."""
+"""JoseCast Analyzer geometric + pseudo-thermal engine v7.2."""
 
 from core.gating import analyze_gating, ingate_contact_area_and_mask
 from core.materials import (

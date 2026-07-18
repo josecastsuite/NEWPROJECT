@@ -1,8 +1,8 @@
-"""Shared types and result containers for JoseCast Analyzer v7.1."""
+"""Shared types and result containers for JoseCast Analyzer v7.2."""
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import trimesh
@@ -59,6 +59,14 @@ class HotSpot:
     darcy_resistance: float = 0.0
     directional_ok: bool = True
     min_neck_m_mm: float = 0.0
+    # v7.2
+    width_mm: float = 0.0
+    shape_factor: float = 0.0
+    curvature_mean: float = 0.0
+    curvature_gaussian: float = 0.0
+    m_uncertainty_mm: float = 0.0
+    niyama_ensemble: float = 0.0
+    niyama_variants: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -76,6 +84,8 @@ class RiserResult:
     effective_m_required: float = 0.0
     # v7.1
     required_volume_cm3: float = 0.0
+    # v7.2
+    resistance_correction_mm: float = 0.0
 
 
 @dataclass
@@ -96,6 +106,11 @@ class GateResult:
     required_ingate_area_cm2: float = 0.0
     runner_ok: bool = True
     ingate_ok: bool = True
+    # v7.2
+    elbow_count: int = 0
+    head_loss_mm: float = 0.0
+    effective_head_mm: float = 0.0
+    required_sprue_area_with_losses_cm2: float = 0.0
 
 
 @dataclass
@@ -139,5 +154,18 @@ class AnalysisResult:
     # section / histogram
     dominant_m_mm: float = 0.0
     wall_thickness_mm: float = 0.0
+    # v7.2 extended physics
+    temperature: np.ndarray = field(default_factory=lambda: np.array([]))
+    cooling_rate: np.ndarray = field(default_factory=lambda: np.array([]))
+    solid_fraction: np.ndarray = field(default_factory=lambda: np.array([]))
+    curvature_mean: np.ndarray = field(default_factory=lambda: np.array([]))
+    curvature_gaussian: np.ndarray = field(default_factory=lambda: np.array([]))
+    subvoxel_sdf: np.ndarray = field(default_factory=lambda: np.array([]))
+    shape_factor_global: float = 0.0
+    m_mean_mm: float = 0.0
+    m_std_mm: float = 0.0
+    m_skewness: float = 0.0
+    niyama_variants: Dict[str, np.ndarray] = field(default_factory=dict)
+    elapsed_s: float = 0.0
     # metadata
     bbox_size_mm: np.ndarray = field(default_factory=lambda: np.zeros(3))

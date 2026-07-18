@@ -22,6 +22,7 @@ from core import (
     get_mold,
     load_step,
 )
+from core.materials import chvorinov_c_from_properties
 from core.types import Body, BodyType
 from ui.viewer import Analyzer3DViewer
 
@@ -188,6 +189,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refine_check = QtWidgets.QCheckBox("Yerel adaptive refine")
         self.refine_check.setChecked(True)
         settings_layout.addRow(self.refine_check)
+
+        self.subvox_spin = QtWidgets.QSpinBox()
+        self.subvox_spin.setRange(1, 3)
+        self.subvox_spin.setValue(2)
+        self.subvox_spin.setToolTip("Kenar vokseli 0.5 gibi kısmi saymak için 2x upsample.")
+        settings_layout.addRow("Sub-voxel faktör:", self.subvox_spin)
+
+        self.thermal_spin = QtWidgets.QSpinBox()
+        self.thermal_spin.setRange(0, 2000)
+        self.thermal_spin.setValue(100)
+        self.thermal_spin.setSingleStep(50)
+        self.thermal_spin.setToolTip("Fourier ısı denklemi explicit adım sayısı (0=termal kapalı).")
+        settings_layout.addRow("Isı adımı:", self.thermal_spin)
 
         self.alloy_combo = QtWidgets.QComboBox()
         for key, alloy in ALLOYS.items():
@@ -465,11 +479,14 @@ class MainWindow(QtWidgets.QMainWindow):
             mold_key = self.mold_combo.currentData()
             max_res = self.res_spin.value()
             refine_local = self.refine_check.isChecked()
+            sub_voxel = self.subvox_spin.value()
+            n_thermal_steps = self.thermal_spin.value()
 
             alloy = get_alloy(alloy_key)
             mold = get_mold(mold_key)
+            chvorinov_c = chvorinov_c_from_properties(alloy, mold)
             self.aiLog(
-                f"Alaşım: {alloy.name} | Kalıp: {mold.name} | C={mold.chvorinov_c:.2f} s/mm²",
+                f"Alaşım: {alloy.name} | Kalıp: {mold.name} | C={chvorinov_c:.3f} s/mm²",
                 "info",
             )
 
@@ -483,6 +500,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 base_res=160,
                 max_res=max_res,
                 refine_local=refine_local,
+                sub_voxel=sub_voxel,
+                n_thermal_steps=n_thermal_steps,
                 progress_callback=self._set_progress,
             )
 

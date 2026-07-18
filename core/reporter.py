@@ -1,4 +1,4 @@
-"""HTML->PDF Turkish report generator for JoseCast v7.1 Titan."""
+"""HTML->PDF Turkish report generator for JoseCast v7.2."""
 
 import base64
 import os
@@ -30,27 +30,26 @@ def generate_report(
     if result.hotspots:
         for i, hs in enumerate(result.hotspots, 1):
             pos = ",".join(f"{v:.1f}" for v in hs.position_mm)
-            status = (
-                "KRİTİK: Besleyiciye ulaşmıyor"
-                if not np.isfinite(hs.dist_to_riser_mm)
-                else ("OK" if hs.feed_ok else "UZAK")
-            )
+            status = "OK" if hs.feed_ok else "UZAK/DARALMA"
+            niy = ", ".join(f"{k}={v:.2f}" for k, v in hs.niyama_variants.items())
             rows_hotspot.append(
                 f"<tr>"
                 f"<td>{i}</td>"
-                f"<td>({pos}) mm</td>"
-                f"<td>{hs.m_value_mm:.2f}</td>"
+                f"<td>({pos})</td>"
+                f"<td>{hs.m_value_mm:.2f} ± {hs.m_uncertainty_mm:.2f}</td>"
                 f"<td>{hs.t_section_mm:.2f}</td>"
                 f"<td>{hs.dist_to_riser_mm:.1f}</td>"
                 f"<td>{hs.max_feeding_distance_mm:.1f}</td>"
-                f"<td>{hs.niyama_min:.2f}</td>"
-                f"<td>{hs.darcy_resistance:.1f}</td>"
+                f"<td>{hs.niyama_ensemble:.2f}</td>"
+                f"<td>{hs.darcy_resistance:.2f}</td>"
+                f"<td>{hs.curvature_mean:.2f}</td>"
+                f"<td>{hs.shape_factor:.4f}</td>"
                 f"<td>{status}</td>"
                 f"</tr>"
             )
     else:
         rows_hotspot.append(
-            '<tr><td colspan="9">Tespit edilmedi.</td></tr>'
+            '<tr><td colspan="11">Tespit edilmedi.</td></tr>'
         )
 
     rows_riser = []
@@ -82,6 +81,7 @@ def generate_report(
             <tr><td>Döküm ağzı taban alanı (As)</td><td>{gr.sprue_base_area_cm2:.2f} cm²</td><td>gerekli {gr.required_sprue_area_cm2:.2f} cm²</td></tr>
             <tr><td>Campbell (Ag/Ar) kontrolü</td><td>{'Geçer' if gr.campbell_ok else 'Geçersiz'}</td><td>Ag/Ar &lt; 1.5</td></tr>
             <tr><td>Bernoulli döküm ağzı kontrolü</td><td>{'Geçer' if gr.bernoulli_ok else 'Geçersiz'}</td><td>As ≥ gerekli</td></tr>
+            <tr><td>Dirsek kaybı (K·v²/2g)</td><td>{gr.elbow_count} dirsek, {gr.head_loss_mm:.1f} mm kayıp</td><td>efektif H={gr.effective_head_mm:.1f} mm</td></tr>
             <tr><td>Meme kalın bölgede</td><td>{'Evet' if gr.ingate_on_thick_region else 'Hayır'} (ortalama M={gr.ingate_avg_m_mm:.2f} mm)</td><td>Hayır olmalı</td></tr>
             <tr><td>Meme kalınlığı</td><td>{gr.ingate_thickness_mm:.2f} mm</td><td>-</td></tr>
             <tr><td>Yolluk kalınlığı</td><td>{gr.runner_thickness_mm:.2f} mm</td><td>-</td></tr>
@@ -93,6 +93,13 @@ def generate_report(
         recs = "<ul>" + "".join(f"<li>{_html_escape(r)}</li>" for r in result.recommendations) + "</ul>"
     else:
         recs = "<p>Öneri üretilemedi.</p>"
+
+    niyama_rows = ""
+    if result.niyama_variants:
+        niyama_rows = "".join(
+            f"<tr><td>{k}</td><td>{np.percentile(v[result.is_metal], 5):.3f}</td><td>{np.percentile(v[result.is_metal], 50):.3f}</td><td>{np.percentile(v[result.is_metal], 95):.3f}</td></tr>"
+            for k, v in result.niyama_variants.items()
+        )
 
     screenshot_html = ""
     if screenshot_path and os.path.exists(screenshot_path):
@@ -108,7 +115,7 @@ def generate_report(
 <html lang="tr">
 <head>
     <meta charset="UTF-8">
-    <title>JoseCast Analyzer v7.1 Titan - Rapor</title>
+    <title>JoseCast Analyzer v7.2 Titan - Rapor</title>
     <style>
         @page {{ size: A4; margin: 18mm; }}
         body {{ font-family: DejaVu Sans, Arial, sans-serif; font-size: 10pt; color: #222; }}
@@ -126,33 +133,39 @@ def generate_report(
     </style>
 </head>
 <body>
-    <h1>JoseCast Analyzer v7.1 Titan – Geometrik Analiz Raporu</h1>
+    <h1>JoseCast Analyzer v7.2 Titan – Geometrik Analiz Raporu</h1>
     <div class="meta">
         Tarih: {datetime.now().strftime('%Y-%m-%d %H:%M')} |
         Alaşım: {result.alloy_name} | Kalıp: {result.mold_name} |
-        Chvorinov C: {result.chvorinov_c:.3f} s/mm² |
+        Chvorinov C: {result.chvorinov_c:.4f} s/mm² |
         Voxel: {result.dx_mm:.3f} mm |
         Grid: {result.grid.shape[0]} x {result.grid.shape[1]} x {result.grid.shape[2]} |
-        Metal voxel: {int(result.is_metal.sum())}
+        Metal voxel: {int(result.is_metal.sum())} |
+        Süre: {result.elapsed_s:.1f} sn
     </div>
 
-    <h2>Voxel Grid Bilgisi</h2>
+    <h2>Voxel Grid ve İstatistik</h2>
     <table>
         <tr><th>Parametre</th><th>Değer</th></tr>
         <tr><td>Voxel boyutu (dx)</td><td>{result.dx_mm:.3f} mm</td></tr>
+        <tr><td>Sub-voxel SDF</td><td>Evet</td></tr>
         <tr><td>Grid boyutları</td><td>{result.grid.shape[0]} x {result.grid.shape[1]} x {result.grid.shape[2]}</td></tr>
         <tr><td>Metal voxel sayısı</td><td>{int(result.is_metal.sum())}</td></tr>
-        <tr><td>Duvar kalınlığı modülü M (mm)</td><td>{result.dominant_m_mm:.2f}</td></tr>
+        <tr><td>Baskın duvar kalınlığı modülü M (mm)</td><td>{result.dominant_m_mm:.2f}</td></tr>
         <tr><td>Baskın duvar kalınlığı t (mm)</td><td>{result.wall_thickness_mm:.2f}</td></tr>
+        <tr><td>SDF ortalama M (mm)</td><td>{result.m_mean_mm:.2f}</td></tr>
+        <tr><td>SDF standart sapma (mm)</td><td>{result.m_std_mm:.2f}</td></tr>
+        <tr><td>SDF çarpıklık</td><td>{result.m_skewness:.2f}</td></tr>
+        <tr><td>Şekil faktörü V²/A³ (global)</td><td>{result.shape_factor_global:.6f}</td></tr>
         <tr><td>Boyut (mm)</td><td>{result.bbox_size_mm[0]:.1f} x {result.bbox_size_mm[1]:.1f} x {result.bbox_size_mm[2]:.1f}</td></tr>
     </table>
 
     <h2>Sıcak Noktalar (Hot Spots)</h2>
     <table>
         <tr>
-            <th>#</th><th>Konum (mm)</th><th>M (mm)</th><th>t (mm)</th>
+            <th>#</th><th>Konum (mm)</th><th>M ± hata (mm)</th><th>t (mm)</th>
             <th>Besleme mesafesi (mm)</th><th>Limit (mm)</th>
-            <th>Niyama</th><th>Darcy</th><th>Durum</th>
+            <th>Niyama ensemble</th><th>Darcy</th><th>Mean curv</th><th>SF</th><th>Durum</th>
         </tr>
         {''.join(rows_hotspot)}
     </table>
@@ -164,6 +177,12 @@ def generate_report(
     </table>
 
     {gate_rows}
+
+    <h2>Niyama Varyantları (p5 / p50 / p95)</h2>
+    <table>
+        <tr><th>Varyant</th><th>p5</th><th>p50</th><th>p95</th></tr>
+        {niyama_rows}
+    </table>
 
     <div class="page-break"></div>
     <h2>Öneriler</h2>
@@ -203,37 +222,39 @@ def _generate_report_fpdf2(
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.set_font(font, "", 18)
-    pdf.cell(0, 10, "JoseCast Analyzer v7.1 - Geometrik Analiz Raporu", ln=True, align="C")
+    pdf.cell(0, 10, "JoseCast Analyzer v7.2 - Geometrik Analiz Raporu", ln=True, align="C")
     pdf.set_font(font, "", 10)
     pdf.cell(0, 6, f"Tarih: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True, align="C")
-    pdf.cell(0, 6, f"Alaşım: {result.alloy_name} | Kalıp: {result.mold_name} | C={result.chvorinov_c:.3f}", ln=True, align="C")
+    pdf.cell(0, 6, f"Alaşım: {result.alloy_name} | Kalıp: {result.mold_name} | C={result.chvorinov_c:.4f}", ln=True, align="C")
     pdf.ln(4)
 
     pdf.set_font(font, "", 13)
-    pdf.cell(0, 8, "Voxel Grid Bilgisi", ln=True)
+    pdf.cell(0, 8, "Voxel Grid ve İstatistik", ln=True)
     pdf.set_font(font, "", 10)
     pdf.cell(0, 6, f"Voxel boyutu (dx): {result.dx_mm:.3f} mm", ln=True)
-    pdf.cell(0, 6, f"Grid boyutları: {result.grid.shape[0]} x {result.grid.shape[1]} x {result.grid.shape[2]}", ln=True)
-    pdf.cell(0, 6, f"Metal voxel sayısı: {int(result.is_metal.sum())}", ln=True)
-    pdf.cell(0, 6, f"Baskın duvar kalınlığı t: {result.wall_thickness_mm:.2f} mm", ln=True)
+    pdf.cell(0, 6, f"Grid: {result.grid.shape[0]} x {result.grid.shape[1]} x {result.grid.shape[2]}", ln=True)
+    pdf.cell(0, 6, f"Metal voxel: {int(result.is_metal.sum())}", ln=True)
+    pdf.cell(0, 6, f"Baskın M: {result.dominant_m_mm:.2f} mm | t: {result.wall_thickness_mm:.2f} mm", ln=True)
+    pdf.cell(0, 6, f"SDF ortalama/std/çarpıklık: {result.m_mean_mm:.2f} / {result.m_std_mm:.2f} / {result.m_skewness:.2f}", ln=True)
+    pdf.cell(0, 6, f"Şekil faktörü: {result.shape_factor_global:.6f}", ln=True)
     pdf.ln(4)
 
     pdf.set_font(font, "", 13)
-    pdf.cell(0, 8, "Sıcak Noktalar (Hot Spots)", ln=True)
+    pdf.cell(0, 8, "Sıcak Noktalar", ln=True)
     pdf.set_font(font, "", 10)
     if result.hotspots:
         for i, hs in enumerate(result.hotspots, 1):
             pos = ",".join(f"{v:.1f}" for v in hs.position_mm)
-            status = "OK" if hs.feed_ok else "UZAK"
-            pdf.cell(0, 6, f"{i}. Konum=({pos}) mm | M={hs.m_value_mm:.2f} mm | t={hs.t_section_mm:.2f} mm | "
-                           f"Besleme={hs.dist_to_riser_mm:.1f}/{hs.max_feeding_distance_mm:.1f} mm | "
-                           f"Niyama={hs.niyama_min:.2f} | Darcy={hs.darcy_resistance:.1f} | {status}", ln=True)
+            status = "OK" if hs.feed_ok else "UZAK/DARALMA"
+            pdf.cell(0, 6, f"{i}. Konum=({pos}) mm | M={hs.m_value_mm:.2f} ± {hs.m_uncertainty_mm:.2f} mm | "
+                           f"t={hs.t_section_mm:.2f} mm | Besleme={hs.dist_to_riser_mm:.1f}/{hs.max_feeding_distance_mm:.1f} mm | "
+                           f"Niyama={hs.niyama_ensemble:.2f} | Darcy={hs.darcy_resistance:.2f} | {status}", ln=True)
     else:
         pdf.cell(0, 6, "Tespit edilmedi.", ln=True)
     pdf.ln(4)
 
     pdf.set_font(font, "", 13)
-    pdf.cell(0, 8, "Besleyici (Riser) Değerlendirmesi", ln=True)
+    pdf.cell(0, 8, "Besleyici Değerlendirmesi", ln=True)
     pdf.set_font(font, "", 10)
     if result.riser_results:
         for rr in result.riser_results:
@@ -253,7 +274,7 @@ def _generate_report_fpdf2(
         pdf.cell(0, 6, f"Yolluk min kesit: {gr.runner_min_area_cm2:.2f} cm² (min {gr.required_runner_area_cm2:.2f} cm²)", ln=True)
         pdf.cell(0, 6, f"Döküm ağzı: {gr.sprue_base_area_cm2:.2f} cm² (gerekli {gr.required_sprue_area_cm2:.2f} cm²)", ln=True)
         pdf.cell(0, 6, f"Campbell: {'Geçer' if gr.campbell_ok else 'Geçersiz'}", ln=True)
-        pdf.cell(0, 6, f"Bernoulli: {'Geçer' if gr.bernoulli_ok else 'Geçersiz'}", ln=True)
+        pdf.cell(0, 6, f"Bernoulli: {'Geçer' if gr.bernoulli_ok else 'Geçersiz'} (dirkek kaybı: {gr.elbow_count}, {gr.head_loss_mm:.1f} mm)", ln=True)
         pdf.cell(0, 6, f"Meme kalın bölgede: {'Evet' if gr.ingate_on_thick_region else 'Hayır'} "
                        f"(ortalama M={gr.ingate_avg_m_mm:.2f} mm)", ln=True)
         pdf.ln(4)
