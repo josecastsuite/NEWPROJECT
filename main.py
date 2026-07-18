@@ -1,4 +1,4 @@
-"""Entry point for JoseCast Analyzer v5.0."""
+"""Entry point for JoseCast Analyzer v7.0 Titan."""
 
 from ui.main_window import main
 

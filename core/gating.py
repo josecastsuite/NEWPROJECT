@@ -1,18 +1,22 @@
-"""Ingate / runner / sprue geometric gating calculations."""
+"""Ingate / runner / sprue geometric gating calculations - JoseCast v7."""
 
 from typing import Optional
 
 import numpy as np
 from scipy import ndimage
 
+from core.materials import get_material
 from core.types import AnalysisResult, BodyType
 
 
 def _neighbor_offsets_6():
     return [
-        (1, 0, 0), (-1, 0, 0),
-        (0, 1, 0), (0, -1, 0),
-        (0, 0, 1), (0, 0, -1),
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
     ]
 
 
@@ -93,10 +97,17 @@ def _sprue_base_area(sprue_mask: np.ndarray, dx: float) -> float:
     return count * dx * dx
 
 
+def _mean_thickness(mask: np.ndarray, dx: float) -> float:
+    """Mean wall thickness of a voxel set (2 * internal distance transform)."""
+    if not mask.any():
+        return 0.0
+    edt = ndimage.distance_transform_edt(mask) * dx
+    return float(edt[mask].mean()) * 2.0
+
+
 def analyze_gating(
     result: AnalysisResult,
     fill_time_s: float = 10.0,
-    metal_density_g_cm3: float = 7.2,
     discharge_coeff: float = 0.8,
 ) -> Optional[object]:
     """Compute gate/sprue/runner checks."""
@@ -105,8 +116,10 @@ def analyze_gating(
     grid = result.grid
     sdf = result.sdf
     dx = result.dx_mm
+    material = get_material(result.material_key)
 
     part_mask = grid == BodyType.PART
+    ingate = grid == BodyType.INGATE
     runner = grid == BodyType.RUNNER
     sprue = grid == BodyType.SPRUE
 
@@ -115,14 +128,17 @@ def analyze_gating(
 
     runner_min_area_mm2 = _minimum_cross_section_area(runner, dx)
     runner_min_area_cm2 = runner_min_area_mm2 / 100.0
+    runner_thickness_mm = _mean_thickness(runner, dx)
 
     sprue_base_mm2 = _sprue_base_area(sprue, dx)
     sprue_base_cm2 = sprue_base_mm2 / 100.0
 
+    ingate_thickness_mm = _mean_thickness(ingate, dx)
+
     # Part weight for Bernoulli
     part_volume_mm3 = float(part_mask.sum()) * dx ** 3
     part_volume_cm3 = part_volume_mm3 / 1000.0
-    part_weight_g = part_volume_cm3 * metal_density_g_cm3
+    part_weight_g = part_volume_cm3 * material.density_g_cm3
 
     # Sprue height H in cm; fallback to total metal height
     metal_mask = result.is_metal
@@ -137,7 +153,7 @@ def analyze_gating(
     if height_cm > 0 and fill_time_s > 0:
         velocity = np.sqrt(2.0 * g_cgs * height_cm)
         as_req_cm2 = part_weight_g / (
-            metal_density_g_cm3 * discharge_coeff * fill_time_s * velocity
+            material.density_g_cm3 * discharge_coeff * fill_time_s * velocity
         )
     else:
         as_req_cm2 = 0.0
@@ -178,4 +194,6 @@ def analyze_gating(
         ingate_on_thick_region=ingate_on_thick,
         ingate_avg_m_mm=ingate_avg_m,
         ingate_max_m_mm=ingate_max_m,
+        ingate_thickness_mm=ingate_thickness_mm,
+        runner_thickness_mm=runner_thickness_mm,
     )

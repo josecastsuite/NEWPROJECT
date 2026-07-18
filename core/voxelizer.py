@@ -1,16 +1,55 @@
-"""Convert a set of Body meshes into a single labelled voxel grid."""
+"""Convert a set of Body meshes into a single labelled voxel grid - JoseCast v7."""
 
 from typing import List, Optional, Tuple
 
 import numpy as np
 import trimesh
-from scipy import ndimage
 
 from core.types import Body, BodyType
 
+BASE_RES = 160
+MAX_RES = 2040
 
-def _global_bbox(bodies: List[Body], padding: int = 4) -> Tuple[np.ndarray, np.ndarray]:
-    """Return (min, max) of all body vertices in mm with a small integer-voxel padding."""
+
+UNIT_SCALE = {
+    "mm": 1.0,
+    "cm": 10.0,
+    "m": 1000.0,
+    "inch": 25.4,
+}
+
+
+def apply_unit_scale(bodies: List[Body], unit: str) -> float:
+    """Scale all body meshes to millimeters and return the scale factor."""
+    scale = UNIT_SCALE.get(unit, 1.0)
+    if scale == 1.0:
+        return 1.0
+    for b in bodies:
+        b.mesh.apply_scale(scale)
+        b.vertices = b.mesh.vertices.copy()
+        b.center = b.mesh.center_mass if b.mesh.is_watertight else b.mesh.centroid
+        b.volume_cm3 = b.mesh.volume / 1000.0
+    return scale
+
+
+def detect_unit_suggestion(bodies: List[Body]) -> str:
+    """Suggest a unit based on bounding box magnitude."""
+    if not bodies:
+        return "mm"
+    max_size = np.max(
+        np.array([b.mesh.bounds[1] - b.mesh.bounds[0] for b in bodies])
+    )
+    if max_size < 0.05:
+        return "m"
+    if max_size < 5.0:
+        return "cm"
+    if max_size > 5000.0:
+        return "m"  # probably metres, not mm
+    return "mm"
+
+
+def _global_bbox(bodies: List[Body]) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (min, max) of all body vertices in mm."""
     mins = np.vstack([b.mesh.bounds[0] for b in bodies])
     maxs = np.vstack([b.mesh.bounds[1] for b in bodies])
     return mins.min(axis=0), maxs.max(axis=0)
@@ -18,7 +57,7 @@ def _global_bbox(bodies: List[Body], padding: int = 4) -> Tuple[np.ndarray, np.n
 
 def build_voxel_grid(
     bodies: List[Body],
-    target_dim: int = 96,
+    target_dim: int = BASE_RES,
     progress_callback: Optional[callable] = None,
     fix_mesh: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, float, List[Body]]:
@@ -34,7 +73,7 @@ def build_voxel_grid(
     dx_mm : float
         Voxel pitch.
     bodies : List[Body]
-        Bodies with possibly repaired meshes.
+        Bodies with repaired meshes.
     """
     if not bodies:
         raise ValueError("Voxelize edilecek body yok.")
@@ -59,37 +98,32 @@ def build_voxel_grid(
 
         mesh = body.mesh.copy()
         if fix_mesh:
-            # Fill small holes so the voxelization is watertight
             mesh.fill_holes()
             mesh.merge_vertices()
+            mesh.remove_unreferenced_vertices()
 
         if len(mesh.faces) == 0:
             continue
 
-        # Trimesh voxelization returns a VoxelGrid object.
         voxelized = trimesh.voxel.creation.voxelize(mesh, pitch=dx)
         if voxelized is None:
             continue
 
-        # By default Trimesh voxelizes the surface. .fill() makes it a solid grid.
+        # Solid voxelization
         voxelized = voxelized.fill()
         matrix = voxelized.matrix
         if not np.any(matrix):
             continue
 
-        # Trimesh VoxelGrid stores the origin in the 4x4 transform.
+        # Trimesh VoxelGrid origin is in the 4x4 transform
         local_origin = voxelized.transform[:3, 3].astype(np.float64)
 
-        # Map local matrix indices into global grid.
-        # global coord = local_origin + (i,j,k)*dx
-        # global index = (coord - origin) / dx
         offset = (local_origin - origin) / dx
         offset_i = int(round(offset[0]))
         offset_j = int(round(offset[1]))
         offset_k = int(round(offset[2]))
 
         mi, mj, mk = matrix.shape
-        # Clip to grid bounds
         i0 = max(0, offset_i)
         i1 = min(grid.shape[0], offset_i + mi)
         j0 = max(0, offset_j)
@@ -110,7 +144,7 @@ def build_voxel_grid(
         region = matrix[li0:li1, lj0:lj1, lk0:lk1]
         mask = region.astype(bool)
 
-        # Overlapping bodies: later one wins; but in a proper STEP they should not overlap.
+        # Later body wins on overlap
         grid[i0:i1, j0:j1, k0:k1][mask] = int(body.body_type)
 
         repaired_bodies.append(body)

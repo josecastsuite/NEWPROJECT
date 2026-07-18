@@ -1,7 +1,7 @@
 [project]
 name = "josecast-analyzer"
-version = "5.0.0"
-description = "Geometric casting analysis engine using SDF and voxelization."
+version = "7.0.0"
+description = "Titan geometric casting analysis engine with adaptive 160-2040 voxel SDF physics."
 requires-python = ">=3.10"
 dependencies = [
     "cadquery>=2.7.0",
@@ -14,6 +14,9 @@ dependencies = [
     "fpdf2>=2.7.0",
     "pypdf>=4.0.0",
     "Pillow>=10.0.0",
+    "numba>=0.60.0",
+    "scikit-learn>=1.5.0",
+    "weasyprint>=60.0",
 ]
 
 [project.optional-dependencies]

@@ -1,8 +1,8 @@
-"""Shared types and result containers for JoseCast Analyzer v5.0."""
+"""Shared types and result containers for JoseCast Analyzer v7.0 Titan."""
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import trimesh
@@ -49,6 +49,11 @@ class HotSpot:
     dist_to_riser_mm: float
     feed_ok: bool
     max_feeding_distance_mm: float
+    # v7 heavy physics
+    niyama_min: float = 0.0
+    resistance: float = 0.0
+    resistance_ok: bool = True
+    local_sdf_max: float = 0.0
 
 
 @dataclass
@@ -62,6 +67,8 @@ class RiserResult:
     large_enough: bool
     volume_ratio_ok: bool
     nearest_hotspot_position_mm: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    gravity_factor: float = 1.0
+    effective_m_required: float = 0.0
 
 
 @dataclass
@@ -75,6 +82,21 @@ class GateResult:
     ingate_on_thick_region: bool
     ingate_avg_m_mm: float
     ingate_max_m_mm: float
+    # v7
+    ingate_thickness_mm: float = 0.0
+    runner_thickness_mm: float = 0.0
+
+
+@dataclass
+class RefinementRegion:
+    """High-resolution local grid around a single hot spot."""
+    hotspot_index: int
+    origin_mm: np.ndarray
+    dx_mm: float
+    grid: np.ndarray  # local mat_id
+    sdf: np.ndarray
+    niyama: np.ndarray
+    risk: np.ndarray
 
 
 @dataclass
@@ -86,7 +108,18 @@ class AnalysisResult:
     sdf: np.ndarray
     dist_to_riser: np.ndarray
     risk: np.ndarray
+    # v7 physics fields
+    solidification_time: np.ndarray
+    niyama: np.ndarray
+    gradient_magnitude: np.ndarray
     hotspots: List[HotSpot]
     riser_results: List[RiserResult]
     gate_result: Optional[GateResult]
     recommendations: List[str] = field(default_factory=list)
+    # v7 adaptive
+    local_regions: List[RefinementRegion] = field(default_factory=list)
+    material_key: str = "steel"
+    unit_scale: float = 1.0
+    # metadata
+    material_name: str = "Çelik"
+    bbox_size_mm: np.ndarray = field(default_factory=lambda: np.zeros(3))
