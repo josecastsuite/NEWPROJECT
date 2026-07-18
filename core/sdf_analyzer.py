@@ -25,6 +25,7 @@ from core.thermal_solver import solve_3d_thermal
 from core.types import (
     BODY_FEEDER_TYPES,
     BODY_METAL_TYPES,
+    CHILL_BODY_TYPES,
     AnalysisResult,
     Body,
     BodyType,
@@ -299,6 +300,7 @@ def compute_niyama_variants(
     R: np.ndarray,
     t_s: np.ndarray,
     alloy: Alloy,
+    max_time_s: float = 600.0,
 ) -> Dict[str, np.ndarray]:
     """
     Four Niyama-related indicators. The physical classical Niyama is kept as-is;
@@ -306,6 +308,10 @@ def compute_niyama_variants(
     """
     eps = 1e-12
     T_ref = (alloy.t_liquidus_c + alloy.t_solidus_c) / 2.0
+    # Guard against NaN/Inf from the thermal solver before variant arithmetic.
+    G = np.nan_to_num(G, nan=0.0, posinf=0.0, neginf=0.0)
+    R = np.nan_to_num(R, nan=0.0, posinf=0.0, neginf=0.0)
+    t_s = np.nan_to_num(t_s, nan=max_time_s, posinf=max_time_s, neginf=0.0)
     raw = {
         "classical": niyama,
         "coarse": G / (
@@ -1028,6 +1034,15 @@ def analyze(
     part_mask = grid == BodyType.PART
     riser_mask = grid == BodyType.RISER
 
+    # v8.6: exposed part surface area (mold contact) and volume for modulus/riser calculations.
+    part_pad = np.pad(part_mask, 1, constant_values=False)
+    metal_pad = np.pad(is_metal, 1, constant_values=False)
+    exposed_faces = np.zeros_like(part_pad, dtype=int)
+    for di, dj, dk in NEIGH_6:
+        exposed_faces += part_pad & ~np.roll(metal_pad, (di, dj, dk), axis=(0, 1, 2))
+    part_surface_area_mm2 = float(exposed_faces[1:-1, 1:-1, 1:-1].sum()) * dx * dx
+    part_volume_mm3 = float(part_mask.sum()) * dx ** 3
+
     # v8.2: If there is no separate riser, use the gating system (sprue/runner/ingate)
     # as the feeding source for distance/path calculations.
     if riser_mask.any():
@@ -1073,7 +1088,7 @@ def analyze(
         progress_callback(60)
 
     # AŞAMA 4: Niyama family from the 3-D thermal solution
-    niyama_variants = compute_niyama_variants(niyama, G, cooling_rate, t_s, alloy)
+    niyama_variants = compute_niyama_variants(niyama, G, cooling_rate, t_s, alloy, max_time_s=thermal_max_time_s)
     niyama = compute_niyama_ensemble(niyama)
     # v8.5: porosity / Niyama display should be restricted to the part,
     # not to risers/gating, to avoid meaningless artifacts.
@@ -1221,13 +1236,18 @@ def analyze(
             nearest_pos = nearest_hs.position_mm
             nearest_resistance = nearest_hs.darcy_resistance
 
-        m_required = alloy.riser_m_factor * nearest_m
+        # v8.6: existing riser must satisfy both the local hotspot and the global part modulus.
+        m_cast_mm = part_volume_mm3 / part_surface_area_mm2 if part_surface_area_mm2 > 0 else 0.0
+        local_m_required = alloy.riser_m_factor * nearest_m
+        global_m_required = alloy.riser_m_factor * m_cast_mm
+        m_required = max(local_m_required, global_m_required)
         riser_z_mm = float((riser_centroid_vox[2] * dx) + origin_mm[2])
         dz = (riser_z_mm - nearest_pos[2]) if nearest_hs is not None else 0.0
         gravity = max(0.85, 1.0 - 0.005 * max(0, -dz))
         resistance_correction = alloy.modulus_resistance_mm * nearest_resistance
         effective_m_required = m_required * gravity + resistance_correction
-        large_enough = m_riser >= effective_m_required if m_required > 0 else True
+        # Allow 5% engineering tolerance.
+        large_enough = m_riser >= 0.95 * effective_m_required if m_required > 0 else True
 
         required_volume_cm3 = 0.0
         volume_ratio_ok = True
@@ -1265,15 +1285,21 @@ def analyze(
     if progress_callback:
         progress_callback(92)
 
-    # AŞAMA 9: Risk map (probabilistic OR of Niyama risk and feeding distance risk)
+    # AŞAMA 9: Risk map (Niyama risk scaled by feeding deficit)
+    # A low-Niyama region is dangerous only if it cannot be fed.  If a riser/
+    # gating source is close enough, the Niyama risk is strongly suppressed.
     with np.errstate(divide="ignore", invalid="ignore"):
-        niyama_risk = np.clip(1.0 - niyama / alloy.niyama_shrinkage, 0.0, 1.0)
         FD_field = alloy.feed_k1 * (2.0 * M_mod)
-        # Smooth feeding risk: 0 when dist << FD, 0.5 at dist == FD, -> 1 when dist >> FD
+        # feed_risk -> 0 at the feeder, -> 1 far beyond the feeding distance.
         feed_risk = dist_feed / (dist_feed + np.maximum(FD_field, 1.0))
-        feed_risk = np.clip(feed_risk, 0.0, 1.0)
-        risk = 1.0 - (1.0 - niyama_risk) * (1.0 - feed_risk)
-        # v8.5: risk belongs to the part only; risers/gating are not part porosity.
+        feed_risk = np.clip(np.nan_to_num(feed_risk, nan=1.0, posinf=1.0, neginf=1.0), 0.0, 1.0)
+        # Macro shrinkage risk (Niyama < alloy.niyama_macro) scaled by feeding.
+        niyama_macro_risk = np.clip(1.0 - niyama / alloy.niyama_macro, 0.0, 1.0)
+        niyama_micro_risk = np.clip(1.0 - niyama / alloy.niyama_shrinkage, 0.0, 1.0)
+        macro_risk = niyama_macro_risk * feed_risk
+        micro_risk = niyama_micro_risk * feed_risk
+        risk = 1.0 - (1.0 - macro_risk) * (1.0 - micro_risk)
+        # v8.6: risk belongs to the part only; risers/gating/chills are not part porosity.
         risk = np.where(part_mask, risk, 0.0)
         risk = np.nan_to_num(risk, nan=0.0, posinf=0.0, neginf=0.0)
     risk_norm = risk
@@ -1340,6 +1366,8 @@ def analyze(
         casting_params=casting_params,
         thermal_divergence=thermal_divergence,
         bbox_size_mm=bbox_size,
+        part_volume_mm3=part_volume_mm3,
+        part_surface_area_mm2=part_surface_area_mm2,
     )
 
     result.riser_proposals = propose_risers(result, alloy, existing_riser_count=len(riser_results))
@@ -1402,22 +1430,42 @@ def _build_recommendations(
                 "ara bölge daha ince/sıcak. Meme konumunu/kalınlığını gözden geçirin."
             )
         if not hs.darcy_ok:
-            recs.append(
-                f"Hot spot: Darcy basınç kaybı ({hs.darcy_resistance:.2f} Pa) mevcut hidrostatik basıncı aşıyor. "
-                f"Mushy-zone geçirgenliği yetersiz; meme/yol kesitini büyütün veya kısa yol seçin."
-            )
+            if hs.darcy_resistance < 0.01:
+                recs.append(
+                    "Hot spot: Besleme yolunda eriyik oranı çok düşük, katılaşmış bölge geçilemiyor. "
+                    "Mesafeyi kısaltın, kesiti büyütün veya yerel besleyici ekleyin."
+                )
+            else:
+                recs.append(
+                    f"Hot spot: Darcy basınç kaybı ({hs.darcy_resistance:.2f} Pa) mevcut hidrostatik basıncı aşıyor. "
+                    f"Mushy-zone geçirgenliği yetersiz; meme/yol kesitini büyütün veya kısa yol seçin."
+                )
 
         niy = hs.niyama_ensemble
         if niy < alloy.niyama_macro:
-            recs.append(
-                f"Hot spot: Niyama {niy:.2f} < {alloy.niyama_macro} -> "
-                f"makro shrinkage / çekinti riski çok yüksek."
-            )
+            if hs.feed_ok and hs.darcy_ok:
+                recs.append(
+                    f"Hot spot: Niyama {niy:.2f} < {alloy.niyama_macro} ama "
+                    f"besleyici ile beslenebiliyor. Mikro çekinti/porozite için "
+                    f"besleyici hacim/boyun kontrolü yapın."
+                )
+            else:
+                recs.append(
+                    f"Hot spot: Niyama {niy:.2f} < {alloy.niyama_macro} -> "
+                    f"makro shrinkage / çekinti riski yüksek; besleme yetersiz."
+                )
         elif niy < alloy.niyama_shrinkage:
-            recs.append(
-                f"Hot spot: Niyama {niy:.2f} < {alloy.niyama_shrinkage} -> "
-                f"mikro gözenek / shrinkage porozite riski."
-            )
+            if hs.feed_ok and hs.darcy_ok:
+                recs.append(
+                    f"Hot spot: Niyama {niy:.2f} < {alloy.niyama_shrinkage}; "
+                    f"besleyici var ancak mikro gözenek / shrinkage porozite riski "
+                    f"takip edilmeli."
+                )
+            else:
+                recs.append(
+                    f"Hot spot: Niyama {niy:.2f} < {alloy.niyama_shrinkage} -> "
+                    f"mikro gözenek / shrinkage porozite riski."
+                )
 
     for rr in result.riser_results:
         if not rr.large_enough:

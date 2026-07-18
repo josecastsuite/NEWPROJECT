@@ -313,9 +313,10 @@ class MainWindow(QtWidgets.QMainWindow):
         _params_labeled(self.t_mold_spin, "Kalıp sıcaklığı T_mold (°C):")
 
         self.t_fill_spin = QtWidgets.QDoubleSpinBox()
-        self.t_fill_spin.setRange(0.1, 300.0)
+        self.t_fill_spin.setRange(0.0, 300.0)
         self.t_fill_spin.setDecimals(1)
-        self.t_fill_spin.setValue(10.0)
+        self.t_fill_spin.setValue(0.0)
+        self.t_fill_spin.setSpecialValueText("Otomatik")
         _params_labeled(self.t_fill_spin, "Döküm süresi t_fill (s):")
 
         self.rho_spin = QtWidgets.QDoubleSpinBox()
@@ -770,39 +771,15 @@ class MainWindow(QtWidgets.QMainWindow):
             "SPRUE_BASE": "Döküm ağzı tabanı",
         }
         recs = []
-        if not gr.runner_ok:
-            short_pct = 0
-            if gr.required_runner_area_cm2 > 0:
-                short_pct = int(
-                    ((gr.required_runner_area_cm2 - gr.runner_min_area_cm2) / gr.required_runner_area_cm2) * 100
-                )
-            recs.append(
-                f"Yolluk (runner) kesiti küçük: {gr.runner_min_area_cm2:.2f} cm², "
-                f"gerekli {gr.required_runner_area_cm2:.2f} cm². Yol kesitini %{short_pct} büyüt."
-            )
-        if not gr.bernoulli_ok:
-            recs.append(
-                f"Döküm ağzı boğaz alanı {gr.sprue_throat_area_cm2:.2f} cm² < gerekli {gr.required_sprue_area_cm2:.2f} cm². "
-                f"Döküm ağzını büyüt (dirsek kaybı {gr.head_loss_mm:.1f} mm dikkate alınarak)."
-            )
+        # Geometry / location notes only; do not force area changes.
         if gr.ingate_on_thick_region:
             recs.append(
-                f"Meme kalın bölgede (ortalama M={gr.ingate_avg_m_mm:.2f} mm). İnce kesite taşıyın."
+                f"Not: giriş/kontakt bölgesi kalın kesimde (ortalama M={gr.ingate_avg_m_mm:.2f} mm)."
             )
-        if not gr.ingate_ok and not gr.ingate_on_thick_region:
-            recs.append(
-                f"Meme toplam temas alanı {gr.total_ingate_contact_area_cm2:.2f} cm², "
-                f"minimum {gr.required_ingate_area_cm2:.2f} cm² önerilir."
-            )
-        # v8.4: gating system type and wall-thickness recommendation
         if getattr(gr, "gating_system_reason", ""):
             recs.append(gr.gating_system_reason)
-            if gr.detected_gating_system and gr.recommended_gating_system and gr.detected_gating_system != gr.recommended_gating_system:
-                recs.append(
-                    f"Sistem uyuşmazlığı: {gr.detected_gating_system} tespit edildi, "
-                    f"{gr.recommended_gating_system} önerilir."
-                )
-        # v8.4: per-section velocity / Re / Fr report with target ranges
+
+        # Per-section velocity / Re / Fr report with reference target ranges.
         for key, sf in getattr(gr, "section_flows", {}).items():
             if sf.area_cm2 <= 0:
                 continue
@@ -812,34 +789,29 @@ class MainWindow(QtWidgets.QMainWindow):
             target = ""
             if sf.target_v_min_m_s > 0 and sf.target_v_max_m_s > 0:
                 target = (
-                    f" hedef v={sf.target_v_min_m_s:.1f}-{sf.target_v_max_m_s:.1f} m/s, "
-                    f"A={sf.target_area_min_cm2:.2f}-{sf.target_area_max_cm2:.2f} cm²"
+                    f" (referans v={sf.target_v_min_m_s:.1f}-{sf.target_v_max_m_s:.1f} m/s, "
+                    f"A={sf.target_area_min_cm2:.2f}-{sf.target_area_max_cm2:.2f} cm²)"
                 )
+            turb_note = ""
             if sf.turbulent:
-                recs.append(
-                    f"{name} hızı {sf.velocity_m_s:.2f} m/s ile yüksek; Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}. "
-                    f"Türbülans / hava kaçırma riski. Kesit alanını büyüt veya döküm süresini artırın.{target}"
-                )
-            else:
-                recs.append(
-                    f"{name}: v={sf.velocity_m_s:.2f} m/s, Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, "
-                    f"A={sf.area_cm2:.2f} cm² -> türbülans yok.{target}"
-                )
-        if hasattr(gr, "velocity_fill_time_match_ok") and not gr.velocity_fill_time_match_ok:
-            t_fill = self._analysis.casting_params.t_fill_s if self._analysis and self._analysis.casting_params else 0.0
-            compatible_v = 0.0
-            if t_fill > 0 and gr.ingate_fill_time_s > 0:
-                compatible_v = gr.ingate_velocity_m_s * gr.ingate_fill_time_s / t_fill
-            section_name = section_names.get(getattr(gr, "selected_section_key", "INGATE"), "Seçili kesit")
+                turb_note = " - yüksek türbülans notu"
             recs.append(
-                f"Girilen {section_name} hızı ({gr.ingate_velocity_m_s:.2f} m/s) ile döküm süresi ({gr.ingate_fill_time_s:.1f}s) tutarsız. "
-                f"t_fill ile uyumlu hız: {compatible_v:.2f} m/s, gerekli seçili kesit alanı {gr.required_ingate_area_for_velocity_cm2:.2f} cm². "
-                "Kesit alanını veya döküm süresini ayarlayın."
+                f"{name}: v={sf.velocity_m_s:.2f} m/s, Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, "
+                f"A={sf.area_cm2:.2f} cm²{turb_note}.{target}"
             )
+
         if gr.ingate_velocity_m_s > 0:
             recs.append(
-                f"Toplam debi Q={gr.ingate_flow_rate_m3_s*1e3:.2f} L/s, doldurma süresi={gr.ingate_fill_time_s:.2f}s. "
-                f"Meme max güvenli hız={gr.ingate_max_velocity_m_s:.2f} m/s."
+                f"Toplam debi Q={gr.ingate_flow_rate_m3_s*1e3:.2f} L/s, doldurma süresi={gr.ingate_fill_time_s:.2f}s, "
+                f"maks. güvenli meme hızı={gr.ingate_max_velocity_m_s:.2f} m/s."
+            )
+
+        # v8.6: practical auto + Campbell fill times
+        if getattr(gr, "auto_fill_time_s", 0.0) > 0:
+            recs.append(
+                f"Dolum süresi: kullanılan {gr.ingate_fill_time_s:.2f} s, "
+                f"pratik öneri {gr.auto_fill_time_s:.2f} s, "
+                f"Campbell önerisi {getattr(gr, 'campbell_fill_time_s', 0.0):.2f} s."
             )
         return recs
 

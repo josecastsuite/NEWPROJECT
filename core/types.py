@@ -54,26 +54,33 @@ BODY_TYPE_LABELS = {
     BodyType.POURING_BASIN: "DÖKÜM HAVZASI",
 }
 
-# Body types that contain liquid metal (CORE and FILTER are non-metal).
-BODY_METAL_TYPES = [
+# Body types that contain liquid metal during pouring (part + gating + riser).
+# CORE, FILTER and COOLING_SPRUE are not part of the liquid metal domain: the
+# latter is a chill insert and should be treated as a heat sink, not as metal.
+BODY_CASTING_METAL_TYPES = [
     BodyType.PART,
     BodyType.RISER,
     BodyType.INGATE,
     BodyType.RUNNER,
     BodyType.SPRUE,
-    BodyType.COOLING_SPRUE,
     BodyType.POURING_BASIN,
 ]
 
-# Body types that can act as a feeding source if no separate riser exists.
+# Backwards-compatible alias; cooling sprue and filter are excluded from
+# geometric/thermal metal domain.
+BODY_METAL_TYPES = BODY_CASTING_METAL_TYPES
+
+# Body types that can act as a feeding source.
 BODY_FEEDER_TYPES = [
     BodyType.RISER,
     BodyType.INGATE,
     BodyType.RUNNER,
     BodyType.SPRUE,
-    BodyType.COOLING_SPRUE,
     BodyType.POURING_BASIN,
 ]
+
+# Inserts that accelerate local cooling and must never be treated as feeders.
+CHILL_BODY_TYPES = [BodyType.COOLING_SPRUE]
 
 
 @dataclass
@@ -220,9 +227,12 @@ class GateResult:
     recommended_gating_system: str = ""
     wall_thickness_category: str = ""
     gating_system_reason: str = ""
-    # v8.5: mass/head/fill-time design cross-check (gating_calculator_tr.py)
+    # v8.5/v8.6: fill-time design (gating_calculator_tr.py + Filling_time_tr.py)
     recommended_fill_time_s: float = 0.0
     fill_time_basis: str = ""
+    auto_fill_time_s: float = 0.0
+    campbell_fill_time_s: float = 0.0
+    campbell_fill_time_basis: str = ""
     head_reduction_percent: float = 0.0
     total_poured_mass_kg: float = 0.0
     pouring_yield: float = 0.0
@@ -294,6 +304,9 @@ class AnalysisResult:
     niyama_variants: Dict[str, np.ndarray] = field(default_factory=dict)
     elapsed_s: float = 0.0
     casting_params: Optional[CastingParameters] = None
+    # v8.6: global part geometry for riser/modulus calculations
+    part_volume_mm3: float = 0.0
+    part_surface_area_mm2: float = 0.0
     thermal_divergence: np.ndarray = field(default_factory=lambda: np.array([]))
     riser_proposals: List[RiserProposal] = field(default_factory=list)
     # metadata

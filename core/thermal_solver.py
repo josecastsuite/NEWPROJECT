@@ -164,12 +164,26 @@ def solve_3d_thermal(
     nx, ny, nz = grid_c.shape
     n = nx * ny * nz
 
-    is_metal_c = np.isin(grid_c, [1, 3, 5, 6, 7])  # PART, RISER, INGATE, RUNNER, SPRUE
+    # Casting metal: part + riser + ingate + runner + sprue + pouring basin.
+    # Chill (cooling sprue) and filter are NOT liquid metal and are handled below.
+    casting_metal_ids = [1, 3, 5, 6, 7, 15]
+    is_metal_c = np.isin(grid_c, casting_metal_ids)
+    chill_mask_3d = grid_c == 11  # COOLING_SPRUE
 
     rho = np.where(is_metal_c, alloy.rho_kg_m3, mold.rho_kg_m3).astype(np.float64).ravel()
     k = np.where(is_metal_c, alloy.k_w_mk, mold.k_w_mk).astype(np.float64)
     T = np.where(is_metal_c, alloy.t_pour_c, mold.t0_c).astype(np.float64)
     T0 = float(mold.t0_c)
+
+    # Treat a cooling sprue as a steel/cast-iron chill insert at the mould temperature.
+    # It extracts heat like a high-conductivity metal but never melts.
+    if np.any(chill_mask_3d):
+        rho_chill = 7850.0
+        k_chill = 45.0
+        cp_chill = 460.0
+        rho[chill_mask_3d.ravel()] = rho_chill
+        k[chill_mask_3d] = k_chill
+        T[chill_mask_3d] = T0
 
     # Boundary mask: fixed-temperature outer shell
     boundary = np.zeros((nx, ny, nz), dtype=bool)
@@ -203,6 +217,9 @@ def solve_3d_thermal(
     for step in range(n_steps):
         T_old = T.copy()
         cp_eff = _cp_eff(T_old, is_metal_c, alloy, mold).ravel()
+        # Cooling sprue cp stays as a solid metal (no latent heat).
+        if np.any(chill_mask_3d):
+            cp_eff[chill_mask_3d.ravel()] = cp_chill
         C = rho * cp_eff
 
         # (C I - dt A) T_new = C T_old
@@ -223,6 +240,8 @@ def solve_3d_thermal(
         else:
             # Fallback to a direct sparse solve if CG fails to converge
             T_new = spla.spsolve(M, b).reshape((nx, ny, nz))
+        # Guard against NaN/Inf from the linear solver before clipping/gradient.
+        T_new = np.nan_to_num(T_new, nan=T0, posinf=alloy.t_pour_c, neginf=T0)
         T_new = np.clip(T_new, T0, alloy.t_pour_c)
 
         # Record solidification times and local G/R

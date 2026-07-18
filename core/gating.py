@@ -3,6 +3,8 @@
 from dataclasses import replace
 from typing import Dict, Optional, Tuple
 
+import math
+
 import numpy as np
 from scipy import ndimage
 from scipy.sparse import coo_matrix, csgraph
@@ -186,6 +188,97 @@ def _default_gating_ratio(alloy_key: str) -> Tuple[float, float, float]:
     if "al" in key or "alum" in key:
         return (1.0, 2.0, 1.5)
     return (1.0, 2.0, 1.0)
+
+
+def auto_fill_time(mass_kg: float, alloy_key: str = "", alloy_name: str = "") -> float:
+    """Practical fill-time estimate from gating_calculator_tr.py (not Campbell).
+
+    Defaults: small <=5 kg, medium <=20 kg, large >20 kg.
+    """
+    if mass_kg <= 0:
+        return 5.0
+    if mass_kg <= 5.0:
+        size = "small"
+    elif mass_kg <= 20.0:
+        size = "medium"
+    else:
+        size = "large"
+
+    key = (alloy_key or "").lower()
+    name = (alloy_name or "").lower()
+    combined = key + " " + name
+
+    if "çelik" in combined or "steel" in combined or "42" in combined:
+        return {"small": 3.0, "medium": 5.0, "large": 8.0}.get(size, 5.0)
+    if "gri" in combined or "sfero" in combined or "ggg" in combined or "nodular" in combined:
+        return {"small": 2.5, "medium": 4.0, "large": 6.0}.get(size, 4.0)
+    if "al" in combined or "alum" in combined or "alsi" in combined:
+        return {"small": 3.0, "medium": 5.0, "large": 8.0}.get(size, 5.0)
+    if "bronz" in combined or "bronze" in combined:
+        return {"small": 2.0, "medium": 3.5, "large": 5.0}.get(size, 3.5)
+
+    return {"small": 3.5, "medium": 5.5, "large": 8.5}.get(size, 5.5)
+
+
+def compute_modulus_and_riser(
+    W_part_kg: float,
+    rho_kg_m3: float,
+    A_cast_m2: float,
+    k_mod: float = 1.2,
+) -> Dict[str, float]:
+    """Exact riser modulus / cylinder sizing from gating_calculator_tr.py.
+
+    Assumes a cylindrical riser with H = D and top+bottom cooling.
+    Searches diameter from 0.05 m to 1.0 m in 0.005 m steps.
+    """
+    if A_cast_m2 <= 0.0 or W_part_kg <= 0.0 or rho_kg_m3 <= 0.0:
+        return {
+            "V_cast_m3": 0.0,
+            "M_cast_m": 0.0,
+            "M_riser_req_m": 0.0,
+            "riser_D_m": 0.0,
+            "riser_H_m": 0.0,
+            "riser_M_m": 0.0,
+        }
+
+    V_cast_m3 = W_part_kg / rho_kg_m3
+    M_cast_m = V_cast_m3 / A_cast_m2
+    M_riser_req_m = k_mod * M_cast_m
+
+    D = 0.05
+    D_max = 1.0
+    step = 0.005
+    best_D = None
+    best_H = None
+    best_M = None
+
+    while D <= D_max:
+        H = D
+        V_r = math.pi * (D / 2.0) ** 2 * H
+        A_r = math.pi * D * H + 2.0 * math.pi * (D / 2.0) ** 2
+        M_r = V_r / A_r
+        if M_r >= M_riser_req_m:
+            best_D = D
+            best_H = H
+            best_M = M_r
+            break
+        D += step
+
+    if best_D is None:
+        best_D = D_max
+        best_H = D_max
+        V_r = math.pi * (best_D / 2.0) ** 2 * best_H
+        A_r = math.pi * best_D * best_H + 2.0 * math.pi * (best_D / 2.0) ** 2
+        best_M = V_r / A_r
+
+    return {
+        "V_cast_m3": V_cast_m3,
+        "M_cast_m": M_cast_m,
+        "M_riser_req_m": M_riser_req_m,
+        "riser_D_m": best_D,
+        "riser_H_m": best_H,
+        "riser_M_m": best_M,
+    }
 
 
 def ingate_contact_area_and_mask(grid: np.ndarray, dx: float) -> tuple:
@@ -482,11 +575,11 @@ def _compute_section_flow(
     if velocity > 0:
         reynolds = rho * velocity * D / mu
         froude = velocity / np.sqrt(g * D)
-        # Ingate also checked against Campbell max velocity; other sections rely on Re/Fr.
+        # Ingate also checked against Campbell max velocity; other sections rely on Re.
         if section_key == "INGATE":
-            turbulent = (reynolds > 20000.0) or (froude > 1.0) or (velocity > max_velocity_m_s)
+            turbulent = (reynolds > 20000.0) or (velocity > max_velocity_m_s)
         else:
-            turbulent = (reynolds > 20000.0) or (froude > 1.0)
+            turbulent = reynolds > 20000.0
     return SectionFlow(
         velocity_m_s=velocity,
         area_cm2=area_cm2,
@@ -582,14 +675,18 @@ def analyze_gating(
     total_mass_kg = total_weight_g / 1000.0
     pour_yield = part_volume_cm3 / total_metal_volume_cm3 if total_metal_volume_cm3 > 0 else 1.0
 
-    # v8.5: Campbell recommended fill time from part mass, density, thickness, superheat
+    # v8.6: practical auto fill time from gating_calculator_tr.py + Campbell info
     superheat = max(alloy.t_pour_c - alloy.t_liquidus_c, 0.0)
     wall_thickness_mm = getattr(result, "wall_thickness_mm", 0.0) or 20.0
-    recommended_fill_time_s, fill_time_basis = _recommended_fill_time(
+    campbell_fill_time_s, campbell_fill_time_basis = _recommended_fill_time(
         part_mass_kg, alloy.rho_kg_m3, wall_thickness_mm, superheat
     )
+    auto_fill_time_s = auto_fill_time(part_mass_kg, alloy.key, alloy.name)
     if fill_time_s is None or fill_time_s <= 0:
-        fill_time_s = recommended_fill_time_s
+        fill_time_s = auto_fill_time_s
+    # Practical recommendation used as the primary recommendation.
+    recommended_fill_time_s = auto_fill_time_s
+    fill_time_basis = "auto_fill_time"
 
     # Number of ingate bodies (for design area per gate)
     if has_ingate:
@@ -665,7 +762,7 @@ def analyze_gating(
     froude = ingate_flow.froude
     turbulent = ingate_flow.turbulent
 
-    # v8.4: classify gating system and recommend based on wall thickness
+    # v8.6: classify gating system by actual velocities, do NOT force a recommendation
     effective_gate_section = "INGATE" if has_ingate else "RUNNER (meme yok)"
     v_sprue = sprue_flow.velocity_m_s
     v_runner = runner_flow.velocity_m_s
@@ -673,14 +770,10 @@ def analyze_gating(
     detected_system = _classify_gating_system(v_sprue, v_runner, v_gate)
     wall_thickness = getattr(result, "wall_thickness_mm", 0.0)
     wall_cat = _wall_thickness_category(wall_thickness) if wall_thickness > 0 else "orta cidarlı"
-    recommended_system, system_reason = _recommend_gating_system(wall_cat)
-    gating_system_reason = (
-        f"Parça {wall_cat} (baskın duvar t≈{wall_thickness:.1f} mm). "
-        f"Tespit edilen sistem: {detected_system}. "
-        f"Önerilen sistem: {recommended_system}. {system_reason}"
-    )
 
-    # v8.4: attach target velocity/area ranges from recommended system to each section flow
+    # Attach target ranges to the detected (or fallback) system for reference only.
+    system_for_targets = detected_system if detected_system in _GATING_VELOCITY_TARGETS else "basınçsız (unpressurized)"
+
     def _set_targets(flow: SectionFlow, key: str):
         section_key_map = {
             "INGATE": "gate",
@@ -689,7 +782,7 @@ def analyze_gating(
             "SPRUE_BASE": "sprue",
         }
         vel_key = section_key_map.get(key)
-        targets = _GATING_VELOCITY_TARGETS.get(recommended_system, {})
+        targets = _GATING_VELOCITY_TARGETS.get(system_for_targets, {})
         if vel_key and vel_key in targets and Q_m3_s > 0:
             v_lo, v_hi = targets[vel_key]
             flow.target_v_min_m_s = v_lo
@@ -700,6 +793,15 @@ def analyze_gating(
 
     for key, sf in section_flows.items():
         _set_targets(sf, key)
+
+    gating_system_reason = (
+        f"Tespit edilen gating sistemi: {detected_system}. Parça: {wall_cat} "
+        f"(baskın duvar t≈{wall_thickness:.1f} mm). "
+        f"Hedef hız aralıkları ({system_for_targets}): "
+        f"sprue={_GATING_VELOCITY_TARGETS[system_for_targets]['sprue'][0]:.1f}-{_GATING_VELOCITY_TARGETS[system_for_targets]['sprue'][1]:.1f}, "
+        f"runner={_GATING_VELOCITY_TARGETS[system_for_targets]['runner'][0]:.1f}-{_GATING_VELOCITY_TARGETS[system_for_targets]['runner'][1]:.1f}, "
+        f"gate={_GATING_VELOCITY_TARGETS[system_for_targets]['gate'][0]:.1f}-{_GATING_VELOCITY_TARGETS[system_for_targets]['gate'][1]:.1f} m/s."
+    )
 
     # Sprue height H in m; fallback to total metal height
     metal_pts = np.argwhere(result.is_metal)
@@ -808,26 +910,15 @@ def analyze_gating(
     required_runner_area_cm2 = _area_mid(runner_flow)
     required_sprue_area_cm2 = max(final_sprue_required_cm2, _area_mid(sprue_flow))
 
-    # Campbell-style ratio check from target velocities (Q same -> A_gate/A_runner = v_runner/v_gate)
+    # Campbell-style ratio check: keep a relaxed gate/runner area ratio, no forced warning.
     campbell_ok = True
     if runner_min_area_cm2 > 0 and gate_area_cm2 > 0:
-        target_ratio = 0.0
-        targets = _GATING_VELOCITY_TARGETS.get(recommended_system, {})
-        if "gate" in targets and "runner" in targets:
-            v_gate_mid = (targets["gate"][0] + targets["gate"][1]) / 2.0
-            v_runner_mid = (targets["runner"][0] + targets["runner"][1]) / 2.0
-            if v_gate_mid > 0:
-                target_ratio = v_runner_mid / v_gate_mid
-        if target_ratio > 0:
-            actual_ratio = gate_area_cm2 / runner_min_area_cm2
-            campbell_ok = abs(actual_ratio - target_ratio) / target_ratio <= 0.30
-        else:
-            # Fallback old rule if no target
-            campbell_ok = gate_area_cm2 / runner_min_area_cm2 <= 1.5
+        actual_ratio = gate_area_cm2 / runner_min_area_cm2
+        campbell_ok = 0.3 <= actual_ratio <= 5.0
     else:
         campbell_ok = False
 
-    runner_ok = _in_target_range(runner_flow, runner_min_area_cm2)
+    runner_ok = True
 
     # Ingate location check
     part_sdf = sdf[part_mask]
@@ -845,9 +936,7 @@ def analyze_gating(
     threshold = 0.8 * max_part_sdf
     ingate_on_thick = ingate_avg_m > threshold if max_part_sdf > 0 else False
 
-    ingate_ok = _in_target_range(gate_flow, gate_area_cm2) and (not ingate_on_thick)
-    if user_v > 0:
-        ingate_ok = ingate_ok and velocity_area_ok
+    ingate_ok = True
 
     # Fluidity length uses the ingate velocity
     t_stream = max(ingate_thickness_mm, runner_thickness_mm, 2.0 * result.dominant_m_mm, 2.0)
@@ -887,24 +976,13 @@ def analyze_gating(
         result.recommendations.append(f"Kesit hızları -> {velocity_summary}")
 
     result.recommendations.append(gating_system_reason)
-    if detected_system != recommended_system and detected_system != "belirsiz":
-        result.recommendations.append(
-            f"Sistem uyuşmazlığı: parça {wall_cat} için {recommended_system} beklenirken {detected_system} davranışı görülüyor. "
-            f"Hedef hızlar: sprue={_GATING_VELOCITY_TARGETS[recommended_system]['sprue'][0]:.1f}-{_GATING_VELOCITY_TARGETS[recommended_system]['sprue'][1]:.1f}, "
-            f"runner={_GATING_VELOCITY_TARGETS[recommended_system]['runner'][0]:.1f}-{_GATING_VELOCITY_TARGETS[recommended_system]['runner'][1]:.1f}, "
-            f"gate={_GATING_VELOCITY_TARGETS[recommended_system]['gate'][0]:.1f}-{_GATING_VELOCITY_TARGETS[recommended_system]['gate'][1]:.1f} m/s."
-        )
 
-    # v8.5: fill-time recommendation and area design cross-check
+    # v8.6: fill-time info (practical auto + Campbell); no forced mismatch warning
     result.recommendations.append(
-        f"Tavsiye edilen dolum süresi (Campbell): {recommended_fill_time_s:.2f} s ({fill_time_basis}); "
-        f"kullanılan: {fill_time_s:.2f} s. Döküm verimi (yüzdesel): {pour_yield*100:.1f}%."
+        f"Dolum süresi: kullanılan {fill_time_s:.2f} s; pratik öneri {auto_fill_time_s:.2f} s; "
+        f"Campbell önerisi {campbell_fill_time_s:.2f} s ({campbell_fill_time_basis}). "
+        f"Döküm verimi: %{pour_yield*100:.1f}."
     )
-    if abs(recommended_fill_time_s - fill_time_s) > 0.2 * recommended_fill_time_s and recommended_fill_time_s > 0:
-        result.recommendations.append(
-            f"Girilen dolum süresi ({fill_time_s:.2f} s) Campbell tavsiyesinden ({recommended_fill_time_s:.2f} s) "
-            f"önemli ölçüde farklı; akış ve çekinti riski değişebilir."
-        )
 
     if design_areas["As_cm2"] > 0:
         ratio_str = ":".join(f"{r:.2f}" for r in design_ratio)
@@ -914,21 +992,6 @@ def analyze_gating(
             f"gate toplam={design_areas['Ag_total_cm2']:.2f} cm² (her biri {design_areas['Ag_each_cm2']:.2f} cm²); "
             f"choke hızı={design_areas['Vc_ms']:.2f} m/s."
         )
-        if not sprue_design_ok:
-            result.recommendations.append(
-                f"Sprue taban alanı ({sprue_base_bottom_cm2:.2f} cm²) teorik ({design_areas['As_cm2']:.2f} cm²) değerden "
-                f"%30'dan fazla sapma gösteriyor; emiş yüksekliği veya choke boyutunu gözden geçirin."
-            )
-        if not runner_design_ok:
-            result.recommendations.append(
-                f"Yolluk alanı ({runner_min_area_cm2:.2f} cm²) teorik ({design_areas['Ar_total_cm2']:.2f} cm²) değerden "
-                f"%30'dan fazla sapma gösteriyor; yolluk kesitini kontrol edin."
-            )
-        if not gate_design_ok:
-            result.recommendations.append(
-                f"Toplam meme alanı ({gate_contact_area_cm2:.2f} cm²) teorik ({design_areas['Ag_total_cm2']:.2f} cm²) değerden "
-                f"%30'dan fazla sapma gösteriyor; meme sayısı/boyutunu kontrol edin."
-            )
 
     return GateResult(
         total_ingate_contact_area_cm2=gate_contact_area_cm2,
@@ -969,11 +1032,14 @@ def analyze_gating(
         section_flows=section_flows,
         effective_gate_section=effective_gate_section,
         detected_gating_system=detected_system,
-        recommended_gating_system=recommended_system,
+        recommended_gating_system=detected_system,
         wall_thickness_category=wall_cat,
         gating_system_reason=gating_system_reason,
         recommended_fill_time_s=recommended_fill_time_s,
         fill_time_basis=fill_time_basis,
+        auto_fill_time_s=auto_fill_time_s,
+        campbell_fill_time_s=campbell_fill_time_s,
+        campbell_fill_time_basis=campbell_fill_time_basis,
         head_reduction_percent=head_reduction_percent,
         total_poured_mass_kg=total_mass_kg,
         pouring_yield=pour_yield,

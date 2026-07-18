@@ -131,7 +131,7 @@ def _format_gate_table(result: AnalysisResult) -> str:
         "basınçlı (pressurized)": {"sprue": (1.0, 1.2), "runner": (1.2, 1.5), "gate": (1.8, 2.5)},
         "basınçsız (unpressurized)": {"sprue": (1.5, 2.0), "runner": (0.8, 1.2), "gate": (0.4, 0.7)},
         "yarı basınçlı (semi-pressurized)": {"sprue": (1.2, 1.5), "runner": (0.6, 1.0), "gate": (0.9, 1.2)},
-    }.get(gr.recommended_gating_system, {})
+    }.get(gr.detected_gating_system, {})
     target_text = ""
     if system_targets:
         target_text = (
@@ -154,13 +154,15 @@ def _format_gate_table(result: AnalysisResult) -> str:
         if v_gate_mid > 0:
             target_ratio = v_runner_mid / v_gate_mid
 
+    auto_fill = getattr(gr, "auto_fill_time_s", gr.recommended_fill_time_s)
+    campbell_fill = getattr(gr, "campbell_fill_time_s", 0.0)
     return f""""
     <table>
         <tr><th>Parametre</th><th>Değer</th><th>Durum / Gerekli</th></tr>
         <tr><td>Seçili giriş kesiti</td><td>{selected_section}</td><td>v = {gr.ingate_velocity_m_s:.2f} m/s</td></tr>
         <tr><td>Efektif gate kesiti</td><td>{gr.effective_gate_section}</td><td>-</td></tr>
-        <tr><td>Tespit edilen / Önerilen sistem</td><td>{gr.detected_gating_system} / {gr.recommended_gating_system}</td><td>Cidar: {gr.wall_thickness_category}</td></tr>
-        <tr><td>Önerilen sistem hedef hızları</td><td>{target_text}</td><td>-</td></tr>
+        <tr><td>Tespit edilen sistem</td><td>{gr.detected_gating_system}</td><td>Cidar: {gr.wall_thickness_category}</td></tr>
+        <tr><td>Referans hedef hızları</td><td>{target_text}</td><td>-</td></tr>
         <tr><td>Gate alanı (Ag)</td><td>{gate_flow.area_cm2:.2f} cm²</td><td>{_target_range(gate_flow)}</td></tr>
         <tr><td>Yolluk min kesit alanı (Ar)</td><td>{gr.runner_min_area_cm2:.2f} cm²</td><td>{_target_range(runner_flow)}</td></tr>
         <tr><td>Döküm ağzı boğaz alanı (As)</td><td>{gr.sprue_throat_area_cm2:.2f} cm²</td><td>gerekli {gr.required_sprue_area_cm2:.2f} cm²</td></tr>
@@ -172,10 +174,10 @@ def _format_gate_table(result: AnalysisResult) -> str:
         <tr><td>Campbell (Ag/Ar) kontrolü</td><td>{'Geçer' if gr.campbell_ok else 'Geçersiz'}</td><td>hedef oran {target_ratio:.2f}</td></tr>
         <tr><td>Bernoulli döküm ağzı kontrolü</td><td>{'Geçer' if gr.bernoulli_ok else 'Geçersiz'}</td><td>As ≥ gerekli</td></tr>
         <tr><td>Dirsek kaybı (K·v²/2g)</td><td>{gr.elbow_count} dirsek, {gr.head_loss_mm:.1f} mm kayıp</td><td>efektif H={gr.effective_head_mm:.1f} mm</td></tr>
-        <tr><td>Meme kalın bölgede</td><td>{'Evet' if gr.ingate_on_thick_region else 'Hayır'} (ortalama M={gr.ingate_avg_m_mm:.2f} mm)</td><td>Hayır olmalı</td></tr>
+        <tr><td>Meme kalın bölgede</td><td>{'Evet' if gr.ingate_on_thick_region else 'Hayır'} (ortalama M={gr.ingate_avg_m_mm:.2f} mm)</td><td>-</td></tr>
         <tr><td>Meme kalınlığı</td><td>{gr.ingate_thickness_mm:.2f} mm</td><td>-</td></tr>
         <tr><td>Yolluk kalınlığı</td><td>{gr.runner_thickness_mm:.2f} mm</td><td>-</td></tr>
-        <tr><td>Tavsiye edilen dolum süresi (Campbell)</td><td>{gr.recommended_fill_time_s:.2f} s</td><td>basis: {gr.fill_time_basis}</td></tr>
+        <tr><td>Dolum süresi</td><td>kullanılan {gr.ingate_fill_time_s:.2f} s</td><td>pratik {auto_fill:.2f} s, Campbell {campbell_fill:.2f} s</td></tr>
         <tr><td>Toplam dökülen kütle / verim</td><td>{gr.total_poured_mass_kg:.3f} kg</td><td>% {gr.pouring_yield*100:.1f}</td></tr>
         <tr><td>Teorik As (sprue taban)</td><td>{gr.design_sprue_base_area_cm2:.2f} cm²</td><td>gerçek {gr.sprue_base_area_cm2:.2f} cm²</td></tr>
         <tr><td>Teorik Ar (yolluk)</td><td>{gr.design_runner_area_cm2:.2f} cm²</td><td>gerçek {gr.runner_min_area_cm2:.2f} cm²</td></tr>
@@ -458,14 +460,14 @@ def _generate_report_fpdf2(
         pdf.set_font(font, "", 10)
         pdf.cell(0, 6, f"Secili giris kesiti: {getattr(gr, 'selected_section_key', 'INGATE')}, v={gr.ingate_velocity_m_s:.2f} m/s", ln=True)
         pdf.cell(0, 6, f"Efektif gate kesiti: {getattr(gr, 'effective_gate_section', 'INGATE')}", ln=True)
-        pdf.cell(0, 6, f"Tespit edilen / Onerilen sistem: {getattr(gr, 'detected_gating_system', '')} / {getattr(gr, 'recommended_gating_system', '')} (cidar: {getattr(gr, 'wall_thickness_category', '')})", ln=True)
+        pdf.cell(0, 6, f"Tespit edilen sistem: {getattr(gr, 'detected_gating_system', '')} (cidar: {getattr(gr, 'wall_thickness_category', '')})", ln=True)
         pdf.cell(0, 6, f"Toplam debi Q: {gr.ingate_flow_rate_m3_s*1e3:.2f} L/s, doldurma suresi: {gr.ingate_fill_time_s:.2f} s", ln=True)
         pdf.cell(0, 6, f"Akiskanlik uzunlugu Lf: {gr.fluidity_length_mm:.1f} mm", ln=True)
         pdf.cell(0, 6, f"Gate alani: {gate_flow.area_cm2:.2f} cm² (hedef {gate_flow.target_area_min_cm2:.2f}-{gate_flow.target_area_max_cm2:.2f})", ln=True)
         pdf.cell(0, 6, f"Yolluk min kesit: {gr.runner_min_area_cm2:.2f} cm² (hedef {runner_flow.target_area_min_cm2:.2f}-{runner_flow.target_area_max_cm2:.2f})", ln=True)
         pdf.cell(0, 6, f"Döküm ağzı boğazı: {gr.sprue_throat_area_cm2:.2f} cm² (gerekli {gr.required_sprue_area_cm2:.2f} cm²)", ln=True)
         pdf.cell(0, 6, f"Döküm ağzı tabanı: {gr.sprue_base_area_cm2:.2f} cm²", ln=True)
-        pdf.cell(0, 6, f"Tavsiye edilen dolum suresi: {gr.recommended_fill_time_s:.2f} s ({gr.fill_time_basis}); girilen: {gr.ingate_fill_time_s:.2f} s", ln=True)
+        pdf.cell(0, 6, f"Dolum suresi: kullanilan {gr.ingate_fill_time_s:.2f} s, pratik {getattr(gr, 'auto_fill_time_s', gr.recommended_fill_time_s):.2f} s, Campbell {getattr(gr, 'campbell_fill_time_s', 0.0):.2f} s", ln=True)
         pdf.cell(0, 6, f"Toplam dokulen kutle: {gr.total_poured_mass_kg:.3f} kg, verim: {gr.pouring_yield*100:.1f}%", ln=True)
         pdf.cell(0, 6, f"Teorik As: {gr.design_sprue_base_area_cm2:.2f} cm², Ar: {gr.design_runner_area_cm2:.2f} cm², Ag: {gr.design_gate_total_area_cm2:.2f} cm²", ln=True)
         pdf.cell(0, 6, f"Teorik caplar: sprue Ø {gr.design_sprue_diameter_mm:.1f} mm, gate Ø {gr.design_gate_diameter_mm:.1f} mm, choke v={gr.design_choke_velocity_m_s:.2f} m/s", ln=True)

@@ -30,10 +30,9 @@ def propose_risers(result: AnalysisResult, alloy: Alloy, existing_riser_count: i
     """Generate concrete riser proposals for hot spots that cannot be fed.
 
     Strategy:
-      * If a riser already exists and is large enough, do not propose a new one.
-      * For every failing hot spot (feed_ok == False or darcy_ok == False or heuvers_ok == False)
-        build a sphere or cylinder riser above the hot spot.
-      * Riser modulus = max(1.2 * hot_spot_M, 1.2 * hot_spot_M + distance_penalty).
+      * If a riser already exists and all hot spots are fed, nothing to do.
+      * For every failing hot spot build a sphere/cylinder riser above it.
+      * Riser modulus = k * hot_spot_M (no arbitrary +1 mm / huge distance penalties).
       * Placement is on top of the hot spot (z + t_section/2 + D/2).
     """
     proposals: List[RiserProposal] = []
@@ -44,22 +43,14 @@ def propose_risers(result: AnalysisResult, alloy: Alloy, existing_riser_count: i
     if existing_riser_count > 0 and all(hs.feed_ok for hs in result.hotspots):
         return proposals
 
+    k_mod = getattr(alloy, "riser_m_factor", 1.2)
+
     for idx, hs in enumerate(result.hotspots):
         if hs.feed_ok and hs.darcy_ok and hs.heuvers_ok and existing_riser_count > 0:
             continue
 
-        # Required modulus: Chvorinov-modulus rule + distance penalty.
-        distance_penalty = 0.0
-        if hs.max_feeding_distance_mm > 0 and hs.dist_to_riser_mm > hs.max_feeding_distance_mm:
-            distance_penalty = 0.15 * (hs.dist_to_riser_mm - hs.max_feeding_distance_mm)
-        elif not np.isfinite(hs.dist_to_riser_mm) or hs.dist_to_riser_mm > 9999:
-            distance_penalty = 2.0
-
-        # Feeding resistance further increases the required riser size.
-        resistance_penalty = 0.05 * hs.feeding_cost
-
-        m_required = 1.2 * hs.m_value_mm + distance_penalty + resistance_penalty
-        m_required = max(m_required, 1.2 * hs.m_value_mm + 1.0)
+        # Required modulus from local hot-spot modulus; clamp to a practical minimum.
+        m_required = max(k_mod * hs.m_value_mm, 3.0)
 
         # Use a spherical side/top riser by default; switch to cylinder for very large M.
         if m_required <= 25.0:
