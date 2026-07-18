@@ -1,7 +1,7 @@
 [project]
 name = "josecast-analyzer"
-version = "7.0.0"
-description = "Titan geometric casting analysis engine with adaptive 160-2040 voxel SDF physics."
+version = "7.1.0"
+description = "Titan geometric casting analysis engine with alloy/mould database, Niyama, Darcy and adaptive 160-2040 voxel SDF physics."
 requires-python = ">=3.10"
 dependencies = [
     "cadquery>=2.7.0",
@@ -16,6 +16,7 @@ dependencies = [
     "Pillow>=10.0.0",
     "numba>=0.60.0",
     "scikit-learn>=1.5.0",
+    "scikit-image>=0.25.0",
     "weasyprint>=60.0",
 ]
 

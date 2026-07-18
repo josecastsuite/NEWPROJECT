@@ -1,4 +1,4 @@
-"""Shared types and result containers for JoseCast Analyzer v7.0 Titan."""
+"""Shared types and result containers for JoseCast Analyzer v7.1."""
 
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -54,6 +54,11 @@ class HotSpot:
     resistance: float = 0.0
     resistance_ok: bool = True
     local_sdf_max: float = 0.0
+    # v7.1
+    t_section_mm: float = 0.0
+    darcy_resistance: float = 0.0
+    directional_ok: bool = True
+    min_neck_m_mm: float = 0.0
 
 
 @dataclass
@@ -69,6 +74,8 @@ class RiserResult:
     nearest_hotspot_position_mm: np.ndarray = field(default_factory=lambda: np.zeros(3))
     gravity_factor: float = 1.0
     effective_m_required: float = 0.0
+    # v7.1
+    required_volume_cm3: float = 0.0
 
 
 @dataclass
@@ -82,9 +89,13 @@ class GateResult:
     ingate_on_thick_region: bool
     ingate_avg_m_mm: float
     ingate_max_m_mm: float
-    # v7
     ingate_thickness_mm: float = 0.0
     runner_thickness_mm: float = 0.0
+    # v7.1
+    required_runner_area_cm2: float = 0.0
+    required_ingate_area_cm2: float = 0.0
+    runner_ok: bool = True
+    ingate_ok: bool = True
 
 
 @dataclass
@@ -118,8 +129,15 @@ class AnalysisResult:
     recommendations: List[str] = field(default_factory=list)
     # v7 adaptive
     local_regions: List[RefinementRegion] = field(default_factory=list)
-    material_key: str = "steel"
+    # v7.1 material
+    alloy_key: str = "42CrMo4"
+    mold_key: str = "sand"
+    alloy_name: str = "42CrMo4 (Çelik)"
+    mold_name: str = "Kum Kalıp"
+    chvorinov_c: float = 2.8
     unit_scale: float = 1.0
+    # section / histogram
+    dominant_m_mm: float = 0.0
+    wall_thickness_mm: float = 0.0
     # metadata
-    material_name: str = "Çelik"
     bbox_size_mm: np.ndarray = field(default_factory=lambda: np.zeros(3))

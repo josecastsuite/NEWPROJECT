@@ -1,12 +1,12 @@
-"""Ingate / runner / sprue geometric gating calculations - JoseCast v7."""
+"""Ingate / runner / sprue geometric gating calculations - JoseCast v7.1."""
 
 from typing import Optional
 
 import numpy as np
 from scipy import ndimage
 
-from core.materials import get_material
-from core.types import AnalysisResult, BodyType
+from core.materials import get_alloy
+from core.types import AnalysisResult, BodyType, GateResult
 
 
 def _neighbor_offsets_6():
@@ -109,14 +109,12 @@ def analyze_gating(
     result: AnalysisResult,
     fill_time_s: float = 10.0,
     discharge_coeff: float = 0.8,
-) -> Optional[object]:
+) -> Optional[GateResult]:
     """Compute gate/sprue/runner checks."""
-    from core.types import GateResult
-
     grid = result.grid
     sdf = result.sdf
     dx = result.dx_mm
-    material = get_material(result.material_key)
+    alloy = get_alloy(result.alloy_key)
 
     part_mask = grid == BodyType.PART
     ingate = grid == BodyType.INGATE
@@ -138,7 +136,7 @@ def analyze_gating(
     # Part weight for Bernoulli
     part_volume_mm3 = float(part_mask.sum()) * dx ** 3
     part_volume_cm3 = part_volume_mm3 / 1000.0
-    part_weight_g = part_volume_cm3 * material.density_g_cm3
+    part_weight_g = part_volume_cm3 * alloy.density_g_cm3
 
     # Sprue height H in cm; fallback to total metal height
     metal_mask = result.is_metal
@@ -153,20 +151,23 @@ def analyze_gating(
     if height_cm > 0 and fill_time_s > 0:
         velocity = np.sqrt(2.0 * g_cgs * height_cm)
         as_req_cm2 = part_weight_g / (
-            material.density_g_cm3 * discharge_coeff * fill_time_s * velocity
+            alloy.density_g_cm3 * discharge_coeff * fill_time_s * velocity
         )
     else:
         as_req_cm2 = 0.0
 
     bernoulli_ok = sprue_base_cm2 >= as_req_cm2
 
-    # Campbell: runner should be larger than total gate area by a reasonable ratio.
+    # Campbell: total ingate area / runner area < 1.5
     if runner_min_area_cm2 > 0:
         gate_to_runner_ratio = ag_total_cm2 / runner_min_area_cm2
         campbell_ok = gate_to_runner_ratio <= 1.5
     else:
         gate_to_runner_ratio = float("inf")
         campbell_ok = False
+
+    required_runner_area_cm2 = ag_total_cm2 / 1.5 if ag_total_cm2 > 0 else 0.0
+    runner_ok = runner_min_area_cm2 >= required_runner_area_cm2
 
     # Ingate location check
     part_sdf = sdf[part_mask]
@@ -184,6 +185,10 @@ def analyze_gating(
     threshold = 0.8 * max_part_sdf
     ingate_on_thick = ingate_avg_m > threshold if max_part_sdf > 0 else False
 
+    # A reasonable minimum ingate contact area: based on runner capacity
+    required_ingate_area_cm2 = required_runner_area_cm2 / 1.5
+    ingate_ok = (ag_total_cm2 >= required_ingate_area_cm2) and (not ingate_on_thick)
+
     return GateResult(
         total_ingate_contact_area_cm2=ag_total_cm2,
         runner_min_area_cm2=runner_min_area_cm2,
@@ -196,4 +201,8 @@ def analyze_gating(
         ingate_max_m_mm=ingate_max_m,
         ingate_thickness_mm=ingate_thickness_mm,
         runner_thickness_mm=runner_thickness_mm,
+        required_runner_area_cm2=required_runner_area_cm2,
+        required_ingate_area_cm2=required_ingate_area_cm2,
+        runner_ok=runner_ok,
+        ingate_ok=ingate_ok,
     )

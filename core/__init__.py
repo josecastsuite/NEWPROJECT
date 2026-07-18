@@ -1,7 +1,17 @@
-"""JoseCast Analyzer geometric engine v7."""
+"""JoseCast Analyzer geometric engine v7.1."""
 
 from core.gating import analyze_gating, ingate_contact_area_and_mask
-from core.materials import MATERIALS, Material, get_material
+from core.materials import (
+    ALLOYS,
+    MATERIALS,
+    MOLDS,
+    Alloy,
+    Material,
+    MoldMaterial,
+    get_alloy,
+    get_material,
+    get_mold,
+)
 from core.reporter import generate_report
 from core.sdf_analyzer import analyze
 from core.step_loader import load_step
@@ -31,8 +41,14 @@ __all__ = [
     "analyze_gating",
     "ingate_contact_area_and_mask",
     "generate_report",
+    "get_alloy",
+    "get_mold",
     "get_material",
+    "Alloy",
+    "MoldMaterial",
     "Material",
+    "ALLOYS",
+    "MOLDS",
     "MATERIALS",
     "BASE_RES",
     "MAX_RES",
