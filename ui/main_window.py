@@ -55,13 +55,16 @@ class CheckListItem(QtWidgets.QWidget):
         super().__init__(parent)
         layout = QtWidgets.QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(6)
         icon = "✓" if ok else "✗"
         color = "#00ff88" if ok else "#ff4444"
         self.label = QtWidgets.QLabel(
             f'<span style="color:{color};font-weight:bold;font-size:14px">{icon}</span> '
-            f'<span style="color:#eeeeee">{_escape_html(text)}</span>'
+            f'<span style="color:#f4f4f5">{_escape_html(text)}</span>'
         )
         self.label.setWordWrap(True)
+        self.label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.MinimumExpanding)
+        self.label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.label)
 
 
@@ -107,14 +110,17 @@ class MainWindow(QtWidgets.QMainWindow):
             """
             QMainWindow { background: #18181b; }
             QGroupBox {
-                color: #00ff88;
-                font-weight: bold;
+                color: #f4f4f5;
+                font-weight: normal;
                 border: 1px solid #3f3f46;
                 border-radius: 8px;
-                margin-top: 12px;
-                padding: 10px;
+                margin-top: 10px;
+                padding: 6px;
             }
-            QGroupBox::title { subcontrol-origin: margin; left: 12px; top: -8px; }
+            QGroupBox::title {
+                subcontrol-origin: margin; left: 12px; top: -8px;
+                color: #00ff88; font-weight: bold;
+            }
             QPushButton {
                 background: #00ff88; color: #000000; border: none;
                 border-radius: 6px; padding: 10px 16px; font-weight: bold;
@@ -127,20 +133,24 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             QProgressBar {
                 background: #27272a; border: 1px solid #52525b; border-radius: 5px;
-                text-align: center; color: #000000;
+                text-align: center; color: #f4f4f5;
             }
             QProgressBar::chunk { background: #00ff88; border-radius: 4px; }
-            QLabel { color: #f4f4f5; }
+            QLabel { color: #f4f4f5; font-weight: normal; }
             QListWidget {
                 background: #09090b; border: 1px solid #3f3f46; border-radius: 6px;
+                color: #f4f4f5;
             }
             QTextEdit {
                 background: #09090b; border: 1px solid #3f3f46; border-radius: 6px;
                 color: #f4f4f5;
             }
-            QCheckBox { color: #f4f4f5; }
+            QCheckBox { color: #f4f4f5; spacing: 6px; }
+            QCheckBox::indicator { width: 16px; height: 16px; }
             QCheckBox::indicator:checked { background: #00ff88; border: 1px solid #00ff88; }
             QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical { background: #27272a; width: 10px; }
+            QScrollBar::handle:vertical { background: #00ff88; border-radius: 5px; }
             """
         )
 
@@ -154,13 +164,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # ---------------- LEFT PANEL (scrollable) ----------------
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidgetResizable(True)
-        left_scroll.setMinimumWidth(340)
-        left_scroll.setMaximumWidth(420)
+        left_scroll.setMinimumWidth(400)
+        left_scroll.setMaximumWidth(480)
         left_panel = QtWidgets.QWidget()
         left_scroll.setWidget(left_panel)
         left_layout = QtWidgets.QVBoxLayout(left_panel)
         left_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         left_layout.setSpacing(10)
+        left_layout.setContentsMargins(8, 8, 8, 8)
 
         # File & body group
         file_group = QtWidgets.QGroupBox("1. STEP ve Body")
@@ -179,97 +190,118 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Settings group
         settings_group = QtWidgets.QGroupBox("2. Analiz Ayarları")
-        settings_layout = QtWidgets.QFormLayout(settings_group)
+        settings_layout = QtWidgets.QVBoxLayout(settings_group)
+        settings_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        settings_layout.setSpacing(6)
+
+        def _settings_labeled(widget, label_text, tooltip=None):
+            lbl = QtWidgets.QLabel(label_text)
+            lbl.setWordWrap(True)
+            lbl.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+            settings_layout.addWidget(lbl)
+            if tooltip:
+                widget.setToolTip(tooltip)
+            settings_layout.addWidget(widget)
 
         self.unit_combo = QtWidgets.QComboBox()
         for unit, label in [("mm", "mm"), ("cm", "cm"), ("m", "m"), ("inch", "inch")]:
             self.unit_combo.addItem(label, unit)
         self.unit_combo.currentIndexChanged.connect(self.on_unit_changed)
-        settings_layout.addRow("Birim:", self.unit_combo)
+        _settings_labeled(self.unit_combo, "Birim:")
 
         self.res_spin = QtWidgets.QSpinBox()
         self.res_spin.setRange(160, MAX_RES)
         self.res_spin.setValue(160)
         self.res_spin.setSingleStep(80)
-        self.res_spin.setToolTip("160 = hızlı, 2040 = Titan mod (yavaş, yerel refine).")
-        settings_layout.addRow("Max çözünürlük:", self.res_spin)
+        _settings_labeled(self.res_spin, "Max çözünürlük:", "160 = hızlı, 2040 = Titan mod (yavaş, yerel refine).")
 
         self.refine_check = QtWidgets.QCheckBox("Yerel adaptive refine")
         self.refine_check.setChecked(True)
-        settings_layout.addRow(self.refine_check)
+        settings_layout.addWidget(self.refine_check)
 
         self.subvox_spin = QtWidgets.QSpinBox()
         self.subvox_spin.setRange(1, 3)
         self.subvox_spin.setValue(2)
-        self.subvox_spin.setToolTip("Kenar vokseli kısmi saymak için 2x/3x upsample.")
-        settings_layout.addRow("Sub-voxel faktör:", self.subvox_spin)
+        _settings_labeled(self.subvox_spin, "Sub-voxel faktör:", "Kenar vokseli kısmi saymak için 2x/3x upsample.")
 
         self.thermal_spin = QtWidgets.QSpinBox()
         self.thermal_spin.setRange(0, 2000)
         self.thermal_spin.setValue(100)
         self.thermal_spin.setSingleStep(50)
-        self.thermal_spin.setToolTip("Fourier / entalpi ısı denklemi explicit adım sayısı (0=termal kapalı).")
-        settings_layout.addRow("Isı adımı:", self.thermal_spin)
+        _settings_labeled(self.thermal_spin, "Isı adımı:", "Fourier / entalpi ısı denklemi explicit adım sayısı (0=termal kapalı).")
 
         self.alloy_combo = QtWidgets.QComboBox()
         for key, alloy in ALLOYS.items():
             self.alloy_combo.addItem(alloy.name, key)
         self.alloy_combo.currentIndexChanged.connect(self._sync_casting_params_from_materials)
-        settings_layout.addRow("Alaşım:", self.alloy_combo)
+        _settings_labeled(self.alloy_combo, "Alaşım:")
 
         self.mold_combo = QtWidgets.QComboBox()
         for key, mold in MOLDS.items():
             self.mold_combo.addItem(mold.name, key)
         self.mold_combo.currentIndexChanged.connect(self._sync_casting_params_from_materials)
-        settings_layout.addRow("Kalıp:", self.mold_combo)
+        _settings_labeled(self.mold_combo, "Kalıp:")
+
         left_layout.addWidget(settings_group)
 
         # Casting parameters group
         params_group = QtWidgets.QGroupBox("3. Döküm Parametreleri")
-        params_layout = QtWidgets.QFormLayout(params_group)
+        params_layout = QtWidgets.QVBoxLayout(params_group)
+        params_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        params_layout.setSpacing(6)
+
+        def _params_labeled(widget, label_text, tooltip=None):
+            lbl = QtWidgets.QLabel(label_text)
+            lbl.setWordWrap(True)
+            lbl.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+            params_layout.addWidget(lbl)
+            if tooltip:
+                widget.setToolTip(tooltip)
+            params_layout.addWidget(widget)
 
         self.t_pour_spin = QtWidgets.QDoubleSpinBox()
         self.t_pour_spin.setRange(0, 2000)
         self.t_pour_spin.setDecimals(1)
         self.t_pour_spin.setValue(1600.0)
-        params_layout.addRow("Döküm sıcaklığı T_pour (°C):", self.t_pour_spin)
+        _params_labeled(self.t_pour_spin, "Döküm sıcaklığı T_pour (°C):")
 
         self.t_liq_spin = QtWidgets.QDoubleSpinBox()
         self.t_liq_spin.setRange(0, 2000)
         self.t_liq_spin.setDecimals(1)
         self.t_liq_spin.setValue(1510.0)
-        params_layout.addRow("Liquidus T_liq (°C):", self.t_liq_spin)
+        _params_labeled(self.t_liq_spin, "Liquidus T_liq (°C):")
 
         self.t_sol_spin = QtWidgets.QDoubleSpinBox()
         self.t_sol_spin.setRange(0, 2000)
         self.t_sol_spin.setDecimals(1)
         self.t_sol_spin.setValue(1410.0)
-        params_layout.addRow("Solidus T_sol (°C):", self.t_sol_spin)
+        _params_labeled(self.t_sol_spin, "Solidus T_sol (°C):")
 
         self.t_mold_spin = QtWidgets.QDoubleSpinBox()
         self.t_mold_spin.setRange(-50, 500)
         self.t_mold_spin.setDecimals(1)
         self.t_mold_spin.setValue(25.0)
-        params_layout.addRow("Kalıp sıcaklığı T_mold (°C):", self.t_mold_spin)
+        _params_labeled(self.t_mold_spin, "Kalıp sıcaklığı T_mold (°C):")
 
         self.t_fill_spin = QtWidgets.QDoubleSpinBox()
         self.t_fill_spin.setRange(0.1, 300.0)
         self.t_fill_spin.setDecimals(1)
         self.t_fill_spin.setValue(10.0)
-        params_layout.addRow("Döküm süresi t_fill (s):", self.t_fill_spin)
+        _params_labeled(self.t_fill_spin, "Döküm süresi t_fill (s):")
 
         self.rho_spin = QtWidgets.QDoubleSpinBox()
         self.rho_spin.setRange(100, 20000)
         self.rho_spin.setDecimals(1)
         self.rho_spin.setValue(7000.0)
         self.rho_spin.setSingleStep(100)
-        params_layout.addRow("Sıvı yoğunluk ρ (kg/m³):", self.rho_spin)
+        _params_labeled(self.rho_spin, "Sıvı yoğunluk ρ (kg/m³):")
 
         self.visc_spin = QtWidgets.QDoubleSpinBox()
         self.visc_spin.setRange(0.0001, 10.0)
         self.visc_spin.setDecimals(4)
         self.visc_spin.setValue(0.0060)
-        params_layout.addRow("Viskozite μ (Pa·s):", self.visc_spin)
+        _params_labeled(self.visc_spin, "Viskozite μ (Pa·s):")
+
         left_layout.addWidget(params_group)
 
         # Actions group
@@ -324,13 +356,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # ---------------- RIGHT PANEL (scrollable) ----------------
         right_scroll = QtWidgets.QScrollArea()
         right_scroll.setWidgetResizable(True)
-        right_scroll.setMinimumWidth(360)
-        right_scroll.setMaximumWidth(480)
+        right_scroll.setMinimumWidth(520)
+        right_scroll.setMaximumWidth(720)
         right_panel = QtWidgets.QWidget()
         right_scroll.setWidget(right_panel)
         right_layout = QtWidgets.QVBoxLayout(right_panel)
         right_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         right_layout.setSpacing(10)
+        right_layout.setContentsMargins(4, 4, 4, 4)
 
         check_group = QtWidgets.QGroupBox("Kontrol Listesi")
         check_inner = QtWidgets.QVBoxLayout(check_group)
@@ -349,23 +382,27 @@ class MainWindow(QtWidgets.QMainWindow):
         vis_group = QtWidgets.QGroupBox("Görselleştirme")
         vis_layout = QtWidgets.QVBoxLayout(vis_group)
 
-        self.hotspot_toggle = QtWidgets.QCheckBox("Hot Spot'ları Göster")
+        self.hotspot_toggle = QtWidgets.QCheckBox("Hot Spot")
+        self.hotspot_toggle.setToolTip("Hot spot kürelerini göster/gizle")
         self.hotspot_toggle.setChecked(True)
         self.hotspot_toggle.toggled.connect(self.on_toggle_hotspots)
         vis_layout.addWidget(self.hotspot_toggle)
 
-        self.risk_toggle = QtWidgets.QCheckBox("Risk Bulutunu Göster")
+        self.risk_toggle = QtWidgets.QCheckBox("Risk Bulutu")
+        self.risk_toggle.setToolTip("Porozite risk bulutunu göster/gizle")
         self.risk_toggle.setChecked(True)
         self.risk_toggle.toggled.connect(self.on_toggle_risk)
         vis_layout.addWidget(self.risk_toggle)
 
-        self.local_toggle = QtWidgets.QCheckBox("Yerel Refine Bölgelerini Göster")
+        self.local_toggle = QtWidgets.QCheckBox("Yerel Refine")
+        self.local_toggle.setToolTip("Yerel adaptive refine bölgelerini göster/gizle")
         self.local_toggle.setChecked(False)
         self.local_toggle.toggled.connect(self.on_toggle_local)
         vis_layout.addWidget(self.local_toggle)
 
         slice_layout = QtWidgets.QHBoxLayout()
-        self.slice_toggle = QtWidgets.QCheckBox("Kesit Düzlemleri")
+        self.slice_toggle = QtWidgets.QCheckBox("Kesit")
+        self.slice_toggle.setToolTip("Kesit düzlemlerini göster/gizle")
         self.slice_toggle.setChecked(False)
         self.slice_toggle.toggled.connect(self.on_toggle_slices)
         slice_layout.addWidget(self.slice_toggle)
@@ -378,6 +415,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ]:
             self.slice_field.addItem(label, field)
         self.slice_field.currentIndexChanged.connect(self.on_slice_field_changed)
+        self.slice_field.setMaximumWidth(130)
         slice_layout.addWidget(self.slice_field)
         vis_layout.addLayout(slice_layout)
         right_layout.addWidget(vis_group)
@@ -404,7 +442,7 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([380, 900, 400])
+        splitter.setSizes([520, 560, 520])
         main_layout.addWidget(splitter)
 
     def _sync_casting_params_from_materials(self):
