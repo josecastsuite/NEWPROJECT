@@ -164,6 +164,11 @@ class SectionFlow:
     froude: float = 0.0
     turbulent: bool = False
     max_velocity_m_s: float = 1.0
+    # v8.4: target velocity/area range for the recommended gating system
+    target_v_min_m_s: float = 0.0
+    target_v_max_m_s: float = 0.0
+    target_area_min_cm2: float = 0.0
+    target_area_max_cm2: float = 0.0
 
 
 @dataclass

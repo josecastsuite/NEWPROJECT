@@ -7,7 +7,7 @@ from typing import Optional
 
 import numpy as np
 
-from core.types import AnalysisResult
+from core.types import AnalysisResult, SectionFlow
 
 
 def _html_escape(text: str) -> str:
@@ -105,10 +105,17 @@ def _section_flow_rows(gr) -> str:
         name = section_names.get(key, key)
         if key == "INGATE" and getattr(gr, "effective_gate_section", "INGATE").startswith("RUNNER"):
             name = "Yolluk (meme yok)"
+        target = ""
+        if sf.target_v_min_m_s > 0 and sf.target_v_max_m_s > 0:
+            target = (
+                f" hedef v={sf.target_v_min_m_s:.1f}-{sf.target_v_max_m_s:.1f} m/s, "
+                f"A={sf.target_area_min_cm2:.2f}-{sf.target_area_max_cm2:.2f} cm²"
+            )
         rows.append(
             f"<tr><td>{name}: v / Re / Fr</td>"
             f"<td>{sf.velocity_m_s:.2f} m/s</td>"
-            f"<td>Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, A={sf.area_cm2:.2f} cm², türbülans={'Evet' if sf.turbulent else 'Hayır'}</td></tr>"
+            f"<td>Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, A={sf.area_cm2:.2f} cm², "
+            f"türbülans={'Evet' if sf.turbulent else 'Hayır'}{target}</td></tr>"
         )
     return "".join(rows)
 
@@ -132,22 +139,37 @@ def _format_gate_table(result: AnalysisResult) -> str:
             f"runner={system_targets['runner'][0]:.1f}-{system_targets['runner'][1]:.1f}, "
             f"gate={system_targets['gate'][0]:.1f}-{system_targets['gate'][1]:.1f} m/s"
         )
-    return f"""
+    gate_flow = gr.section_flows.get("INGATE", SectionFlow())
+    runner_flow = gr.section_flows.get("RUNNER", SectionFlow())
+
+    def _target_range(sf: SectionFlow) -> str:
+        if sf.target_area_min_cm2 > 0 and sf.target_area_max_cm2 > 0:
+            return f"hedef {sf.target_area_min_cm2:.2f}-{sf.target_area_max_cm2:.2f} cm²"
+        return "hedef -"
+
+    target_ratio = 0.0
+    if system_targets and "gate" in system_targets and "runner" in system_targets:
+        v_gate_mid = (system_targets["gate"][0] + system_targets["gate"][1]) / 2.0
+        v_runner_mid = (system_targets["runner"][0] + system_targets["runner"][1]) / 2.0
+        if v_gate_mid > 0:
+            target_ratio = v_runner_mid / v_gate_mid
+
+    return f""""
     <table>
         <tr><th>Parametre</th><th>Değer</th><th>Durum / Gerekli</th></tr>
         <tr><td>Seçili giriş kesiti</td><td>{selected_section}</td><td>v = {gr.ingate_velocity_m_s:.2f} m/s</td></tr>
         <tr><td>Efektif gate kesiti</td><td>{gr.effective_gate_section}</td><td>-</td></tr>
         <tr><td>Tespit edilen / Önerilen sistem</td><td>{gr.detected_gating_system} / {gr.recommended_gating_system}</td><td>Cidar: {gr.wall_thickness_category}</td></tr>
         <tr><td>Önerilen sistem hedef hızları</td><td>{target_text}</td><td>-</td></tr>
-        <tr><td>Toplam meme temas alanı (Ag)</td><td>{gr.total_ingate_contact_area_cm2:.2f} cm²</td><td>min {gr.required_ingate_area_cm2:.2f} cm²</td></tr>
-        <tr><td>Yolluk min kesit alanı (Ar)</td><td>{gr.runner_min_area_cm2:.2f} cm²</td><td>min {gr.required_runner_area_cm2:.2f} cm²</td></tr>
+        <tr><td>Gate alanı (Ag)</td><td>{gate_flow.area_cm2:.2f} cm²</td><td>{_target_range(gate_flow)}</td></tr>
+        <tr><td>Yolluk min kesit alanı (Ar)</td><td>{gr.runner_min_area_cm2:.2f} cm²</td><td>{_target_range(runner_flow)}</td></tr>
         <tr><td>Döküm ağzı boğaz alanı (As)</td><td>{gr.sprue_throat_area_cm2:.2f} cm²</td><td>gerekli {gr.required_sprue_area_cm2:.2f} cm²</td></tr>
         <tr><td>Döküm ağzı taban alanı</td><td>{gr.sprue_base_area_cm2:.2f} cm²</td><td>-</td></tr>
         {_section_flow_rows(gr)}
         <tr><td>Toplam debi Q</td><td>{gr.ingate_flow_rate_m3_s*1e3:.2f} L/s</td><td>doldurma süresi {gr.ingate_fill_time_s:.2f} s</td></tr>
         <tr><td>Akışkanlık uzunluğu Lf</td><td>{gr.fluidity_length_mm:.1f} mm</td><td>parça boyutu ≤ Lf</td></tr>
         <tr><td>Hız için gerekli seçili kesit alanı</td><td>{gr.required_ingate_area_for_velocity_cm2:.2f} cm²</td><td>mevcut {selected_area:.2f} cm²</td></tr>
-        <tr><td>Campbell (Ag/Ar) kontrolü</td><td>{'Geçer' if gr.campbell_ok else 'Geçersiz'}</td><td>Ag/Ar &lt; 1.5</td></tr>
+        <tr><td>Campbell (Ag/Ar) kontrolü</td><td>{'Geçer' if gr.campbell_ok else 'Geçersiz'}</td><td>hedef oran {target_ratio:.2f}</td></tr>
         <tr><td>Bernoulli döküm ağzı kontrolü</td><td>{'Geçer' if gr.bernoulli_ok else 'Geçersiz'}</td><td>As ≥ gerekli</td></tr>
         <tr><td>Dirsek kaybı (K·v²/2g)</td><td>{gr.elbow_count} dirsek, {gr.head_loss_mm:.1f} mm kayıp</td><td>efektif H={gr.effective_head_mm:.1f} mm</td></tr>
         <tr><td>Meme kalın bölgede</td><td>{'Evet' if gr.ingate_on_thick_region else 'Hayır'} (ortalama M={gr.ingate_avg_m_mm:.2f} mm)</td><td>Hayır olmalı</td></tr>
@@ -418,6 +440,8 @@ def _generate_report_fpdf2(
             "SPRUE_THROAT": "D.AgzI bogazi",
             "SPRUE_BASE": "D.AgzI tabani",
         }
+        gate_flow = gr.section_flows.get("INGATE", SectionFlow())
+        runner_flow = gr.section_flows.get("RUNNER", SectionFlow())
         pdf.set_font(font, "", 13)
         pdf.cell(0, 8, "Meme / Yolluk / Döküm Ağzı", ln=True)
         pdf.set_font(font, "", 10)
@@ -426,8 +450,8 @@ def _generate_report_fpdf2(
         pdf.cell(0, 6, f"Tespit edilen / Onerilen sistem: {getattr(gr, 'detected_gating_system', '')} / {getattr(gr, 'recommended_gating_system', '')} (cidar: {getattr(gr, 'wall_thickness_category', '')})", ln=True)
         pdf.cell(0, 6, f"Toplam debi Q: {gr.ingate_flow_rate_m3_s*1e3:.2f} L/s, doldurma suresi: {gr.ingate_fill_time_s:.2f} s", ln=True)
         pdf.cell(0, 6, f"Akiskanlik uzunlugu Lf: {gr.fluidity_length_mm:.1f} mm", ln=True)
-        pdf.cell(0, 6, f"Meme temas alani: {gr.total_ingate_contact_area_cm2:.2f} cm² (min {gr.required_ingate_area_cm2:.2f} cm²)", ln=True)
-        pdf.cell(0, 6, f"Yolluk min kesit: {gr.runner_min_area_cm2:.2f} cm² (min {gr.required_runner_area_cm2:.2f} cm²)", ln=True)
+        pdf.cell(0, 6, f"Gate alani: {gate_flow.area_cm2:.2f} cm² (hedef {gate_flow.target_area_min_cm2:.2f}-{gate_flow.target_area_max_cm2:.2f})", ln=True)
+        pdf.cell(0, 6, f"Yolluk min kesit: {gr.runner_min_area_cm2:.2f} cm² (hedef {runner_flow.target_area_min_cm2:.2f}-{runner_flow.target_area_max_cm2:.2f})", ln=True)
         pdf.cell(0, 6, f"Döküm ağzı boğazı: {gr.sprue_throat_area_cm2:.2f} cm² (gerekli {gr.required_sprue_area_cm2:.2f} cm²)", ln=True)
         pdf.cell(0, 6, f"Döküm ağzı tabanı: {gr.sprue_base_area_cm2:.2f} cm²", ln=True)
         for key, sf in getattr(gr, "section_flows", {}).items():
@@ -436,7 +460,13 @@ def _generate_report_fpdf2(
             name = section_names.get(key, key)
             if key == "INGATE" and getattr(gr, "effective_gate_section", "INGATE").startswith("RUNNER"):
                 name = "Yolluk (meme yok)"
-            pdf.cell(0, 6, f"{name}: v={sf.velocity_m_s:.2f} m/s, Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, A={sf.area_cm2:.2f} cm2, turb={sf.turbulent}", ln=True)
+            target = ""
+            if sf.target_v_min_m_s > 0 and sf.target_v_max_m_s > 0:
+                target = (
+                    f" hedef v={sf.target_v_min_m_s:.1f}-{sf.target_v_max_m_s:.1f}, "
+                    f"A={sf.target_area_min_cm2:.2f}-{sf.target_area_max_cm2:.2f} cm2"
+                )
+            pdf.cell(0, 6, f"{name}: v={sf.velocity_m_s:.2f}, Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, A={sf.area_cm2:.2f}{target}, turb={sf.turbulent}", ln=True)
         pdf.cell(0, 6, f"Campbell: {'Geçer' if gr.campbell_ok else 'Geçersiz'}", ln=True)
         pdf.cell(0, 6, f"Bernoulli: {'Geçer' if gr.bernoulli_ok else 'Geçersiz'} (dirsek kaybi: {gr.elbow_count}, {gr.head_loss_mm:.1f} mm)", ln=True)
         pdf.cell(0, 6, f"Meme kalın bölgede: {'Evet' if gr.ingate_on_thick_region else 'Hayır'} "

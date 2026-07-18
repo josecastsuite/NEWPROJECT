@@ -802,22 +802,28 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"Sistem uyuşmazlığı: {gr.detected_gating_system} tespit edildi, "
                     f"{gr.recommended_gating_system} önerilir."
                 )
-        # v8.3: per-section velocity / Re / Fr report
+        # v8.4: per-section velocity / Re / Fr report with target ranges
         for key, sf in getattr(gr, "section_flows", {}).items():
             if sf.area_cm2 <= 0:
                 continue
             name = section_names.get(key, key)
             if key == "INGATE" and gr.effective_gate_section.startswith("RUNNER"):
                 name = "Yolluk (meme yok)"
+            target = ""
+            if sf.target_v_min_m_s > 0 and sf.target_v_max_m_s > 0:
+                target = (
+                    f" hedef v={sf.target_v_min_m_s:.1f}-{sf.target_v_max_m_s:.1f} m/s, "
+                    f"A={sf.target_area_min_cm2:.2f}-{sf.target_area_max_cm2:.2f} cm²"
+                )
             if sf.turbulent:
                 recs.append(
                     f"{name} hızı {sf.velocity_m_s:.2f} m/s ile yüksek; Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}. "
-                    f"Türbülans / hava kaçırma riski. Kesit alanını büyüt veya döküm süresini artırın."
+                    f"Türbülans / hava kaçırma riski. Kesit alanını büyüt veya döküm süresini artırın.{target}"
                 )
             else:
                 recs.append(
                     f"{name}: v={sf.velocity_m_s:.2f} m/s, Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, "
-                    f"A={sf.area_cm2:.2f} cm² -> türbülans yok."
+                    f"A={sf.area_cm2:.2f} cm² -> türbülans yok.{target}"
                 )
         if hasattr(gr, "velocity_fill_time_match_ok") and not gr.velocity_fill_time_match_ok:
             t_fill = self._analysis.casting_params.t_fill_s if self._analysis and self._analysis.casting_params else 0.0
@@ -897,17 +903,26 @@ class MainWindow(QtWidgets.QMainWindow):
                         gr.detected_gating_system == gr.recommended_gating_system,
                     )
                 )
-            # v8.3: per-section velocity / Re / Fr checklist items
+            # v8.4: per-section velocity / Re / Fr checklist items with target ranges
             for key, sf in getattr(gr, "section_flows", {}).items():
                 if sf.area_cm2 <= 0:
                     continue
                 name = section_names.get(key, key)
                 if key == "INGATE" and gr.effective_gate_section.startswith("RUNNER"):
                     name = "Yolluk (meme yok)"
+                target = ""
+                if sf.target_v_min_m_s > 0 and sf.target_v_max_m_s > 0:
+                    target = (
+                        f" hedef v={sf.target_v_min_m_s:.1f}-{sf.target_v_max_m_s:.1f}, "
+                        f"A={sf.target_area_min_cm2:.2f}-{sf.target_area_max_cm2:.2f}"
+                    )
+                ok = not sf.turbulent
+                if sf.target_v_min_m_s > 0 and sf.target_v_max_m_s > 0:
+                    ok = ok and (sf.target_v_min_m_s <= sf.velocity_m_s <= sf.target_v_max_m_s)
                 self.checklist_layout.addWidget(
                     CheckListItem(
-                        f"{name}: v={sf.velocity_m_s:.2f} m/s, Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, A={sf.area_cm2:.2f} cm²",
-                        not sf.turbulent,
+                        f"{name}: v={sf.velocity_m_s:.2f}{target}",
+                        ok,
                     )
                 )
             if hasattr(gr, "velocity_fill_time_match_ok"):

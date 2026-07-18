@@ -47,10 +47,14 @@ def _apply_edge_mask(arr, di, dj, dk):
 
 
 def _gate_source_mask(grid: np.ndarray) -> np.ndarray:
-    """Return gating bodies that can feed metal into the part."""
+    """Return gating bodies that can feed metal into the part.
+
+    Filter and pouring basin may also act as entry points; cooling sprue
+    is a chill and must not be treated as a feeder.
+    """
     return np.isin(
         grid,
-        [BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE, BodyType.COOLING_SPRUE, BodyType.POURING_BASIN],
+        [BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE, BodyType.FILTER, BodyType.POURING_BASIN],
     )
 
 
@@ -102,7 +106,8 @@ def _minimum_cross_section_area(mask: np.ndarray, dx: float) -> float:
     min_area = float("inf")
     for s, count in counts:
         # Ignore end slices that contain only a few voxels; they are not a real cross-section.
-        if count < max(3, max_count * 0.05):
+        # Use a small relative threshold (2% or at least 2 voxels) so thin throats are kept.
+        if count < max(2, max_count * 0.02):
             continue
         area = count * dx * dx
         if area < min_area:
@@ -252,6 +257,16 @@ _GATING_VELOCITY_TARGETS = {
 }
 
 
+def _target_area_range_cm2(Q_m3_s: float, v_lo: float, v_hi: float) -> Tuple[float, float]:
+    """Return (A_min, A_max) in cm² so that v = Q/A stays inside [v_lo, v_hi]."""
+    if Q_m3_s <= 0 or v_lo <= 0 or v_hi <= 0:
+        return 0.0, 0.0
+    # A = Q / v ; larger v needs smaller A
+    a_min_m2 = Q_m3_s / v_hi
+    a_max_m2 = Q_m3_s / v_lo
+    return a_min_m2 * 1e4, a_max_m2 * 1e4
+
+
 def _normalized_distance_to_range(v: float, lo: float, hi: float) -> float:
     if lo <= v <= hi:
         return 0.0
@@ -390,8 +405,22 @@ def analyze_gating(
     has_ingate = ingate.any()
 
     # Contact/cross-sectional areas of each gating section
-    ag_total_mm2, _ = ingate_contact_area_and_mask(grid, dx)
-    ag_total_cm2 = ag_total_mm2 / 100.0
+    gate_contact_area_mm2, _ = ingate_contact_area_and_mask(grid, dx)
+    gate_contact_area_cm2 = gate_contact_area_mm2 / 100.0
+
+    # True gate area is the minimum cross-section of the ingate body;
+    # if there is no ingate body, the runner exit touching the part is used.
+    ingate_min_area_mm2 = _minimum_cross_section_area(ingate, dx) if has_ingate else 0.0
+    ingate_min_area_cm2 = ingate_min_area_mm2 / 100.0
+    # Effective gate area is the smaller of (a) the ingate body's minimum cross-section
+    # and (b) the contact face with the part.  If the ingate is too thin to resolve,
+    # fall back to the contact area.
+    if has_ingate:
+        if ingate_min_area_cm2 <= 0:
+            ingate_min_area_cm2 = gate_contact_area_cm2
+        else:
+            ingate_min_area_cm2 = min(ingate_min_area_cm2, gate_contact_area_cm2)
+    gate_area_cm2 = ingate_min_area_cm2 if has_ingate else gate_contact_area_cm2
 
     runner_min_area_mm2 = _minimum_cross_section_area(runner, dx)
     runner_min_area_cm2 = runner_min_area_mm2 / 100.0
@@ -406,7 +435,7 @@ def analyze_gating(
 
     runner_thickness_mm = _mean_thickness(runner, dx)
     sprue_thickness_mm = _mean_thickness(sprue, dx)
-    ingate_thickness_mm = _mean_thickness(source, dx)
+    ingate_thickness_mm = _mean_thickness(ingate if has_ingate else source, dx)
 
     # Part weight for Bernoulli
     part_volume_mm3 = float(part_mask.sum()) * (dx ** 3)
@@ -416,12 +445,12 @@ def analyze_gating(
 
     # Section area map for velocity calculations
     section_area_cm2 = {
-        "INGATE": ag_total_cm2,
+        "INGATE": gate_area_cm2,
         "RUNNER": runner_min_area_cm2,
         "SPRUE_THROAT": sprue_throat_cm2,
         "SPRUE_BASE": sprue_base_bottom_cm2,
     }
-    selected_area_cm2 = section_area_cm2.get(velocity_section_key, ag_total_cm2)
+    selected_area_cm2 = section_area_cm2.get(velocity_section_key, gate_area_cm2)
     selected_area_m2 = selected_area_cm2 / 1e4
 
     # v8.3: user-specified inlet velocity for the selected section (0 = auto Q = V_part / t_fill)
@@ -493,6 +522,27 @@ def analyze_gating(
         f"Önerilen sistem: {recommended_system}. {system_reason}"
     )
 
+    # v8.4: attach target velocity/area ranges from recommended system to each section flow
+    def _set_targets(flow: SectionFlow, key: str):
+        section_key_map = {
+            "INGATE": "gate",
+            "RUNNER": "runner",
+            "SPRUE_THROAT": "sprue",
+            "SPRUE_BASE": "sprue",
+        }
+        vel_key = section_key_map.get(key)
+        targets = _GATING_VELOCITY_TARGETS.get(recommended_system, {})
+        if vel_key and vel_key in targets and Q_m3_s > 0:
+            v_lo, v_hi = targets[vel_key]
+            flow.target_v_min_m_s = v_lo
+            flow.target_v_max_m_s = v_hi
+            flow.target_area_min_cm2, flow.target_area_max_cm2 = _target_area_range_cm2(
+                Q_m3_s, v_lo, v_hi
+            )
+
+    for key, sf in section_flows.items():
+        _set_targets(sf, key)
+
     # Sprue height H in cm; fallback to total metal height
     metal_pts = np.argwhere(result.is_metal)
     if len(metal_pts) > 0:
@@ -514,7 +564,7 @@ def analyze_gating(
     # Bernoulli with elbow losses along the gating channel
     channel_mask = np.isin(
         grid,
-        [BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE, BodyType.COOLING_SPRUE, BodyType.POURING_BASIN],
+        [BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE, BodyType.FILTER, BodyType.POURING_BASIN],
     )
     sprue_mask = sprue & channel_mask
     effective_head_cm = height_cm
@@ -548,15 +598,48 @@ def analyze_gating(
     final_sprue_required_cm2 = max(as_req_cm2, required_sprue_area_with_losses_cm2)
     bernoulli_ok = sprue_throat_cm2 >= final_sprue_required_cm2
 
-    # Campbell: total ingate area / runner area < 1.5
-    if runner_min_area_cm2 > 0:
-        gate_to_runner_ratio = ag_total_cm2 / runner_min_area_cm2
-        campbell_ok = gate_to_runner_ratio <= 1.5
+    # v8.4: area checks against target ranges from the recommended gating system.
+    # The target area range for a section is A = Q / v, using the system's v range.
+    gate_flow = section_flows.get("INGATE", SectionFlow())
+    runner_flow = section_flows.get("RUNNER", SectionFlow())
+    sprue_flow = section_flows.get("SPRUE_THROAT", SectionFlow())
+
+    def _area_mid(sf: SectionFlow) -> float:
+        if sf.target_area_min_cm2 > 0 and sf.target_area_max_cm2 > 0:
+            return (sf.target_area_min_cm2 + sf.target_area_max_cm2) / 2.0
+        return 0.0
+
+    def _in_target_range(sf: SectionFlow, area_cm2: float) -> bool:
+        if sf.target_area_min_cm2 <= 0 or sf.target_area_max_cm2 <= 0:
+            return True
+        lo = sf.target_area_min_cm2 * 0.95
+        hi = sf.target_area_max_cm2 * 1.05
+        return lo <= area_cm2 <= hi
+
+    required_ingate_area_cm2 = _area_mid(gate_flow)
+    required_runner_area_cm2 = _area_mid(runner_flow)
+    required_sprue_area_cm2 = max(final_sprue_required_cm2, _area_mid(sprue_flow))
+
+    # Campbell-style ratio check from target velocities (Q same -> A_gate/A_runner = v_runner/v_gate)
+    campbell_ok = True
+    if runner_min_area_cm2 > 0 and gate_area_cm2 > 0:
+        target_ratio = 0.0
+        targets = _GATING_VELOCITY_TARGETS.get(recommended_system, {})
+        if "gate" in targets and "runner" in targets:
+            v_gate_mid = (targets["gate"][0] + targets["gate"][1]) / 2.0
+            v_runner_mid = (targets["runner"][0] + targets["runner"][1]) / 2.0
+            if v_gate_mid > 0:
+                target_ratio = v_runner_mid / v_gate_mid
+        if target_ratio > 0:
+            actual_ratio = gate_area_cm2 / runner_min_area_cm2
+            campbell_ok = abs(actual_ratio - target_ratio) / target_ratio <= 0.30
+        else:
+            # Fallback old rule if no target
+            campbell_ok = gate_area_cm2 / runner_min_area_cm2 <= 1.5
     else:
         campbell_ok = False
 
-    required_runner_area_cm2 = ag_total_cm2 / 1.5 if ag_total_cm2 > 0 else 0.0
-    runner_ok = runner_min_area_cm2 >= required_runner_area_cm2
+    runner_ok = _in_target_range(runner_flow, runner_min_area_cm2)
 
     # Ingate location check
     part_sdf = sdf[part_mask]
@@ -574,8 +657,7 @@ def analyze_gating(
     threshold = 0.8 * max_part_sdf
     ingate_on_thick = ingate_avg_m > threshold if max_part_sdf > 0 else False
 
-    required_ingate_area_cm2 = required_runner_area_cm2 / 1.5
-    ingate_ok = (ag_total_cm2 >= required_ingate_area_cm2) and (not ingate_on_thick)
+    ingate_ok = _in_target_range(gate_flow, gate_area_cm2) and (not ingate_on_thick)
     if user_v > 0:
         ingate_ok = ingate_ok and velocity_area_ok
 
@@ -626,7 +708,7 @@ def analyze_gating(
         )
 
     return GateResult(
-        total_ingate_contact_area_cm2=ag_total_cm2,
+        total_ingate_contact_area_cm2=gate_contact_area_cm2,
         runner_min_area_cm2=runner_min_area_cm2,
         sprue_base_area_cm2=sprue_base_cm2,
         required_sprue_area_cm2=final_sprue_required_cm2,
