@@ -1059,8 +1059,10 @@ def analyze_gating(
             v_loss_m_s = math.sqrt(2.0 * 9.81 * H_eff_m)
             h_loss_per_elbow_m = alloy.elbow_loss_k * (v_loss_m_s ** 2) / (2.0 * 9.81)
             head_loss_m = h_loss_per_elbow_m * elbow_count
-    H_eff_m = max(0.02, H_eff_m - head_loss_m)
-    head_reduction_percent = 100.0 * (1.0 - (H_eff_m / max(height_m, 1e-9)))
+    # Engine will subtract head_loss from its own effective-head calculation.
+    # We keep the raw H_eff_m for the local loss estimate and update H_eff_m
+    # from the engine result afterwards.
+    head_reduction_percent = 100.0 * (1.0 - (max(H_eff_m - head_loss_m, 0.02) / max(height_m, 1e-9)))
 
     # Geometry-aware gating design engine.
     # It uses Q = A·v with material/system specific velocity targets, while
@@ -1079,12 +1081,9 @@ def analyze_gating(
             val = user_section_areas_cm2.get(ui_key)
             if val is not None and val > 0.0:
                 engine_measured_cm2[ui_key] = float(val)
-    # Fall back to CAD/auto-measured values for the main sections if the user
-    # did not override them, but do not auto-override the throat.
+    # Fall back to CAD/auto-measured values for comparison/warning only.
     for ui_key, real_key in ui_to_real.items():
         if ui_key in engine_measured_cm2:
-            continue
-        if ui_key in ("SPRUE_BASE", "SPRUE_THROAT"):
             continue
         val = real_areas.get(real_key, 0.0)
         if val > 0.0:
@@ -1118,11 +1117,12 @@ def analyze_gating(
         user_velocity_section_key=user_velocity_section,
         discharge_coeff=discharge_coeff,
         measured_areas_cm2=engine_measured_cm2,
-        n_gates=n_ingates,
+        n_gates=n_ingates if n_ingates > 1 else None,
         head_loss_m=head_loss_m,
         max_gates=4,
     )
     design = calculate_gating_design(engine_input)
+    H_eff_m = design.h_eff_mm / 1000.0  # engine's H_eff already includes losses
 
     # Pull results back into the names the rest of analyze_gating expects.
     As_m2 = design.sprue_base_area_cm2 / 1e4
@@ -1300,13 +1300,24 @@ def analyze_gating(
         f"hacim oranı = {feed_to_part_volume_ratio:.2f}."
     )
 
+    # Actual (measured/CAD) areas for the report; design areas come from the engine.
+    actual_sprue_base_cm2 = sprue_base_cm2 if sprue_base_cm2 > 0.0 else As_m2 * 1e4
+    actual_runner_cm2 = runner_min_area_cm2 if runner_min_area_cm2 > 0.0 else Ar_total_m2 * 1e4
+    actual_gate_total_cm2 = gate_area_cm2 if gate_area_cm2 > 0.0 else Ag_total_m2 * 1e4
+
+    def _area_design_ok(actual_cm2: float, design_cm2: float) -> bool:
+        if actual_cm2 <= 0.0 or design_cm2 <= 0.0:
+            return True
+        ratio = actual_cm2 / design_cm2
+        return 0.6 <= ratio <= 1.5
+
     return GateResult(
-        total_ingate_contact_area_cm2=Ag_total_m2 * 1e4,
-        runner_min_area_cm2=Ar_total_m2 * 1e4,
-        sprue_base_area_cm2=As_m2 * 1e4,
+        total_ingate_contact_area_cm2=actual_gate_total_cm2,
+        runner_min_area_cm2=actual_runner_cm2,
+        sprue_base_area_cm2=actual_sprue_base_cm2,
         required_sprue_area_cm2=As_m2 * 1e4,
         campbell_ok=True,
-        bernoulli_ok=( max(sprue_throat_cm2, sprue_base_cm2, As_m2 * 1e4 * 0.95) >= 0.95 * As_m2 * 1e4) if As_m2 > 0 else True,
+        bernoulli_ok=_area_design_ok(actual_sprue_base_cm2, As_m2 * 1e4) if As_m2 > 0 else True,
         ingate_on_thick_region=ingate_on_thick,
         ingate_avg_m_mm=ingate_avg_m,
         ingate_max_m_mm=ingate_max_m,
@@ -1328,11 +1339,11 @@ def analyze_gating(
         ingate_flow_rate_m3_s=Q_design_m3_s,
         ingate_fill_time_s=design_fill_time_s,
         velocity_fill_time_match_ok=True,
-        required_ingate_area_for_velocity_cm2=Ag_total_m2 * 1e4 / max(n_ingates, 1),
+        required_ingate_area_for_velocity_cm2=Ag_each_m2 * 1e4,
         velocity_area_ok=True,
         fluidity_length_mm=fluidity_length_mm,
-        sprue_throat_area_cm2=design.sprue_throat_area_cm2,
-        sprue_base_bottom_area_cm2=design.sprue_base_area_cm2,
+        sprue_throat_area_cm2=sprue_throat_cm2 if sprue_throat_cm2 > 0.0 else design.sprue_throat_area_cm2,
+        sprue_base_bottom_area_cm2=actual_sprue_base_cm2,
         sprue_thickness_mm=sprue_thickness_mm,
         selected_section_key="INGATE",
         selected_velocity_m_s=0.0,
@@ -1358,9 +1369,9 @@ def analyze_gating(
         design_gate_diameter_mm=d_ingate_each_mm,
         design_choke_velocity_m_s=Vc_ms,
         design_gating_ratio=final_ratio,
-        sprue_design_ok=True,
-        runner_design_ok=True,
-        gate_design_ok=True,
+        sprue_design_ok=_area_design_ok(actual_sprue_base_cm2, As_m2 * 1e4),
+        runner_design_ok=_area_design_ok(actual_runner_cm2, Ar_total_m2 * 1e4),
+        gate_design_ok=_area_design_ok(actual_gate_total_cm2, Ag_total_m2 * 1e4),
         part_mass_kg=part_mass_kg,
         total_riser_mass_kg=total_riser_mass_kg,
         gating_mass_kg=gating_mass_kg,
