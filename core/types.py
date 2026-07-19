@@ -132,6 +132,10 @@ class HotSpot:
     heuvers_ok: bool = True
     feeding_cost: float = 0.0
     darcy_ok: bool = True
+    # v8.8: estimated pore size from Niyama + SDAS + feeding risk
+    pore_size_um: float = 0.0
+    pore_size_mm: float = 0.0
+    pore_size_class: str = ""
 
 
 @dataclass
@@ -326,5 +330,11 @@ class AnalysisResult:
     part_surface_area_mm2: float = 0.0
     thermal_divergence: np.ndarray = field(default_factory=lambda: np.array([]))
     riser_proposals: List[RiserProposal] = field(default_factory=list)
+    # v8.8: per-voxel estimated pore size (µm) and macro/micro/fine masks
+    pore_size_um: np.ndarray = field(default_factory=lambda: np.array([]))
+    pore_size_mm: np.ndarray = field(default_factory=lambda: np.array([]))
+    pore_size_macro_mask: np.ndarray = field(default_factory=lambda: np.array([]))
+    pore_size_micro_mask: np.ndarray = field(default_factory=lambda: np.array([]))
+    pore_size_fine_mask: np.ndarray = field(default_factory=lambda: np.array([]))
     # metadata
     bbox_size_mm: np.ndarray = field(default_factory=lambda: np.zeros(3))

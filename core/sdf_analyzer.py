@@ -333,6 +333,64 @@ def compute_niyama_ensemble(niyama: np.ndarray) -> np.ndarray:
     return niyama
 
 
+def compute_pore_size(
+    niyama: np.ndarray,
+    M_mod: np.ndarray,
+    feed_risk: np.ndarray,
+    alloy: Alloy,
+    part_mask: np.ndarray,
+    macro_threshold_um: float = 1000.0,
+    micro_threshold_um: float = 100.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Estimate pore size (µm) from Niyama, local modulus and feeding deficit.
+
+    Macro shrinkage pore:
+        d_macro [mm] = t_section * shrinkage_factor * (1 - N/N_macro) * feed_risk
+    Interdendritic micro pore:
+        d_micro [µm] = SDAS_um * (1 - N/N_shrinkage) * feed_risk
+
+    Returns pore_size_um, pore_size_mm, macro_mask, micro_mask, fine_mask.
+    """
+    t_section_mm = 2.0 * np.maximum(M_mod, 0.0)
+
+    macro_factor = np.clip(1.0 - niyama / max(alloy.niyama_macro, 1e-9), 0.0, 1.0)
+    micro_factor = np.clip(1.0 - niyama / max(alloy.niyama_shrinkage, 1e-9), 0.0, 1.0)
+
+    # No feeding deficit -> no shrinkage porosity can grow.
+    feed_factor = np.clip(feed_risk, 0.0, 1.0)
+
+    d_macro_mm = t_section_mm * alloy.shrinkage_factor * macro_factor * feed_factor
+    sdas_um = alloy.dendrite_spacing_mm * 1000.0
+    d_micro_um = sdas_um * micro_factor * feed_factor
+
+    pore_size_mm = d_macro_mm + d_micro_um / 1000.0
+    pore_size_um = pore_size_mm * 1000.0
+
+    # Restrict to part; outside metal nothing is reported.
+    pore_size_um = np.where(part_mask, pore_size_um, 0.0)
+    pore_size_mm = np.where(part_mask, pore_size_mm, 0.0)
+    pore_size_um = np.nan_to_num(pore_size_um, nan=0.0, posinf=0.0, neginf=0.0)
+    pore_size_mm = np.nan_to_num(pore_size_mm, nan=0.0, posinf=0.0, neginf=0.0)
+
+    macro_mask = (pore_size_um >= macro_threshold_um) & part_mask
+    micro_mask = (
+        (pore_size_um >= micro_threshold_um) & (pore_size_um < macro_threshold_um) & part_mask
+    )
+    fine_mask = (pore_size_um < micro_threshold_um) & part_mask
+
+    return pore_size_um, pore_size_mm, macro_mask, micro_mask, fine_mask
+
+
+def _pore_size_class(pore_size_um: float, macro_threshold_um: float = 1000.0, micro_threshold_um: float = 100.0) -> str:
+    if pore_size_um >= macro_threshold_um:
+        return "macro"
+    if pore_size_um >= micro_threshold_um:
+        return "micro"
+    if pore_size_um > 0.0:
+        return "fine"
+    return ""
+
+
 def _sdf_histogram(sdf: np.ndarray, mask: np.ndarray, bins: int = 50):
     """Histogram and dominant interior modulus."""
     vals = sdf[mask]
@@ -1616,6 +1674,21 @@ def analyze(
         risk = np.nan_to_num(risk, nan=0.0, posinf=0.0, neginf=0.0)
     risk_norm = risk
 
+    # v8.8: estimate pore size from Niyama, local modulus and feeding deficit.
+    pore_size_um, pore_size_mm, pore_macro_mask, pore_micro_mask, pore_fine_mask = compute_pore_size(
+        niyama, M_mod, feed_risk, alloy, part_mask
+    )
+
+    # Assign pore-size estimate to each hot spot.
+    for hs in hotspots:
+        vox_raw = np.round((hs.position_mm - origin_mm) / dx).astype(int)
+        vox = _snap_to_part(vox_raw)
+        if 0 <= vox[0] < grid.shape[0] and 0 <= vox[1] < grid.shape[1] and 0 <= vox[2] < grid.shape[2]:
+            ps_um = float(pore_size_um[vox[0], vox[1], vox[2]])
+            hs.pore_size_um = ps_um
+            hs.pore_size_mm = ps_um / 1000.0
+            hs.pore_size_class = _pore_size_class(ps_um)
+
     if progress_callback:
         progress_callback(95)
 
@@ -1680,6 +1753,11 @@ def analyze(
         bbox_size_mm=bbox_size,
         part_volume_mm3=part_volume_mm3,
         part_surface_area_mm2=part_surface_area_mm2,
+        pore_size_um=pore_size_um,
+        pore_size_mm=pore_size_mm,
+        pore_size_macro_mask=pore_macro_mask,
+        pore_size_micro_mask=pore_micro_mask,
+        pore_size_fine_mask=pore_fine_mask,
     )
 
     result.riser_proposals = propose_risers(result, alloy, existing_riser_count=len(riser_results))
