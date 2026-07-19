@@ -108,6 +108,41 @@ def _flow_axis(mesh: trimesh.Trimesh) -> np.ndarray:
     return axis / norm
 
 
+def _section_2d_area_and_perim(
+    section: trimesh.path.Path3D,
+    axis: np.ndarray,
+    origin: np.ndarray,
+) -> Tuple[float, float]:
+    """Return area (mm²) and perimeter (mm) of a 3D section path.
+
+    The vertices are projected onto an orthonormal basis perpendicular to
+    ``axis`` and the convex-hull area is used; the perimeter comes from the
+    path length (trimesh does not require shapely for this).
+    """
+    axis = np.asarray(axis, dtype=np.float64)
+    axis = axis / (float(np.linalg.norm(axis)) + 1e-12)
+    # Choose a reference vector not parallel to axis.
+    tmp = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    if abs(np.dot(axis, tmp)) > 0.9:
+        tmp = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    u = np.cross(axis, tmp)
+    u = u / (float(np.linalg.norm(u)) + 1e-12)
+    v = np.cross(axis, u)
+    v = v / (float(np.linalg.norm(v)) + 1e-12)
+
+    verts = section.vertices - origin
+    coords = np.column_stack((verts @ u, verts @ v))
+    area = 0.0
+    if len(coords) >= 3:
+        try:
+            hull = ConvexHull(coords)
+            area = float(hull.volume)
+        except Exception:
+            area = 0.0
+    perim = float(getattr(section, "length", 0.0))
+    return area, perim
+
+
 def _section_profile_detailed(
     mesh: trimesh.Trimesh,
     axis: np.ndarray,
@@ -137,21 +172,7 @@ def _section_profile_detailed(
         section = mesh.section(plane_origin=origin, plane_normal=axis)
         if section is None:
             continue
-        area = 0.0
-        perim = 0.0
-        try:
-            p2d, _ = section.to_2D()
-            area = float(getattr(p2d, "area", 0.0))
-            perim = float(getattr(p2d, "length", 0.0))
-        except Exception:
-            try:
-                v = section.vertices[:, :2]
-                if v.shape[0] >= 3:
-                    hull = ConvexHull(v)
-                    area = float(hull.volume)
-                    perim = 0.0
-            except Exception:
-                area = 0.0
+        area, perim = _section_2d_area_and_perim(section, axis, origin)
         if area > 0.0 and perim > 0.0:
             circ = 4.0 * math.pi * area / (perim * perim)
         else:
@@ -300,18 +321,36 @@ def _sprue_circular_base_and_throat(
     if max_area <= 0.0:
         return 0.0, 0.0
 
-    valid = (areas > 0.05 * max_area) & (circs > 0.85) & (circ_areas > 0.0)
-    if not valid.any():
-        base = float(np.median(areas[1:-1])) if len(areas) > 2 else float(np.median(areas))
-        throat = base
+    # Use the largest contiguous region where the cross-section is well inside
+    # the body (area > 30 % of max) and reasonably circular.  End-cap partial
+    # intersections are excluded because they can look circular while being tiny.
+    significant = (areas > 0.30 * max_area) & (circs > 0.85) & (circ_areas > 0.0)
+    runs = []
+    i = 0
+    while i < len(areas):
+        if significant[i]:
+            j = i
+            while j < len(areas) and significant[j]:
+                j += 1
+            runs.append((i, j))
+            i = j
+        else:
+            i += 1
+
+    if runs:
+        # Prefer a run that does not touch the first/last slice (avoids partials).
+        good_runs = [r for r in runs if r[0] > 0 and r[1] < len(areas)]
+        if not good_runs:
+            good_runs = runs
+        run = max(good_runs, key=lambda r: r[1] - r[0])
+        i, j = run
+        base = float(circ_areas[i:j].max())
+        throat = float(circ_areas[i:j].min())
         return base, throat
 
-    base = float(circ_areas[valid].max())
-    interior = np.ones_like(areas, dtype=bool)
-    interior[0] = interior[-1] = False
-    if not (interior & valid).any():
-        interior = valid
-    throat = float(circ_areas[interior & valid].min())
+    # Prismatic / non-circular sprue: use the median cross-sectional area.
+    base = float(np.median(areas[1:-1])) if len(areas) > 2 else float(np.median(areas))
+    throat = base
     return base, throat
 
 
@@ -1030,10 +1069,28 @@ def analyze_gating(
     d_sprue_mm = design_res["d_sprue_m"] * 1000.0
     d_ingate_each_mm = design_res["d_ingate_m"] * 1000.0
 
-    v_sprue_design = Vc_ms
-    v_runner_design = Vc_ms * (As_ratio / Ar_ratio) if Ar_ratio > 0.0 else 0.0
-    v_gate_design = Vc_ms * (As_ratio / Ag_ratio) if Ag_ratio > 0.0 else 0.0
+    # If the STEP file contains explicit gating geometry, prefer its measured
+    # cross-sectional areas to the theoretical design values.  Velocities are
+    # then recomputed from the real geometry and the same total flow rate.
+    if use_bodies:
+        measured_Ag_total_cm2 = real_areas.get("ingate_total_cm2", 0.0)
+        measured_Ar_total_cm2 = real_areas.get("runner_total_cm2", 0.0)
+        measured_As_cm2 = real_areas.get("sprue_base_cm2", 0.0)
+        if measured_Ag_total_cm2 > 0.0:
+            Ag_total_m2 = measured_Ag_total_cm2 / 1e4
+            Ag_each_m2 = Ag_total_m2 / max(n_ingates, 1)
+        if measured_Ar_total_cm2 > 0.0:
+            Ar_total_m2 = measured_Ar_total_cm2 / 1e4
+        if measured_As_cm2 > 0.0:
+            As_m2 = measured_As_cm2 / 1e4
+        d_sprue_mm = 1000.0 * math.sqrt(4.0 * max(As_m2, 0.0) / math.pi)
+        d_ingate_each_mm = 1000.0 * math.sqrt(4.0 * max(Ag_each_m2, 0.0) / math.pi)
+
     Q_design_m3_s = total_metal_volume_m3 / design_fill_time_s
+    ingate_Q_each = Q_design_m3_s / max(n_ingates, 1)
+    v_sprue_design = Q_design_m3_s / As_m2 if As_m2 > 0.0 else Vc_ms
+    v_runner_design = Q_design_m3_s / Ar_total_m2 if Ar_total_m2 > 0.0 else 0.0
+    v_gate_design = ingate_Q_each / Ag_each_m2 if Ag_each_m2 > 0.0 else 0.0
 
     # Target velocity ranges for the recommended gating system.
     recommended_system, _ = _recommend_gating_system(wall_cat)
@@ -1044,7 +1101,6 @@ def analyze_gating(
     sprue_v_range = velocity_targets["sprue"]
     runner_v_range = velocity_targets["runner"]
     gate_v_range = velocity_targets["gate"]
-    ingate_Q_each = Q_design_m3_s / max(n_ingates, 1)
     sprue_A_min, sprue_A_max = _target_area_range_cm2(Q_design_m3_s, *sprue_v_range)
     runner_A_min, runner_A_max = _target_area_range_cm2(Q_design_m3_s, *runner_v_range)
     gate_A_min, gate_A_max = _target_area_range_cm2(ingate_Q_each, *gate_v_range)

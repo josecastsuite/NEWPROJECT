@@ -61,6 +61,156 @@ def _global_bbox(bodies: List[Body]) -> Tuple[np.ndarray, np.ndarray]:
     return mins.min(axis=0), maxs.max(axis=0)
 
 
+def _bboxes_overlap_or_close(
+    min_a: np.ndarray,
+    max_a: np.ndarray,
+    min_b: np.ndarray,
+    max_b: np.ndarray,
+    tol: float = 2.0,
+) -> bool:
+    """True if two bounding boxes overlap or are within ``tol`` of each other."""
+    return bool(np.all((max_a + tol) >= min_b) and np.all((max_b + tol) >= min_a))
+
+
+def _classify_casting_bodies(
+    bodies: List[Body],
+    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
+    tol_mm: float = 2.0,
+) -> None:
+    """Heuristic body-type assignment for STEP files with multiple solids.
+
+    - The largest solid is the casting (PART).
+    - Solids connected to the part that extend opposite to gravity are labelled RISER.
+    - Remaining connected solids are ordered by distance from the part along the
+      gating chain; the closest is INGATE, the farthest is SPRUE, and the rest
+      are RUNNER.
+    """
+    if not bodies or any(b.body_type != BodyType.PART for b in bodies):
+        return
+
+    # Use mesh volume; if mesh is non-watertight fall back to bbox volume.
+    def _volume(b: Body) -> float:
+        if b.volume_cm3 > 0.0:
+            return b.volume_cm3
+        size = b.mesh.bounds[1] - b.mesh.bounds[0]
+        return float(np.prod(size)) / 1000.0
+
+    part_idx = int(np.argmax([_volume(b) for b in bodies]))
+    part = bodies[part_idx]
+    part_center = part.center
+    part_min = part.mesh.bounds[0]
+    part_max = part.mesh.bounds[1]
+    part_size = part_max - part_min
+    part_min_dim = float(np.min(part_size))
+
+    # Up is opposite to gravity (where a riser sits).
+    g = np.asarray(gravity_vector, dtype=np.float64)
+    g_norm = float(np.linalg.norm(g)) + 1e-12
+    up = -g / g_norm
+
+    n = len(bodies)
+    mins = [b.mesh.bounds[0] for b in bodies]
+    maxs = [b.mesh.bounds[1] for b in bodies]
+
+    # Build adjacency from bounding-box proximity.
+    adj: List[List[int]] = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _bboxes_overlap_or_close(mins[i], maxs[i], mins[j], maxs[j], tol_mm):
+                adj[i].append(j)
+                adj[j].append(i)
+
+    # Breadth-first search from the part to find attached auxiliaries.
+    visited = [False] * n
+    visited[part_idx] = True
+    queue = [part_idx]
+    connected: List[int] = []
+    while queue:
+        u = queue.pop(0)
+        for v in adj[u]:
+            if not visited[v]:
+                visited[v] = True
+                queue.append(v)
+                if v != part_idx:
+                    connected.append(v)
+
+    # Only keep auxiliaries that protrude outside the part's bounding box.
+    # Internal bodies (holes, cores, mounting bosses) are left as PART.
+    def _protrudes(v: int) -> bool:
+        bmin = mins[v]
+        bmax = maxs[v]
+        return bool(
+            np.any(bmin < part_min - tol_mm) or np.any(bmax > part_max + tol_mm)
+        )
+
+    connected = [v for v in connected if _protrudes(v)]
+
+    if not connected:
+        return
+
+    # Identify the riser.  First try the gravity-opposite direction; if that
+    # fails, look for a body that is strongly off the main gating axis (e.g. a
+    # side/top riser in a horizontal gating system).
+    riser_idx: Optional[int] = None
+    max_up = 0.2 * part_min_dim
+    for v in connected:
+        vec = bodies[v].center - part_center
+        proj = float(np.dot(vec, up))
+        if proj > max_up:
+            max_up = proj
+            riser_idx = v
+
+    if riser_idx is None:
+        # Fallback: the riser is the outlier perpendicular to the dominant
+        # direction of the remaining auxiliary bodies.
+        gating_candidates = [v for v in connected]
+        centered = np.vstack([bodies[v].center - part_center for v in gating_candidates])
+        if centered.shape[0] >= 2:
+            cov = np.cov(centered.T)
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            main_axis = eigvecs[:, int(np.argmax(eigvals))]
+            main_axis /= float(np.linalg.norm(main_axis)) + 1e-12
+            best_score = 0.0
+            for v in gating_candidates:
+                vec = bodies[v].center - part_center
+                proj_main = float(np.dot(vec, main_axis))
+                residual = float(np.linalg.norm(vec - proj_main * main_axis))
+                # A riser is far from the gating line and not far along it.
+                if residual > 0.5 * part_min_dim and residual > 2.0 * abs(proj_main):
+                    if residual > best_score:
+                        best_score = residual
+                        riser_idx = v
+
+    gating = [v for v in connected if v != riser_idx]
+    if riser_idx is not None:
+        bodies[riser_idx].body_type = BodyType.RISER
+
+    if not gating:
+        return
+
+    # Main gating direction: from part centroid to the average gating centroid.
+    gating_centers = np.vstack([bodies[v].center for v in gating])
+    flow_vec = gating_centers.mean(axis=0) - part_center
+    flow_norm = float(np.linalg.norm(flow_vec))
+    if flow_norm > 1e-12:
+        flow_dir = flow_vec / flow_norm
+    else:
+        flow_dir = np.array([1.0, 0.0, 0.0])
+
+    gating_sorted = sorted(
+        gating,
+        key=lambda i: float(np.dot(bodies[i].center - part_center, flow_dir)),
+    )
+
+    if len(gating_sorted) == 1:
+        bodies[gating_sorted[0]].body_type = BodyType.INGATE
+    else:
+        bodies[gating_sorted[0]].body_type = BodyType.INGATE
+        bodies[gating_sorted[-1]].body_type = BodyType.SPRUE
+        for idx in gating_sorted[1:-1]:
+            bodies[idx].body_type = BodyType.RUNNER
+
+
 def _voxelize_at_dim(
     bodies: List[Body],
     target_dim: int,
@@ -148,6 +298,7 @@ def build_voxel_grid(
     target_dim: int = BASE_RES,
     progress_callback: Optional[callable] = None,
     fix_mesh: bool = True,
+    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
 ) -> Tuple[np.ndarray, np.ndarray, float, List[Body]]:
     """
     Build a global voxel grid.
@@ -156,6 +307,10 @@ def build_voxel_grid(
     of SDF/gradient calculations.  The resolution is automatically increased if
     the chosen voxel size exceeds one third of the minimum wall thickness
     (Nyquist criterion for thin-wall feeding paths).
+
+    If every body is still ``BodyType.PART`` (typical for a raw STEP import),
+    a heuristic classifier is run first to distinguish casting, riser, sprue,
+    runner and ingate solids using ``gravity_vector``.
 
     Returns
     -------
@@ -170,6 +325,8 @@ def build_voxel_grid(
     """
     if not bodies:
         raise ValueError("Voxelize edilecek body yok.")
+
+    _classify_casting_bodies(bodies, gravity_vector=gravity_vector)
 
     bbox_min, bbox_max = _global_bbox(bodies)
     bbox_size = bbox_max - bbox_min

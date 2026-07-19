@@ -31,9 +31,15 @@ def main(path: str = "data/Knuckle.STEP", out_dir: str = "/tmp/josecast_test"):
     # Run analysis with mm assumption
     apply_unit_scale(bodies, "mm")
 
+    # Parça1 model has the riser above the part in +Y and gating in +X;
+    # Knuckle uses the conventional -Z gravity.
+    gravity = (0.0, -1.0, 0.0) if "parca" in path.lower() else (0.0, 0.0, -1.0)
+
     target_dim = 160
     print(f"Voxelizing at {target_dim} ...")
-    grid, origin, dx, bodies = build_voxel_grid(bodies, target_dim=target_dim)
+    grid, origin, dx, bodies = build_voxel_grid(
+        bodies, target_dim=target_dim, gravity_vector=gravity
+    )
     print(f"  grid shape={grid.shape}, dx={dx:.4f} mm, origin={origin}")
 
     alloy_key = "42CrMo4"
@@ -46,6 +52,7 @@ def main(path: str = "data/Knuckle.STEP", out_dir: str = "/tmp/josecast_test"):
         t_fill_s=0.0,
         rho_liquid_kg_m3=7850.0,
         viscosity_pa_s=0.005,
+        gravity_vector=gravity,
     )
 
     alloy = get_alloy(alloy_key)
