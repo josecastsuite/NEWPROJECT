@@ -82,19 +82,29 @@ class SectionDialog(QtWidgets.QDialog):
 
     @staticmethod
     def _default_key_for(body: Body) -> str:
-        if body.body_type == BodyType.SPRUE:
+        try:
+            bt = BodyType(body.body_type) if isinstance(body.body_type, int) else body.body_type
+        except Exception:
+            return "INGATE"
+        if bt == BodyType.SPRUE:
             return "SPRUE_BASE"
-        if body.body_type == BodyType.RUNNER:
+        if bt == BodyType.RUNNER:
             return "RUNNER"
-        if body.body_type == BodyType.INGATE:
+        if bt == BodyType.INGATE:
             return "INGATE"
         return "INGATE"
 
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
 
+        try:
+            bt = BodyType(self.body.body_type) if isinstance(self.body.body_type, int) else self.body.body_type
+            type_name = bt.name if isinstance(bt, BodyType) else str(bt)
+        except Exception:
+            type_name = str(self.body.body_type)
+
         info = QtWidgets.QLabel(
-            f"<b>{self.body.name}</b> ({self.body.body_type.name})<br>"
+            f"<b>{self.body.name}</b> ({type_name})<br>"
             f"Hacim: {self.body.volume_cm3:.2f} cm³<br>"
             "Lütfen kesit alanını seçin veya elle girin:"
         )

@@ -720,7 +720,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.viewer.show_bodies(self._bodies)
 
     def on_body_type_changed(self, body: Body, combo: QtWidgets.QComboBox):
-        body.body_type = combo.currentData()
+        data = combo.currentData()
+        try:
+            body.body_type = BodyType(data) if isinstance(data, int) else data
+        except Exception:
+            body.body_type = BodyType.PART
         btn = self._body_section_buttons.get(body.name)
         if btn is not None:
             btn.setEnabled(body.body_type in (BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE))
@@ -728,10 +732,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_body_section(self, body: Body):
         """Open the per-body section-area selection dialog."""
-        if body is None or body.body_type not in (BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE):
+        if body is None:
             return
-        default_key = self._section_key_for_body(body)
-        dialog = SectionDialog(body, section_key=default_key, parent=self)
+        try:
+            bt = BodyType(body.body_type) if isinstance(body.body_type, int) else body.body_type
+        except Exception:
+            bt = body.body_type
+        if bt not in (BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE):
+            return
+        default_key = self._section_key_for_body(bt)
+        try:
+            dialog = SectionDialog(body, section_key=default_key, parent=self)
+        except Exception as e:
+            self.aiLog(f"Kesit dialogu açılamadı: {e}", "crit")
+            QtWidgets.QMessageBox.critical(self, "Hata", f"Kesit dialogu açılamadı:\n{e}")
+            return
+
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             if dialog.area_cm2 is not None and dialog.section_key is not None:
                 self._body_section_areas_cm2[(body.name, dialog.section_key)] = dialog.area_cm2
@@ -740,12 +756,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"{body.name} - {dialog.section_key}: A = {dialog.area_cm2:.4f} cm²", "ok"
                 )
 
-    def _section_key_for_body(self, body: Body) -> str:
-        if body.body_type == BodyType.SPRUE:
+    def _section_key_for_body(self, body_or_type) -> str:
+        bt = body_or_type.body_type if isinstance(body_or_type, Body) else body_or_type
+        if bt == BodyType.SPRUE:
             return "SPRUE_BASE"
-        if body.body_type == BodyType.RUNNER:
+        if bt == BodyType.RUNNER:
             return "RUNNER"
-        if body.body_type == BodyType.INGATE:
+        if bt == BodyType.INGATE:
             return "INGATE"
         return "INGATE"
 
