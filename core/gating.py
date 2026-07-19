@@ -1020,6 +1020,43 @@ def analyze_gating(
     else:
         n_ingates = 1
 
+    # User-specified velocity override: if the engineer enters a positive velocity
+    # for a section, we derive a fill time from the (user- or CAD-measured) area
+    # of that section so v = Q/A is exactly matched.  If no measured area is
+    # available, the target velocity is passed to the ratio auto-tuner so the
+    # design still aims for it.  The target is divided by Cd because the design
+    # formula produces an actual gate velocity of Cd * target_v_gate.
+    user_velocity_m_s = 0.0
+    user_velocity_key = "INGATE"
+    if casting_params is not None and isinstance(casting_params, CastingParameters):
+        user_velocity_m_s = float(getattr(casting_params, "ingate_velocity_m_s", 0.0) or 0.0)
+        user_velocity_key = str(getattr(casting_params, "velocity_section_key", "INGATE") or "INGATE")
+
+    A_user_section_m2 = 0.0
+    if user_velocity_m_s > 0.0:
+        if user_velocity_key == "INGATE":
+            Ag_total_cm2 = real_areas.get("ingate_total_cm2", 0.0)
+            if Ag_total_cm2 > 0.0 and n_ingates > 0:
+                A_user_section_m2 = (Ag_total_cm2 / float(n_ingates)) / 1e4
+        elif user_velocity_key == "RUNNER":
+            Ar_total_cm2 = real_areas.get("runner_total_cm2", 0.0)
+            if Ar_total_cm2 > 0.0:
+                A_user_section_m2 = Ar_total_cm2 / 1e4
+        elif user_velocity_key == "SPRUE_THROAT":
+            As_throat_cm2 = real_areas.get("sprue_throat_cm2", 0.0)
+            if As_throat_cm2 <= 0.0:
+                As_throat_cm2 = real_areas.get("sprue_base_cm2", 0.0)
+            if As_throat_cm2 > 0.0:
+                A_user_section_m2 = As_throat_cm2 / 1e4
+        elif user_velocity_key in ("SPRUE_BASE", "SPRUE"):
+            As_base_cm2 = real_areas.get("sprue_base_cm2", 0.0)
+            if As_base_cm2 > 0.0:
+                A_user_section_m2 = As_base_cm2 / 1e4
+
+    if user_velocity_m_s > 0.0 and A_user_section_m2 > 0.0:
+        t_from_velocity = total_metal_volume_m3 / (user_velocity_m_s * A_user_section_m2)
+        design_fill_time_s = float(np.clip(t_from_velocity, 0.2, 120.0))
+
     # Effective metal head from geometry + mass reduction + elbow losses.
     # Use average ferrostatic head (h_max - c/2) to account for backpressure as
     # the mold fills; c is the part height in the casting direction.
@@ -1061,9 +1098,15 @@ def analyze_gating(
     H_eff_m = max(0.02, H_eff_m - head_loss_m)
     head_reduction_percent = 100.0 * (1.0 - (H_eff_m / max(height_m, 1e-9)))
 
-    # Gating ratio: material default + auto-tune Ag to target gate velocity
+    # Gating ratio: material default + auto-tune Ag to target gate velocity.
+    # If the user supplied a velocity and no measured area exists for that
+    # section, we target the user value divided by Cd so the design's actual
+    # gate velocity equals the user's input.
     base_ratio = _default_gating_ratio(alloy.key)
-    target_v_gate = _target_gate_velocity_m_s(alloy.key, wall_cat)
+    if user_velocity_m_s > 0.0 and A_user_section_m2 <= 0.0:
+        target_v_gate = user_velocity_m_s / max(discharge_coeff, 0.01)
+    else:
+        target_v_gate = _target_gate_velocity_m_s(alloy.key, wall_cat)
     final_ratio = _auto_tune_gating_ratio(H_eff_m, base_ratio, target_v_gate, part_mass_kg)
     As_ratio, Ar_ratio, Ag_ratio = final_ratio
 

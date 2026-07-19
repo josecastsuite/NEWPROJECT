@@ -47,6 +47,8 @@ def main():
     parser.add_argument("--out-dir", default="/tmp/josecast_test", help="HTML output directory")
     parser.add_argument("--gravity", default=None, help="Yerçekimi vektörü x,y,z (örn: 0,-1,0)")
     parser.add_argument("--section-area", default=None, help="Kullanıcı kesit alanları: KEY=cm2,... (RUNNER,INGATE,SPRUE_BASE,SPRUE_THROAT)")
+    parser.add_argument("--velocity", default=None, type=float, help="Hedef kesit hızı v (m/s)")
+    parser.add_argument("--velocity-section", default="INGATE", help="Hedef hız kesiti (INGATE/RUNNER/SPRUE_BASE/SPRUE_THROAT)")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -91,6 +93,8 @@ def main():
         rho_liquid_kg_m3=7850.0,
         viscosity_pa_s=0.005,
         gravity_vector=gravity,
+        ingate_velocity_m_s=float(args.velocity) if args.velocity else 0.0,
+        velocity_section_key=args.velocity_section,
     )
 
     alloy = get_alloy(alloy_key)
