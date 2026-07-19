@@ -185,7 +185,7 @@ class SectionDialog(QtWidgets.QDialog):
 
     def _set_radio_text(self, radio: QtWidgets.QRadioButton, label: str, value: Optional[float]):
         if value is not None and value > 0:
-            d_mm = 1000.0 * np.sqrt(4.0 * value * 100.0 / np.pi)
+            d_mm = np.sqrt(4.0 * value * 100.0 / np.pi)
             radio.setText(f"{label}: A = {value:.4f} cm² (≈ Ø {d_mm:.2f} mm)")
             radio.setEnabled(True)
             radio.setToolTip("Bu değeri seçmek için tıklayın")
