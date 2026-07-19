@@ -259,17 +259,21 @@ class Analyzer3DViewer(QtInteractor):
         result: Optional[AnalysisResult],
         percentile: float = 95.0,
         max_points: int = 1500,
+        pore_size_filter: Optional[str] = None,
     ):
-        """High-risk porosity as bright point markers inside the part.
+        """Porosity point cloud colored by estimated pore size.
 
-        Uses the slowest-solidifying regions (solidification time) so the cloud
-        is visible even when the normalized risk score is low.  If no
-        solidification time field is present, falls back to the top percentile of
-        the risk field.
+        If ``pore_size_filter`` is ``None`` or ``all`` and the result contains
+        pore-size arrays, the cloud shows all cells with a positive pore size,
+        colored by size (µm).  Valid filters are ``macro``, ``micro`` and
+        ``fine``; each restricts the cloud to the matching pore-size mask.
+        Falls back to the slowest-solidifying regions when pore-size data are
+        not available.
         """
         if self._porosity_actor is not None:
             self.remove_actor(self._porosity_actor)
             self._porosity_actor = None
+        self._remove_scalar_bar("Pore size (µm)")
         if result is None:
             return
 
@@ -277,33 +281,51 @@ class Analyzer3DViewer(QtInteractor):
         if not part_mask.any():
             return
 
-        # Prefer solidification time: last-to-solidify regions are the real
-        # porosity-prone volumes.  Risk is used as a fallback / for coloring.
-        solid_time = np.asarray(result.solidification_time) if result.solidification_time is not None else np.array([])
-        risk = np.asarray(result.risk) if result.risk is not None else np.array([])
-        if solid_time.size and np.isfinite(solid_time[part_mask]).any():
-            field = solid_time
-            scalar_name = "t_solid"
-        elif risk.size:
-            field = risk
-            scalar_name = "risk"
-        else:
-            return
+        pore_size_filter = (pore_size_filter or "").lower()
+        pore_size_um = np.asarray(result.pore_size_um) if result.pore_size_um is not None else np.array([])
+        has_pore_size = pore_size_um.size and pore_size_um.shape == part_mask.shape
 
-        part_values = np.asarray(field[part_mask], dtype=np.float64)
-        finite = np.isfinite(part_values)
+        class_mask = np.zeros_like(part_mask, dtype=bool)
+        use_pore_size = False
+        if has_pore_size and pore_size_filter in ("macro", "micro", "fine"):
+            class_mask = np.asarray(getattr(result, f"pore_size_{pore_size_filter}_mask", class_mask))
+            if class_mask is None or class_mask.size == 0:
+                class_mask = np.zeros_like(part_mask, dtype=bool)
+            use_pore_size = class_mask.any()
+        elif has_pore_size and pore_size_filter in ("", "all"):
+            class_mask = part_mask & (pore_size_um > 0.0)
+            use_pore_size = class_mask.any()
+
+        if use_pore_size:
+            field = pore_size_um
+            scalar_name = "pore_size_um"
+            mask = class_mask
+        else:
+            # Fallback to the old behaviour if no pore-size field or no voxels.
+            solid_time = np.asarray(result.solidification_time) if result.solidification_time is not None else np.array([])
+            risk = np.asarray(result.risk) if result.risk is not None else np.array([])
+            if solid_time.size and np.isfinite(solid_time[part_mask]).any():
+                field = solid_time
+                scalar_name = "t_solid"
+            elif risk.size:
+                field = risk
+                scalar_name = "risk"
+            else:
+                return
+            mask = part_mask
+
+        values = np.asarray(field[mask], dtype=np.float64)
+        finite = np.isfinite(values)
         if not finite.any():
             return
-        finite_max = float(np.max(part_values[finite]))
-        lo = float(np.percentile(part_values[finite], percentile))
-        # Cells that never solidified (inf) are the most porosity-prone; assign a
-        # value above the finite maximum so they fall inside the threshold.
+        finite_max = float(np.max(values[finite]))
+        lo = float(np.percentile(values[finite], percentile))
         if finite_max > 0.0:
             inf_replace = finite_max * 1.5
         else:
             inf_replace = 1.0
         clean_field = np.where(np.isfinite(field), field, inf_replace)
-        hi = float(np.max(clean_field[part_mask]))
+        hi = float(np.max(clean_field[mask]))
         if hi <= lo:
             return
 
@@ -322,13 +344,16 @@ class Analyzer3DViewer(QtInteractor):
 
         self._porosity_actor = self.add_mesh(
             cloud,
-            color="#ff0000",
+            scalars=scalar_name,
+            cmap="plasma",
+            clim=[0.0, max(hi, 1.0)],
             style="points",
             point_size=8,
             render_points_as_spheres=True,
             opacity=1.0,
             lighting=False,
-            show_scalar_bar=False,
+            show_scalar_bar=True,
+            scalar_bar_args=_scalar_bar_args("Pore size (µm)", (0.82, 0.02)),
         )
 
     def show_niyama_isosurfaces(self, result: Optional[AnalysisResult]):
@@ -504,13 +529,14 @@ class Analyzer3DViewer(QtInteractor):
                 self.remove_actor(self._hotspot_label_actor)
                 self._hotspot_label_actor = None
 
-    def toggle_porosity(self, result: AnalysisResult, checked: bool, percentile: float = 95.0, max_points: int = 1500):
+    def toggle_porosity(self, result: AnalysisResult, checked: bool, percentile: float = 95.0, max_points: int = 1500, pore_size_filter: Optional[str] = None):
         if checked:
-            self.show_porosity_cloud(result, percentile=percentile, max_points=max_points)
+            self.show_porosity_cloud(result, percentile=percentile, max_points=max_points, pore_size_filter=pore_size_filter)
         else:
             if self._porosity_actor is not None:
                 self.remove_actor(self._porosity_actor)
                 self._porosity_actor = None
+            self._remove_scalar_bar("Pore size (µm)")
 
     def toggle_niyama(self, result: AnalysisResult, checked: bool):
         if checked:

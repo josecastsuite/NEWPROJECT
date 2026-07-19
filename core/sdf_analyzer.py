@@ -376,7 +376,7 @@ def compute_pore_size(
     micro_mask = (
         (pore_size_um >= micro_threshold_um) & (pore_size_um < macro_threshold_um) & part_mask
     )
-    fine_mask = (pore_size_um < micro_threshold_um) & part_mask
+    fine_mask = (pore_size_um > 0.0) & (pore_size_um < micro_threshold_um) & part_mask
 
     return pore_size_um, pore_size_mm, macro_mask, micro_mask, fine_mask
 

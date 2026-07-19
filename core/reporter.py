@@ -20,6 +20,37 @@ def _html_escape(text: str) -> str:
     )
 
 
+def _format_pore_size_summary(result: AnalysisResult) -> str:
+    """Return an HTML table summarising estimated pore size distribution."""
+    ps = result.pore_size_um
+    if ps is None or ps.size == 0:
+        return "<p>Gözenek boyutu hesabı mevcut değil.</p>"
+    pm = result.pore_size_macro_mask
+    pmi = result.pore_size_micro_mask
+    pf = result.pore_size_fine_mask
+    macro_vox = int(pm.sum()) if pm is not None and pm.size else 0
+    micro_vox = int(pmi.sum()) if pmi is not None and pmi.size else 0
+    fine_vox = int(pf.sum()) if pf is not None and pf.size else 0
+    total = macro_vox + micro_vox + fine_vox
+    if total == 0:
+        return "<p>Tahmini gözenek tespit edilmedi.</p>"
+
+    ps = np.asarray(ps, dtype=np.float64)
+    macro_vals = ps[pm & np.isfinite(ps) & (ps > 0)] if pm is not None and pm.size else np.array([])
+    micro_vals = ps[pmi & np.isfinite(ps) & (ps > 0)] if pmi is not None and pmi.size else np.array([])
+    fine_vals = ps[pf & np.isfinite(ps) & (ps > 0)] if pf is not None and pf.size else np.array([])
+
+    def _max(a: np.ndarray) -> float:
+        return float(np.max(a)) if len(a) else 0.0
+
+    return f"""<table>
+        <tr><th>Sınıf</th><th>Voxel sayısı</th><th>Oran</th><th>Max gözenek (µm)</th></tr>
+        <tr><td>Makro (&gt;1000 µm)</td><td>{macro_vox}</td><td>{100.0*macro_vox/total:.1f}%</td><td>{_max(macro_vals):.1f}</td></tr>
+        <tr><td>Mikro (100–1000 µm)</td><td>{micro_vox}</td><td>{100.0*micro_vox/total:.1f}%</td><td>{_max(micro_vals):.1f}</td></tr>
+        <tr><td>İnce (&lt;100 µm)</td><td>{fine_vox}</td><td>{100.0*fine_vox/total:.1f}%</td><td>{_max(fine_vals):.1f}</td></tr>
+    </table>"""
+
+
 def _format_hotspot_table(result: AnalysisResult) -> str:
     rows = []
     if result.hotspots:
@@ -27,6 +58,7 @@ def _format_hotspot_table(result: AnalysisResult) -> str:
             pos = ",".join(f"{v:.1f}" for v in hs.position_mm)
             status = "OK" if hs.feed_ok else "UZAK/DARALMA"
             niy = ", ".join(f"{k}={v:.3f}" for k, v in hs.niyama_variants.items())
+            pore = f"{hs.pore_size_um:.1f} µm ({hs.pore_size_class})" if hs.pore_size_class else "-"
             rows.append(
                 f"<tr>"
                 f"<td>{i}</td>"
@@ -41,11 +73,12 @@ def _format_hotspot_table(result: AnalysisResult) -> str:
                 f"<td>{hs.curvature_mean:.2f}</td>"
                 f"<td>{hs.shape_factor:.4f}</td>"
                 f"<td>{'Evet' if hs.heuvers_ok else 'Hayır'}</td>"
+                f"<td>{pore}</td>"
                 f"<td>{status}</td>"
                 f"</tr>"
             )
     else:
-        rows.append('<tr><td colspan="13">Tespit edilmedi.</td></tr>')
+        rows.append('<tr><td colspan="14">Tespit edilmedi.</td></tr>')
     return "".join(rows)
 
 
@@ -297,12 +330,15 @@ def _render_html(result: AnalysisResult, screenshot_path: Optional[str] = None) 
         <tr><td>Boyut (mm)</td><td>{result.bbox_size_mm[0]:.1f} x {result.bbox_size_mm[1]:.1f} x {result.bbox_size_mm[2]:.1f}</td></tr>
     </table>
 
+    <h2>Gözenek Boyutu Tahmini (µm)</h2>
+    {_format_pore_size_summary(result)}
+
     <h2>Sıcak Noktalar (Hot Spots)</h2>
     <table>
         <tr>
             <th>#</th><th>Konum (mm)</th><th>M ± hata (mm)</th><th>t (mm)</th>
             <th>Mesafe (mm)</th><th>Limit (mm)</th><th>Maliyet</th>
-            <th>Niyama ens.</th><th>Darcy</th><th>Mean curv</th><th>SF</th><th>Heuver</th><th>Durum</th>
+            <th>Niyama ens.</th><th>Darcy</th><th>Mean curv</th><th>SF</th><th>Heuver</th><th>Gözenek</th><th>Durum</th>
         </tr>
         {_format_hotspot_table(result)}
     </table>
@@ -412,15 +448,37 @@ def _generate_report_fpdf2(
     pdf.ln(4)
 
     pdf.set_font(font, "", 13)
+    pdf.cell(0, 8, "Gözenek Boyutu Tahmini", ln=True)
+    pdf.set_font(font, "", 10)
+    ps = result.pore_size_um
+    if ps is not None and ps.size:
+        pm = result.pore_size_macro_mask
+        pmi = result.pore_size_micro_mask
+        pf = result.pore_size_fine_mask
+        macro_vox = int(pm.sum()) if pm is not None and pm.size else 0
+        micro_vox = int(pmi.sum()) if pmi is not None and pmi.size else 0
+        fine_vox = int(pf.sum()) if pf is not None and pf.size else 0
+        total = macro_vox + micro_vox + fine_vox
+        ps_arr = np.asarray(ps, dtype=np.float64)
+        macro_max = float(np.max(ps_arr[pm & np.isfinite(ps_arr) & (ps_arr > 0)])) if (pm is not None and pm.size and macro_vox) else 0.0
+        micro_max = float(np.max(ps_arr[pmi & np.isfinite(ps_arr) & (ps_arr > 0)])) if (pmi is not None and pmi.size and micro_vox) else 0.0
+        fine_max = float(np.max(ps_arr[pf & np.isfinite(ps_arr) & (ps_arr > 0)])) if (pf is not None and pf.size and fine_vox) else 0.0
+        pdf.cell(0, 6, f"Makro (>1000 um): {macro_vox} vox (max {macro_max:.1f} um) | Mikro (100-1000 um): {micro_vox} vox (max {micro_max:.1f} um) | Ince (<100 um): {fine_vox} vox (max {fine_max:.1f} um)", ln=True)
+    else:
+        pdf.cell(0, 6, "Gözenek boyutu hesabi mevcut degil.", ln=True)
+    pdf.ln(4)
+
+    pdf.set_font(font, "", 13)
     pdf.cell(0, 8, "Sıcak Noktalar", ln=True)
     pdf.set_font(font, "", 10)
     if result.hotspots:
         for i, hs in enumerate(result.hotspots, 1):
             pos = ",".join(f"{v:.1f}" for v in hs.position_mm)
             status = "OK" if hs.feed_ok else "UZAK/DARALMA"
+            pore = f" | Gozenek={hs.pore_size_um:.1f} um ({hs.pore_size_class})" if hs.pore_size_class else ""
             pdf.cell(0, 6, f"{i}. Konum=({pos}) mm | M={hs.m_value_mm:.2f} ± {hs.m_uncertainty_mm:.2f} mm | "
                            f"t={hs.t_section_mm:.2f} mm | Besleme={hs.dist_to_riser_mm:.1f}/{hs.max_feeding_distance_mm:.1f} mm | "
-                           f"Niyama={hs.niyama_ensemble:.2f} | Darcy={hs.darcy_resistance:.2f} | Heuver={'OK' if hs.heuvers_ok else 'FAIL'} | {status}", ln=True)
+                           f"Niyama={hs.niyama_ensemble:.2f} | Darcy={hs.darcy_resistance:.2f} | Heuver={'OK' if hs.heuvers_ok else 'FAIL'} | {status}{pore}", ln=True)
     else:
         pdf.cell(0, 6, "Tespit edilmedi.", ln=True)
     pdf.ln(4)

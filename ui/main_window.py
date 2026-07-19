@@ -469,6 +469,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.porosity_detail_slider.valueChanged.connect(self.on_porosity_detail_changed)
         vis_layout.addWidget(self.porosity_detail_slider)
 
+        self.porosity_size_filter = QtWidgets.QComboBox()
+        self.porosity_size_filter.addItem("Tüm poroziteler", "all")
+        self.porosity_size_filter.addItem("Makro (>1000 µm)", "macro")
+        self.porosity_size_filter.addItem("Mikro (100–1000 µm)", "micro")
+        self.porosity_size_filter.addItem("İnce (<100 µm)", "fine")
+        self.porosity_size_filter.setToolTip("Gösterilecek gözenek boyutu sınıfı")
+        self.porosity_size_filter.currentIndexChanged.connect(self.on_porosity_size_filter_changed)
+        vis_layout.addWidget(self.porosity_size_filter)
+
         self.niyama_toggle = QtWidgets.QCheckBox("Niyama İzosurface")
         self.niyama_toggle.setToolTip("Niyama 0.775 / 1.5 izoyüzeyleri")
         self.niyama_toggle.setChecked(False)
@@ -906,8 +915,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.risk_toggle.isChecked():
                 self.viewer.show_risk(self._analysis)
             if self.porosity_toggle.isChecked():
-                pct, mp = self._porosity_cloud_params()
-                self.viewer.show_porosity_cloud(self._analysis, percentile=pct, max_points=mp)
+                pct, mp, size_filter = self._porosity_cloud_params()
+                self.viewer.show_porosity_cloud(self._analysis, percentile=pct, max_points=mp, pore_size_filter=size_filter)
             if self.niyama_toggle.isChecked():
                 self.viewer.show_niyama_isosurfaces(self._analysis)
             if self.path_toggle.isChecked():
@@ -1123,19 +1132,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_toggle_porosity(self, checked: bool):
         if self._analysis:
-            pct, mp = self._porosity_cloud_params()
-            self.viewer.toggle_porosity(self._analysis, checked, percentile=pct, max_points=mp)
+            pct, mp, size_filter = self._porosity_cloud_params()
+            self.viewer.toggle_porosity(self._analysis, checked, percentile=pct, max_points=mp, pore_size_filter=size_filter)
 
     def on_porosity_detail_changed(self, value: int):
         if self._analysis and self.porosity_toggle.isChecked():
-            pct, mp = self._porosity_cloud_params()
-            self.viewer.show_porosity_cloud(self._analysis, percentile=pct, max_points=mp)
+            pct, mp, size_filter = self._porosity_cloud_params()
+            self.viewer.show_porosity_cloud(self._analysis, percentile=pct, max_points=mp, pore_size_filter=size_filter)
 
-    def _porosity_cloud_params(self) -> Tuple[float, int]:
+    def on_porosity_size_filter_changed(self, index: int):
+        if self._analysis and self.porosity_toggle.isChecked():
+            pct, mp, size_filter = self._porosity_cloud_params()
+            self.viewer.show_porosity_cloud(self._analysis, percentile=pct, max_points=mp, pore_size_filter=size_filter)
+
+    def _porosity_cloud_params(self) -> Tuple[float, int, str]:
         detail = self.porosity_detail_slider.value() / 100.0
         percentile = 99.5 - detail * 19.5  # 99.5 (az) .. 80.0 (yoğun)
         max_points = int(500 + detail * 4500)  # 500 .. 5000 nokta
-        return float(percentile), int(max_points)
+        size_filter = str(self.porosity_size_filter.currentData() or "all")
+        return float(percentile), int(max_points), size_filter
 
     def on_toggle_niyama(self, checked: bool):
         if self._analysis:
