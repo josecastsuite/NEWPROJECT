@@ -413,8 +413,11 @@ def find_hotspots(
     """
     # Shape-corrected modulus
     if curvature is not None:
+        # Concave regions (positive curvature) get a smaller shape factor,
+        # increasing the local modulus to reflect heat accumulation at L/T/X
+        # junctions.  f ≈ 0.77 gives up to ~30 % modulus boost.
         shape_factor_field = np.clip(
-            1.0 + np.maximum(-curvature * sdf, 0.0), 1.0, 3.0
+            1.0 - curvature * sdf, 0.77, 3.0
         )
     else:
         shape_factor_field = np.ones_like(sdf)
@@ -1077,7 +1080,7 @@ def _refine_region(
     C = chvorinov_c_from_properties(alloy, mold)
     mean_curv, _ = compute_curvature(sdf, dx)
     shape_factor_field = np.clip(
-        1.0 + np.maximum(-mean_curv * sdf, 0.0), 1.0, 3.0
+        1.0 - mean_curv * sdf, 0.77, 3.0
     )
     M_mod = sdf / shape_factor_field
     t_s = compute_chvorinov_t(M_mod, C)
@@ -1151,7 +1154,7 @@ def _high_res_part_hotspots(
     part_sdf = compute_subvoxel_sdf(part_is_metal, part_dx, sub=1)
     mean_curv, _ = compute_curvature(part_sdf, part_dx)
     shape_factor_field = np.clip(
-        1.0 + np.maximum(-mean_curv * part_sdf, 0.0), 1.0, 3.0
+        1.0 - mean_curv * part_sdf, 0.77, 3.0
     )
     part_M_mod = part_sdf / shape_factor_field
 
@@ -1287,9 +1290,10 @@ def analyze(
         progress_callback(18)
 
     mean_curv, gauss_curv = compute_curvature(sdf, dx)
-    # Shape factor from mean curvature: f=1 for plates, f≈2 for cylinders, f≈3 for spheres
+    # Shape factor from mean curvature: f=1 for plates, f≈2 for cylinders,
+    # f≈3 for spheres, f<1 for concave L/T/X junctions (heat accumulation).
     shape_factor_field = np.clip(
-        1.0 + np.maximum(-mean_curv * sdf, 0.0), 1.0, 3.0
+        1.0 - mean_curv * sdf, 0.77, 3.0
     )
     M_mod = sdf / shape_factor_field
     if progress_callback:
