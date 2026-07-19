@@ -635,7 +635,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         section_btn = QtWidgets.QPushButton("Kesit")
         section_btn.setToolTip("Bu body'nin gating kesit alanını seç (sadece yolluk/meme/döküm ağzı)")
-        section_btn.setEnabled(body.body_type in (BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE))
         section_btn.clicked.connect(lambda _, b=body: self.on_body_section(b))
         row.addWidget(section_btn)
         self._body_section_buttons[body.name] = section_btn
@@ -725,9 +724,10 @@ class MainWindow(QtWidgets.QMainWindow):
             body.body_type = BodyType(data) if isinstance(data, int) else data
         except Exception:
             body.body_type = BodyType.PART
+        # Kesit butonu her zaman tıklanabilir; yanlış tip seçilirse dialog uyarır.
         btn = self._body_section_buttons.get(body.name)
         if btn is not None:
-            btn.setEnabled(body.body_type in (BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE))
+            btn.setEnabled(True)
         self.viewer.show_bodies(self._bodies)
 
     def on_body_section(self, body: Body):
@@ -739,13 +739,18 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             bt = body.body_type
         if bt not in (BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE):
+            QtWidgets.QMessageBox.information(
+                self, "Tip Uyarısı",
+                "Kesit seçimi sadece YOLLUK, MEME veya DÖKÜM AĞZI tipindeki body'ler için geçerlidir.\n"
+                "Lütfen önce body tipini değiştirin."
+            )
             return
         default_key = self._section_key_for_body(bt)
         try:
             dialog = SectionDialog(body, section_key=default_key, parent=self)
         except Exception as e:
             self.aiLog(f"Kesit dialogu açılamadı: {e}", "crit")
-            QtWidgets.QMessageBox.critical(self, "Hata", f"Kesit dialogu açılamadı:\n{e}")
+            QtWidgets.QMessageBox.critical(self, "Hata", f"Kesit dialogu açılamadı:\n{e}\n\nElle değer girebilirsiniz.")
             return
 
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
