@@ -942,9 +942,6 @@ def analyze_gating(
             rho_kg_m3=casting_params.rho_liquid_kg_m3,
             viscosity_pa_s=casting_params.viscosity_pa_s,
         )
-    if fill_time_s is None:
-        fill_time_s = 10.0
-
     part_mask = grid == BodyType.PART
     is_metal = result.is_metal
     ingate = grid == BodyType.INGATE
@@ -1013,11 +1010,10 @@ def analyze_gating(
     campbell_fill_time_s = campbell_res["t_fill"]
     campbell_fill_time_basis = campbell_res["t_base_detail"]
     auto_fill_time_s = auto_fill_time(part_mass_kg, alloy.key, alloy.name)
-    if fill_time_s is None or fill_time_s <= 0:
-        fill_time_s = auto_fill_time_s
+    user_fill_time_s = fill_time_s if (fill_time_s and fill_time_s > 0) else None
     recommended_fill_time_s = auto_fill_time_s
     fill_time_basis = "auto_fill_time"
-    design_fill_time_s = float(np.clip(fill_time_s, 0.2, 120.0))
+    design_fill_time_s = user_fill_time_s
 
     # Number of ingate bodies
     if has_ingate:
@@ -1088,7 +1084,7 @@ def analyze_gating(
     for ui_key, real_key in ui_to_real.items():
         if ui_key in engine_measured_cm2:
             continue
-        if ui_key == "SPRUE_THROAT":
+        if ui_key in ("SPRUE_BASE", "SPRUE_THROAT"):
             continue
         val = real_areas.get(real_key, 0.0)
         if val > 0.0:
@@ -1108,7 +1104,7 @@ def analyze_gating(
         part_height_mm=part_height_mm,
         total_height_mm=total_height_mm,
         max_flow_path_mm=float(result.bbox_size_mm.max()),
-        wall_category=wall_cat,
+        wall_thickness_mm=wall_thickness_mm,
         alloy_key=alloy.key,
         alloy_name=alloy.name,
         rho_kg_m3=alloy.rho_kg_m3,
@@ -1117,13 +1113,12 @@ def analyze_gating(
         cp_j_kgk=alloy.cp_j_kgk,
         t_pour_c=alloy.t_pour_c,
         t_liquidus_c=alloy.t_liquidus_c,
-        t_fill_s=fill_time_s if fill_time_s > 0 else None,
+        t_fill_s=user_fill_time_s,
         user_gate_velocity_m_s=user_gate_velocity if user_gate_velocity > 0 else None,
         user_velocity_section_key=user_velocity_section,
         discharge_coeff=discharge_coeff,
         measured_areas_cm2=engine_measured_cm2,
         n_gates=n_ingates,
-        n_runners=1,
         head_loss_m=head_loss_m,
         max_gates=4,
     )
@@ -1136,7 +1131,8 @@ def analyze_gating(
     Ag_each_m2 = design.gate_each_area_cm2 / 1e4
     Vc_ms = design.v_choke_m_s
     Q_design_m3_s = design.q_m3_s
-    design_fill_time_s = design.t_fill_s
+    fill_time_s = design.t_fill_s
+    design_fill_time_s = fill_time_s
     ingate_Q_each = Q_design_m3_s / max(design.n_gates, 1)
 
     v_sprue_design = design.sprue_velocity_m_s
