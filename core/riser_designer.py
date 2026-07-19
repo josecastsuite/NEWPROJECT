@@ -158,14 +158,6 @@ def propose_risers(
         if hs.feed_ok and hs.darcy_ok and hs.heuvers_ok and existing_riser_count > 0:
             continue
 
-        m_required = max(k_mod * hs.m_value_mm, 3.0)
-
-        # Cylindrical feeder / pad is smaller than a sphere for the same modulus.
-        shape = "cylinder"
-        diameter = _cylinder_diameter_for_m(m_required, height_to_diameter=h2d)
-        height = h2d * diameter
-        volume = (np.pi * (diameter ** 2) * height / 4.0) / 1000.0
-
         # Smart surface attachment: find the best place on the part surface.
         surface_vox, surface_pos, t_attach = _best_surface_attachment(result, hs)
         normal = _surface_normal(result.is_metal, surface_vox)
@@ -175,12 +167,38 @@ def propose_risers(
         if normal[2] < 0:
             normal = np.array([0.0, 0.0, 1.0])
 
-        # The feeder centre is placed along the outward normal, base at surface.
-        placement = surface_pos + normal * (height / 2.0)
+        # Decide between a feeder (riser) and a chill/çıkıcı.
+        # Small, isolated hot spots on a relatively thin wall are good chill candidates
+        # when at least one riser already exists; otherwise a feeder is still needed.
+        prefer_chill = (
+            existing_riser_count > 0
+            and hs.m_value_mm <= 10.0
+            and hs.t_section_mm <= 20.0
+            and t_attach <= 20.0
+        )
 
-        # Neck/contact dimensions: the local section feeds into the feeder/pad.
-        neck_diameter = max(diameter * 0.5, t_attach * 0.8, hs.t_section_mm * 0.8, 5.0)
-        neck_height = max(t_attach * 0.5, hs.t_section_mm * 0.5, 3.0)
+        if prefer_chill:
+            shape = "chill"
+            m_required = hs.m_value_mm
+            # Chill insert: cylindrical metal (cast iron/steel) placed on the surface.
+            diameter = max(1.5 * hs.t_section_mm, 2.0 * hs.m_value_mm, 12.0)
+            height = diameter
+            volume = (np.pi * (diameter ** 2) * height / 4.0) / 1000.0
+            neck_diameter = 0.0
+            neck_height = 0.0
+        else:
+            m_required = max(k_mod * hs.m_value_mm, 3.0)
+            # Cylindrical feeder / pad is smaller than a sphere for the same modulus.
+            shape = "cylinder"
+            diameter = _cylinder_diameter_for_m(m_required, height_to_diameter=h2d)
+            height = h2d * diameter
+            volume = (np.pi * (diameter ** 2) * height / 4.0) / 1000.0
+            # Neck/contact dimensions: the local section feeds into the feeder/pad.
+            neck_diameter = max(diameter * 0.5, t_attach * 0.8, hs.t_section_mm * 0.8, 5.0)
+            neck_height = max(t_attach * 0.5, hs.t_section_mm * 0.5, 3.0)
+
+        # The centre is placed along the outward normal, base at surface.
+        placement = surface_pos + normal * (height / 2.0)
 
         reason_parts = []
         if not hs.feed_ok:

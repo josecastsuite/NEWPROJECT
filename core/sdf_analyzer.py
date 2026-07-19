@@ -1488,6 +1488,12 @@ def analyze(
             required_volume_cm3 = alloy.riser_volume_factor * feed_volume_mm3 / 1000.0
             volume_ratio_ok = volume_cm3 >= required_volume_cm3
 
+        part_volume_cm3 = part_volume_mm3 / 1000.0
+        riser_mass_kg = volume_cm3 * alloy.density_g_cm3 / 1000.0
+        feed_to_part_volume_ratio = (
+            volume_cm3 / part_volume_cm3 if part_volume_cm3 > 0.0 else 0.0
+        )
+
         riser_results.append(
             RiserResult(
                 body_index=body.index,
@@ -1503,6 +1509,9 @@ def analyze(
                 effective_m_required=effective_m_required,
                 required_volume_cm3=required_volume_cm3,
                 resistance_correction_mm=resistance_correction,
+                mass_kg=riser_mass_kg,
+                feed_to_part_mass_ratio=feed_to_part_volume_ratio,
+                feed_to_part_volume_ratio=feed_to_part_volume_ratio,
             )
         )
 
@@ -1603,6 +1612,15 @@ def _build_recommendations(
     result: AnalysisResult, alloy: Alloy, mold: MoldMaterial
 ) -> List[str]:
     recs: List[str] = []
+
+    # v9.0: 1:1 scale sanity check.
+    part_volume_cm3 = result.part_volume_mm3 / 1000.0
+    bbox_max_mm = float(np.max(result.bbox_size_mm))
+    if bbox_max_mm < 0.1 or bbox_max_mm > 10000.0 or part_volume_cm3 < 0.01 or part_volume_cm3 > 1e6:
+        recs.append(
+            f"UYARI: Ölçek / 1:1 kontrolü yapılmalı. Parça hacmi = {part_volume_cm3:.3f} cm³, "
+            f"kutu boyu = {bbox_max_mm:.2f} mm. STEP dosyasının mm biriminde ve 1:1 ölçekte olduğundan emin olun."
+        )
 
     has_riser = (result.grid == BodyType.RISER).any()
     if not has_riser:
@@ -1708,13 +1726,22 @@ def _build_recommendations(
             )
 
     for idx, proposal in enumerate(result.riser_proposals):
-        recs.append(
-            f"ÖNERİ {idx + 1}: {proposal.shape} besleyici ekle -> "
-            f"çap={proposal.diameter_mm:.1f} mm, yükseklik={proposal.height_mm:.1f} mm, "
-            f"V={proposal.volume_cm3:.2f} cm³, M={proposal.m_required_mm:.2f} mm. "
-            f"Konum ({proposal.placement_mm[0]:.1f}, {proposal.placement_mm[1]:.1f}, "
-            f"{proposal.placement_mm[2]:.1f}) mm. Neden: {proposal.reason}."
-        )
+        if proposal.shape == "chill":
+            recs.append(
+                f"ÖNERİ {idx + 1}: çıkıcı (chill) ekle -> "
+                f"çap={proposal.diameter_mm:.1f} mm, yükseklik={proposal.height_mm:.1f} mm, "
+                f"V={proposal.volume_cm3:.2f} cm³. "
+                f"Konum ({proposal.placement_mm[0]:.1f}, {proposal.placement_mm[1]:.1f}, "
+                f"{proposal.placement_mm[2]:.1f}) mm. Neden: {proposal.reason}."
+            )
+        else:
+            recs.append(
+                f"ÖNERİ {idx + 1}: {proposal.shape} besleyici ekle -> "
+                f"çap={proposal.diameter_mm:.1f} mm, yükseklik={proposal.height_mm:.1f} mm, "
+                f"V={proposal.volume_cm3:.2f} cm³, M={proposal.m_required_mm:.2f} mm. "
+                f"Konum ({proposal.placement_mm[0]:.1f}, {proposal.placement_mm[1]:.1f}, "
+                f"{proposal.placement_mm[2]:.1f}) mm. Neden: {proposal.reason}."
+            )
 
     all_feed_ok = all(hs.feed_ok for hs in result.hotspots)
     if all_feed_ok and all(rr.large_enough for rr in result.riser_results):

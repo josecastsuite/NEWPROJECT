@@ -144,6 +144,10 @@ class RiserResult:
     required_volume_cm3: float = 0.0
     # v7.2
     resistance_correction_mm: float = 0.0
+    # v9.0
+    mass_kg: float = 0.0
+    feed_to_part_mass_ratio: float = 0.0
+    feed_to_part_volume_ratio: float = 0.0
 
 
 @dataclass
@@ -247,6 +251,12 @@ class GateResult:
     sprue_design_ok: bool = True
     runner_design_ok: bool = True
     gate_design_ok: bool = True
+    # v9.0: part and feed metal masses for feeder/part ratio checks.
+    part_mass_kg: float = 0.0
+    total_riser_mass_kg: float = 0.0
+    gating_mass_kg: float = 0.0
+    feed_to_part_mass_ratio: float = 0.0
+    feed_to_part_volume_ratio: float = 0.0
 
 
 @dataclass

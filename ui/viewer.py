@@ -245,36 +245,80 @@ class Analyzer3DViewer(QtInteractor):
             smooth_shading=True,
         )
 
-    def show_porosity_cloud(self, result: Optional[AnalysisResult], threshold: float = 0.90, max_points: int = 1500):
-        """High-risk porosity as bright point markers inside the part."""
+    def show_porosity_cloud(
+        self,
+        result: Optional[AnalysisResult],
+        percentile: float = 95.0,
+        max_points: int = 1500,
+    ):
+        """High-risk porosity as bright point markers inside the part.
+
+        Uses the slowest-solidifying regions (solidification time) so the cloud
+        is visible even when the normalized risk score is low.  If no
+        solidification time field is present, falls back to the top percentile of
+        the risk field.
+        """
         if self._porosity_actor is not None:
             self.remove_actor(self._porosity_actor)
             self._porosity_actor = None
         if result is None:
             return
 
-        grid = self._make_grid(result, result.risk, "risk")
+        part_mask = result.grid == BodyType.PART
+        if not part_mask.any():
+            return
+
+        # Prefer solidification time: last-to-solidify regions are the real
+        # porosity-prone volumes.  Risk is used as a fallback / for coloring.
+        solid_time = np.asarray(result.solidification_time) if result.solidification_time is not None else np.array([])
+        risk = np.asarray(result.risk) if result.risk is not None else np.array([])
+        if solid_time.size and np.isfinite(solid_time[part_mask]).any():
+            field = solid_time
+            scalar_name = "t_solid"
+        elif risk.size:
+            field = risk
+            scalar_name = "risk"
+        else:
+            return
+
+        part_values = np.asarray(field[part_mask], dtype=np.float64)
+        finite = np.isfinite(part_values)
+        if not finite.any():
+            return
+        finite_max = float(np.max(part_values[finite]))
+        lo = float(np.percentile(part_values[finite], percentile))
+        # Cells that never solidified (inf) are the most porosity-prone; assign a
+        # value above the finite maximum so they fall inside the threshold.
+        if finite_max > 0.0:
+            inf_replace = finite_max * 1.5
+        else:
+            inf_replace = 1.0
+        clean_field = np.where(np.isfinite(field), field, inf_replace)
+        hi = float(np.max(clean_field[part_mask]))
+        if hi <= lo:
+            return
+
+        grid = self._make_grid(result, clean_field, scalar_name)
         part = self._part_only(grid)
         if part.n_cells == 0:
             return
-        high = part.threshold([threshold, 1.0], scalars="risk")
+        high = part.threshold([lo, hi], scalars=scalar_name)
         if high.n_cells == 0:
             return
 
         cloud = high.cell_centers()
         if cloud.n_points > max_points:
             idx = np.random.choice(cloud.n_points, max_points, replace=False)
-            points = cloud.points[idx]
-            cloud = pv.PolyData(points)
+            cloud = pv.PolyData(cloud.points[idx])
 
         self._porosity_actor = self.add_mesh(
             cloud,
             color="#ff0000",
             style="points",
-            point_size=4,
+            point_size=8,
             render_points_as_spheres=True,
-            opacity=0.9,
-            emissive=True,
+            opacity=1.0,
+            lighting=False,
             show_scalar_bar=False,
         )
 

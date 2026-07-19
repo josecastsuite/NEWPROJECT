@@ -164,50 +164,211 @@ def _flow_axis(mesh: trimesh.Trimesh) -> np.ndarray:
     return axis / norm
 
 
-def _section_area_profile(
+def _section_profile_detailed(
     mesh: trimesh.Trimesh,
     axis: np.ndarray,
-    n: int = 30,
-) -> List[float]:
-    """Slice a body perpendicular to its flow axis and return cross-sectional areas [mm2].
+    n: int = 50,
+) -> List[Tuple[float, float, float, float]]:
+    """Slice a body perpendicular to its flow axis and return (t, area, perimeter, circularity).
 
-    Partial end-cap intersections are discarded by a small area threshold relative
-    to the median cross-section.
+    t is the signed distance along ``axis`` from the body centroid.
+    Area and perimeter are in mm² / mm.  Circularity = 4πA / P² (1.0 for a perfect circle).
+    Partial end-cap intersections may return very small areas / perimeters.
     """
-    pts = mesh.vertices
-    proj = (pts - pts.mean(axis=0)) @ axis
+    axis = np.asarray(axis, dtype=np.float64)
+    norm = float(np.linalg.norm(axis))
+    if norm <= 0:
+        return []
+    axis = axis / norm
+    center = mesh.vertices.mean(axis=0)
+    pts = mesh.vertices - center
+    proj = pts @ axis
     lo, hi = float(proj.min()), float(proj.max())
     if hi <= lo:
         return []
     values = np.linspace(lo, hi, max(n, 5))
-    areas = []
+    rows: List[Tuple[float, float, float, float]] = []
     for t in values:
-        origin = pts.mean(axis=0) + axis * t
+        origin = center + axis * t
         section = mesh.section(plane_origin=origin, plane_normal=axis)
         if section is None:
             continue
         area = 0.0
+        perim = 0.0
         try:
             p2d, _ = section.to_2D()
             area = float(getattr(p2d, "area", 0.0))
+            perim = float(getattr(p2d, "length", 0.0))
         except Exception:
             try:
-                # Convex-hull fallback when shapely/trimesh path area is unavailable.
                 v = section.vertices[:, :2]
                 if v.shape[0] >= 3:
                     hull = ConvexHull(v)
                     area = float(hull.volume)
+                    perim = 0.0
             except Exception:
                 area = 0.0
-        if area > 0.0:
-            areas.append(area)
-    if not areas:
-        return []
-    # Drop partial end caps: areas smaller than 10% of the median are not reliable.
-    median = float(np.median(areas))
-    threshold = 0.1 * max(median, 1e-9)
-    filtered = [a for a in areas if a >= threshold]
-    return filtered
+        if area > 0.0 and perim > 0.0:
+            circ = 4.0 * math.pi * area / (perim * perim)
+        else:
+            circ = 0.0
+        rows.append((t, area, perim, circ))
+    return rows
+
+
+def _section_area_profile(
+    mesh: trimesh.Trimesh,
+    axis: np.ndarray,
+    n: int = 50,
+) -> List[float]:
+    """Return only cross-sectional areas [mm2] for callers that do not need perimeter."""
+    return [a for _, a, _, _ in _section_profile_detailed(mesh, axis, n=n)]
+
+
+def _body_flow_length(mesh: trimesh.Trimesh, axis: np.ndarray) -> float:
+    """Return the body extent along the flow axis in mm."""
+    axis = np.asarray(axis, dtype=np.float64)
+    norm = float(np.linalg.norm(axis))
+    if norm <= 0:
+        return 0.0
+    axis = axis / norm
+    proj = (mesh.vertices - mesh.vertices.mean(axis=0)) @ axis
+    return float(proj.max() - proj.min())
+
+
+def _characteristic_cross_section_area(
+    mesh: trimesh.Trimesh,
+    axis: np.ndarray,
+    n: int = 50,
+) -> float:
+    """Return the most representative cross-sectional area [mm2] perpendicular to axis.
+
+    The algorithm looks for a constant (plateau) cross-section first.  If found,
+    it returns the mean of that plateau; for circular plateaus it uses the equivalent
+    circle area from the perimeter to compensate for tessellation coarseness.
+    If no plateau exists, circular bodies are classified as conical (monotonic)
+    or non-monotonic; conical uses the minimum circular area (throat), otherwise the
+    maximum circular area.  Non-circular / prismatic bodies use the median area.
+    """
+    axis = np.asarray(axis, dtype=np.float64)
+    norm = float(np.linalg.norm(axis))
+    if norm <= 0:
+        return 0.0
+    axis = axis / norm
+
+    rows = _section_profile_detailed(mesh, axis, n=n)
+    if not rows:
+        length_mm = _body_flow_length(mesh, axis)
+        if length_mm > 0.0:
+            return float(mesh.volume / (length_mm * 1e-3))
+        return 0.0
+
+    t = np.array([r[0] for r in rows])
+    areas = np.array([r[1] for r in rows])
+    perims = np.array([r[2] for r in rows])
+    circs = np.array([r[3] for r in rows])
+
+    max_area = float(areas.max())
+    if max_area <= 0.0:
+        return 0.0
+
+    best_window: Optional[Tuple[int, int]] = None
+    best_score = -1.0
+    min_len = 3
+    for i in range(len(areas) - min_len + 1):
+        for j in range(i + min_len - 1, len(areas)):
+            w_areas = areas[i : j + 1]
+            if w_areas.min() < 0.15 * max_area:
+                continue
+            if w_areas.max() / w_areas.min() > 1.25:
+                continue
+            score = (j - i + 1) * w_areas.mean()
+            if score > best_score:
+                best_score = score
+                best_window = (i, j)
+
+    if best_window is not None:
+        i, j = best_window
+        mean_circ = float(circs[i : j + 1].mean())
+        if mean_circ > 0.85:
+            return float((perims[i : j + 1] ** 2 / (4.0 * math.pi)).mean())
+        return float(areas[i : j + 1].mean())
+
+    valid = areas > 0.05 * max_area
+    if not valid.any():
+        return float(np.median(areas))
+
+    mean_circ = float(circs[valid].mean())
+    if mean_circ > 0.85:
+        circ_areas = perims ** 2 / (4.0 * math.pi)
+        x = np.arange(len(areas))
+        if valid.sum() > 2:
+            a_valid = areas[valid]
+            x_valid = x[valid]
+            cov = np.cov(x_valid, a_valid)
+            if cov[0, 0] > 0.0:
+                r = cov[0, 1] / np.sqrt(cov[0, 0] * cov[1, 1])
+            else:
+                r = 0.0
+            if abs(r) > 0.65:
+                interior = np.ones_like(areas, dtype=bool)
+                interior[0] = interior[-1] = False
+                if not (interior & valid).any():
+                    interior = valid
+                return float(circ_areas[interior & valid].min())
+        return float(circ_areas[valid].max())
+
+    central = areas[1:-1] if len(areas) > 2 else areas
+    return float(np.median(central))
+
+
+def _sprue_circular_base_and_throat(
+    mesh: trimesh.Trimesh,
+    axis: np.ndarray,
+    n: int = 50,
+) -> Tuple[float, float]:
+    """Return (base_area_mm2, throat_area_mm2) for a sprue.
+
+    ``base_area`` is the characteristic/main circular cross-section.
+    ``throat_area`` is the minimum reliable circular cross-section.
+    """
+    axis = np.asarray(axis, dtype=np.float64)
+    norm = float(np.linalg.norm(axis))
+    if norm <= 0:
+        return 0.0, 0.0
+    axis = axis / norm
+
+    rows = _section_profile_detailed(mesh, axis, n=n)
+    if not rows:
+        length_mm = _body_flow_length(mesh, axis)
+        if length_mm > 0.0:
+            avg = float(mesh.volume / (length_mm * 1e-3))
+            return avg, avg
+        return 0.0, 0.0
+
+    t = np.array([r[0] for r in rows])
+    areas = np.array([r[1] for r in rows])
+    perims = np.array([r[2] for r in rows])
+    circs = np.array([r[3] for r in rows])
+    circ_areas = np.where(perims > 0.0, perims ** 2 / (4.0 * math.pi), 0.0)
+
+    max_area = float(areas.max())
+    if max_area <= 0.0:
+        return 0.0, 0.0
+
+    valid = (areas > 0.05 * max_area) & (circs > 0.85) & (circ_areas > 0.0)
+    if not valid.any():
+        base = float(np.median(areas[1:-1])) if len(areas) > 2 else float(np.median(areas))
+        throat = base
+        return base, throat
+
+    base = float(circ_areas[valid].max())
+    interior = np.ones_like(areas, dtype=bool)
+    interior[0] = interior[-1] = False
+    if not (interior & valid).any():
+        interior = valid
+    throat = float(circ_areas[interior & valid].min())
+    return base, throat
 
 
 def _real_gating_areas_from_bodies(
@@ -216,49 +377,47 @@ def _real_gating_areas_from_bodies(
     """Compute real sprue/runner/ingate cross-section areas from CAD meshes.
 
     Returns areas in cm2:
-      sprue_min, sprue_max, sprue_mean, runner_min, runner_max, runner_mean,
-      ingate_min, ingate_max, ingate_mean.
-    For a pressurized system the sprue base is the largest cross-section and the
-    gate is the smallest cross-section.
+      runner_total, ingate_total, sprue_base, sprue_throat.
+    Runner and ingate areas are the characteristic cross-sections, summed when
+    multiple bodies are present.  Sprue base is the main circular cross-section;
+    sprue throat is the minimum reliable circular cross-section.
     """
-    type_min: Dict[BodyType, List[float]] = {
-        BodyType.SPRUE: [],
-        BodyType.RUNNER: [],
-        BodyType.INGATE: [],
-    }
-    type_max: Dict[BodyType, List[float]] = {k: [] for k in type_min}
-    type_mean: Dict[BodyType, List[float]] = {k: [] for k in type_min}
+    runner_total_mm2 = 0.0
+    ingate_total_mm2 = 0.0
+    sprue_bases: List[float] = []
+    sprue_throats: List[float] = []
 
     for body in bodies:
-        if body.body_type not in type_min:
+        if body.body_type not in (BodyType.SPRUE, BodyType.RUNNER, BodyType.INGATE):
             continue
         mesh = _repair_mesh(body.mesh)
         if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
             continue
         axis = _flow_axis(mesh)
-        profile = _section_area_profile(mesh, axis)
-        if not profile:
-            continue
-        type_min[body.body_type].append(float(np.min(profile)))
-        type_max[body.body_type].append(float(np.max(profile)))
-        type_mean[body.body_type].append(float(np.mean(profile)))
+        if body.body_type == BodyType.SPRUE:
+            base_mm2, throat_mm2 = _sprue_circular_base_and_throat(mesh, axis)
+            sprue_bases.append(base_mm2)
+            sprue_throats.append(throat_mm2)
+        else:
+            area_mm2 = _characteristic_cross_section_area(mesh, axis)
+            if body.body_type == BodyType.RUNNER:
+                runner_total_mm2 += area_mm2
+            elif body.body_type == BodyType.INGATE:
+                ingate_total_mm2 += area_mm2
 
-    def _sum_or_zero(vals: List[float]) -> float:
-        return float(np.sum(vals)) if vals else 0.0
+    sprue_base_total_mm2 = float(np.sum(sprue_bases)) if sprue_bases else 0.0
+    sprue_throat_min_mm2 = float(np.min(sprue_throats)) if sprue_throats else 0.0
 
-    def _to_cm2(mm2: float) -> float:
-        return mm2 / 100.0
-
-    result = {}
-    for key in [BodyType.SPRUE, BodyType.RUNNER, BodyType.INGATE]:
-        prefix = {BodyType.SPRUE: "sprue", BodyType.RUNNER: "runner", BodyType.INGATE: "ingate"}[key]
-        result[f"{prefix}_min_mm2"] = _sum_or_zero(type_min[key])
-        result[f"{prefix}_max_mm2"] = _sum_or_zero(type_max[key])
-        result[f"{prefix}_mean_mm2"] = _sum_or_zero(type_mean[key])
-        result[f"{prefix}_min_cm2"] = _to_cm2(result[f"{prefix}_min_mm2"])
-        result[f"{prefix}_max_cm2"] = _to_cm2(result[f"{prefix}_max_mm2"])
-        result[f"{prefix}_mean_cm2"] = _to_cm2(result[f"{prefix}_mean_mm2"])
-    return result
+    return {
+        "runner_total_mm2": runner_total_mm2,
+        "runner_total_cm2": runner_total_mm2 / 100.0,
+        "ingate_total_mm2": ingate_total_mm2,
+        "ingate_total_cm2": ingate_total_mm2 / 100.0,
+        "sprue_base_mm2": sprue_base_total_mm2,
+        "sprue_base_cm2": sprue_base_total_mm2 / 100.0,
+        "sprue_throat_mm2": sprue_throat_min_mm2,
+        "sprue_throat_cm2": sprue_throat_min_mm2 / 100.0,
+    }
 
 
 def _volumes_from_bodies(bodies: List[Body]) -> Tuple[float, float]:
@@ -795,12 +954,22 @@ def analyze_gating(
 
     # v8.8: use real CAD cross-sections and volumes when the original bodies are supplied.
     if use_bodies:
-        gate_area_cm2 = real_areas.get("ingate_min_cm2", 0.0)
-        gate_contact_area_cm2 = real_areas.get("ingate_max_cm2", gate_area_cm2)
-        runner_min_area_cm2 = real_areas.get("runner_mean_cm2", 0.0)
-        sprue_throat_cm2 = real_areas.get("sprue_min_cm2", 0.0)
-        sprue_base_bottom_cm2 = real_areas.get("sprue_max_cm2", 0.0)
-        sprue_base_cm2 = sprue_base_bottom_cm2
+        # v9.0: characteristic (contact-equivalent) cross-sections from body meshes.
+        gate_area_cm2 = real_areas.get("ingate_total_cm2", 0.0)
+        runner_min_area_cm2 = real_areas.get("runner_total_cm2", 0.0)
+        sprue_base_cm2 = real_areas.get("sprue_base_cm2", 0.0)
+        sprue_base_bottom_cm2 = sprue_base_cm2
+        sprue_throat_cm2 = real_areas.get("sprue_throat_cm2", 0.0)
+
+        # If no separate ingate body exists, the runner/sprue-part contact area acts
+        # as the gate (common in simple systems like Knuckle).
+        contact_area_mm2, _ = ingate_contact_area_and_mask(grid, dx)
+        gate_contact_area_cm2 = (
+            gate_area_cm2 if gate_area_cm2 > 0.0 else contact_area_mm2 / 100.0
+        )
+        if gate_area_cm2 <= 0.0:
+            gate_area_cm2 = gate_contact_area_cm2
+
         part_volume_cm3, total_metal_volume_cm3 = _volumes_from_bodies(bodies)
     else:
         # Fallback: coarse voxel-based areas.
@@ -875,6 +1044,9 @@ def analyze_gating(
         "SPRUE_THROAT": sprue_throat_cm2,
         "SPRUE_BASE": sprue_base_bottom_cm2,
     }
+    # If the requested section has no area (e.g. no ingate body), fall back to RUNNER.
+    if velocity_section_key == "INGATE" and section_area_cm2["INGATE"] <= 0.0:
+        velocity_section_key = "RUNNER"
     selected_area_cm2 = section_area_cm2.get(velocity_section_key, gate_area_cm2)
     selected_area_m2 = selected_area_cm2 / 1e4
 
@@ -1163,6 +1335,30 @@ def analyze_gating(
             f"choke hızı={design_areas['Vc_ms']:.2f} m/s."
         )
 
+    # v9.0: feeder / part mass and volume ratios.
+    if result.riser_results:
+        total_riser_mass_kg = sum(r.mass_kg for r in result.riser_results)
+    else:
+        # Fallback: estimate riser volume from any bodies not part/gating/core.
+        riser_volume_cm3 = sum(
+            b.volume_cm3 for b in bodies if b.body_type == BodyType.RISER
+        )
+        total_riser_mass_kg = riser_volume_cm3 * alloy.density_g_cm3 / 1000.0
+    gating_mass_kg = max(0.0, total_mass_kg - part_mass_kg - total_riser_mass_kg)
+    feed_to_part_mass_ratio = (
+        (total_riser_mass_kg + gating_mass_kg) / part_mass_kg
+        if part_mass_kg > 0.0 else 0.0
+    )
+    feed_to_part_volume_ratio = (
+        (total_metal_volume_cm3 - part_volume_cm3) / part_volume_cm3
+        if part_volume_cm3 > 0.0 else 0.0
+    )
+    result.recommendations.append(
+        f"Besleyici/yolluk toplam kütlesi = {total_riser_mass_kg + gating_mass_kg:.3f} kg; "
+        f"parça kütlesi = {part_mass_kg:.3f} kg; besleyici/parça kütlesi oranı = {feed_to_part_mass_ratio:.2f}; "
+        f"hacim oranı = {feed_to_part_volume_ratio:.2f}."
+    )
+
     return GateResult(
         total_ingate_contact_area_cm2=gate_contact_area_cm2,
         runner_min_area_cm2=runner_min_area_cm2,
@@ -1224,4 +1420,9 @@ def analyze_gating(
         sprue_design_ok=sprue_design_ok,
         runner_design_ok=runner_design_ok,
         gate_design_ok=gate_design_ok,
+        part_mass_kg=part_mass_kg,
+        total_riser_mass_kg=total_riser_mass_kg,
+        gating_mass_kg=gating_mass_kg,
+        feed_to_part_mass_ratio=feed_to_part_mass_ratio,
+        feed_to_part_volume_ratio=feed_to_part_volume_ratio,
     )
