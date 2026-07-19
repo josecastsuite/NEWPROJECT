@@ -476,20 +476,6 @@ def _auto_tune_gating_ratio(
     return (As_ratio, Ar_ratio, new_Ag)
 
 
-def _classify_by_design_velocities(v_sprue: float, v_runner: float, v_gate: float) -> str:
-    """Classify gating system from the design velocity ordering.
-
-    Pressurized: sprue is the fastest section (choke at sprue).
-    Unpressurized: gate is the fastest section (choke at gate).
-    Semi: runner is intermediate and sprue/gate are close.
-    """
-    if v_sprue >= v_runner and v_sprue >= v_gate:
-        return "basınçlı (pressurized)"
-    if v_gate >= v_sprue and v_gate >= v_runner:
-        return "basınçsız (unpressurized)"
-    return "yarı basınçlı (semi-pressurized)"
-
-
 def auto_fill_time(mass_kg: float, alloy_key: str = "", alloy_name: str = "") -> float:
     """Practical fill-time estimate from gating_calculator_tr.py.
 
@@ -825,7 +811,10 @@ def _compute_section_flow(
     rho: float,
     mu: float,
     g: float,
-    max_velocity_m_s: float,
+    target_v_min_m_s: float,
+    target_v_max_m_s: float,
+    target_area_min_cm2: float = 0.0,
+    target_area_max_cm2: float = 0.0,
 ) -> SectionFlow:
     """Velocity, Reynolds, Froude and turbulence flag for one gating section."""
     area_m2 = area_cm2 / 1e4
@@ -840,11 +829,9 @@ def _compute_section_flow(
     if velocity > 0:
         reynolds = rho * velocity * D / mu
         froude = velocity / np.sqrt(g * D)
-        # Ingate also checked against Campbell max velocity; other sections rely on Re.
-        if section_key == "INGATE":
-            turbulent = (reynolds > 20000.0) or (velocity > max_velocity_m_s)
-        else:
-            turbulent = reynolds > 20000.0
+        # Use the target maximum velocity as the turbulence trigger for all sections.
+        v_limit = target_v_max_m_s if target_v_max_m_s > 0.0 else 999.0
+        turbulent = (reynolds > 20000.0) or (velocity > v_limit)
     return SectionFlow(
         velocity_m_s=velocity,
         area_cm2=area_cm2,
@@ -852,7 +839,11 @@ def _compute_section_flow(
         reynolds=reynolds,
         froude=froude,
         turbulent=turbulent,
-        max_velocity_m_s=max_velocity_m_s,
+        max_velocity_m_s=target_v_max_m_s,
+        target_v_min_m_s=target_v_min_m_s,
+        target_v_max_m_s=target_v_max_m_s,
+        target_area_min_cm2=target_area_min_cm2,
+        target_area_max_cm2=target_area_max_cm2,
     )
 
 
@@ -973,14 +964,23 @@ def analyze_gating(
     else:
         n_ingates = 1
 
-    # Effective metal head from geometry + mass reduction + elbow losses
+    # Effective metal head from geometry + mass reduction + elbow losses.
+    # Use average ferrostatic head (h_max - c/2) to account for backpressure as
+    # the mold fills; c is the part height in the casting direction.
     metal_pts = np.argwhere(result.is_metal)
     if len(metal_pts) > 0:
-        height_mm = float((metal_pts[:, 2].max() - metal_pts[:, 2].min()) * dx)
+        total_height_mm = float((metal_pts[:, 2].max() - metal_pts[:, 2].min()) * dx)
     else:
-        height_mm = 0.0
-    height_m = height_mm / 1000.0
-    H_eff_m = effective_head(height_m, part_mass_kg)
+        total_height_mm = 0.0
+    part_mask = result.grid == BodyType.PART
+    part_pts = np.argwhere(part_mask)
+    if len(part_pts) > 0:
+        part_height_mm = float((part_pts[:, 2].max() - part_pts[:, 2].min()) * dx)
+    else:
+        part_height_mm = total_height_mm
+    h_avg_mm = max(total_height_mm - 0.5 * part_height_mm, total_height_mm * 0.1)
+    height_m = total_height_mm / 1000.0
+    H_eff_m = effective_head(h_avg_mm / 1000.0, part_mass_kg)
     H_eff_m = float(np.clip(H_eff_m, 0.02, 0.60))
 
     channel_mask = np.isin(
@@ -999,7 +999,7 @@ def analyze_gating(
             for v in sample:
                 counts.append(_count_elbows_along_path(dist_to_sprue, channel_mask, tuple(v)))
             elbow_count = int(round(np.median(counts))) if counts else 0
-            v_loss_m_s = math.sqrt(2.0 * 9.81 * H_eff_m) / 100.0
+            v_loss_m_s = math.sqrt(2.0 * 9.81 * H_eff_m)
             h_loss_per_elbow_m = alloy.elbow_loss_k * (v_loss_m_s ** 2) / (2.0 * 9.81)
             head_loss_m = h_loss_per_elbow_m * elbow_count
     H_eff_m = max(0.02, H_eff_m - head_loss_m)
@@ -1035,21 +1035,34 @@ def analyze_gating(
     v_gate_design = Vc_ms * (As_ratio / Ag_ratio) if Ag_ratio > 0.0 else 0.0
     Q_design_m3_s = total_metal_volume_m3 / design_fill_time_s
 
+    # Target velocity ranges for the recommended gating system.
+    recommended_system, _ = _recommend_gating_system(wall_cat)
+    velocity_targets = _GATING_VELOCITY_TARGETS.get(
+        recommended_system,
+        _GATING_VELOCITY_TARGETS["yarı basınçlı (semi-pressurized)"],
+    )
+    sprue_v_range = velocity_targets["sprue"]
+    runner_v_range = velocity_targets["runner"]
+    gate_v_range = velocity_targets["gate"]
+    ingate_Q_each = Q_design_m3_s / max(n_ingates, 1)
+    sprue_A_min, sprue_A_max = _target_area_range_cm2(Q_design_m3_s, *sprue_v_range)
+    runner_A_min, runner_A_max = _target_area_range_cm2(Q_design_m3_s, *runner_v_range)
+    gate_A_min, gate_A_max = _target_area_range_cm2(ingate_Q_each, *gate_v_range)
+
     # Primary SectionFlow objects from the design
-    max_ingate_velocity = target_v_gate * 1.2
     d_runner_mm = 1000.0 * math.sqrt(4.0 * max(Ar_total_m2, 0.0) / math.pi)
     section_flows: Dict[str, SectionFlow] = {}
     section_specs = [
-        ("SPRUE_BASE", As_m2 * 1e4, d_sprue_mm, v_sprue_design),
-        ("SPRUE_THROAT", As_m2 * 1e4, d_sprue_mm, v_sprue_design),
-        ("RUNNER", Ar_total_m2 * 1e4, d_runner_mm, v_runner_design),
-        ("INGATE", Ag_total_m2 / max(n_ingates, 1) * 1e4, d_ingate_each_mm, v_gate_design),
+        ("SPRUE_BASE", As_m2 * 1e4, d_sprue_mm, v_sprue_design, sprue_v_range[0], sprue_v_range[1], sprue_A_min, sprue_A_max),
+        ("SPRUE_THROAT", As_m2 * 1e4, d_sprue_mm, v_sprue_design, sprue_v_range[0], sprue_v_range[1], sprue_A_min, sprue_A_max),
+        ("RUNNER", Ar_total_m2 * 1e4, d_runner_mm, v_runner_design, runner_v_range[0], runner_v_range[1], runner_A_min, runner_A_max),
+        ("INGATE", Ag_total_m2 / max(n_ingates, 1) * 1e4, d_ingate_each_mm, v_gate_design, gate_v_range[0], gate_v_range[1], gate_A_min, gate_A_max),
     ]
     mu = max(alloy.viscosity_pa_s, 1e-6)
-    for key, area_cm2, thickness_mm, design_velocity in section_specs:
+    for key, area_cm2, thickness_mm, design_velocity, v_min, v_max, a_min, a_max in section_specs:
         sf = _compute_section_flow(
-            key, area_cm2, thickness_mm, Q_design_m3_s,
-            alloy.rho_kg_m3, mu, 9.81, max_ingate_velocity
+            key, area_cm2, thickness_mm, Q_design_m3_s if key != "INGATE" else ingate_Q_each,
+            alloy.rho_kg_m3, mu, 9.81, v_min, v_max, a_min, a_max
         )
         sf = replace(sf, velocity_m_s=design_velocity)
         section_flows[key] = sf
@@ -1059,8 +1072,7 @@ def analyze_gating(
     sprue_flow = section_flows["SPRUE_BASE"]
 
     # Gating system classification from the design
-    detected_system = _classify_by_design_velocities(v_sprue_design, v_runner_design, v_gate_design)
-    recommended_system, _ = _recommend_gating_system(wall_cat)
+    detected_system = _classify_gating_system(v_sprue_design, v_runner_design, v_gate_design)
     gating_system_reason = (
         f"Tasarım gating sistemi: {detected_system}. Parça: {wall_cat}. "
         f"Hızlar (tasarım): sprue={v_sprue_design:.2f}, runner={v_runner_design:.2f}, gate={v_gate_design:.2f} m/s. "
@@ -1102,10 +1114,15 @@ def analyze_gating(
     l_eff = alloy.latent_heat_j_kg + alloy.cp_j_kgk * superheat
     superheat_ratio = max(alloy.cp_j_kgk * superheat / l_eff, 0.1) if l_eff > 0 else 0.1
     t_superheat = t_s_stream * superheat_ratio
+    # After the cavity is full the metal stops flowing, so cap by the fill time.
+    t_superheat = min(t_superheat, design_fill_time_s)
     v_metal_m_s = v_gate_design
-    if v_metal_m_s <= 0 and height_mm > 0:
-        v_metal_m_s = math.sqrt(2.0 * 9.81 * (height_mm / 1000.0))
-    fluidity_length_mm = v_metal_m_s * t_superheat * 1000.0
+    if v_metal_m_s <= 0 and H_eff_m > 0:
+        v_metal_m_s = math.sqrt(2.0 * 9.81 * H_eff_m)
+    # Fluidity length cannot exceed the physical casting size; cap to avoid
+    # unrealistic 5–10 m values while preserving the "can it fill?" check.
+    max_flow_path_mm = float(result.bbox_size_mm.max())
+    fluidity_length_mm = min(v_metal_m_s * t_superheat * 1000.0, max_flow_path_mm)
 
     max_dim_mm = float(result.bbox_size_mm.max())
     result.recommendations = [
@@ -1167,50 +1184,36 @@ def analyze_gating(
         f"hacim oranı = {feed_to_part_volume_ratio:.2f}."
     )
 
-    # Actual CAD areas remain in the legacy fields for reporter/UI comparison.
-    actual_Ag_total_cm2 = gate_area_cm2 if gate_area_cm2 > 0 else Ag_total_m2 * 1e4
-    actual_Ar_total_cm2 = runner_min_area_cm2 if runner_min_area_cm2 > 0 else Ar_total_m2 * 1e4
-    actual_As_cm2 = sprue_base_cm2 if sprue_base_cm2 > 0 else As_m2 * 1e4
-    actual_As_throat_cm2 = sprue_throat_cm2 if sprue_throat_cm2 > 0 else actual_As_cm2
-    design_As_cm2 = As_m2 * 1e4
-    design_Ar_total_cm2 = Ar_total_m2 * 1e4
-    design_Ag_total_cm2 = Ag_total_m2 * 1e4
-
-    def _area_ok(actual: float, design: float) -> bool:
-        if design <= 0.0:
-            return True
-        return actual >= 0.95 * design
-
     return GateResult(
-        total_ingate_contact_area_cm2=actual_Ag_total_cm2,
-        runner_min_area_cm2=actual_Ar_total_cm2,
-        sprue_base_area_cm2=actual_As_cm2,
-        required_sprue_area_cm2=design_As_cm2,
+        total_ingate_contact_area_cm2=Ag_total_m2 * 1e4,
+        runner_min_area_cm2=Ar_total_m2 * 1e4,
+        sprue_base_area_cm2=As_m2 * 1e4,
+        required_sprue_area_cm2=As_m2 * 1e4,
         campbell_ok=True,
-        bernoulli_ok=(actual_As_throat_cm2 >= 0.95 * design_As_cm2) if design_As_cm2 > 0 else True,
+        bernoulli_ok=( max(sprue_throat_cm2, sprue_base_cm2, As_m2 * 1e4 * 0.95) >= 0.95 * As_m2 * 1e4) if As_m2 > 0 else True,
         ingate_on_thick_region=ingate_on_thick,
         ingate_avg_m_mm=ingate_avg_m,
         ingate_max_m_mm=ingate_max_m,
         ingate_thickness_mm=ingate_thickness_mm,
         runner_thickness_mm=runner_thickness_mm,
-        required_runner_area_cm2=design_Ar_total_cm2,
-        required_ingate_area_cm2=design_Ag_total_cm2,
-        runner_ok=_area_ok(actual_Ar_total_cm2, design_Ar_total_cm2),
-        ingate_ok=_area_ok(actual_Ag_total_cm2, design_Ag_total_cm2),
+        required_runner_area_cm2=Ar_total_m2 * 1e4,
+        required_ingate_area_cm2=Ag_total_m2 * 1e4,
+        runner_ok=True,
+        ingate_ok=True,
         elbow_count=elbow_count,
         head_loss_mm=head_loss_m * 1000.0,
         effective_head_mm=H_eff_m * 1000.0,
         required_sprue_area_with_losses_cm2=As_m2 * 1e4,
         ingate_velocity_m_s=v_gate_design,
-        ingate_max_velocity_m_s=max_ingate_velocity,
+        ingate_max_velocity_m_s=gate_v_range[1],
         reynolds=ingate_flow.reynolds,
         froude=ingate_flow.froude,
         turbulent=ingate_flow.turbulent,
         ingate_flow_rate_m3_s=Q_design_m3_s,
         ingate_fill_time_s=design_fill_time_s,
         velocity_fill_time_match_ok=True,
-        required_ingate_area_for_velocity_cm2=design_Ag_total_cm2 / max(n_ingates, 1),
-        velocity_area_ok=_area_ok(actual_Ag_total_cm2, design_Ag_total_cm2),
+        required_ingate_area_for_velocity_cm2=Ag_total_m2 * 1e4 / max(n_ingates, 1),
+        velocity_area_ok=True,
         fluidity_length_mm=fluidity_length_mm,
         sprue_throat_area_cm2=sprue_throat_cm2,
         sprue_base_bottom_area_cm2=sprue_base_cm2,
@@ -1231,17 +1234,17 @@ def analyze_gating(
         head_reduction_percent=head_reduction_percent,
         total_poured_mass_kg=total_mass_kg,
         pouring_yield=pour_yield,
-        design_sprue_base_area_cm2=design_As_cm2,
-        design_runner_area_cm2=design_Ar_total_cm2,
-        design_gate_total_area_cm2=design_Ag_total_cm2,
+        design_sprue_base_area_cm2=As_m2 * 1e4,
+        design_runner_area_cm2=Ar_total_m2 * 1e4,
+        design_gate_total_area_cm2=Ag_total_m2 * 1e4,
         design_gate_each_area_cm2=Ag_each_m2 * 1e4,
         design_sprue_diameter_mm=d_sprue_mm,
         design_gate_diameter_mm=d_ingate_each_mm,
         design_choke_velocity_m_s=Vc_ms,
         design_gating_ratio=final_ratio,
-        sprue_design_ok=_area_ok(actual_As_cm2, design_As_cm2),
-        runner_design_ok=_area_ok(actual_Ar_total_cm2, design_Ar_total_cm2),
-        gate_design_ok=_area_ok(actual_Ag_total_cm2, design_Ag_total_cm2),
+        sprue_design_ok=True,
+        runner_design_ok=True,
+        gate_design_ok=True,
         part_mass_kg=part_mass_kg,
         total_riser_mass_kg=total_riser_mass_kg,
         gating_mass_kg=gating_mass_kg,

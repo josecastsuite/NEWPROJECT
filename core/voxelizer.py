@@ -1,9 +1,11 @@
 """Convert a set of Body meshes into a single labelled voxel grid - JoseCast v7."""
 
+import warnings
 from typing import List, Optional, Tuple
 
 import numpy as np
 import trimesh
+from scipy import ndimage
 
 from core.types import Body, BodyType
 
@@ -23,12 +25,16 @@ def apply_unit_scale(bodies: List[Body], unit: str) -> float:
     """Scale all body meshes to millimeters and return the scale factor."""
     scale = UNIT_SCALE.get(unit, 1.0)
     if scale == 1.0:
+        for b in bodies:
+            b.surface_area_cm2 = b.mesh.area / 100.0
+            b.volume_cm3 = b.mesh.volume / 1000.0
         return 1.0
     for b in bodies:
         b.mesh.apply_scale(scale)
         b.vertices = b.mesh.vertices.copy()
         b.center = b.mesh.center_mass if b.mesh.is_watertight else b.mesh.centroid
         b.volume_cm3 = b.mesh.volume / 1000.0
+        b.surface_area_cm2 = b.mesh.area / 100.0
     return scale
 
 
@@ -55,40 +61,22 @@ def _global_bbox(bodies: List[Body]) -> Tuple[np.ndarray, np.ndarray]:
     return mins.min(axis=0), maxs.max(axis=0)
 
 
-def build_voxel_grid(
+def _voxelize_at_dim(
     bodies: List[Body],
-    target_dim: int = BASE_RES,
-    progress_callback: Optional[callable] = None,
-    fix_mesh: bool = True,
+    target_dim: int,
+    margin: int,
+    progress_callback: Optional[callable],
+    fix_mesh: bool,
 ) -> Tuple[np.ndarray, np.ndarray, float, List[Body]]:
-    """
-    Build a global voxel grid.
-
-    Returns
-    -------
-    grid : np.ndarray[int]
-        Material id grid (Nx, Ny, Nz).
-    origin_mm : np.ndarray
-        World coordinate of grid[0,0,0].
-    dx_mm : float
-        Voxel pitch.
-    bodies : List[Body]
-        Bodies with repaired meshes.
-    """
-    if not bodies:
-        raise ValueError("Voxelize edilecek body yok.")
-
+    """Single-shot voxelization used by build_voxel_grid."""
     bbox_min, bbox_max = _global_bbox(bodies)
     bbox_size = bbox_max - bbox_min
     dx = float(np.max(bbox_size) / target_dim)
     if dx <= 0:
         raise ValueError("Geçersiz bounding box.")
 
-    # Add a small empty border
-    margin = 4
     grid_shape = np.ceil((bbox_size + 2 * margin * dx) / dx).astype(int)
     origin = bbox_min - margin * dx
-
     grid = np.zeros(grid_shape, dtype=np.int16)
 
     repaired_bodies: List[Body] = []
@@ -151,6 +139,68 @@ def build_voxel_grid(
 
     if progress_callback:
         progress_callback(50)
+
+    return grid, origin, dx, repaired_bodies
+
+
+def build_voxel_grid(
+    bodies: List[Body],
+    target_dim: int = BASE_RES,
+    progress_callback: Optional[callable] = None,
+    fix_mesh: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, float, List[Body]]:
+    """
+    Build a global voxel grid.
+
+    The grid is padded with a 4-voxel empty border to avoid boundary clipping
+    of SDF/gradient calculations.  The resolution is automatically increased if
+    the chosen voxel size exceeds one third of the minimum wall thickness
+    (Nyquist criterion for thin-wall feeding paths).
+
+    Returns
+    -------
+    grid : np.ndarray[int]
+        Material id grid (Nx, Ny, Nz).
+    origin_mm : np.ndarray
+        World coordinate of grid[0,0,0].
+    dx_mm : float
+        Voxel pitch.
+    bodies : List[Body]
+        Bodies with repaired meshes.
+    """
+    if not bodies:
+        raise ValueError("Voxelize edilecek body yok.")
+
+    bbox_min, bbox_max = _global_bbox(bodies)
+    bbox_size = bbox_max - bbox_min
+    margin = 4
+
+    grid, origin, dx, repaired_bodies = _voxelize_at_dim(
+        bodies, target_dim, margin, progress_callback, fix_mesh
+    )
+
+    # Resolution sanity check: dx must be <= t_min / 3 to capture thin walls.
+    is_metal = grid != 0
+    if is_metal.any():
+        sdf_grid = ndimage.distance_transform_edt(is_metal) * dx
+        min_sdf = float(sdf_grid[is_metal].min())
+        t_min = 2.0 * min_sdf
+        if t_min > 0.0 and dx > t_min / 3.0:
+            required_dim = int(np.ceil(np.max(bbox_size) / (t_min / 3.0)))
+            if required_dim > target_dim and required_dim <= MAX_RES:
+                warnings.warn(
+                    f"Voxel pitch {dx:.3f} mm > t_min/3 ({t_min/3.0:.3f} mm). "
+                    f"Re-voxelizing at dimension {required_dim} to satisfy Nyquist criterion."
+                )
+                target_dim = required_dim
+                grid, origin, dx, repaired_bodies = _voxelize_at_dim(
+                    bodies, target_dim, margin, progress_callback, fix_mesh
+                )
+            elif required_dim > MAX_RES:
+                warnings.warn(
+                    f"Tavsiye edilen çözünürlük ({required_dim}) MAX_RES ({MAX_RES}) aşıyor. "
+                    f"İnce cidarlar (t_min ≈ {t_min:.2f} mm) voxel ağında kopabilir."
+                )
 
     return grid, origin, dx, repaired_bodies
 

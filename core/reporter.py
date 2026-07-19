@@ -26,7 +26,7 @@ def _format_hotspot_table(result: AnalysisResult) -> str:
         for i, hs in enumerate(result.hotspots, 1):
             pos = ",".join(f"{v:.1f}" for v in hs.position_mm)
             status = "OK" if hs.feed_ok else "UZAK/DARALMA"
-            niy = ", ".join(f"{k}={v:.2f}" for k, v in hs.niyama_variants.items())
+            niy = ", ".join(f"{k}={v:.3f}" for k, v in hs.niyama_variants.items())
             rows.append(
                 f"<tr>"
                 f"<td>{i}</td>"
@@ -36,7 +36,7 @@ def _format_hotspot_table(result: AnalysisResult) -> str:
                 f"<td>{hs.dist_to_riser_mm:.1f}</td>"
                 f"<td>{hs.max_feeding_distance_mm:.1f}</td>"
                 f"<td>{hs.feeding_cost:.2f}</td>"
-                f"<td>{hs.niyama_ensemble:.2f}</td>"
+                f"<td>{hs.niyama_ensemble:.4f}</td>"
                 f"<td>{hs.darcy_resistance:.2f}</td>"
                 f"<td>{hs.curvature_mean:.2f}</td>"
                 f"<td>{hs.shape_factor:.4f}</td>"
@@ -157,7 +157,7 @@ def _format_gate_table(result: AnalysisResult) -> str:
 
     auto_fill = getattr(gr, "auto_fill_time_s", gr.recommended_fill_time_s)
     campbell_fill = getattr(gr, "campbell_fill_time_s", 0.0)
-    return f""""
+    return f"""
     <p><strong>Ana motor:</strong> parça kütlesi → dolum süresi → metal yüksekliği → sprue hızı → As:Ar:Ag oranıyla hedef alanlar. CAD ölçümleri sadece karşılaştırmadır.</p>
     <table>
         <tr><th>Parametre</th><th>Değer</th><th>Durum / Gerekli</th></tr>

@@ -22,6 +22,8 @@ class CastingParameters:
     ingate_velocity_m_s: float = 0.0
     # v8.3: which gating section the velocity above refers to
     velocity_section_key: str = "INGATE"
+    # v8.7: gravity direction for feeding and gating calculations (default -Z)
+    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0)
 
     @property
     def superheat_c(self) -> float:
@@ -93,6 +95,7 @@ class Body:
     mesh: trimesh.Trimesh
     body_type: BodyType = BodyType.PART
     volume_cm3: float = 0.0
+    surface_area_cm2: float = 0.0
     center: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
 

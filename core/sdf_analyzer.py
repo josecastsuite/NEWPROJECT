@@ -1,5 +1,6 @@
 """SDF-based geometric + pseudo-thermal casting analyzer - JoseCast v8.0."""
 
+import math
 from dataclasses import replace
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -159,7 +160,10 @@ def _marching_cubes_surface(
 
 
 def _scheil_fs(T_arr, t_liq, t_sol, k):
-    """Vectorised Scheil solid fraction."""
+    """Vectorised Scheil solid fraction.
+
+    fs = 1 - ((T - T_sol) / (T_liq - T_sol))^(1 / (1 - k))
+    """
     fs = np.zeros_like(T_arr)
     mask_past = T_arr <= t_sol
     mask_liq = T_arr >= t_liq
@@ -167,10 +171,11 @@ def _scheil_fs(T_arr, t_liq, t_sol, k):
     fs[mask_past] = 1.0
     fs[mask_liq] = 0.0
     if mask_mush.any():
-        k = max(k, 1e-6)
+        k = max(min(k, 0.999), 1e-6)
         ratio = (t_liq - T_arr[mask_mush]) / (t_liq - t_sol + 1e-9)
+        ratio = np.clip(ratio, 0.0, 1.0)
         with np.errstate(divide="ignore", invalid="ignore"):
-            fs[mask_mush] = 1.0 - np.power(np.clip(ratio, 0.0, 1.0), 1.0 / (k - 1.0))
+            fs[mask_mush] = 1.0 - np.power(1.0 - ratio, 1.0 / (1.0 - k))
             fs = np.clip(fs, 0.0, 1.0)
     return fs
 
@@ -306,34 +311,21 @@ def compute_niyama_variants(
     max_time_s: float = 600.0,
 ) -> Dict[str, np.ndarray]:
     """
-    Four Niyama-related indicators. The physical classical Niyama is kept as-is;
-    the others are scaled to a 0..2 range for the report table only.
+    Return physically meaningful Niyama indicators.
+
+    - classical: G / sqrt(R)  [K sqrt(s) / mm]
+    - macro_risk: max(0, 1 - N / N_macro)
+    - shrinkage_risk: max(0, 1 - N / N_shrinkage)
     """
-    eps = 1e-12
-    T_ref = (alloy.t_liquidus_c + alloy.t_solidus_c) / 2.0
-    # Guard against NaN/Inf from the thermal solver before variant arithmetic.
-    G = np.nan_to_num(G, nan=0.0, posinf=0.0, neginf=0.0)
-    R = np.nan_to_num(R, nan=0.0, posinf=0.0, neginf=0.0)
-    t_s = np.nan_to_num(t_s, nan=max_time_s, posinf=max_time_s, neginf=0.0)
-    raw = {
+    niyama = np.nan_to_num(niyama, nan=0.0, posinf=0.0, neginf=0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        macro_risk = np.clip(1.0 - niyama / max(alloy.niyama_macro, 1e-9), 0.0, 1.0)
+        shrinkage_risk = np.clip(1.0 - niyama / max(alloy.niyama_shrinkage, 1e-9), 0.0, 1.0)
+    return {
         "classical": niyama,
-        "coarse": G / (
-            np.power(np.maximum(R, eps), 0.5)
-            * np.sqrt(np.maximum(T_ref, 1.0) / 1000.0)
-        ),
-        "elbow": G * np.sqrt(np.maximum(t_s, eps)),
-        "lcc": G / (R + eps),
+        "macro_risk": macro_risk,
+        "shrinkage_risk": shrinkage_risk,
     }
-    scaled: Dict[str, np.ndarray] = {}
-    for key, val in raw.items():
-        finite = np.isfinite(val)
-        if finite.any():
-            p5, p95 = np.percentile(val[finite], [5, 95])
-            span = max(p95 - p5, 1e-9)
-            scaled[key] = np.clip((val - p5) / span * 2.0, 0.0, 2.0)
-        else:
-            scaled[key] = np.zeros_like(val)
-    return scaled
 
 
 def compute_niyama_ensemble(niyama: np.ndarray) -> np.ndarray:
@@ -409,32 +401,24 @@ def find_hotspots(
     feeder_mask: Optional[np.ndarray] = None,
     chvorinov_c: Optional[float] = None,
     n_time_steps: int = 40,
-    solidification_time: Optional[np.ndarray] = None,
 ) -> List[HotSpot]:
-    """Detect hot spots by Chvorinov pseudo-thermal solidification + CCL (Method 2).
+    """Detect hot spots by pseudo-thermal solidification + CCL (Method 2).
 
-    Hot-spot detection is driven by a part-only geometric modulus.  The SDF is
-    computed from the part mask alone, so the thickest part regions solidify
-    last and thin feeder necks solidify first.  ``solidification_time`` and
-    ``curvature`` are kept in the signature for backwards compatibility but are
-    not used because the transient thermal field is often incomplete and the
-    curvature-based shape factor over-corrects plate mid-planes.
-
-    At each layer the remaining liquid metal is labelled with 26-connectivity.
-    Liquid pockets that are not connected to a feeder (riser / gating) are
-    isolated; the last points to become isolated are the true hot spots.  A
-    feeder/riser neck naturally solidifies earlier and breaks the connection, so
-    the region directly under a riser is not reported as a part hot spot.
+    The metal is solidified in Chvorinov time layers.  At each layer, the
+    remaining liquid metal is labelled with 26-connectivity.  Liquid pockets
+    that are not connected to a feeder (riser / gating) are isolated; the last
+    points to become isolated are the true hot spots.  A feeder/riser neck
+    naturally solidifies earlier and breaks the connection, so the region under
+    a riser is not reported as a part hot spot.
     """
-    # For hot-spot detection use a part-only SDF: the distance to the nearest
-    # non-PART voxel (i.e. the part surface or the feeder/gating interface).
-    # Treating the part alone keeps the thickest part region as the last to
-    # solidify and lets the feeder neck solidify first, so true hot spots in
-    # the part body can be isolated by the CCL.  The curvature-based shape
-    # factor is intentionally not used here because it over-corrects plate mid-
-    # planes and drives hot spots toward corners.
-    part_sdf = compute_sdf(part_mask, dx)
-    M_mod = np.maximum(part_sdf, 0.1)
+    # Shape-corrected modulus
+    if curvature is not None:
+        shape_factor_field = np.clip(
+            1.0 + np.maximum(-curvature * sdf, 0.0), 1.0, 3.0
+        )
+    else:
+        shape_factor_field = np.ones_like(sdf)
+    M_mod = sdf / shape_factor_field
 
     if is_metal is None:
         is_metal = part_mask
@@ -443,15 +427,11 @@ def find_hotspots(
     if chvorinov_c is None or chvorinov_c <= 0:
         chvorinov_c = 1.0
 
-    # Build the solidification-time field from the part-only geometric modulus.
-    # This is the Chvorinov pseudo-thermal time; it is robust, never incomplete,
-    # and correctly places hot spots in the thickest / last-to-solidify part
-    # regions while letting thin feeder necks solidify first.
-    chvor_t = chvorinov_c * M_mod * M_mod
-    t_solid = chvor_t
+    # Solidification time from shape-corrected modulus (Chvorinov)
+    t_solid = chvorinov_c * M_mod * M_mod
     t_solid = np.nan_to_num(t_solid, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Time horizon: use the part, fall back to all metal.
+    # Time horizon: use the part, fall back to all metal
     if part_mask.any():
         max_t = float(np.percentile(t_solid[part_mask], 99.9))
     else:
@@ -570,9 +550,16 @@ def find_hotspots(
 
 
 def feeding_distance_dijkstra(
-    is_metal: np.ndarray, riser_mask: np.ndarray, dx: float
+    is_metal: np.ndarray,
+    riser_mask: np.ndarray,
+    dx: float,
+    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
 ) -> np.ndarray:
-    """26-neighbor weighted Dijkstra distance to the nearest riser inside metal."""
+    """Directed 26-neighbor weighted Dijkstra distance to the nearest riser.
+
+    Upward steps (against gravity) are strongly penalised so that liquid metal
+    cannot be fed uphill.  Returns distance in mm.
+    """
     dist = np.full(is_metal.shape, np.inf, dtype=np.float64)
     if not (is_metal & riser_mask).any():
         return dist
@@ -581,6 +568,12 @@ def feeding_distance_dijkstra(
     metal_vox = np.argwhere(is_metal)
     n = int(metal_vox.shape[0])
     idx[tuple(metal_vox.T)] = np.arange(n)
+
+    gx, gy, gz = gravity_vector
+    norm = math.sqrt(gx * gx + gy * gy + gz * gz) + 1e-12
+    gx, gy, gz = gx / norm, gy / norm, gz / norm
+    UPWARD_PENALTY = 1.0e9
+    DOWNWARD_BONUS = 0.7
 
     rows: List[np.ndarray] = []
     cols: List[np.ndarray] = []
@@ -605,9 +598,15 @@ def feeding_distance_dijkstra(
         valid = neighbor_idx >= 0
         if not valid.any():
             continue
+        dot = (di * gx + dj * gy + dk * gz) / math.sqrt(di * di + dj * dj + dk * dk)
+        step = np.full(valid.sum(), c * dx, dtype=np.float64)
+        if dot < 0:
+            step *= (1.0 + UPWARD_PENALTY * (-dot))
+        elif dot > 0:
+            step *= max(0.5, 1.0 - 0.3 * dot)
         rows.append(source_idx[valid])
         cols.append(neighbor_idx[valid])
-        vals.append(np.full(valid.sum(), c * dx, dtype=np.float32))
+        vals.append(step.astype(np.float32))
 
     riser_flat = np.where(riser_mask[tuple(metal_vox.T)])[0]
     if len(riser_flat) == 0:
@@ -620,7 +619,7 @@ def feeding_distance_dijkstra(
         (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
         shape=(n + 1, n + 1),
     ).tocsr()
-    flat_dist = csgraph.dijkstra(graph, directed=False, indices=n, return_predecessors=False)
+    flat_dist = csgraph.dijkstra(graph, directed=True, indices=n, return_predecessors=False)
     dist[tuple(metal_vox.T)] = flat_dist[:n].astype(np.float64)
     return dist
 
@@ -630,12 +629,13 @@ def feeding_cost_dijkstra(
     riser_mask: np.ndarray,
     modulus: np.ndarray,
     dx: float,
+    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    26-neighbor Dijkstra where edge cost = dx / M (section modulus) of the voxel
-    being entered.  This yields the lowest-resistance feeding path and a scalar
-    feeding-cost field from every metal voxel to the nearest riser.
-    Returns (cost_grid, predecessors, metal_vox).
+    26-neighbor directed Dijkstra where edge cost = dx / M (section modulus) of the
+    voxel being entered.  Steps against the user-defined gravity vector are strongly
+    penalised so liquid metal cannot be fed uphill.  Returns
+    (cost_grid, predecessors, metal_vox).
     """
     cost = np.full(is_metal.shape, np.inf, dtype=np.float64)
     pred = np.full(is_metal.shape, -1, dtype=np.int64)
@@ -647,7 +647,12 @@ def feeding_cost_dijkstra(
     n = int(metal_vox.shape[0])
     idx[tuple(metal_vox.T)] = np.arange(n)
 
-    # Edge cost = Euclidean step factor * dx / max(M_neighbor, 0.1 mm)
+    gx, gy, gz = gravity_vector
+    norm = math.sqrt(gx * gx + gy * gy + gz * gz) + 1e-12
+    gx, gy, gz = gx / norm, gy / norm, gz / norm
+    UPWARD_PENALTY = 1.0e9
+    DOWNWARD_BONUS = 0.7
+
     rows, cols, vals = [], [], []
     for (di, dj, dk), c in zip(NEIGH_26, COST_26):
         ni = metal_vox[:, 0] + di
@@ -670,9 +675,15 @@ def feeding_cost_dijkstra(
             continue
         # cost of moving into neighbor
         m_nb = np.clip(modulus[ni[mask][valid], nj[mask][valid], nk[mask][valid]], 0.1, None)
+        step = (c * dx / m_nb).astype(np.float64)
+        dot = (di * gx + dj * gy + dk * gz) / math.sqrt(di * di + dj * dj + dk * dk)
+        if dot < 0:
+            step *= (1.0 + UPWARD_PENALTY * (-dot))
+        elif dot > 0:
+            step *= max(0.5, 1.0 - 0.3 * dot)
         rows.append(source_idx[valid])
         cols.append(neighbor_idx[valid])
-        vals.append((c * dx / m_nb).astype(np.float32))
+        vals.append(step.astype(np.float32))
 
     riser_flat = np.where(riser_mask[tuple(metal_vox.T)])[0]
     if len(riser_flat) == 0:
@@ -687,7 +698,7 @@ def feeding_cost_dijkstra(
     ).tocsr()
     flat_cost, flat_pred = csgraph.dijkstra(
         graph,
-        directed=False,
+        directed=True,
         indices=n,
         return_predecessors=True,
     )
@@ -914,13 +925,30 @@ def _path_darcy_and_directional(
     m_part = np.array([M_mod[v[0], v[1], v[2]] for v in part_path])
     min_neck_m = float(m_part.min()) if len(m_part) else m_hot
 
-    # Heuver: modulus must NOT decrease toward the feeder after the first step.
-    # The hot spot itself is a local maximum, so the initial drop is expected.
+    # Heuver (vector): modulus gradient projected on the feeding direction must be
+    # non-negative.  A negative dot product means the modulus is decreasing toward
+    # the feeder (geometric choking).
     heuvers_ok = True
-    if len(m_part) > 4:
-        tol = max(dx * 0.5, 0.1)
-        if np.any(np.diff(m_part[1:]) < -tol):
-            heuvers_ok = False
+    if len(part_path) > 4:
+        grad_M = np.stack(np.gradient(M_mod), axis=0)  # mm / voxel
+        tol = max(0.05 * m_hot, 0.1)
+        for i in range(1, len(part_path)):
+            a = np.array(part_path[i - 1], dtype=np.float64)
+            b = np.array(part_path[i], dtype=np.float64)
+            step = b - a
+            step_len = float(np.linalg.norm(step)) + 1e-12
+            u = step / step_len
+            v = part_path[i - 1]
+            g = np.array(
+                [
+                    float(grad_M[0][v[0], v[1], v[2]]),
+                    float(grad_M[1][v[0], v[1], v[2]]),
+                    float(grad_M[2][v[0], v[1], v[2]]),
+                ]
+            )
+            if float(np.dot(g, u)) < -tol:
+                heuvers_ok = False
+                break
 
     # Directional solidification: solidification time must increase (or stay)
     # toward the feeder.  A drop means a cold pocket blocking feeding.
@@ -1092,15 +1120,12 @@ def _high_res_part_hotspots(
     part_max_dim: int,
     chvorinov_c: float,
     progress_callback: Optional[callable] = None,
-    solidification_time: Optional[np.ndarray] = None,
 ) -> Optional[List[HotSpot]]:
     """Build a high-resolution grid containing only PART bodies and detect hot spots.
 
     The feeder mask from the coarse global grid is resampled onto the part grid
-    so the CCL can still identify which liquid pockets are connected to feeders.
-    ``solidification_time`` is accepted for API compatibility but currently ignored;
-    hot spots are detected with a part-only geometric Chvorinov estimate, which is
-    robust against incomplete transient fields.
+    so the pseudo-thermal CCL can still identify which liquid pockets are connected
+    to feeders/risers.
     """
     try:
         part_grid, part_origin, part_dx, _ = build_part_grid(
@@ -1130,7 +1155,7 @@ def _high_res_part_hotspots(
     )
     part_M_mod = part_sdf / shape_factor_field
 
-    # Resample coarse feeder_mask and solidification time onto the part grid.
+    # Resample coarse feeder_mask onto the part grid (nearest neighbour).
     idx = np.indices(part_grid.shape, dtype=np.float64)
     coarse_coords = (
         part_origin[:, None, None, None]
@@ -1147,15 +1172,6 @@ def _high_res_part_hotspots(
         )
         > 0.5
     )
-    part_t_s: Optional[np.ndarray] = None
-    if solidification_time is not None and solidification_time.shape == feeder_mask.shape:
-        part_t_s = ndimage.map_coordinates(
-            solidification_time.astype(np.float64),
-            coarse_coords,
-            order=1,
-            mode="constant",
-            cval=0.0,
-        )
 
     # Guard against a completely missing feeder: in that case the CCL cannot mark
     # anything as fed and every liquid pocket becomes isolated, which is fine.
@@ -1178,7 +1194,6 @@ def _high_res_part_hotspots(
         is_metal=part_is_metal,
         feeder_mask=part_feeder_mask,
         chvorinov_c=chvorinov_c,
-        solidification_time=part_t_s,
     )
     return part_hotspots
 
@@ -1222,6 +1237,11 @@ def analyze(
         )
         mold = replace(mold, t0_c=casting_params.t_mold_c)
     chvorinov_c = chvorinov_c_from_properties(alloy, mold)
+    gravity_vector = (
+        casting_params.gravity_vector
+        if casting_params is not None
+        else (0.0, 0.0, -1.0)
+    )
     bbox_size = np.array(grid.shape) * dx
 
     is_metal = np.isin(grid, BODY_METAL_TYPES)
@@ -1243,7 +1263,13 @@ def analyze(
     exposed_faces = np.zeros_like(part_pad, dtype=int)
     for di, dj, dk in NEIGH_6:
         exposed_faces += part_pad & ~np.roll(metal_pad, (di, dj, dk), axis=(0, 1, 2))
-    part_surface_area_mm2 = float(exposed_faces[1:-1, 1:-1, 1:-1].sum()) * dx * dx
+    voxel_surface_area_mm2 = float(exposed_faces[1:-1, 1:-1, 1:-1].sum()) * dx * dx
+    mesh_surface_area_mm2 = sum(
+        b.surface_area_cm2 for b in bodies if b.body_type == BodyType.PART
+    ) * 100.0
+    part_surface_area_mm2 = (
+        mesh_surface_area_mm2 if mesh_surface_area_mm2 > 0.0 else voxel_surface_area_mm2
+    )
     part_volume_mm3 = float(part_mask.sum()) * dx ** 3
 
     # v8.2: If there is no separate riser, use the gating system (sprue/runner/ingate)
@@ -1272,7 +1298,10 @@ def analyze(
     _, _, dominant_m = _sdf_histogram(M_mod, part_mask, bins=50)
     wall_thickness = 2.0 * dominant_m if dominant_m > 0 else 0.0
     m_mean, m_std, m_skew = _histogram_stats(M_mod, part_mask)
-    shape_factor_global = _shape_factor(part_mask, dx)
+    if part_surface_area_mm2 > 0.0 and part_volume_mm3 > 0.0:
+        shape_factor_global = (part_volume_mm3 ** 2) / (part_surface_area_mm2 ** 3)
+    else:
+        shape_factor_global = _shape_factor(part_mask, dx)
     if progress_callback:
         progress_callback(28)
 
@@ -1286,6 +1315,16 @@ def analyze(
         downsample=thermal_downsample,
         progress_callback=progress_callback,
     )
+    # Fallback for thick regions that did not reach solidus within max_time_s:
+    # use the analytical Chvorinov/Stefan Niyama so hot spots are not reported as 0.
+    G_ana, R_ana, niyama_ana = compute_niyama(
+        sdf, M_mod, alloy, mold, dx, is_metal=is_metal
+    )
+    solidified = np.isfinite(t_s) & (t_s > 0.0) & (niyama > 0.0)
+    niyama = np.where(solidified, niyama, niyama_ana)
+    G = np.where(solidified, G, G_ana)
+    cooling_rate = np.where(solidified, cooling_rate, R_ana)
+
     thermal_divergence = ndimage.laplace(temperature) / (dx * dx)
     if progress_callback:
         progress_callback(60)
@@ -1312,14 +1351,15 @@ def analyze(
         is_metal=is_metal,
         feeder_mask=feeder_mask,
         chvorinov_c=chvorinov_c,
-        solidification_time=t_s,
     )
     if progress_callback:
         progress_callback(75)
 
     # AŞAMA 6: 26-neighbor Dijkstra feeding distance and lowest-resistance cost path
-    dist_feed = feeding_distance_dijkstra(is_metal, feeder_mask, dx)
-    cost_feed, cost_pred, _ = feeding_cost_dijkstra(is_metal, feeder_mask, M_mod, dx)
+    dist_feed = feeding_distance_dijkstra(is_metal, feeder_mask, dx, gravity_vector=gravity_vector)
+    cost_feed, cost_pred, _ = feeding_cost_dijkstra(
+        is_metal, feeder_mask, M_mod, dx, gravity_vector=gravity_vector
+    )
     if progress_callback:
         progress_callback(82)
 
@@ -1337,13 +1377,23 @@ def analyze(
             part_max_dim,
             chvorinov_c,
             progress_callback,
-            solidification_time=t_s,
         )
         if part_hotspots is not None and part_hotspots:
             hotspots = part_hotspots
 
     if progress_callback:
         progress_callback(84)
+
+    # Nearest-part-voxel lookup: high-resolution hotspots may map to a coarse
+    # voxel that is just outside the part (boundary discretisation).  Snap to
+    # the closest metal voxel so Niyama / feeding values are not lost.
+    _, nearest_part_vox = ndimage.distance_transform_edt(part_mask, return_indices=True)
+
+    def _snap_to_part(voxel):
+        v = np.clip(voxel, 0, np.array(grid.shape) - 1).astype(int)
+        if part_mask[v[0], v[1], v[2]]:
+            return (int(v[0]), int(v[1]), int(v[2]))
+        return tuple(int(x) for x in nearest_part_vox[:, v[0], v[1], v[2]])
 
     # v8.7: part voxels immediately adjacent to a feeder are fed by that feeder
     # and should not be reported as part hot spots (e.g., directly under a riser).
@@ -1355,20 +1405,18 @@ def analyze(
         fed_zone = dilated_feeder & part_mask
         filtered_hotspots: List[HotSpot] = []
         for hs in hotspots:
-            vox = np.round((hs.position_mm - origin_mm) / dx).astype(int)
-            if (
-                0 <= vox[0] < grid.shape[0]
-                and 0 <= vox[1] < grid.shape[1]
-                and 0 <= vox[2] < grid.shape[2]
-                and not fed_zone[vox[0], vox[1], vox[2]]
-            ):
+            vox_raw = np.round((hs.position_mm - origin_mm) / dx).astype(int)
+            vox = _snap_to_part(vox_raw)
+            if not fed_zone[vox[0], vox[1], vox[2]]:
                 filtered_hotspots.append(hs)
         hotspots = filtered_hotspots
 
     # AŞAMA 7: Hot-spot physics
     feeder_voxels = np.argwhere(feeder_mask)
+
     for hs in hotspots:
-        vox = np.round((hs.position_mm - origin_mm) / dx).astype(int)
+        vox_raw = np.round((hs.position_mm - origin_mm) / dx).astype(int)
+        vox = _snap_to_part(vox_raw)
         if 0 <= vox[0] < grid.shape[0] and 0 <= vox[1] < grid.shape[1] and 0 <= vox[2] < grid.shape[2]:
             hs.dist_to_riser_mm = float(dist_feed[vox[0], vox[1], vox[2]])
             hs.niyama_min = float(niyama[vox[0], vox[1], vox[2]])
@@ -1631,7 +1679,19 @@ def analyze(
     )
 
     result.riser_proposals = propose_risers(result, alloy, existing_riser_count=len(riser_results))
+
+    # AŞAMA 11: Connect gating solver so the report receives mass / sprue / runner data.
+    try:
+        from core.gating import analyze_gating
+        result.gate_result = analyze_gating(
+            result, casting_params=casting_params, bodies=bodies
+        )
+    except Exception as exc:
+        result.recommendations.append(f"Gating analizi atlandı: {exc}")
+
     result.recommendations = _build_recommendations(result, alloy, mold)
+    if result.gate_result and result.gate_result.gating_system_reason:
+        result.recommendations.append(result.gate_result.gating_system_reason)
     return result
 
 

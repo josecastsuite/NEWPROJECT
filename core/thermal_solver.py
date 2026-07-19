@@ -24,13 +24,18 @@ def _scheil_fs(
     t_solidus: float,
     partition_coeff: float,
 ) -> np.ndarray:
-    """Scheil solid fraction [0..1]."""
+    """Scheil solid fraction [0..1].
+
+    fs = 1 - ((T - T_solidus) / (T_liquidus - T_solidus))^(1 / (1 - k))
+    """
     fs = np.zeros_like(T)
     mask = (T <= t_liquidus) & (T >= t_solidus)
     denom = max(t_liquidus - t_solidus, 1.0)
+    # u is the solidified fraction of the temperature interval, 0 at liquidus, 1 at solidus
     u = np.clip((t_liquidus - T[mask]) / denom, 0.0, 1.0)
-    exponent = 1.0 / (max(partition_coeff, 1e-6) - 1.0)
-    fs[mask] = 1.0 - np.power(u, exponent)
+    v = 1.0 - u
+    exponent = 1.0 / max(1.0 - partition_coeff, 1e-6)
+    fs[mask] = 1.0 - np.power(v, exponent)
     fs[T < t_solidus] = 1.0
     return np.clip(fs, 0.0, 1.0)
 
@@ -49,10 +54,11 @@ def _dscheil_dT(
     denom = max(t_liquidus - t_solidus, 1.0)
     u = (t_liquidus - T[mask]) / denom
     u = np.clip(u, 1e-9, 1.0 - 1e-9)
+    v = 1.0 - u
     k = max(partition_coeff, 1e-6)
-    p = 1.0 / (k - 1.0)
-    d[mask] = p * np.power(u, p - 1.0) / denom
-    return np.clip(d, -1e6, 0.0)
+    p = 1.0 / (1.0 - k)
+    d[mask] = p * np.power(v, p - 1.0) / denom
+    return np.clip(d, 0.0, 1e6)
 
 
 def _cp_eff(
@@ -67,7 +73,7 @@ def _cp_eff(
         dT_mush = max(alloy.t_liquidus_c - alloy.t_solidus_c, 1.0)
         df = _dscheil_dT(T, alloy.t_liquidus_c, alloy.t_solidus_c, alloy.partition_coefficient)
         # Cap the latent contribution so the total latent over the mush equals L
-        cp[is_metal] += alloy.latent_heat_j_kg * np.clip(-df[is_metal], 0.0, 1.0 / dT_mush)
+        cp[is_metal] += alloy.latent_heat_j_kg * np.clip(df[is_metal], 0.0, 1.0 / dT_mush)
     return cp
 
 

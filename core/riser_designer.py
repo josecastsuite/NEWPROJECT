@@ -19,10 +19,10 @@ def _diameter_for_sphere_m(m_mm: float) -> float:
 
 def _cylinder_diameter_for_m(m_mm: float, height_to_diameter: float = 1.0) -> float:
     # Cylinder with H = h2d * D, top cooling only (bottom attached to casting)
-    # M = V/A = (pi D^2 H / 4) / (pi D H + pi D^2 / 4)
+    # M = V/A = (pi D^2 H / 4) / (pi D H + 2 * pi D^2 / 4)
     # Solve for D given M and h2d.
     h2d = float(height_to_diameter)
-    ratio = (h2d / 4.0) / (h2d + 0.25)
+    ratio = (h2d / 4.0) / (h2d + 0.5)
     return m_mm / ratio
 
 
