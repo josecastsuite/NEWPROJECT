@@ -5,7 +5,7 @@ import sys
 import time
 import webbrowser
 from dataclasses import replace
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import pyvista as pv
 from PyQt6 import QtCore, QtGui, QtWidgets
@@ -430,6 +430,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.porosity_toggle.toggled.connect(self.on_toggle_porosity)
         vis_layout.addWidget(self.porosity_toggle)
 
+        self.porosity_detail_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.porosity_detail_slider.setMinimum(0)
+        self.porosity_detail_slider.setMaximum(100)
+        self.porosity_detail_slider.setValue(50)
+        self.porosity_detail_slider.setToolTip("Porozite bulutu detayı: 0 = az/sadece uç değerler, 100 = yoğun")
+        self.porosity_detail_slider.valueChanged.connect(self.on_porosity_detail_changed)
+        vis_layout.addWidget(self.porosity_detail_slider)
+
         self.niyama_toggle = QtWidgets.QCheckBox("Niyama İzosurface")
         self.niyama_toggle.setToolTip("Niyama 0.775 / 1.5 izoyüzeyleri")
         self.niyama_toggle.setChecked(False)
@@ -746,7 +754,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.risk_toggle.isChecked():
                 self.viewer.show_risk(self._analysis)
             if self.porosity_toggle.isChecked():
-                self.viewer.show_porosity_cloud(self._analysis)
+                pct, mp = self._porosity_cloud_params()
+                self.viewer.show_porosity_cloud(self._analysis, percentile=pct, max_points=mp)
             if self.niyama_toggle.isChecked():
                 self.viewer.show_niyama_isosurfaces(self._analysis)
             if self.path_toggle.isChecked():
@@ -962,7 +971,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_toggle_porosity(self, checked: bool):
         if self._analysis:
-            self.viewer.toggle_porosity(self._analysis, checked)
+            pct, mp = self._porosity_cloud_params()
+            self.viewer.toggle_porosity(self._analysis, checked, percentile=pct, max_points=mp)
+
+    def on_porosity_detail_changed(self, value: int):
+        if self._analysis and self.porosity_toggle.isChecked():
+            pct, mp = self._porosity_cloud_params()
+            self.viewer.show_porosity_cloud(self._analysis, percentile=pct, max_points=mp)
+
+    def _porosity_cloud_params(self) -> Tuple[float, int]:
+        detail = self.porosity_detail_slider.value() / 100.0
+        percentile = 99.5 - detail * 19.5  # 99.5 (az) .. 80.0 (yoğun)
+        max_points = int(500 + detail * 4500)  # 500 .. 5000 nokta
+        return float(percentile), int(max_points)
 
     def on_toggle_niyama(self, checked: bool):
         if self._analysis:

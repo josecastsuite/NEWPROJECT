@@ -11,6 +11,13 @@ from scipy import ndimage
 from scipy.sparse import coo_matrix, csgraph
 from scipy.spatial import ConvexHull
 
+from core.gating_calculator import (
+    auto_fill_time as _gc_auto_fill_time,
+    calc_campbell_parameters,
+    compute_gating,
+    compute_modulus_and_riser as _gc_compute_modulus_and_riser,
+    effective_head,
+)
 from core.materials import get_alloy, get_mold, chvorinov_c_from_properties
 from core.sdf_analyzer import COST_26, NEIGH_26
 from core.types import (
@@ -64,71 +71,8 @@ def _gate_source_mask(grid: np.ndarray) -> np.ndarray:
 
 
 # v8.5: helpers from Filling_time_tr.py / gating_calculator_tr.py
-RHO_REF_KG_M3 = 7000.0
-
-
-def _campbell_base_fill_time(m_kg: float) -> Tuple[float, str]:
-    """Campbell Table 4.1 piecewise log interpolation for base fill time [s]."""
-    m = max(m_kg, 1e-6)
-    points = [
-        (20.0, 2.0),
-        (100.0, 6.0),
-        (250.0, 14.0),
-        (500.0, 30.0),
-        (2000.0, 60.0),
-        (3000.0, 130.0),
-    ]
-    if m <= points[0][0]:
-        return points[0][1], f"m <= {points[0][0]} kg"
-    for i in range(len(points) - 1):
-        m1, t1 = points[i]
-        m2, t2 = points[i + 1]
-        if m1 < m <= m2:
-            t = t1 + (t2 - t1) * (np.log10(m / m1) / np.log10(m2 / m1))
-            return float(t), f"{m1}-{m2} kg (log interp)"
-    return points[-1][1], f"m > {points[-1][0]} kg"
-
-
-def _recommended_fill_time(
-    m_kg: float, rho_kg_m3: float, thickness_mm: float, superheat_c: float
-) -> Tuple[float, str]:
-    """Campbell-corrected fill time: t = t_base * f_rho * f_thick * f_temp."""
-    t_base, detail = _campbell_base_fill_time(m_kg)
-    f_rho = (RHO_REF_KG_M3 / max(rho_kg_m3, 1e-6)) ** 0.35
-    f_thick = (max(thickness_mm, 1.0) / 20.0) ** 0.2
-    f_temp = (max(superheat_c, 10.0) / 100.0) ** 0.4
-    return float(t_base * f_rho * f_thick * f_temp), detail
-
-
-def _head_reduction_fraction(W_part_kg: float) -> float:
-    """Mass-dependent head reduction for effective metal head [0..0.75]."""
-    m = float(np.clip(W_part_kg, 0.0, 3000.0))
-    points = [
-        (0.0, 0.00),
-        (100.0, 0.40),
-        (250.0, 0.50),
-        (500.0, 0.60),
-        (1000.0, 0.70),
-        (3000.0, 0.75),
-    ]
-    for i in range(len(points) - 1):
-        m0, r0 = points[i]
-        m1, r1 = points[i + 1]
-        if m0 <= m <= m1:
-            if m1 == m0:
-                return float(r1)
-            t = (m - m0) / (m1 - m0)
-            return float(r0 + t * (r1 - r0))
-    return float(points[-1][1])
-
-
-def _effective_head_m(H_m: float, W_part_kg: float) -> float:
-    """Apply mass-dependent reduction to the available metal head."""
-    if H_m <= 0.0:
-        return H_m
-    frac = np.clip(_head_reduction_fraction(W_part_kg), 0.0, 0.9)
-    return H_m * (1.0 - frac)
-
+# Imported directly from core.gating_calculator so the analyzer uses the exact
+# equations from the user's working field scripts.
 
 def _area_to_diameter_mm(area_cm2: float) -> float:
     """Circular equivalent diameter [mm] from area [cm2]."""
@@ -441,11 +385,7 @@ def _gating_area_design(
     gating_ratio: Tuple[float, float, float] = (1.0, 2.0, 1.0),
     n_ingates: int = 1,
 ) -> Dict[str, float]:
-    """
-    Theoretical gating areas from total poured mass / head / fill time.
-    Returns sprue base (choke), runner, gate total/each areas in cm2 and diameters in mm.
-    """
-    g = 9.81
+    """Wrap compute_gating from gating_calculator_tr.py; return cm² / mm."""
     if H_eff_m <= 0.0 or t_fill_s <= 0.0 or rho_kg_m3 <= 0.0:
         return {
             "As_cm2": 0.0,
@@ -458,21 +398,24 @@ def _gating_area_design(
             "ratio": gating_ratio,
         }
 
-    Vc = np.sqrt(2.0 * g * H_eff_m)  # choke velocity at sprue base
-    As_m2 = W_total_kg / (rho_kg_m3 * Cd * t_fill_s * Vc)
-    As_ratio, Ar_ratio, Ag_ratio = gating_ratio
-    Ar_total_m2 = As_m2 * (Ar_ratio / max(As_ratio, 1e-9))
-    Ag_total_m2 = As_m2 * (Ag_ratio / max(As_ratio, 1e-9))
-    Ag_each_m2 = Ag_total_m2 / max(n_ingates, 1)
-
+    res = compute_gating(
+        W_kg=W_total_kg,
+        rho_kgm3=rho_kg_m3,
+        H_m=H_eff_m,
+        t_fill_s=t_fill_s,
+        Cd=Cd,
+        gating_ratio=gating_ratio,
+        n_ingates=max(n_ingates, 1),
+    )
+    conv = 1e4  # m² -> cm²
     return {
-        "As_cm2": As_m2 * 1e4,
-        "Ar_total_cm2": Ar_total_m2 * 1e4,
-        "Ag_total_cm2": Ag_total_m2 * 1e4,
-        "Ag_each_cm2": Ag_each_m2 * 1e4,
-        "Vc_ms": float(Vc),
-        "d_sprue_mm": _area_to_diameter_mm(As_m2 * 1e4),
-        "d_ingate_each_mm": _area_to_diameter_mm(Ag_each_m2 * 1e4),
+        "As_cm2": res["As_m2"] * conv,
+        "Ar_total_cm2": res["Ar_total_m2"] * conv,
+        "Ag_total_cm2": res["Ag_total_m2"] * conv,
+        "Ag_each_cm2": res["Ag_each_m2"] * conv,
+        "Vc_ms": float(res["Vc_ms"]),
+        "d_sprue_mm": res["d_sprue_m"] * 1000.0,
+        "d_ingate_each_mm": res["d_ingate_m"] * 1000.0,
         "ratio": gating_ratio,
     }
 
@@ -488,33 +431,16 @@ def _default_gating_ratio(alloy_key: str) -> Tuple[float, float, float]:
 
 
 def auto_fill_time(mass_kg: float, alloy_key: str = "", alloy_name: str = "") -> float:
-    """Practical fill-time estimate from gating_calculator_tr.py (not Campbell).
+    """Practical fill-time estimate from gating_calculator_tr.py.
 
-    Defaults: small <=5 kg, medium <=20 kg, large >20 kg.
+    Wraps core.gating_calculator.auto_fill_time and clamps the result so very
+    small / very large masses do not drive design into unrealistic regions.
     """
-    if mass_kg <= 0:
-        return 5.0
-    if mass_kg <= 5.0:
-        size = "small"
-    elif mass_kg <= 20.0:
-        size = "medium"
-    else:
-        size = "large"
-
-    key = (alloy_key or "").lower()
-    name = (alloy_name or "").lower()
-    combined = key + " " + name
-
-    if "çelik" in combined or "steel" in combined or "42" in combined:
-        return {"small": 3.0, "medium": 5.0, "large": 8.0}.get(size, 5.0)
-    if "gri" in combined or "sfero" in combined or "ggg" in combined or "nodular" in combined:
-        return {"small": 2.5, "medium": 4.0, "large": 6.0}.get(size, 4.0)
-    if "al" in combined or "alum" in combined or "alsi" in combined:
-        return {"small": 3.0, "medium": 5.0, "large": 8.0}.get(size, 5.0)
-    if "bronz" in combined or "bronze" in combined:
-        return {"small": 2.0, "medium": 3.5, "large": 5.0}.get(size, 3.5)
-
-    return {"small": 3.5, "medium": 5.5, "large": 8.5}.get(size, 5.5)
+    if mass_kg <= 0.0:
+        return 3.0
+    name = (alloy_name or alloy_key or "Çelik")
+    t = _gc_auto_fill_time(name, mass_kg)
+    return float(np.clip(t, 0.2, 120.0))
 
 
 def compute_modulus_and_riser(
@@ -523,11 +449,7 @@ def compute_modulus_and_riser(
     A_cast_m2: float,
     k_mod: float = 1.2,
 ) -> Dict[str, float]:
-    """Exact riser modulus / cylinder sizing from gating_calculator_tr.py.
-
-    Assumes a cylindrical riser with H = D and top+bottom cooling.
-    Searches diameter from 0.05 m to 1.0 m in 0.005 m steps.
-    """
+    """Wrap compute_modulus_and_riser from gating_calculator_tr.py."""
     if A_cast_m2 <= 0.0 or W_part_kg <= 0.0 or rho_kg_m3 <= 0.0:
         return {
             "V_cast_m3": 0.0,
@@ -537,45 +459,12 @@ def compute_modulus_and_riser(
             "riser_H_m": 0.0,
             "riser_M_m": 0.0,
         }
-
-    V_cast_m3 = W_part_kg / rho_kg_m3
-    M_cast_m = V_cast_m3 / A_cast_m2
-    M_riser_req_m = k_mod * M_cast_m
-
-    D = 0.05
-    D_max = 1.0
-    step = 0.005
-    best_D = None
-    best_H = None
-    best_M = None
-
-    while D <= D_max:
-        H = D
-        V_r = math.pi * (D / 2.0) ** 2 * H
-        A_r = math.pi * D * H + 2.0 * math.pi * (D / 2.0) ** 2
-        M_r = V_r / A_r
-        if M_r >= M_riser_req_m:
-            best_D = D
-            best_H = H
-            best_M = M_r
-            break
-        D += step
-
-    if best_D is None:
-        best_D = D_max
-        best_H = D_max
-        V_r = math.pi * (best_D / 2.0) ** 2 * best_H
-        A_r = math.pi * best_D * best_H + 2.0 * math.pi * (best_D / 2.0) ** 2
-        best_M = V_r / A_r
-
-    return {
-        "V_cast_m3": V_cast_m3,
-        "M_cast_m": M_cast_m,
-        "M_riser_req_m": M_riser_req_m,
-        "riser_D_m": best_D,
-        "riser_H_m": best_H,
-        "riser_M_m": best_M,
-    }
+    return _gc_compute_modulus_and_riser(
+        W_part_kg=W_part_kg,
+        rho_kgm3=rho_kg_m3,
+        A_cast_m2=A_cast_m2,
+        k_mod=k_mod,
+    )
 
 
 def ingate_contact_area_and_mask(grid: np.ndarray, dx: float) -> tuple:
@@ -1016,12 +905,17 @@ def analyze_gating(
     # v8.6: practical auto fill time from gating_calculator_tr.py + Campbell info
     superheat = max(alloy.t_pour_c - alloy.t_liquidus_c, 0.0)
     wall_thickness_mm = getattr(result, "wall_thickness_mm", 0.0) or 20.0
-    campbell_fill_time_s, campbell_fill_time_basis = _recommended_fill_time(
+    campbell_res = calc_campbell_parameters(
         part_mass_kg, alloy.rho_kg_m3, wall_thickness_mm, superheat
     )
+    campbell_fill_time_s = campbell_res["t_fill"]
+    campbell_fill_time_basis = campbell_res["t_base_detail"]
     auto_fill_time_s = auto_fill_time(part_mass_kg, alloy.key, alloy.name)
     if fill_time_s is None or fill_time_s <= 0:
         fill_time_s = auto_fill_time_s
+    # v9.1: design floor so tiny parts / tiny fill times do not drive areas to
+    # physically meaningless values (< 10 kg behaviour remains stable).
+    design_fill_time_s = float(np.clip(fill_time_s, 0.2, 120.0))
     # Practical recommendation used as the primary recommendation.
     recommended_fill_time_s = auto_fill_time_s
     fill_time_basis = "auto_fill_time"
@@ -1154,16 +1048,22 @@ def analyze_gating(
     height_m = height_mm / 1000.0
 
     # v8.5: effective metal head with mass-dependent reduction (gating_calculator_tr.py)
-    H_eff_m = _effective_head_m(height_m, part_mass_kg)
+    H_eff_m = effective_head(height_m, part_mass_kg)
+    # v9.1: minimum 2 cm effective head so choke velocity / area stay realistic
+    # for very small castings; maximum 60 cm avoids erosion-driven extreme areas.
+    H_eff_m = float(np.clip(H_eff_m, 0.02, 0.60))
     head_reduction_percent = 100.0 * (1.0 - (H_eff_m / max(height_m, 1e-9)))
     H_eff_cm = H_eff_m * 100.0
     g_cgs = 981.0  # cm/s^2
 
-    if H_eff_cm > 0 and fill_time_s > 0:
+    # v9.1: design total mass floor (0.1 kg) prevents zero/infinitesimal areas.
+    design_total_weight_g = max(total_weight_g, 0.1 * 1000.0)
+
+    if H_eff_cm > 0 and design_fill_time_s > 0:
         velocity = np.sqrt(2.0 * g_cgs * H_eff_cm)
         # Use total poured weight (gating+riser+part) for choke area
-        as_req_cm2 = total_weight_g / (
-            alloy.density_g_cm3 * discharge_coeff * fill_time_s * velocity
+        as_req_cm2 = design_total_weight_g / (
+            alloy.density_g_cm3 * discharge_coeff * design_fill_time_s * velocity
         )
     else:
         as_req_cm2 = 0.0
@@ -1196,10 +1096,10 @@ def analyze_gating(
                 h_loss_per_elbow_m = alloy.elbow_loss_k * (v_loss_m_s ** 2) / (2.0 * 9.81)
                 head_loss_cm = h_loss_per_elbow_m * 100.0 * elbow_count
                 effective_head_cm = max(0.0, H_eff_cm - head_loss_cm)
-                if effective_head_cm > 0 and fill_time_s > 0:
+                if effective_head_cm > 0 and design_fill_time_s > 0:
                     v_eff = np.sqrt(2.0 * g_cgs * effective_head_cm)
-                    required_sprue_area_with_losses_cm2 = total_weight_g / (
-                        alloy.density_g_cm3 * discharge_coeff * fill_time_s * v_eff
+                    required_sprue_area_with_losses_cm2 = design_total_weight_g / (
+                        alloy.density_g_cm3 * discharge_coeff * design_fill_time_s * v_eff
                     )
                 else:
                     required_sprue_area_with_losses_cm2 = float("inf")
@@ -1210,11 +1110,12 @@ def analyze_gating(
 
     # v8.5: theoretical gating areas from mass/head/fill time for cross-check
     design_ratio = _default_gating_ratio(alloy.key)
+    design_total_mass_kg = design_total_weight_g / 1000.0
     design_areas = _gating_area_design(
-        total_mass_kg,
+        design_total_mass_kg,
         alloy.rho_kg_m3,
         H_eff_m,
-        fill_time_s,
+        design_fill_time_s,
         discharge_coeff,
         design_ratio,
         n_ingates,

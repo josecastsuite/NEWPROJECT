@@ -495,9 +495,9 @@ class Analyzer3DViewer(QtInteractor):
                 self.remove_actor(self._hotspot_label_actor)
                 self._hotspot_label_actor = None
 
-    def toggle_porosity(self, result: AnalysisResult, checked: bool):
+    def toggle_porosity(self, result: AnalysisResult, checked: bool, percentile: float = 95.0, max_points: int = 1500):
         if checked:
-            self.show_porosity_cloud(result)
+            self.show_porosity_cloud(result, percentile=percentile, max_points=max_points)
         else:
             if self._porosity_actor is not None:
                 self.remove_actor(self._porosity_actor)
