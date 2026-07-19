@@ -153,3 +153,44 @@ def build_voxel_grid(
         progress_callback(50)
 
     return grid, origin, dx, repaired_bodies
+
+
+def build_part_grid(
+    bodies: List[Body],
+    target_voxels: int = 10_000_000,
+    max_dim: int = 600,
+    margin_vox: int = 4,
+) -> Tuple[np.ndarray, np.ndarray, float, List[Body]]:
+    """Build a high-resolution voxel grid containing only the PART bodies.
+
+    The grid resolution is chosen so that the total number of voxels is close to
+    ``target_voxels`` while respecting the part's aspect ratio.  A small margin is
+    added around the part to avoid boundary clipping.
+    """
+    part_bodies = [b for b in bodies if b.body_type == BodyType.PART]
+    if not part_bodies:
+        return build_voxel_grid(bodies, target_dim=BASE_RES)
+
+    bbox_min, bbox_max = _global_bbox(part_bodies)
+    size = bbox_max - bbox_min
+    max_size = float(size.max())
+    if max_size <= 0.0:
+        return build_voxel_grid(bodies, target_dim=BASE_RES)
+
+    volume = float(np.prod(size))
+    if volume > 0.0:
+        # Choose part_dim so that total voxels ~= target_voxels.
+        part_dim = int(round((target_voxels * max_size ** 3 / volume) ** (1.0 / 3.0)))
+    else:
+        part_dim = int(round(target_voxels ** (1.0 / 3.0)))
+
+    # Clamp resolution: avoid impossibly fine voxels and enforce a ceiling.
+    part_dim = max(60, min(part_dim, max_dim))
+    dx = max_size / part_dim
+    # Ensure at least 0.05 mm voxel pitch (finer is usually overkill and slow).
+    if dx < 0.05:
+        part_dim = int(round(max_size / 0.05))
+        part_dim = max(60, min(part_dim, max_dim))
+
+    # build_voxel_grid adds its own margin; pass only part bodies so the bbox is tight.
+    return build_voxel_grid(part_bodies, target_dim=part_dim, progress_callback=None)

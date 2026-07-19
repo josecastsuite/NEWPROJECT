@@ -725,7 +725,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._analysis.casting_params = casting_params
 
             self.aiLog("AŞAMA 5/6: Meme / yolluk / döküm ağzı kontrolleri yapılıyor...", "info")
-            gate_result = analyze_gating(self._analysis, casting_params=casting_params)
+            gate_result = analyze_gating(self._analysis, casting_params=casting_params, bodies=self._bodies)
             self._analysis.gate_result = gate_result
             self._analysis.recommendations.extend(self._gating_recommendations(gate_result))
 

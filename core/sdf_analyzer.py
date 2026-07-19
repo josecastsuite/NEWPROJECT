@@ -24,6 +24,7 @@ from core.materials import (
 )
 from core.riser_designer import propose_risers
 from core.thermal_solver import solve_3d_thermal
+from core.voxelizer import build_part_grid
 from core.types import (
     BODY_FEEDER_TYPES,
     BODY_METAL_TYPES,
@@ -1070,6 +1071,93 @@ def _refine_region(
     )
 
 
+def _high_res_part_hotspots(
+    bodies: List[Body],
+    feeder_mask: np.ndarray,
+    origin_mm: np.ndarray,
+    coarse_dx: float,
+    part_voxels_target: int,
+    part_max_dim: int,
+    chvorinov_c: float,
+    progress_callback: Optional[callable] = None,
+) -> Optional[List[HotSpot]]:
+    """Build a high-resolution grid containing only PART bodies and detect hot spots.
+
+    The feeder mask from the coarse global grid is resampled onto the part grid
+    so the pseudo-thermal CCL can still identify which liquid pockets are connected
+    to feeders/risers.
+    """
+    try:
+        part_grid, part_origin, part_dx, _ = build_part_grid(
+            bodies,
+            target_voxels=part_voxels_target,
+            max_dim=part_max_dim,
+        )
+    except Exception:
+        return None
+
+    if part_grid is None or part_grid.size == 0:
+        return None
+
+    part_mask = part_grid == BodyType.PART
+    part_is_metal = np.isin(part_grid, [int(BodyType.PART)])
+    if not part_mask.any() or part_is_metal.sum() < 1000:
+        return None
+
+    if progress_callback:
+        progress_callback(83)
+
+    # SDF and curvature on the part-only high-res grid (sub=1 to avoid 8x blowup).
+    part_sdf = compute_subvoxel_sdf(part_is_metal, part_dx, sub=1)
+    mean_curv, _ = compute_curvature(part_sdf, part_dx)
+    shape_factor_field = np.clip(
+        1.0 + np.maximum(-mean_curv * part_sdf, 0.0), 1.0, 3.0
+    )
+    part_M_mod = part_sdf / shape_factor_field
+
+    # Resample coarse feeder_mask onto the part grid (nearest neighbour).
+    idx = np.indices(part_grid.shape, dtype=np.float64)
+    coarse_coords = (
+        part_origin[:, None, None, None]
+        + idx * part_dx
+        - origin_mm[:, None, None, None]
+    ) / coarse_dx
+    part_feeder_mask = (
+        ndimage.map_coordinates(
+            feeder_mask.astype(np.float32),
+            coarse_coords,
+            order=0,
+            mode="constant",
+            cval=0.0,
+        )
+        > 0.5
+    )
+
+    # Guard against a completely missing feeder: in that case the CCL cannot mark
+    # anything as fed and every liquid pocket becomes isolated, which is fine.
+    max_part_sdf = float(part_sdf[part_mask].max()) if part_mask.any() else 0.0
+    hotspot_min_size_mm = min(2.0, max(0.5, 0.5 * max_part_sdf))
+    hotspot_cluster_mm = max(12.0, 2.0 * part_dx)
+
+    if progress_callback:
+        progress_callback(83)
+
+    part_hotspots = find_hotspots(
+        part_sdf,
+        part_mask,
+        part_dx,
+        part_origin,
+        curvature=mean_curv,
+        use_skeleton=True,
+        min_size_mm=hotspot_min_size_mm,
+        cluster_eps_mm=hotspot_cluster_mm,
+        is_metal=part_is_metal,
+        feeder_mask=part_feeder_mask,
+        chvorinov_c=chvorinov_c,
+    )
+    return part_hotspots
+
+
 def analyze(
     bodies: List[Body],
     grid: np.ndarray,
@@ -1085,6 +1173,8 @@ def analyze(
     thermal_downsample: int = 2,
     casting_params: Optional[CastingParameters] = None,
     progress_callback: Optional[callable] = None,
+    part_voxels_target: int = 10_000_000,
+    part_max_dim: int = 600,
 ) -> AnalysisResult:
     """Run the full v8.0+ geometric + 3-D transient thermal analysis pipeline."""
     import time
@@ -1206,6 +1296,27 @@ def analyze(
     cost_feed, cost_pred, _ = feeding_cost_dijkstra(is_metal, feeder_mask, M_mod, dx)
     if progress_callback:
         progress_callback(82)
+
+    # AŞAMA 6.5: High-resolution PART-only grid (hybrid voxelization).
+    # The gating/riser geometry is already handled by CAD cross-sections and the
+    # coarse global grid is only used for connectivity/feeding distance; the
+    # critical part geometry is resolved at ~10 M voxels for accurate hot spots.
+    if part_voxels_target > 0:
+        part_hotspots = _high_res_part_hotspots(
+            bodies,
+            feeder_mask,
+            origin_mm,
+            dx,
+            part_voxels_target,
+            part_max_dim,
+            chvorinov_c,
+            progress_callback,
+        )
+        if part_hotspots is not None and part_hotspots:
+            hotspots = part_hotspots
+
+    if progress_callback:
+        progress_callback(84)
 
     # v8.7: part voxels immediately adjacent to a feeder are fed by that feeder
     # and should not be reported as part hot spots (e.g., directly under a riser).

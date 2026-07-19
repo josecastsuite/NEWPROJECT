@@ -1,13 +1,15 @@
 """Ingate / runner / sprue geometric gating calculations - JoseCast v8.0."""
 
 from dataclasses import replace
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import math
 
 import numpy as np
+import trimesh
 from scipy import ndimage
 from scipy.sparse import coo_matrix, csgraph
+from scipy.spatial import ConvexHull
 
 from core.materials import get_alloy, get_mold, chvorinov_c_from_properties
 from core.sdf_analyzer import COST_26, NEIGH_26
@@ -15,6 +17,7 @@ from core.types import (
     BODY_FEEDER_TYPES,
     BODY_METAL_TYPES,
     AnalysisResult,
+    Body,
     BodyType,
     GateResult,
     SectionFlow,
@@ -133,6 +136,141 @@ def _area_to_diameter_mm(area_cm2: float) -> float:
     if area_m2 <= 0.0:
         return 0.0
     return 1000.0 * np.sqrt(4.0 * area_m2 / np.pi)
+
+
+def _repair_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Repair a copy of the body mesh for cross-section calculations."""
+    m = mesh.copy()
+    try:
+        m.fill_holes()
+        m.merge_vertices()
+        m.remove_unreferenced_vertices()
+    except Exception:
+        pass
+    return m
+
+
+def _flow_axis(mesh: trimesh.Trimesh) -> np.ndarray:
+    """Return the principal (longest) axis of a body."""
+    pts = mesh.vertices - mesh.vertices.mean(axis=0)
+    if len(pts) < 3:
+        return np.array([0.0, 0.0, 1.0])
+    cov = np.cov(pts.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    axis = eigvecs[:, np.argmax(eigvals)]
+    norm = float(np.linalg.norm(axis))
+    if norm <= 0:
+        return np.array([0.0, 0.0, 1.0])
+    return axis / norm
+
+
+def _section_area_profile(
+    mesh: trimesh.Trimesh,
+    axis: np.ndarray,
+    n: int = 30,
+) -> List[float]:
+    """Slice a body perpendicular to its flow axis and return cross-sectional areas [mm2].
+
+    Partial end-cap intersections are discarded by a small area threshold relative
+    to the median cross-section.
+    """
+    pts = mesh.vertices
+    proj = (pts - pts.mean(axis=0)) @ axis
+    lo, hi = float(proj.min()), float(proj.max())
+    if hi <= lo:
+        return []
+    values = np.linspace(lo, hi, max(n, 5))
+    areas = []
+    for t in values:
+        origin = pts.mean(axis=0) + axis * t
+        section = mesh.section(plane_origin=origin, plane_normal=axis)
+        if section is None:
+            continue
+        area = 0.0
+        try:
+            p2d, _ = section.to_2D()
+            area = float(getattr(p2d, "area", 0.0))
+        except Exception:
+            try:
+                # Convex-hull fallback when shapely/trimesh path area is unavailable.
+                v = section.vertices[:, :2]
+                if v.shape[0] >= 3:
+                    hull = ConvexHull(v)
+                    area = float(hull.volume)
+            except Exception:
+                area = 0.0
+        if area > 0.0:
+            areas.append(area)
+    if not areas:
+        return []
+    # Drop partial end caps: areas smaller than 10% of the median are not reliable.
+    median = float(np.median(areas))
+    threshold = 0.1 * max(median, 1e-9)
+    filtered = [a for a in areas if a >= threshold]
+    return filtered
+
+
+def _real_gating_areas_from_bodies(
+    bodies: List[Body],
+) -> Dict[str, float]:
+    """Compute real sprue/runner/ingate cross-section areas from CAD meshes.
+
+    Returns areas in cm2:
+      sprue_min, sprue_max, sprue_mean, runner_min, runner_max, runner_mean,
+      ingate_min, ingate_max, ingate_mean.
+    For a pressurized system the sprue base is the largest cross-section and the
+    gate is the smallest cross-section.
+    """
+    type_min: Dict[BodyType, List[float]] = {
+        BodyType.SPRUE: [],
+        BodyType.RUNNER: [],
+        BodyType.INGATE: [],
+    }
+    type_max: Dict[BodyType, List[float]] = {k: [] for k in type_min}
+    type_mean: Dict[BodyType, List[float]] = {k: [] for k in type_min}
+
+    for body in bodies:
+        if body.body_type not in type_min:
+            continue
+        mesh = _repair_mesh(body.mesh)
+        if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+            continue
+        axis = _flow_axis(mesh)
+        profile = _section_area_profile(mesh, axis)
+        if not profile:
+            continue
+        type_min[body.body_type].append(float(np.min(profile)))
+        type_max[body.body_type].append(float(np.max(profile)))
+        type_mean[body.body_type].append(float(np.mean(profile)))
+
+    def _sum_or_zero(vals: List[float]) -> float:
+        return float(np.sum(vals)) if vals else 0.0
+
+    def _to_cm2(mm2: float) -> float:
+        return mm2 / 100.0
+
+    result = {}
+    for key in [BodyType.SPRUE, BodyType.RUNNER, BodyType.INGATE]:
+        prefix = {BodyType.SPRUE: "sprue", BodyType.RUNNER: "runner", BodyType.INGATE: "ingate"}[key]
+        result[f"{prefix}_min_mm2"] = _sum_or_zero(type_min[key])
+        result[f"{prefix}_max_mm2"] = _sum_or_zero(type_max[key])
+        result[f"{prefix}_mean_mm2"] = _sum_or_zero(type_mean[key])
+        result[f"{prefix}_min_cm2"] = _to_cm2(result[f"{prefix}_min_mm2"])
+        result[f"{prefix}_max_cm2"] = _to_cm2(result[f"{prefix}_max_mm2"])
+        result[f"{prefix}_mean_cm2"] = _to_cm2(result[f"{prefix}_mean_mm2"])
+    return result
+
+
+def _volumes_from_bodies(bodies: List[Body]) -> Tuple[float, float]:
+    """Return (part_volume_cm3, total_metal_volume_cm3) from CAD body volumes."""
+    part_volume_cm3 = 0.0
+    total_metal_volume_cm3 = 0.0
+    for body in bodies:
+        if body.body_type == BodyType.PART:
+            part_volume_cm3 += max(body.volume_cm3, 0.0)
+        if body.body_type in BODY_METAL_TYPES:
+            total_metal_volume_cm3 += max(body.volume_cm3, 0.0)
+    return part_volume_cm3, total_metal_volume_cm3
 
 
 def _gating_area_design(
@@ -500,28 +638,47 @@ def _normalized_distance_to_range(v: float, lo: float, hi: float) -> float:
 
 
 def _classify_gating_system(v_sprue: float, v_runner: float, v_gate: float) -> str:
-    """Pick the closest gating-system type by velocity range and ordering."""
-    best = "belirsiz"
-    best_score = float("inf")
-    for name, targets in _GATING_VELOCITY_TARGETS.items():
-        score = 0.0
-        score += _normalized_distance_to_range(v_sprue, *targets["sprue"])
-        score += _normalized_distance_to_range(v_runner, *targets["runner"])
-        score += _normalized_distance_to_range(v_gate, *targets["gate"])
-        avg = max((v_sprue + v_runner + v_gate) / 3.0, 0.01)
-        # Ordering penalty
-        if name == "basınçlı (pressurized)":
-            score += (max(0.0, v_sprue - v_runner) + max(0.0, v_runner - v_gate)) / avg
-        elif name == "basınçsız (unpressurized)":
-            score += (max(0.0, v_runner - v_sprue) + max(0.0, v_gate - v_runner)) / avg
-        elif name == "yarı basınçlı (semi-pressurized)":
-            # Sprue >= runner, gate >= runner, sprue and gate similar magnitude
-            score += (max(0.0, v_runner - v_sprue) + max(0.0, v_runner - v_gate)) / avg
-            score += abs(v_sprue - v_gate) / avg * 0.5
-        if score < best_score:
-            best_score = score
-            best = name
-    return best
+    """Classify by velocity/area ordering first, then by absolute range proximity.
+
+    Pressurized: As > Ar > Ag  => v_sprue <= v_runner <= v_gate
+    Unpressurized: As < Ar < Ag => v_sprue >= v_runner >= v_gate
+    Semi-pressurized: Ar is largest => v_runner is lowest.
+    """
+    avg = max((v_sprue + v_runner + v_gate) / 3.0, 0.01)
+
+    # Normalized ordering penalties (primary signal)
+    def press_penalty() -> float:
+        return (max(0.0, v_sprue - v_runner) + max(0.0, v_runner - v_gate)) / avg
+
+    def unpress_penalty() -> float:
+        return (max(0.0, v_runner - v_sprue) + max(0.0, v_gate - v_runner)) / avg
+
+    def semi_penalty() -> float:
+        return (
+            max(0.0, v_runner - v_sprue)
+            + max(0.0, v_runner - v_gate)
+            + 0.5 * abs(v_sprue - v_gate) / avg
+        ) / avg
+
+    # Small range-distance tie-breaker so unrealistic fill times do not override ordering.
+    range_score = 0.0
+    for v, lo, hi in [
+        (v_sprue, *(_GATING_VELOCITY_TARGETS["basınçlı (pressurized)"]["sprue"])),
+        (v_runner, *(_GATING_VELOCITY_TARGETS["basınçlı (pressurized)"]["runner"])),
+        (v_gate, *(_GATING_VELOCITY_TARGETS["basınçlı (pressurized)"]["gate"])),
+    ]:
+        width = max(hi - lo, 0.1)
+        if v < lo:
+            range_score += (lo - v) / width
+        elif v > hi:
+            range_score += (v - hi) / width
+
+    candidates = {
+        "basınçlı (pressurized)": press_penalty() + 0.05 * range_score,
+        "basınçsız (unpressurized)": unpress_penalty() + 0.05 * range_score,
+        "yarı basınçlı (semi-pressurized)": semi_penalty() + 0.05 * range_score,
+    }
+    return min(candidates, key=candidates.get)
 
 
 def _wall_thickness_category(wall_thickness_mm: float) -> str:
@@ -596,8 +753,13 @@ def analyze_gating(
     fill_time_s: Optional[float] = None,
     discharge_coeff: float = 0.8,
     casting_params=None,
+    bodies: Optional[List[Body]] = None,
 ) -> Optional[GateResult]:
-    """Compute gate/sprue/runner checks including Bernoulli elbow losses and all section velocities/Re/Fr."""
+    """Compute gate/sprue/runner checks including Bernoulli elbow losses and all section velocities/Re/Fr.
+
+    If ``bodies`` is supplied, real CAD cross-sectional areas and volumes are used
+    instead of coarse voxel approximations.
+    """
     from core.types import CastingParameters
 
     grid = result.grid
@@ -605,6 +767,9 @@ def analyze_gating(
     dx = result.dx_mm
     alloy = get_alloy(result.alloy_key)
     mold = get_mold(result.mold_key)
+
+    use_bodies = bodies is not None and len(bodies) > 0
+    real_areas = _real_gating_areas_from_bodies(bodies) if use_bodies else {}
     velocity_section_key = "INGATE"
     if casting_params is not None and isinstance(casting_params, CastingParameters):
         fill_time_s = casting_params.t_fill_s
@@ -628,50 +793,54 @@ def analyze_gating(
     source = _gate_source_mask(grid)
     has_ingate = ingate.any()
 
-    # Contact/cross-sectional areas of each gating section
-    gate_contact_area_mm2, _ = ingate_contact_area_and_mask(grid, dx)
-    gate_contact_area_cm2 = gate_contact_area_mm2 / 100.0
+    # v8.8: use real CAD cross-sections and volumes when the original bodies are supplied.
+    if use_bodies:
+        gate_area_cm2 = real_areas.get("ingate_min_cm2", 0.0)
+        gate_contact_area_cm2 = real_areas.get("ingate_max_cm2", gate_area_cm2)
+        runner_min_area_cm2 = real_areas.get("runner_mean_cm2", 0.0)
+        sprue_throat_cm2 = real_areas.get("sprue_min_cm2", 0.0)
+        sprue_base_bottom_cm2 = real_areas.get("sprue_max_cm2", 0.0)
+        sprue_base_cm2 = sprue_base_bottom_cm2
+        part_volume_cm3, total_metal_volume_cm3 = _volumes_from_bodies(bodies)
+    else:
+        # Fallback: coarse voxel-based areas.
+        gate_contact_area_mm2, _ = ingate_contact_area_and_mask(grid, dx)
+        gate_contact_area_cm2 = gate_contact_area_mm2 / 100.0
 
-    # True gate area is the minimum cross-section of the ingate body;
-    # if there is no ingate body, the runner exit touching the part is used.
-    ingate_min_area_mm2 = _minimum_cross_section_area(ingate, dx) if has_ingate else 0.0
-    ingate_min_area_cm2 = ingate_min_area_mm2 / 100.0
-    # Effective gate area is the smaller of (a) the ingate body's minimum cross-section
-    # and (b) the contact face with the part.  If the ingate is too thin to resolve,
-    # fall back to the contact area.
-    if has_ingate:
-        if ingate_min_area_cm2 <= 0:
-            ingate_min_area_cm2 = gate_contact_area_cm2
-        else:
-            ingate_min_area_cm2 = min(ingate_min_area_cm2, gate_contact_area_cm2)
-    gate_area_cm2 = ingate_min_area_cm2 if has_ingate else gate_contact_area_cm2
+        ingate_min_area_mm2 = _minimum_cross_section_area(ingate, dx) if has_ingate else 0.0
+        ingate_min_area_cm2 = ingate_min_area_mm2 / 100.0
+        if has_ingate:
+            if ingate_min_area_cm2 <= 0:
+                ingate_min_area_cm2 = gate_contact_area_cm2
+            else:
+                ingate_min_area_cm2 = min(ingate_min_area_cm2, gate_contact_area_cm2)
+        gate_area_cm2 = ingate_min_area_cm2 if has_ingate else gate_contact_area_cm2
 
-    runner_min_area_mm2 = _minimum_cross_section_area(runner, dx)
-    runner_min_area_cm2 = runner_min_area_mm2 / 100.0
+        runner_min_area_mm2 = _minimum_cross_section_area(runner, dx)
+        runner_min_area_cm2 = runner_min_area_mm2 / 100.0
 
-    sprue_throat_mm2 = _minimum_cross_section_area(sprue, dx) if sprue.any() else 0.0
-    sprue_throat_cm2 = sprue_throat_mm2 / 100.0
-    sprue_base_bottom_mm2 = _sprue_base_area(sprue, dx) if sprue.any() else 0.0
-    sprue_base_bottom_cm2 = sprue_base_bottom_mm2 / 100.0
+        sprue_throat_mm2 = _minimum_cross_section_area(sprue, dx) if sprue.any() else 0.0
+        sprue_throat_cm2 = sprue_throat_mm2 / 100.0
+        sprue_base_bottom_mm2 = _sprue_base_area(sprue, dx) if sprue.any() else 0.0
+        sprue_base_bottom_cm2 = sprue_base_bottom_mm2 / 100.0
+        sprue_base_cm2 = sprue_base_bottom_cm2
 
-    # Legacy field: sprue_base_area_cm2 is the bottom area.
-    sprue_base_cm2 = sprue_base_bottom_cm2
+        part_volume_mm3 = float(part_mask.sum()) * (dx ** 3)
+        part_volume_cm3 = part_volume_mm3 / 1000.0
 
+        total_metal_volume_mm3 = float(is_metal.sum()) * (dx ** 3)
+        total_metal_volume_cm3 = total_metal_volume_mm3 / 1000.0
+
+    # Wall thickness / characteristic diameters for Re/Fr (keep voxel estimates where useful)
     runner_thickness_mm = _mean_thickness(runner, dx)
     sprue_thickness_mm = _mean_thickness(sprue, dx)
     ingate_thickness_mm = _mean_thickness(ingate if has_ingate else source, dx)
 
-    # Part / total metal volumes and weights
-    part_volume_mm3 = float(part_mask.sum()) * (dx ** 3)
-    part_volume_cm3 = part_volume_mm3 / 1000.0
     part_weight_g = part_volume_cm3 * alloy.density_g_cm3
-    part_volume_m3 = part_volume_mm3 / 1e9
     part_mass_kg = part_weight_g / 1000.0
 
-    total_metal_volume_mm3 = float(is_metal.sum()) * (dx ** 3)
-    total_metal_volume_cm3 = total_metal_volume_mm3 / 1000.0
     total_weight_g = total_metal_volume_cm3 * alloy.density_g_cm3
-    total_metal_volume_m3 = total_metal_volume_mm3 / 1e9
+    total_metal_volume_m3 = total_metal_volume_cm3 / 1e6
     total_mass_kg = total_weight_g / 1000.0
     pour_yield = part_volume_cm3 / total_metal_volume_cm3 if total_metal_volume_cm3 > 0 else 1.0
 
@@ -754,7 +923,7 @@ def analyze_gating(
 
     ingate_flow = section_flows.get("INGATE", SectionFlow())
     runner_flow = section_flows.get("RUNNER", SectionFlow())
-    sprue_flow = section_flows.get("SPRUE_THROAT", SectionFlow())
+    sprue_flow = section_flows.get("SPRUE_BASE", SectionFlow())
     ingate_velocity_m_s = ingate_flow.velocity_m_s
     ingate_flow_rate_m3_s = Q_m3_s
     ingate_fill_time_s = t_fill_computed_s
@@ -762,7 +931,8 @@ def analyze_gating(
     froude = ingate_flow.froude
     turbulent = ingate_flow.turbulent
 
-    # v8.6: classify gating system by actual velocities, do NOT force a recommendation
+    # v8.8: classify by the sprue exit/base area, not the physical throat, because the
+    # hydraulic ordering As > Ar > Ag is determined by the sprue exit cross-section.
     effective_gate_section = "INGATE" if has_ingate else "RUNNER (meme yok)"
     v_sprue = sprue_flow.velocity_m_s
     v_runner = runner_flow.velocity_m_s
