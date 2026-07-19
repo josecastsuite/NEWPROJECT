@@ -409,24 +409,32 @@ def find_hotspots(
     feeder_mask: Optional[np.ndarray] = None,
     chvorinov_c: Optional[float] = None,
     n_time_steps: int = 40,
+    solidification_time: Optional[np.ndarray] = None,
 ) -> List[HotSpot]:
-    """Detect hot spots by pseudo-thermal solidification + CCL (Method 2).
+    """Detect hot spots by Chvorinov pseudo-thermal solidification + CCL (Method 2).
 
-    The metal is solidified in Chvorinov time layers.  At each layer, the
-    remaining liquid metal is labelled with 26-connectivity.  Liquid pockets
-    that are not connected to a feeder (riser / gating) are isolated; the last
-    points to become isolated are the true hot spots.  A feeder/riser neck
-    naturally solidifies earlier and breaks the connection, so the region under
-    a riser is not reported as a part hot spot.
+    Hot-spot detection is driven by a part-only geometric modulus.  The SDF is
+    computed from the part mask alone, so the thickest part regions solidify
+    last and thin feeder necks solidify first.  ``solidification_time`` and
+    ``curvature`` are kept in the signature for backwards compatibility but are
+    not used because the transient thermal field is often incomplete and the
+    curvature-based shape factor over-corrects plate mid-planes.
+
+    At each layer the remaining liquid metal is labelled with 26-connectivity.
+    Liquid pockets that are not connected to a feeder (riser / gating) are
+    isolated; the last points to become isolated are the true hot spots.  A
+    feeder/riser neck naturally solidifies earlier and breaks the connection, so
+    the region directly under a riser is not reported as a part hot spot.
     """
-    # Shape-corrected modulus
-    if curvature is not None:
-        shape_factor_field = np.clip(
-            1.0 + np.maximum(-curvature * sdf, 0.0), 1.0, 3.0
-        )
-    else:
-        shape_factor_field = np.ones_like(sdf)
-    M_mod = sdf / shape_factor_field
+    # For hot-spot detection use a part-only SDF: the distance to the nearest
+    # non-PART voxel (i.e. the part surface or the feeder/gating interface).
+    # Treating the part alone keeps the thickest part region as the last to
+    # solidify and lets the feeder neck solidify first, so true hot spots in
+    # the part body can be isolated by the CCL.  The curvature-based shape
+    # factor is intentionally not used here because it over-corrects plate mid-
+    # planes and drives hot spots toward corners.
+    part_sdf = compute_sdf(part_mask, dx)
+    M_mod = np.maximum(part_sdf, 0.1)
 
     if is_metal is None:
         is_metal = part_mask
@@ -435,11 +443,15 @@ def find_hotspots(
     if chvorinov_c is None or chvorinov_c <= 0:
         chvorinov_c = 1.0
 
-    # Solidification time from shape-corrected modulus (Chvorinov)
-    t_solid = chvorinov_c * M_mod * M_mod
+    # Build the solidification-time field from the part-only geometric modulus.
+    # This is the Chvorinov pseudo-thermal time; it is robust, never incomplete,
+    # and correctly places hot spots in the thickest / last-to-solidify part
+    # regions while letting thin feeder necks solidify first.
+    chvor_t = chvorinov_c * M_mod * M_mod
+    t_solid = chvor_t
     t_solid = np.nan_to_num(t_solid, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Time horizon: use the part, fall back to all metal
+    # Time horizon: use the part, fall back to all metal.
     if part_mask.any():
         max_t = float(np.percentile(t_solid[part_mask], 99.9))
     else:
@@ -1080,12 +1092,15 @@ def _high_res_part_hotspots(
     part_max_dim: int,
     chvorinov_c: float,
     progress_callback: Optional[callable] = None,
+    solidification_time: Optional[np.ndarray] = None,
 ) -> Optional[List[HotSpot]]:
     """Build a high-resolution grid containing only PART bodies and detect hot spots.
 
     The feeder mask from the coarse global grid is resampled onto the part grid
-    so the pseudo-thermal CCL can still identify which liquid pockets are connected
-    to feeders/risers.
+    so the CCL can still identify which liquid pockets are connected to feeders.
+    ``solidification_time`` is accepted for API compatibility but currently ignored;
+    hot spots are detected with a part-only geometric Chvorinov estimate, which is
+    robust against incomplete transient fields.
     """
     try:
         part_grid, part_origin, part_dx, _ = build_part_grid(
@@ -1115,7 +1130,7 @@ def _high_res_part_hotspots(
     )
     part_M_mod = part_sdf / shape_factor_field
 
-    # Resample coarse feeder_mask onto the part grid (nearest neighbour).
+    # Resample coarse feeder_mask and solidification time onto the part grid.
     idx = np.indices(part_grid.shape, dtype=np.float64)
     coarse_coords = (
         part_origin[:, None, None, None]
@@ -1132,6 +1147,15 @@ def _high_res_part_hotspots(
         )
         > 0.5
     )
+    part_t_s: Optional[np.ndarray] = None
+    if solidification_time is not None and solidification_time.shape == feeder_mask.shape:
+        part_t_s = ndimage.map_coordinates(
+            solidification_time.astype(np.float64),
+            coarse_coords,
+            order=1,
+            mode="constant",
+            cval=0.0,
+        )
 
     # Guard against a completely missing feeder: in that case the CCL cannot mark
     # anything as fed and every liquid pocket becomes isolated, which is fine.
@@ -1154,6 +1178,7 @@ def _high_res_part_hotspots(
         is_metal=part_is_metal,
         feeder_mask=part_feeder_mask,
         chvorinov_c=chvorinov_c,
+        solidification_time=part_t_s,
     )
     return part_hotspots
 
@@ -1287,6 +1312,7 @@ def analyze(
         is_metal=is_metal,
         feeder_mask=feeder_mask,
         chvorinov_c=chvorinov_c,
+        solidification_time=t_s,
     )
     if progress_callback:
         progress_callback(75)
@@ -1311,6 +1337,7 @@ def analyze(
             part_max_dim,
             chvorinov_c,
             progress_callback,
+            solidification_time=t_s,
         )
         if part_hotspots is not None and part_hotspots:
             hotspots = part_hotspots

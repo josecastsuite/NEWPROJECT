@@ -1167,22 +1167,36 @@ def analyze_gating(
         f"hacim oranı = {feed_to_part_volume_ratio:.2f}."
     )
 
+    # Actual CAD areas remain in the legacy fields for reporter/UI comparison.
+    actual_Ag_total_cm2 = gate_area_cm2 if gate_area_cm2 > 0 else Ag_total_m2 * 1e4
+    actual_Ar_total_cm2 = runner_min_area_cm2 if runner_min_area_cm2 > 0 else Ar_total_m2 * 1e4
+    actual_As_cm2 = sprue_base_cm2 if sprue_base_cm2 > 0 else As_m2 * 1e4
+    actual_As_throat_cm2 = sprue_throat_cm2 if sprue_throat_cm2 > 0 else actual_As_cm2
+    design_As_cm2 = As_m2 * 1e4
+    design_Ar_total_cm2 = Ar_total_m2 * 1e4
+    design_Ag_total_cm2 = Ag_total_m2 * 1e4
+
+    def _area_ok(actual: float, design: float) -> bool:
+        if design <= 0.0:
+            return True
+        return actual >= 0.95 * design
+
     return GateResult(
-        total_ingate_contact_area_cm2=Ag_total_m2 * 1e4,
-        runner_min_area_cm2=Ar_total_m2 * 1e4,
-        sprue_base_area_cm2=As_m2 * 1e4,
-        required_sprue_area_cm2=As_m2 * 1e4,
+        total_ingate_contact_area_cm2=actual_Ag_total_cm2,
+        runner_min_area_cm2=actual_Ar_total_cm2,
+        sprue_base_area_cm2=actual_As_cm2,
+        required_sprue_area_cm2=design_As_cm2,
         campbell_ok=True,
-        bernoulli_ok=(sprue_base_cm2 >= 0.95 * As_m2 * 1e4) if As_m2 > 0 else True,
+        bernoulli_ok=(actual_As_throat_cm2 >= 0.95 * design_As_cm2) if design_As_cm2 > 0 else True,
         ingate_on_thick_region=ingate_on_thick,
         ingate_avg_m_mm=ingate_avg_m,
         ingate_max_m_mm=ingate_max_m,
         ingate_thickness_mm=ingate_thickness_mm,
         runner_thickness_mm=runner_thickness_mm,
-        required_runner_area_cm2=Ar_total_m2 * 1e4,
-        required_ingate_area_cm2=Ag_total_m2 * 1e4,
-        runner_ok=True,
-        ingate_ok=True,
+        required_runner_area_cm2=design_Ar_total_cm2,
+        required_ingate_area_cm2=design_Ag_total_cm2,
+        runner_ok=_area_ok(actual_Ar_total_cm2, design_Ar_total_cm2),
+        ingate_ok=_area_ok(actual_Ag_total_cm2, design_Ag_total_cm2),
         elbow_count=elbow_count,
         head_loss_mm=head_loss_m * 1000.0,
         effective_head_mm=H_eff_m * 1000.0,
@@ -1195,8 +1209,8 @@ def analyze_gating(
         ingate_flow_rate_m3_s=Q_design_m3_s,
         ingate_fill_time_s=design_fill_time_s,
         velocity_fill_time_match_ok=True,
-        required_ingate_area_for_velocity_cm2=Ag_total_m2 * 1e4 / max(n_ingates, 1),
-        velocity_area_ok=True,
+        required_ingate_area_for_velocity_cm2=design_Ag_total_cm2 / max(n_ingates, 1),
+        velocity_area_ok=_area_ok(actual_Ag_total_cm2, design_Ag_total_cm2),
         fluidity_length_mm=fluidity_length_mm,
         sprue_throat_area_cm2=sprue_throat_cm2,
         sprue_base_bottom_area_cm2=sprue_base_cm2,
@@ -1217,17 +1231,17 @@ def analyze_gating(
         head_reduction_percent=head_reduction_percent,
         total_poured_mass_kg=total_mass_kg,
         pouring_yield=pour_yield,
-        design_sprue_base_area_cm2=As_m2 * 1e4,
-        design_runner_area_cm2=Ar_total_m2 * 1e4,
-        design_gate_total_area_cm2=Ag_total_m2 * 1e4,
+        design_sprue_base_area_cm2=design_As_cm2,
+        design_runner_area_cm2=design_Ar_total_cm2,
+        design_gate_total_area_cm2=design_Ag_total_cm2,
         design_gate_each_area_cm2=Ag_each_m2 * 1e4,
         design_sprue_diameter_mm=d_sprue_mm,
         design_gate_diameter_mm=d_ingate_each_mm,
         design_choke_velocity_m_s=Vc_ms,
         design_gating_ratio=final_ratio,
-        sprue_design_ok=True,
-        runner_design_ok=True,
-        gate_design_ok=True,
+        sprue_design_ok=_area_ok(actual_As_cm2, design_As_cm2),
+        runner_design_ok=_area_ok(actual_Ar_total_cm2, design_Ar_total_cm2),
+        gate_design_ok=_area_ok(actual_Ag_total_cm2, design_Ag_total_cm2),
         part_mass_kg=part_mass_kg,
         total_riser_mass_kg=total_riser_mass_kg,
         gating_mass_kg=gating_mass_kg,
