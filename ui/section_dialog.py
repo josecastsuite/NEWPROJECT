@@ -2,7 +2,7 @@
 from typing import Optional, Tuple
 
 import numpy as np
-from PyQt6 import QtWidgets
+from PyQt6 import QtCore, QtWidgets
 
 from core.gating import (
     _characteristic_cross_section_area,
@@ -73,6 +73,10 @@ class SectionDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle(f"{body.name} - Kesit Alanı Seçimi")
         self.resize(420, 320)
+        self.setWindowFlags(
+            self.windowFlags() | QtCore.Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
         self.body = body
         self.section_key = section_key or self._default_key_for(body)
         self.area_cm2: Optional[float] = None
@@ -165,33 +169,49 @@ class SectionDialog(QtWidgets.QDialog):
         layout.addWidget(buttons)
 
     def _compute_candidates(self):
-        axis = _flow_axis(self.body.mesh)
-
-        # Characteristic flow area
         try:
-            if self.section_key in ("SPRUE_BASE", "SPRUE_THROAT"):
-                base_mm2, throat_mm2 = _sprue_circular_base_and_throat(
-                    self.body.mesh, axis
-                )
-                char_mm2 = base_mm2 if self.section_key == "SPRUE_BASE" else throat_mm2
-            else:
-                char_mm2 = _characteristic_cross_section_area(self.body.mesh, axis)
-            self.char_area = char_mm2 / 100.0
+            axis = _flow_axis(self.body.mesh)
+
+            # Characteristic flow area
+            try:
+                if self.section_key in ("SPRUE_BASE", "SPRUE_THROAT"):
+                    base_mm2, throat_mm2 = _sprue_circular_base_and_throat(
+                        self.body.mesh, axis
+                    )
+                    char_mm2 = base_mm2 if self.section_key == "SPRUE_BASE" else throat_mm2
+                else:
+                    char_mm2 = _characteristic_cross_section_area(self.body.mesh, axis)
+                self.char_area = char_mm2 / 100.0
+            except Exception:
+                self.char_area = None
+
+            self.x_area = _area_along_axis_cm2(self.body, (1.0, 0.0, 0.0))
+            self.y_area = _area_along_axis_cm2(self.body, (0.0, 1.0, 0.0))
+            self.z_area = _area_along_axis_cm2(self.body, (0.0, 0.0, 1.0))
+
+            self._set_radio_text(self.char_radio, "Karakteristik (önerilen)", self.char_area)
+            self._set_radio_text(self.x_radio, "X düzlemine dik kesit", self.x_area)
+            self._set_radio_text(self.y_radio, "Y düzlemine dik kesit", self.y_area)
+            self._set_radio_text(self.z_radio, "Z düzlemine dik kesit", self.z_area)
+
+            # Pre-fill manual spin with the recommended value for convenience
+            if self.char_area is not None and self.char_area > 0:
+                self.manual_spin.setValue(self.char_area)
         except Exception:
+            # Never let a calculation failure block the dialog; manual entry is always available.
             self.char_area = None
+            self.x_area = None
+            self.y_area = None
+            self.z_area = None
+            for radio in (self.char_radio, self.x_radio, self.y_radio, self.z_radio):
+                radio.setText(radio.text().split(":")[0] + ": hesaplanamadı")
+                radio.setEnabled(False)
 
-        self.x_area = _area_along_axis_cm2(self.body, (1.0, 0.0, 0.0))
-        self.y_area = _area_along_axis_cm2(self.body, (0.0, 1.0, 0.0))
-        self.z_area = _area_along_axis_cm2(self.body, (0.0, 0.0, 1.0))
-
-        self._set_radio_text(self.char_radio, "Karakteristik (önerilen)", self.char_area)
-        self._set_radio_text(self.x_radio, "X düzlemine dik kesit", self.x_area)
-        self._set_radio_text(self.y_radio, "Y düzlemine dik kesit", self.y_area)
-        self._set_radio_text(self.z_radio, "Z düzlemine dik kesit", self.z_area)
-
-        # Pre-fill manual spin with the recommended value for convenience
-        if self.char_area is not None and self.char_area > 0:
-            self.manual_spin.setValue(self.char_area)
+        # Manual is always available; if no computed candidate, select it.
+        self.manual_radio.setEnabled(True)
+        self.manual_spin.setEnabled(True)
+        if self.char_area is None:
+            self.manual_radio.setChecked(True)
 
     def _set_radio_text(self, radio: QtWidgets.QRadioButton, label: str, value: Optional[float]):
         if value is not None and value > 0:
