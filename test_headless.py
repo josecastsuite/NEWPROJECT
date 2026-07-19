@@ -1,4 +1,5 @@
-"""Headless test of core analysis on Knuckle.STEP."""
+"""Headless test of core analysis on a STEP file."""
+import argparse
 import os
 import sys
 import time
@@ -16,24 +17,61 @@ from core.types import CastingParameters, BodyType
 from core.reporter import _generate_html
 
 
-def main(path: str = "data/Knuckle.STEP", out_dir: str = "/tmp/josecast_test"):
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"Loading {path} ...")
-    bodies = load_step(path)
+def _parse_gravity(text: str):
+    if text is None:
+        return None
+    parts = [float(x.strip()) for x in text.split(",")]
+    if len(parts) != 3:
+        raise ValueError("Yerçekimi vektörü x,y,z formatında 3 sayı olmalı.")
+    v = np.array(parts, dtype=np.float64)
+    norm = float(np.linalg.norm(v))
+    if norm == 0:
+        raise ValueError("Yerçekimi vektörü sıfır olamaz.")
+    return tuple((v / norm).tolist())
+
+
+def _parse_section_areas(text: str):
+    """Parse --section-area KEY=VALUE,... pairs, e.g. RUNNER=9.85,INGATE=4.89."""
+    out = {}
+    if not text:
+        return out
+    for item in text.split(","):
+        key, value = item.split("=")
+        out[key.strip().upper()] = float(value.strip())
+    return out
+
+
+def main():
+    parser = argparse.ArgumentParser(description="JoseCast headless test")
+    parser.add_argument("path", nargs="?", default="data/Knuckle.STEP", help="STEP file")
+    parser.add_argument("--out-dir", default="/tmp/josecast_test", help="HTML output directory")
+    parser.add_argument("--gravity", default=None, help="Yerçekimi vektörü x,y,z (örn: 0,-1,0)")
+    parser.add_argument("--section-area", default=None, help="Kullanıcı kesit alanları: KEY=cm2,... (RUNNER,INGATE,SPRUE_BASE,SPRUE_THROAT)")
+    args = parser.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    print(f"Loading {args.path} ...")
+    bodies = load_step(args.path)
     print(f"Loaded {len(bodies)} bodies")
     for i, b in enumerate(bodies):
         print(f"  Body {i}: {b.name}, vol={b.volume_cm3:.2f} cm3, bbox={b.mesh.bounds}")
 
-    # Try to auto-detect unit
     max_size = max((b.mesh.bounds[1] - b.mesh.bounds[0]).max() for b in bodies)
     print(f"Max bbox size raw = {max_size:.3f} units")
 
-    # Run analysis with mm assumption
     apply_unit_scale(bodies, "mm")
 
-    # Parça1 model has the riser above the part in +Y and gating in +X;
-    # Knuckle uses the conventional -Z gravity.
-    gravity = (0.0, -1.0, 0.0) if "parca" in path.lower() else (0.0, 0.0, -1.0)
+    if args.gravity:
+        gravity = _parse_gravity(args.gravity)
+    else:
+        # Parça1 model has the riser above the part in +Y and gating in +X;
+        # Knuckle uses the conventional -Z gravity.
+        gravity = (0.0, -1.0, 0.0) if "parca" in args.path.lower() else (0.0, 0.0, -1.0)
+    print(f"Using gravity vector: {gravity}")
+
+    user_section_areas = _parse_section_areas(args.section_area)
+    if user_section_areas:
+        print(f"User section areas (cm2): {user_section_areas}")
 
     target_dim = 160
     print(f"Voxelizing at {target_dim} ...")
@@ -86,7 +124,12 @@ def main(path: str = "data/Knuckle.STEP", out_dir: str = "/tmp/josecast_test"):
               f"feed_ok={hs.feed_ok}, dir_ok={hs.directional_ok}, heuver_ok={hs.heuvers_ok}, darcy_ok={hs.darcy_ok}")
 
     print("Running gating ...")
-    gate = analyze_gating(result, casting_params=params, bodies=bodies)
+    gate = analyze_gating(
+        result,
+        casting_params=params,
+        bodies=bodies,
+        user_section_areas_cm2=user_section_areas,
+    )
     print(f"  gate: {gate}")
     if gate:
         print(f"    fluidity_length_mm={gate.fluidity_length_mm:.1f}")
@@ -97,11 +140,10 @@ def main(path: str = "data/Knuckle.STEP", out_dir: str = "/tmp/josecast_test"):
             print(f"    {k}: v={sf.velocity_m_s:.2f}, Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, A={sf.area_cm2:.2f}")
 
     print("Generating HTML report ...")
-    html_path = os.path.join(out_dir, "test_report.html")
+    html_path = os.path.join(args.out_dir, "test_report.html")
     _generate_html(result, html_path)
     print(f"  saved to {html_path}")
 
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else "data/Knuckle.STEP"
-    main(path)
+    main()

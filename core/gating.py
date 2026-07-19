@@ -892,6 +892,7 @@ def analyze_gating(
     discharge_coeff: float = 0.8,
     casting_params=None,
     bodies: Optional[List[Body]] = None,
+    user_section_areas_cm2: Optional[Dict[str, float]] = None,
 ) -> Optional[GateResult]:
     """Compute gate/sprue/runner design from gating_calculator_tr.py / Filling_time_tr.py.
 
@@ -909,6 +910,22 @@ def analyze_gating(
 
     use_bodies = bodies is not None and len(bodies) > 0
     real_areas = _real_gating_areas_from_bodies(bodies) if use_bodies else {}
+
+    # User-supplied cross-section areas from the 3D viewer override automatic
+    # mesh measurements so the engineer can correct ambiguous geometries.
+    if user_section_areas_cm2:
+        key_map = {
+            "SPRUE_BASE": "sprue_base_cm2",
+            "SPRUE_THROAT": "sprue_throat_cm2",
+            "RUNNER": "runner_total_cm2",
+            "INGATE": "ingate_total_cm2",
+        }
+        for ui_key, real_key in key_map.items():
+            val = user_section_areas_cm2.get(ui_key)
+            if val is not None and val > 0.0:
+                real_areas[real_key] = float(val)
+                # Store the raw mm² value as well so downstream code is consistent.
+                real_areas[real_key.replace("_cm2", "_mm2")] = float(val) * 100.0
 
     if casting_params is not None and isinstance(casting_params, CastingParameters):
         fill_time_s = casting_params.t_fill_s

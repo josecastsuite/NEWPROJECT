@@ -1,11 +1,17 @@
 """PyVistaQt 3D viewer wrapper for JoseCast Analyzer v8.x."""
 
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import pyvista as pv
 from pyvistaqt import QtInteractor
 
+from core.gating import (
+    _characteristic_cross_section_area,
+    _flow_axis,
+    _section_2d_area_and_perim,
+    _sprue_circular_base_and_throat,
+)
 from core.materials import get_alloy
 from core.sdf_analyzer import _trace_path_to_riser
 from core.types import AnalysisResult, Body, BodyType, RefinementRegion
@@ -79,6 +85,8 @@ class Analyzer3DViewer(QtInteractor):
         self._path_actors: List = []
         self._slice_actors: List = []
         self._local_actors: List = []
+        self._section_actors: List = []
+        self._section_picker = None
 
     def clear_scene(self):
         self.clear_actors()
@@ -92,6 +100,7 @@ class Analyzer3DViewer(QtInteractor):
         self._path_actors.clear()
         self._slice_actors.clear()
         self._local_actors.clear()
+        self._clear_section_actors()
 
     def show_bodies(self, bodies: List[Body], reset_camera: bool = True):
         """Display original body meshes colored by type; part is semi-transparent."""
@@ -530,6 +539,156 @@ class Analyzer3DViewer(QtInteractor):
             # Remove any slice scalar bar to avoid overlap when switching fields.
             for title in ["SDF (mm)", "Risk", "Niyama", "Mat ID", "T (°C)"]:
                 self._remove_scalar_bar(title)
+
+    # ---------------- gating cross-section picker ----------------
+    def start_section_picker(
+        self,
+        section_key: str,
+        bodies: List[Body],
+        callback: Callable[[str, float, str], None],
+    ):
+        """Let the user click on a gating body to measure its cross-sectional area.
+
+        The cut plane is perpendicular to the principal axis that best aligns
+        with the clicked face normal, so the measured area corresponds to the
+        flow cross-section when the user clicks on an end face.
+        """
+        self._clear_section_actors()
+        self._section_callback = callback
+        self._section_bodies = bodies
+        self._section_key = section_key
+
+        def _on_pick(point):
+            self._handle_section_pick(np.asarray(point, dtype=np.float64))
+
+        print(f"[section picker] '{section_key}' kesiti için 3D görünümde ilgili yüzeye tıklayın.")
+        self._section_picker = self.enable_point_picking(
+            _on_pick,
+            use_mesh=True,
+            left_clicking=True,
+            show_message=False,
+            color="#ff00ff",
+            point_size=12,
+        )
+
+    def _handle_section_pick(self, point: np.ndarray):
+        try:
+            body = self._find_body_at_point(point)
+            if body is None:
+                print("[section picker] Tıklanan nokta herhangi bir body yüzeyine yakın değil.")
+                return
+
+            # Use the body's natural flow axis and the robust cross-section
+            # estimator so a single click on any face gives the characteristic
+            # runner/ingate/sprue area, not a one-off slice.
+            axis = _flow_axis(body.mesh)
+
+            if self._section_key in ("SPRUE_BASE", "SPRUE_THROAT"):
+                base_mm2, throat_mm2 = _sprue_circular_base_and_throat(
+                    body.mesh, axis
+                )
+                area_mm2 = base_mm2 if self._section_key == "SPRUE_BASE" else throat_mm2
+            else:
+                area_mm2 = _characteristic_cross_section_area(body.mesh, axis)
+
+            area_cm2 = area_mm2 / 100.0
+
+            # Visualise a representative section through the body centroid.
+            centroid = np.asarray(body.mesh.centroid, dtype=np.float64)
+            section = body.mesh.section(plane_origin=centroid, plane_normal=axis)
+            if section is not None and len(section.vertices) >= 3:
+                self._show_section_outline(centroid, axis, body, section)
+            print(f"[section picker] {body.name} ({self._section_key}): A = {area_cm2:.3f} cm²")
+
+            if self._section_callback is not None:
+                self._section_callback(self._section_key, area_cm2, body.name)
+        except Exception as e:
+            print(f"[section picker] Kesit ölçüm hatası: {e}")
+        finally:
+            self.disable_picking()
+            self._section_picker = None
+
+    def _find_body_at_point(self, point: np.ndarray) -> Optional[Body]:
+        import trimesh
+
+        best_body = None
+        best_dist = float("inf")
+        for body in self._section_bodies:
+            if len(body.faces) == 0:
+                continue
+            try:
+                closest, dist, _ = trimesh.proximity.closest_point(
+                    body.mesh, np.array([point])
+                )
+                dist = float(dist[0])
+                if dist < best_dist:
+                    best_dist = dist
+                    best_body = body
+            except Exception:
+                continue
+        return best_body
+
+    def _show_section_outline(
+        self,
+        point: np.ndarray,
+        axis: np.ndarray,
+        body: Body,
+        section,
+    ):
+        """Visualise the picked point, cutting plane and section outline."""
+        # Picked point marker
+        marker = pv.PolyData(point)
+        actor = self.add_mesh(
+            marker,
+            color="#ff00ff",
+            style="points",
+            point_size=14,
+            render_points_as_spheres=True,
+            pickable=False,
+        )
+        self._section_actors.append(actor)
+
+        # Section vertices as a point cloud / outline
+        pts = np.asarray(section.vertices, dtype=np.float64)
+        if len(pts) >= 3:
+            poly = pv.PolyData(pts)
+            actor = self.add_mesh(
+                poly,
+                color="#ffff00",
+                style="points",
+                point_size=8,
+                render_points_as_spheres=True,
+                pickable=False,
+            )
+            self._section_actors.append(actor)
+
+        # Transparent cutting plane sized to the body bounds
+        bounds = body.mesh.bounds
+        diag = float(np.linalg.norm(bounds[1] - bounds[0]))
+        if diag <= 0:
+            diag = 50.0
+        plane = pv.Plane(
+            center=point,
+            direction=axis,
+            i_size=diag,
+            j_size=diag,
+        )
+        actor = self.add_mesh(
+            plane,
+            color="#00ffff",
+            opacity=0.15,
+            pickable=False,
+        )
+        self._section_actors.append(actor)
+        self.render()
+
+    def _clear_section_actors(self):
+        for actor in getattr(self, "_section_actors", []):
+            try:
+                self.remove_actor(actor)
+            except Exception:
+                pass
+        self._section_actors = []
 
     def save_screenshot(self, path: str) -> str:
         """Save a PNG screenshot of the current 3D view."""

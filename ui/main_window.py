@@ -83,6 +83,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._origin = None
         self._dx = None
         self._unit_scale = 1.0
+        self._user_section_areas_cm2: Dict[str, float] = {}
 
         self._build_ui()
         self._apply_dark_theme()
@@ -352,6 +353,58 @@ class MainWindow(QtWidgets.QMainWindow):
 
         left_layout.addWidget(params_group)
 
+        # Gravity direction group
+        gravity_group = QtWidgets.QGroupBox("Yerçekimi Yönü")
+        gravity_layout = QtWidgets.QVBoxLayout(gravity_group)
+        gravity_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        gravity_layout.setSpacing(6)
+        self.gravity_combo = QtWidgets.QComboBox()
+        for label, value in [
+            ("Aşağı (-Z)", "0,0,-1"),
+            ("Yukarı (+Z)", "0,0,1"),
+            ("Ön (-Y)", "0,-1,0"),
+            ("Arka (+Y)", "0,1,0"),
+            ("Sol (-X)", "-1,0,0"),
+            ("Sağ (+X)", "1,0,0"),
+            ("Özel", "custom"),
+        ]:
+            self.gravity_combo.addItem(label, value)
+        self.gravity_combo.setCurrentIndex(0)
+        self.gravity_custom = QtWidgets.QLineEdit()
+        self.gravity_custom.setPlaceholderText("x,y,z (örn: 0.0,-1.0,0.0)")
+        self.gravity_custom.setEnabled(False)
+        self.gravity_combo.currentIndexChanged.connect(self._on_gravity_preset_changed)
+        gravity_layout.addWidget(self.gravity_combo)
+        gravity_layout.addWidget(self.gravity_custom)
+        left_layout.addWidget(gravity_group)
+
+        # Gating cross-section picker group
+        section_group = QtWidgets.QGroupBox("Gating Kesitleri")
+        section_layout = QtWidgets.QVBoxLayout(section_group)
+        section_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        section_layout.setSpacing(6)
+        self.section_type_combo = QtWidgets.QComboBox()
+        for label, key in [
+            ("Döküm ağzı tabanı", "SPRUE_BASE"),
+            ("Döküm ağzı boğazı", "SPRUE_THROAT"),
+            ("Yolluk", "RUNNER"),
+            ("Meme", "INGATE"),
+        ]:
+            self.section_type_combo.addItem(label, key)
+        self.pick_section_btn = QtWidgets.QPushButton("Kesit Seç (3D tıkla)")
+        self.pick_section_btn.setEnabled(False)
+        self.pick_section_btn.clicked.connect(self.on_pick_section)
+        self.clear_section_btn = QtWidgets.QPushButton("Kesit Seçimlerini Temizle")
+        self.clear_section_btn.setEnabled(False)
+        self.clear_section_btn.clicked.connect(self.on_clear_sections)
+        self.section_status_label = QtWidgets.QLabel("Seçili kesit yok")
+        self.section_status_label.setWordWrap(True)
+        section_layout.addWidget(self.section_type_combo)
+        section_layout.addWidget(self.pick_section_btn)
+        section_layout.addWidget(self.clear_section_btn)
+        section_layout.addWidget(self.section_status_label)
+        left_layout.addWidget(section_group)
+
         # Sync casting parameter defaults now that all parameter spin boxes exist.
         self._sync_casting_params_from_materials()
 
@@ -547,7 +600,31 @@ class MainWindow(QtWidgets.QMainWindow):
             viscosity_pa_s=self.visc_spin.value(),
             ingate_velocity_m_s=self.v_ingate_spin.value(),
             velocity_section_key=self.velocity_section_combo.currentData(),
+            gravity_vector=self._gravity_vector_from_ui(),
         )
+
+    def _gravity_vector_from_ui(self) -> Tuple[float, float, float]:
+        data = self.gravity_combo.currentData()
+        if data == "custom":
+            text = self.gravity_custom.text().strip()
+            if text:
+                try:
+                    parts = [float(x.strip()) for x in text.split(",")]
+                    if len(parts) == 3:
+                        v = np.array(parts, dtype=np.float64)
+                        norm = float(np.linalg.norm(v))
+                        if norm > 0:
+                            return tuple((v / norm).tolist())
+                except Exception:
+                    pass
+            return (0.0, 0.0, -1.0)
+        return tuple(float(x) for x in data.split(","))
+
+    def _on_gravity_preset_changed(self):
+        is_custom = self.gravity_combo.currentData() == "custom"
+        self.gravity_custom.setEnabled(is_custom)
+        if not is_custom:
+            self.gravity_custom.clear()
 
     def aiLog(self, msg: str, type_: str = "info"):
         """Print a line to the black AI terminal."""
@@ -627,6 +704,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"{len(self._bodies)} body yüklendi. Tip atamalarını yapıp voxelize edin."
             )
             self.voxelize_btn.setEnabled(True)
+            self.pick_section_btn.setEnabled(True)
+            self.clear_section_btn.setEnabled(True)
             self.analyze_btn.setEnabled(False)
             self._analysis = None
             self._clear_checklist()
@@ -653,6 +732,44 @@ class MainWindow(QtWidgets.QMainWindow):
         body.body_type = combo.currentData()
         self.viewer.show_bodies(self._bodies)
 
+    def on_pick_section(self):
+        if not self._bodies:
+            return
+        section_key = self.section_type_combo.currentData()
+        self.status_label.setText(
+            f"'{section_key}' kesiti için 3D görünümde ilgili body'nin herhangi bir yüzeyine tıklayın."
+        )
+        self.viewer.start_section_picker(
+            section_key,
+            self._bodies,
+            callback=self._on_section_picked,
+        )
+
+    def on_clear_sections(self):
+        self._user_section_areas_cm2.clear()
+        self._update_section_status()
+        self.aiLog("Kesit seçimleri temizlendi.", "info")
+
+    def _on_section_picked(self, section_key: str, area_cm2: float, body_name: str):
+        self._user_section_areas_cm2[section_key] = area_cm2
+        self._update_section_status()
+        self.aiLog(
+            f"{body_name} için {section_key} kesit alanı: {area_cm2:.3f} cm²", "ok"
+        )
+        self.status_label.setText(
+            f"{body_name} - {section_key}: A = {area_cm2:.3f} cm²"
+        )
+
+    def _update_section_status(self):
+        if not self._user_section_areas_cm2:
+            self.section_status_label.setText("Seçili kesit yok")
+            return
+        lines = [
+            f"{key}: {val:.3f} cm²"
+            for key, val in self._user_section_areas_cm2.items()
+        ]
+        self.section_status_label.setText("\n".join(lines))
+
     def on_voxelize(self):
         if not self._bodies:
             return
@@ -666,6 +783,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._bodies,
                 target_dim=target_dim,
                 progress_callback=self._set_progress,
+                gravity_vector=self._gravity_vector_from_ui(),
             )
             self._grid = grid
             self._origin = origin
@@ -733,7 +851,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._analysis.casting_params = casting_params
 
             self.aiLog("AŞAMA 5/6: Meme / yolluk / döküm ağzı kontrolleri yapılıyor...", "info")
-            gate_result = analyze_gating(self._analysis, casting_params=casting_params, bodies=self._bodies)
+            gate_result = analyze_gating(
+                self._analysis,
+                casting_params=casting_params,
+                bodies=self._bodies,
+                user_section_areas_cm2=self._user_section_areas_cm2,
+            )
             self._analysis.gate_result = gate_result
             self._analysis.recommendations.extend(self._gating_recommendations(gate_result))
 
