@@ -573,7 +573,7 @@ class Analyzer3DViewer(QtInteractor):
         self._section_picker = self.enable_point_picking(
             _on_pick,
             left_clicking=True,
-            picker=pv.PickerType.CELL,
+            picker="cell",
             show_message=False,
             color="#ff00ff",
             point_size=12,

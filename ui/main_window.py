@@ -5,7 +5,7 @@ import sys
 import time
 import webbrowser
 from dataclasses import replace
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pyvista as pv
 from PyQt6 import QtCore, QtGui, QtWidgets
@@ -26,7 +26,7 @@ from core import (
 )
 from core.materials import chvorinov_c_from_properties
 from core.types import Body, BodyType, CastingParameters
-from ui.section_picker import SectionPickerDialog
+from ui.section_dialog import SectionDialog
 from ui.viewer import Analyzer3DViewer
 
 
@@ -84,7 +84,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._origin = None
         self._dx = None
         self._unit_scale = 1.0
-        self._user_section_areas_cm2: Dict[str, float] = {}
+        # per-body section areas keyed by (body.name, section_key)
+        self._body_section_areas_cm2: Dict[Tuple[str, str], float] = {}
+        self._body_section_labels: Dict[str, QtWidgets.QLabel] = {}
 
         self._build_ui()
         self._apply_dark_theme()
@@ -392,14 +394,10 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Meme", "INGATE"),
         ]:
             self.section_type_combo.addItem(label, key)
-        self.pick_section_btn = QtWidgets.QPushButton("Kesit Seç (Ana Pencere)")
+        self.pick_section_btn = QtWidgets.QPushButton("3D'den Kesit Seç")
         self.pick_section_btn.setEnabled(False)
-        self.pick_section_btn.setToolTip("3D ana görünümde doğrudan tıklayarak ölç.")
+        self.pick_section_btn.setToolTip("Ana 3D görünümde doğrudan tıklayarak ölç.")
         self.pick_section_btn.clicked.connect(self.on_pick_section)
-        self.correct_section_btn = QtWidgets.QPushButton("Kesit Düzelt (Yeni Pencere)")
-        self.correct_section_btn.setEnabled(False)
-        self.correct_section_btn.setToolTip("Ayrı bir 3D pencere açarak daha net kesit seç.")
-        self.correct_section_btn.clicked.connect(self.on_correct_section)
         self.clear_section_btn = QtWidgets.QPushButton("Kesit Seçimlerini Temizle")
         self.clear_section_btn.setEnabled(False)
         self.clear_section_btn.clicked.connect(self.on_clear_sections)
@@ -407,7 +405,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.section_status_label.setWordWrap(True)
         section_layout.addWidget(self.section_type_combo)
         section_layout.addWidget(self.pick_section_btn)
-        section_layout.addWidget(self.correct_section_btn)
         section_layout.addWidget(self.clear_section_btn)
         section_layout.addWidget(self.section_status_label)
         left_layout.addWidget(section_group)
@@ -663,6 +660,17 @@ class MainWindow(QtWidgets.QMainWindow):
         label.setToolTip(f"Merkez: {body.center}")
         row.addWidget(label, stretch=1)
 
+        section_btn = QtWidgets.QPushButton("Kesit")
+        section_btn.setToolTip("Bu body'nin gating kesit alanını seç")
+        section_btn.clicked.connect(lambda _, b=body: self.on_body_section(b))
+        row.addWidget(section_btn)
+
+        area_label = QtWidgets.QLabel("A = ---")
+        area_label.setStyleSheet("color: #888888; font-size: 11px;")
+        area_label.setToolTip("Seçilen kesit alanı cm²")
+        row.addWidget(area_label)
+        self._body_section_labels[body.name] = area_label
+
         combo = QtWidgets.QComboBox()
         for bt in (
             BodyType.PART,
@@ -712,10 +720,11 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self.voxelize_btn.setEnabled(True)
             self.pick_section_btn.setEnabled(True)
-            self.correct_section_btn.setEnabled(True)
             self.clear_section_btn.setEnabled(True)
             self.analyze_btn.setEnabled(False)
             self._analysis = None
+            self._body_section_areas_cm2.clear()
+            self._body_section_labels.clear()
             self._clear_checklist()
             self.rec_text.clear()
             self._grid = None
@@ -753,45 +762,73 @@ class MainWindow(QtWidgets.QMainWindow):
             callback=self._on_section_picked,
         )
 
-    def on_correct_section(self):
-        if not self._bodies:
+    def on_body_section(self, body: Body):
+        """Open the per-body section-area selection dialog."""
+        if body is None:
             return
-        section_key = self.section_type_combo.currentData()
-        dialog = SectionPickerDialog(
-            self._bodies,
-            section_key,
-            parent=self,
-        )
+        default_key = self._section_key_for_body(body)
+        dialog = SectionDialog(body, section_key=default_key, parent=self)
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            if dialog.area_cm2 is not None:
-                self._on_section_picked(section_key, dialog.area_cm2, dialog.body_name)
-        else:
-            self.aiLog("Kesit düzeltme iptal edildi.", "info")
+            if dialog.area_cm2 is not None and dialog.section_key is not None:
+                self._body_section_areas_cm2[(body.name, dialog.section_key)] = dialog.area_cm2
+                self._update_body_section_label(body.name)
+                self._update_section_status()
+                self.aiLog(
+                    f"{body.name} - {dialog.section_key}: A = {dialog.area_cm2:.4f} cm²", "ok"
+                )
+
+    def _section_key_for_body(self, body: Body) -> str:
+        if body.body_type == BodyType.SPRUE:
+            return "SPRUE_BASE"
+        if body.body_type == BodyType.RUNNER:
+            return "RUNNER"
+        if body.body_type == BodyType.INGATE:
+            return "INGATE"
+        return self.section_type_combo.currentData() if self.section_type_combo else "INGATE"
 
     def on_clear_sections(self):
-        self._user_section_areas_cm2.clear()
+        self._body_section_areas_cm2.clear()
+        for label in self._body_section_labels.values():
+            label.setText("A = ---")
         self._update_section_status()
         self.aiLog("Kesit seçimleri temizlendi.", "info")
 
     def _on_section_picked(self, section_key: str, area_cm2: float, body_name: str):
-        self._user_section_areas_cm2[section_key] = area_cm2
+        self._body_section_areas_cm2[(body_name, section_key)] = area_cm2
+        self._update_body_section_label(body_name)
         self._update_section_status()
         self.aiLog(
-            f"{body_name} için {section_key} kesit alanı: {area_cm2:.3f} cm²", "ok"
+            f"{body_name} için {section_key} kesit alanı: {area_cm2:.4f} cm²", "ok"
         )
         self.status_label.setText(
-            f"{body_name} - {section_key}: A = {area_cm2:.3f} cm²"
+            f"{body_name} - {section_key}: A = {area_cm2:.4f} cm²"
         )
 
+    def _update_body_section_label(self, body_name: str):
+        label = self._body_section_labels.get(body_name)
+        if label is None:
+            return
+        keys = [k for (b, k), v in self._body_section_areas_cm2.items() if b == body_name]
+        if not keys:
+            label.setText("A = ---")
+            return
+        texts = [f"{k}={self._body_section_areas_cm2[(body_name, k)]:.3f}" for k in keys]
+        label.setText("A = " + ", ".join(texts))
+
     def _update_section_status(self):
-        if not self._user_section_areas_cm2:
+        if not self._body_section_areas_cm2:
             self.section_status_label.setText("Seçili kesit yok")
             return
-        lines = [
-            f"{key}: {val:.3f} cm²"
-            for key, val in self._user_section_areas_cm2.items()
-        ]
+        totals = self._aggregate_section_areas()
+        lines = [f"{key}: {val:.4f} cm²" for key, val in totals.items()]
         self.section_status_label.setText("\n".join(lines))
+
+    def _aggregate_section_areas(self) -> Dict[str, float]:
+        """Sum runner/ingate areas; keep sprue base/throat per section key."""
+        totals: Dict[str, float] = {}
+        for (body_name, key), value in self._body_section_areas_cm2.items():
+            totals[key] = totals.get(key, 0.0) + value
+        return totals
 
     def on_voxelize(self):
         if not self._bodies:
@@ -878,7 +915,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._analysis,
                 casting_params=casting_params,
                 bodies=self._bodies,
-                user_section_areas_cm2=self._user_section_areas_cm2,
+                user_section_areas_cm2=self._aggregate_section_areas(),
             )
             self._analysis.gate_result = gate_result
             self._analysis.recommendations.extend(self._gating_recommendations(gate_result))
