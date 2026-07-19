@@ -79,6 +79,7 @@ class GatingDesign:
     """Result of a standalone gating design."""
 
     gating_system: str
+    recommended_gating_system: str
     choke_section: str
     n_gates: int
     n_runners: int
@@ -346,23 +347,30 @@ def calculate_gating_design(inp: GatingEngineInput) -> GatingDesign:
     v_runner = q_m3_s / a_runner_total_m2 if a_runner_total_m2 > 0.0 else 0.0
     v_sprue = q_m3_s / a_sprue_base_m2 if a_sprue_base_m2 > 0.0 else 0.0
 
-    # 10. Re-classify actual system from velocities and warn on mismatch
+    # 10. Re-classify actual system from velocities
     detected_system = _classify_from_velocities(v_sprue, v_runner, v_gate)
     if detected_system != system:
         warnings.append(
-            f"Öngörülen sistem '{system}', ölçülen/hızlarla '{detected_system}' çıktı."
+            f"Geometriye göre '{system}' önerildi; ölçülen/hızlarla '{detected_system}' çıktı."
         )
         # Use the detected system for range checks, but keep the design geometry.
         check_system = detected_system
     else:
         check_system = system
 
-    # 11. Velocity range warnings
+    # 11. Velocity range warnings (skip sections the user explicitly measured)
+    measured_sections = {
+        "sprue": has_measured["SPRUE_BASE"],
+        "runner": has_measured["RUNNER"],
+        "gate": has_measured["INGATE"],
+    }
     for section, v in [
         ("sprue", v_sprue),
         ("runner", v_runner),
         ("gate", v_gate),
     ]:
+        if measured_sections.get(section, False):
+            continue
         lo, hi = _target_range(check_system, section)
         if v < lo * 0.8:
             warnings.append(
@@ -397,6 +405,7 @@ def calculate_gating_design(inp: GatingEngineInput) -> GatingDesign:
 
     return GatingDesign(
         gating_system=detected_system,
+        recommended_gating_system=system,
         choke_section=choke,
         n_gates=n_gates,
         n_runners=n_runners,
