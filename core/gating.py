@@ -71,7 +71,7 @@ def _gate_source_mask(grid: np.ndarray) -> np.ndarray:
     """
     return np.isin(
         grid,
-        [BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE, BodyType.FILTER, BodyType.POURING_BASIN],
+        [BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE, BodyType.SPRUE_THROAT, BodyType.FILTER, BodyType.POURING_BASIN],
     )
 
 
@@ -376,7 +376,7 @@ def _real_gating_areas_from_bodies(
     sprue_throats: List[float] = []
 
     for body in bodies:
-        if body.body_type not in (BodyType.SPRUE, BodyType.RUNNER, BodyType.INGATE):
+        if body.body_type not in (BodyType.SPRUE, BodyType.SPRUE_THROAT, BodyType.RUNNER, BodyType.INGATE):
             continue
         mesh = _repair_mesh(body.mesh)
         if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
@@ -386,12 +386,15 @@ def _real_gating_areas_from_bodies(
             base_mm2, throat_mm2 = _sprue_circular_base_and_throat(mesh, axis)
             sprue_bases.append(base_mm2)
             sprue_throats.append(throat_mm2)
-        else:
+        elif body.body_type == BodyType.SPRUE_THROAT:
             area_mm2 = _characteristic_cross_section_area(mesh, axis)
-            if body.body_type == BodyType.RUNNER:
-                runner_total_mm2 += area_mm2
-            elif body.body_type == BodyType.INGATE:
-                ingate_total_mm2 += area_mm2
+            sprue_throats.append(area_mm2)
+        elif body.body_type == BodyType.RUNNER:
+            area_mm2 = _characteristic_cross_section_area(mesh, axis)
+            runner_total_mm2 += area_mm2
+        elif body.body_type == BodyType.INGATE:
+            area_mm2 = _characteristic_cross_section_area(mesh, axis)
+            ingate_total_mm2 += area_mm2
 
     sprue_base_total_mm2 = float(np.sum(sprue_bases)) if sprue_bases else 0.0
     sprue_throat_min_mm2 = float(np.min(sprue_throats)) if sprue_throats else 0.0
@@ -946,7 +949,7 @@ def analyze_gating(
     is_metal = result.is_metal
     ingate = grid == BodyType.INGATE
     runner = grid == BodyType.RUNNER
-    sprue = grid == BodyType.SPRUE
+    sprue = (grid == BodyType.SPRUE) | (grid == BodyType.SPRUE_THROAT)
     source = _gate_source_mask(grid)
     has_ingate = ingate.any()
 
@@ -1042,7 +1045,7 @@ def analyze_gating(
 
     channel_mask = np.isin(
         grid,
-        [BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE, BodyType.FILTER, BodyType.POURING_BASIN],
+        [BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE, BodyType.SPRUE_THROAT, BodyType.FILTER, BodyType.POURING_BASIN],
     )
     sprue_mask = sprue & channel_mask
     elbow_count = 0
@@ -1325,8 +1328,8 @@ def analyze_gating(
         runner_thickness_mm=runner_thickness_mm,
         required_runner_area_cm2=Ar_total_m2 * 1e4,
         required_ingate_area_cm2=Ag_total_m2 * 1e4,
-        runner_ok=True,
-        ingate_ok=True,
+        runner_ok=_area_design_ok(actual_runner_cm2, Ar_total_m2 * 1e4),
+        ingate_ok=_area_design_ok(actual_gate_total_cm2, Ag_total_m2 * 1e4),
         elbow_count=elbow_count,
         head_loss_mm=head_loss_m * 1000.0,
         effective_head_mm=H_eff_m * 1000.0,
@@ -1345,8 +1348,8 @@ def analyze_gating(
         sprue_throat_area_cm2=sprue_throat_cm2 if sprue_throat_cm2 > 0.0 else design.sprue_throat_area_cm2,
         sprue_base_bottom_area_cm2=actual_sprue_base_cm2,
         sprue_thickness_mm=sprue_thickness_mm,
-        selected_section_key="INGATE",
-        selected_velocity_m_s=0.0,
+        selected_section_key=user_velocity_section,
+        selected_velocity_m_s=user_gate_velocity,
         section_flows=section_flows,
         effective_gate_section="INGATE" if has_ingate else "RUNNER (meme yok)",
         detected_gating_system=detected_system,

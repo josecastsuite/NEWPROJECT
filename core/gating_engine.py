@@ -1,19 +1,22 @@
 """Geometry-aware gating design engine for JoseCast Analyzer.
 
-The engine does **not** blindly trust user-measured cross-sectional areas.  It
-calculates a physically consistent design from the casting geometry and the
-material, then compares the measured areas (if any) to that design and warns
-about mismatches.
+The engine is built around the principle: once the flow rate `Q` and fill time
+`t_fill` are fixed, every section area is `A = Q / v`.  The selected section
+(user velocity / measured area or the choke section) anchors the design; the
+remaining sections are derived from the gating-system ratio.
 
 Design sequence (Campbell / field-script compatible):
   1. geometry + material -> recommended gating system and target gate speed
-  2. fill time            -> Campbell or practical table, user override wins
+  2. fill time / flow rate -> user velocity+measured area, or Campbell/practical
   3. effective head       -> H_eff with mass-dependent head reduction
-  4. sprue base area      -> A_s = W / (rho * Cd * t_fill * sqrt(2gH_eff))
-  5. gate total area      -> A_g = Q / v_gate_target  (standard ingate formula)
-  6. runner area / ratio  -> chosen so the area order matches the system type
-  7. gate count           -> from flow-path length and safe local velocity
-  8. measured comparison  -> Q/A for each measured area, warnings if far off
+  4. anchor section area  -> A_anchor = Q / v_anchor
+  5. derive As, Ar, Ag    -> from the system ratio and the anchor
+  6. gate count           -> from flow-path length and local gate velocity
+  7. measured comparison  -> Q/A for each measured area, warnings if far off
+
+Key property: when a user gives a velocity for a measured section, the engine
+produces exactly that velocity for that section and builds the rest around it
+with simple proportion.  No hidden double bookkeeping.
 """
 
 from __future__ import annotations
@@ -263,28 +266,10 @@ def _reynolds_froude(
     return float(re), float(fr)
 
 
-def _resolve_fill_time(
-    inp: GatingEngineInput,
-    measured: Dict[str, float],
-) -> Tuple[float, str]:
-    """Choose a fill time from user, measured velocity, Campbell or practical table."""
+def _auto_fill_time(inp: GatingEngineInput) -> Tuple[float, str]:
+    """Fill time ignoring any user velocity; Campbell + practical table."""
     if inp.t_fill_s is not None and inp.t_fill_s > 0.0:
         return float(np.clip(inp.t_fill_s, 0.2, 120.0)), "Kullanıcı t_fill."
-
-    if (
-        inp.user_gate_velocity_m_s is not None
-        and inp.user_gate_velocity_m_s > 0.0
-    ):
-        section = (inp.user_velocity_section_key or "INGATE").upper()
-        a = measured.get(section, 0.0)
-        if a <= 0.0:
-            a = measured.get("INGATE", 0.0) or measured.get("RUNNER", 0.0) or measured.get("SPRUE_BASE", 0.0)
-        if a > 0.0:
-            t_fill = inp.total_metal_volume_m3 / (inp.user_gate_velocity_m_s * (a / 1e4))
-            return float(np.clip(t_fill, 0.2, 120.0)), (
-                f"t_fill, kullanıcı hızı ({inp.user_gate_velocity_m_s:.2f} m/s) "
-                f"ve ölçülen {section} alanından hesaplandı."
-            )
 
     part_mass = inp.part_mass_kg if inp.part_mass_kg > 0.0 else inp.total_mass_kg
     superheat = max(inp.t_pour_c - inp.t_liquidus_c, 0.0)
@@ -308,6 +293,52 @@ def _resolve_fill_time(
     return float(np.clip(t_fill, 0.2, 120.0)), reason
 
 
+def _system_ratio(system: str) -> Tuple[float, float, float]:
+    """As:Ar:Ag ratio normalized so As = 1."""
+    if "yarı" in system:
+        return (1.0, 2.0, 1.5)
+    if "basınçsız" in system:
+        return (1.0, 2.0, 2.0)
+    if "basınçlı" in system:
+        return (1.0, 0.75, 0.5)
+    return (1.0, 2.0, 1.5)
+
+
+def _derive_areas_from_anchor(
+    anchor_key: str,
+    A_anchor_m2: float,
+    ratio: Tuple[float, float, float],
+) -> Tuple[float, float, float]:
+    """Given one area (anchor), return (As, Ar, Ag) using the system ratio.
+
+    Ratio is (As, Ar, Ag) with As = 1.0.
+    """
+    r_s, r_r, r_g = ratio
+    r_s = max(r_s, 1e-6)
+    r_r = max(r_r, 1e-6)
+    r_g = max(r_g, 1e-6)
+
+    if anchor_key in ("INGATE",):
+        Ag = A_anchor_m2
+        As = Ag / r_g * r_s
+        Ar = As / r_s * r_r
+    elif anchor_key in ("RUNNER",):
+        Ar = A_anchor_m2
+        As = Ar / r_r * r_s
+        Ag = As / r_s * r_g
+    elif anchor_key in ("SPRUE_BASE", "SPRUE_THROAT"):
+        As = A_anchor_m2
+        Ar = As / r_s * r_r
+        Ag = As / r_s * r_g
+    else:
+        # Fallback to sprue anchor if something unexpected arrives.
+        As = A_anchor_m2
+        Ar = As / r_s * r_r
+        Ag = As / r_s * r_g
+
+    return max(As, 1e-9), max(Ar, 1e-9), max(Ag, 1e-9)
+
+
 def _fluidity_time_s(
     t_pour_c: float, t_liquidus_c: float, latent_heat_j_kg: float, cp_j_kgk: float
 ) -> float:
@@ -320,10 +351,6 @@ def _fluidity_time_s(
     layer_m = 0.001
     t_s = layer_m * energy_j_m3 / q
     return float(np.clip(t_s, 0.2, 20.0))
-
-
-def _area_from_measured_cm2(a_cm2: float) -> float:
-    return float(a_cm2) / 1e4 if a_cm2 > 0.0 else 0.0
 
 
 def calculate_gating_design(inp: GatingEngineInput) -> GatingDesign:
@@ -344,13 +371,13 @@ def calculate_gating_design(inp: GatingEngineInput) -> GatingDesign:
     recommended_system = _recommend_system(
         inp.alloy_key, wall_cat, flow_factor, inp.gating_system
     )
+    system = inp.gating_system or recommended_system
+    ratio = inp.gating_ratio or _system_ratio(system)
+
     v_gate_target = _safe_gate_velocity_m_s(inp.alloy_key, wall_cat)
     v_gate_max = _max_gate_velocity_m_s(inp.alloy_key)
 
-    # 2. Fill time
-    t_fill, t_fill_reason = _resolve_fill_time(inp, measured)
-
-    # 3. Effective head
+    # 2. Effective head and theoretical Bernoulli sprue velocity
     h_avg_m = (
         max(inp.total_height_mm - 0.5 * inp.part_height_mm, inp.total_height_mm * 0.1)
         / 1000.0
@@ -358,76 +385,106 @@ def calculate_gating_design(inp: GatingEngineInput) -> GatingDesign:
     h_eff_m = effective_head(h_avg_m, inp.total_mass_kg) - inp.head_loss_m
     h_eff_m = float(np.clip(h_eff_m, 0.02, 0.60))
 
-    # 4. Choke velocity and total flow
-    v_c = math.sqrt(2.0 * G * h_eff_m)  # theoretical Bernoulli velocity
-    v_s_design = inp.discharge_coeff * v_c  # actual sprue base velocity with Cd
-    Q = inp.total_metal_volume_m3 / max(t_fill, 0.1)
+    v_c = math.sqrt(2.0 * G * h_eff_m)  # theoretical velocity at full head
+    v_s_bernoulli = inp.discharge_coeff * v_c  # actual sprue (choke) velocity
 
-    # 5. Sprue base area from Bernoulli
-    As = Q / max(v_s_design, 0.01)
+    # 3. Resolve fill time and flow rate Q
+    user_v = float(inp.user_gate_velocity_m_s or 0.0)
+    user_sec = (inp.user_velocity_section_key or "INGATE").upper()
 
-    # 6. Gate total area from standard ingate formula A = Q / v
-    Ag = Q / max(v_gate_target, 0.01)
-
-    # 7. Runner area and system from geometry so the area order is physically correct
-    if Ag < 0.6 * As:
-        # Gate is the smallest section -> pressurized
-        system = "basınçlı (pressurized)"
-        Ar = max(0.75 * As, 1.1 * Ag)
-        if Ar >= As:
-            Ar = 0.95 * As
-    elif Ag > 1.4 * As:
-        # Gate is the largest section -> unpressurized
-        if Ag > 2.0 * As:
-            system = "basınçsız (unpressurized)"
-            Ar = max(2.0 * As, math.sqrt(As * Ag))
-            if Ar >= Ag:
-                Ar = 0.95 * Ag
-        else:
-            system = "yarı basınçlı (semi-pressurized)"
-            Ar = 2.0 * As  # runner is largest
-    else:
-        # Gate and sprue are comparable -> semi-pressurized, runner as largest
-        system = "yarı basınçlı (semi-pressurized)"
-        Ar = 2.0 * As
-        if Ar <= max(As, Ag):
-            Ar = max(As, Ag) * 1.1
-
-    # Override if the user explicitly selected a system
-    if inp.gating_system:
-        system = inp.gating_system
-
-    # The geometry-based recommendation is the physically consistent system.
-    if not inp.gating_system:
-        recommended_system = system
-
-    # 8. Recompute velocities from the chosen areas
-    v_s = Q / As
-    v_r = Q / Ar
-    v_g = Q / Ag
-
-    # 9. Do not allow gate velocity above the absolute material limit
-    if v_g > v_gate_max:
-        Ag = Q / v_gate_max
-        v_g = v_gate_max
-        warnings.append(
-            f"Hedef meme hızı malzeme üst sınırını ({v_gate_max:.2f} m/s) aştığı için "
-            f"A_g büyütüldü; yeni v_g = {v_g:.2f} m/s."
+    # Measured area for the user's selected section, with fallback.
+    A_user_measured_cm2 = measured.get(user_sec, 0.0)
+    if A_user_measured_cm2 <= 0.0:
+        A_user_measured_cm2 = (
+            measured.get("INGATE", 0.0)
+            or measured.get("RUNNER", 0.0)
+            or measured.get("SPRUE_BASE", 0.0)
+            or measured.get("SPRUE_THROAT", 0.0)
+            or 0.0
         )
-        # Re-evaluate system after Ag changed
-        if Ag < 0.6 * As:
-            system = "basınçlı (pressurized)"
-        elif Ag > 1.4 * As:
-            system = "basınçsız (unpressurized)"
-        else:
-            system = "yarı basınçlı (semi-pressurized)"
+    A_user_measured_m2 = A_user_measured_cm2 / 1e4
 
-    # 10. Number of ingates from flow-path length and safe local velocity
+    if user_v > 0.0 and A_user_measured_m2 > 0.0:
+        # User velocity + measured area: Q and t_fill are fixed directly.
+        Q = user_v * A_user_measured_m2
+        t_fill = inp.total_metal_volume_m3 / max(Q, 1e-9)
+        t_fill = float(np.clip(t_fill, 0.2, 120.0))
+        t_fill_reason = (
+            f"Kullanıcı {user_sec} hızı ({user_v:.2f} m/s) ve ölçülen "
+            f"{A_user_measured_cm2:.2f} cm²'dan Q={Q*1e3:.2f} L/s, t_fill={t_fill:.2f} s."
+        )
+        anchor_key = user_sec
+        A_anchor_m2 = A_user_measured_m2
+        v_anchor = user_v
+        anchor_from_user = True
+    elif user_v > 0.0:
+        # User velocity but no measured area: keep auto t_fill, design area for that section.
+        t_fill, t_fill_reason = _auto_fill_time(inp)
+        Q = inp.total_metal_volume_m3 / max(t_fill, 0.1)
+        A_anchor_m2 = Q / max(user_v, 0.01)
+        anchor_key = user_sec
+        v_anchor = user_v
+        anchor_from_user = True
+        warnings.append(
+            f"{user_sec} için ölçülen alan olmadığından A={A_anchor_m2*1e4:.2f} cm² "
+            f"(Q/v) olarak tasarlandı."
+        )
+    else:
+        # No user velocity: use Campbell/practical fill time.
+        t_fill, t_fill_reason = _auto_fill_time(inp)
+        Q = inp.total_metal_volume_m3 / max(t_fill, 0.1)
+        anchor_key = None
+        A_anchor_m2 = 0.0
+        v_anchor = 0.0
+        anchor_from_user = False
+
+    # 4. Compute design areas
+    if anchor_from_user:
+        As, Ar, Ag = _derive_areas_from_anchor(anchor_key, A_anchor_m2, ratio)
+    else:
+        # No user velocity: anchor on the choke section for the system.
+        if "basınçlı" in system and "yarı" not in system:
+            # Pressurized: gate is the choke, use safe gate velocity.
+            v_anchor = min(v_gate_target, v_gate_max)
+            anchor_key = "INGATE"
+            A_anchor_m2 = Q / max(v_anchor, 0.01)
+            As, Ar, Ag = _derive_areas_from_anchor(anchor_key, A_anchor_m2, ratio)
+        else:
+            # Unpressurized / semi: sprue is the choke, use Bernoulli.
+            anchor_key = "SPRUE_BASE"
+            A_anchor_m2 = Q / max(v_s_bernoulli, 0.01)
+            As, Ar, Ag = _derive_areas_from_anchor(anchor_key, A_anchor_m2, ratio)
+
+    # 5. Enforce material velocity limits and physical ordering
+    v_s = Q / max(As, 1e-9)
+    v_r = Q / max(Ar, 1e-9)
+    v_g = Q / max(Ag, 1e-9)
+
+    if v_g > v_gate_max:
+        warnings.append(
+            f"Hesaplanan meme hızı {v_g:.2f} m/s üst sınırı {v_gate_max:.2f} m/s aştı; "
+            f"A_g ve A_r büyütüldü."
+        )
+        Ag = Q / v_gate_max
+        if "basınçlı" in system and "yarı" not in system:
+            # Pressurized: keep As > Ar > Ag.
+            if As <= Ag:
+                As = Ag * 1.05 / max(ratio[2], 0.5)
+            Ar = max(min(Ar, As * 0.95), Ag * 1.05)
+        else:
+            # Unpressurized / semi: keep Ar >= Ag >= As.
+            if Ag < As:
+                Ag = As * 1.05
+            Ar = max(Ar, Ag * 1.05)
+        v_s = Q / max(As, 1e-9)
+        v_r = Q / max(Ar, 1e-9)
+        v_g = Q / max(Ag, 1e-9)
+
+    # 6. Number of ingates from flow-path length and local gate velocity
     if inp.n_gates is not None and inp.n_gates > 0:
         n_gates = int(inp.n_gates)
         n_reason = "Kullanıcı meme sayısı."
     else:
-        # Distance metal can travel at gate speed during fill
         reach_mm = v_g * t_fill * 1000.0
         if reach_mm <= 0.0:
             n_gates = 1
@@ -436,26 +493,16 @@ def calculate_gating_design(inp: GatingEngineInput) -> GatingDesign:
         n_gates = int(np.clip(n_gates, 1, max(1, inp.max_gates)))
         n_reason = f"Akış yolu {inp.max_flow_path_mm:.0f} mm / reach {reach_mm:.0f} mm."
 
-    # If a single gate still exceeds the safe local velocity, split while keeping total Ag
-    # (A_each = Ag/n, v_each stays the same, but this is a clean practical split).
-    # For pressurized / small Ag we allow more gates up to max_gates if needed.
-    if n_gates > 1 and v_g > v_gate_target:
-        # Splitting does not change total Ag; it only divides the flow geometrically.
-        # To truly lower v_g we already adjusted Ag above.  Report the split.
-        warnings.append(
-            f"Meme hızı hedefi {v_gate_target:.2f} m/s; {n_gates} memeye bölünmesi önerilir."
-        )
-
     Ag_each = Ag / max(n_gates, 1)
 
-    # 11. Detected system from real velocities
+    # 7. Detected system from real velocities
     detected_system = _classify_from_velocities(v_s, v_r, v_g)
     if detected_system != system:
         warnings.append(
             f"Önerilen sistem '{system}', hesaplanan hızlara göre '{detected_system}' olarak sınıflandırıldı."
         )
 
-    # 12. Compare measured areas (if any)
+    # 8. Compare measured areas (if any)
     measured_vel: Dict[str, float] = {}
     if measured:
         for key, area_cm2 in measured.items():
@@ -463,7 +510,7 @@ def calculate_gating_design(inp: GatingEngineInput) -> GatingDesign:
             if a_m2 > 0.0:
                 measured_vel[key] = Q / a_m2
 
-        # Check measured gate against design
+        # Check measured gate
         if "INGATE" in measured:
             v_meas_g = measured_vel["INGATE"]
             if v_meas_g > v_gate_max:
@@ -472,30 +519,30 @@ def calculate_gating_design(inp: GatingEngineInput) -> GatingDesign:
                     f"hız {v_meas_g:.2f} m/s (limit {v_gate_max:.2f} m/s)."
                 )
 
-        # Check measured sprue
-        if "SPRUE_BASE" in measured:
-            v_meas_s = measured_vel["SPRUE_BASE"]
-            if not (0.3 * v_s <= v_meas_s <= 1.5 * v_s):
+        # Check each measured area against the design (area ratio 0.6..1.5 or velocity mismatch)
+        design_areas = {
+            "SPRUE_BASE": (As * 1e4, v_s),
+            "SPRUE_THROAT": (As * 1e4, v_s),
+            "RUNNER": (Ar * 1e4, v_r),
+            "INGATE": (Ag * 1e4, v_g),
+        }
+        for key, (area_design_cm2, v_design) in design_areas.items():
+            if key not in measured:
+                continue
+            area_meas = measured[key]
+            ratio = area_meas / area_design_cm2 if area_design_cm2 > 0.0 else 0.0
+            if ratio < 0.6 or ratio > 1.5:
+                v_meas = measured_vel[key]
                 warnings.append(
-                    f"Ölçülen sprue taban alanı ({measured['SPRUE_BASE']:.2f} cm²) "
-                    f"Bernoulli tasarımına uymuyor (v={v_meas_s:.2f} m/s, tasarım v={v_s:.2f} m/s)."
+                    f"Ölçülen {key} alanı ({area_meas:.2f} cm²) tasarımdan ({area_design_cm2:.2f} cm²) "
+                    f"farklı; oran={ratio:.2f}, v_ölçülen={v_meas:.2f} m/s, v_tasarım={v_design:.2f} m/s."
                 )
 
-        # Check measured runner
-        if "RUNNER" in measured:
-            v_meas_r = measured_vel["RUNNER"]
-            max_r = _max_runner_velocity_m_s(inp.alloy_key)
-            if v_meas_r > max_r:
-                warnings.append(
-                    f"Ölçülen yolluk alanı ({measured['RUNNER']:.2f} cm²) çok küçük; "
-                    f"hız {v_meas_r:.2f} m/s (limit {max_r:.2f} m/s)."
-                )
-
-    # 13. Reynolds / Froude at each gate
+    # 9. Reynolds / Froude at each gate
     re, fr = _reynolds_froude(inp.rho_kg_m3, v_g, Ag_each, inp.viscosity_pa_s)
     turbulent = re > 20000.0 or v_g > v_gate_max
 
-    # 14. Fluidity length
+    # 10. Fluidity length
     t_fluid = _fluidity_time_s(
         inp.t_pour_c, inp.t_liquidus_c, inp.latent_heat_j_kg, inp.cp_j_kgk
     )
@@ -507,19 +554,19 @@ def calculate_gating_design(inp: GatingEngineInput) -> GatingDesign:
         )
 
     # Final ratio and reason
-    ratio = (1.0, Ar / As, Ag / As)
+    ratio_out = (
+        1.0,
+        Ar / max(As, 1e-9),
+        Ag / max(As, 1e-9),
+    )
     choke_section = _choke_section_for_system(detected_system)
 
     reason = (
-        f"Önerilen sistem: {recommended_system}, geometriden tespit: {detected_system}. "
+        f"Önerilen sistem: {recommended_system}, seçilen: {system}, tespit: {detected_system}. "
         f"{t_fill_reason} {n_reason} "
-        f"Oran As:Ar:Ag ≈ {ratio[0]:.2f}:{ratio[1]:.2f}:{ratio[2]:.2f}. "
+        f"Oran As:Ar:Ag ≈ {ratio_out[0]:.2f}:{ratio_out[1]:.2f}:{ratio_out[2]:.2f}. "
         f"H_eff={h_eff_m*1000:.1f} mm, v_c={v_c:.2f} m/s."
     )
-
-    # Sprue throat (design) is taken as the base area; a separate measured throat
-    # is kept for comparison only.
-    sprue_throat_design = As
 
     return GatingDesign(
         gating_system=detected_system,
@@ -531,7 +578,7 @@ def calculate_gating_design(inp: GatingEngineInput) -> GatingDesign:
         h_eff_mm=h_eff_m * 1000.0,
         v_choke_m_s=v_c,
         sprue_base_area_cm2=As * 1e4,
-        sprue_throat_area_cm2=sprue_throat_design * 1e4,
+        sprue_throat_area_cm2=As * 1e4,
         runner_total_area_cm2=Ar * 1e4,
         gate_total_area_cm2=Ag * 1e4,
         gate_each_area_cm2=Ag_each * 1e4,

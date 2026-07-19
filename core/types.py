@@ -42,6 +42,7 @@ class BodyType(IntEnum):
     COOLING_SPRUE = 11
     FILTER = 13
     POURING_BASIN = 15
+    SPRUE_THROAT = 17
 
 
 BODY_TYPE_LABELS = {
@@ -54,6 +55,7 @@ BODY_TYPE_LABELS = {
     BodyType.COOLING_SPRUE: "SOĞUTUCU DÖKÜM AĞZI",
     BodyType.FILTER: "FİLTRE",
     BodyType.POURING_BASIN: "DÖKÜM HAVZASI",
+    BodyType.SPRUE_THROAT: "D.AĞZI BOĞAZI",
 }
 
 # Body types that contain liquid metal during pouring (part + gating + riser).
@@ -65,6 +67,7 @@ BODY_CASTING_METAL_TYPES = [
     BodyType.INGATE,
     BodyType.RUNNER,
     BodyType.SPRUE,
+    BodyType.SPRUE_THROAT,
     BodyType.POURING_BASIN,
 ]
 
@@ -78,6 +81,7 @@ BODY_FEEDER_TYPES = [
     BodyType.INGATE,
     BodyType.RUNNER,
     BodyType.SPRUE,
+    BodyType.SPRUE_THROAT,
     BodyType.POURING_BASIN,
 ]
 

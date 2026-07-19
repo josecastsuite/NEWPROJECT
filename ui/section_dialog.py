@@ -92,6 +92,8 @@ class SectionDialog(QtWidgets.QDialog):
             return "INGATE"
         if bt == BodyType.SPRUE:
             return "SPRUE_BASE"
+        if bt == BodyType.SPRUE_THROAT:
+            return "SPRUE_THROAT"
         if bt == BodyType.RUNNER:
             return "RUNNER"
         if bt == BodyType.INGATE:
@@ -175,10 +177,18 @@ class SectionDialog(QtWidgets.QDialog):
             # Characteristic flow area
             try:
                 if self.section_key in ("SPRUE_BASE", "SPRUE_THROAT"):
-                    base_mm2, throat_mm2 = _sprue_circular_base_and_throat(
-                        self.body.mesh, axis
-                    )
-                    char_mm2 = base_mm2 if self.section_key == "SPRUE_BASE" else throat_mm2
+                    try:
+                        bt = BodyType(self.body.body_type) if isinstance(self.body.body_type, int) else self.body.body_type
+                    except Exception:
+                        bt = BodyType.INGATE
+                    if bt == BodyType.SPRUE_THROAT:
+                        # A dedicated throat body: use its characteristic cross-section directly.
+                        char_mm2 = _characteristic_cross_section_area(self.body.mesh, axis)
+                    else:
+                        base_mm2, throat_mm2 = _sprue_circular_base_and_throat(
+                            self.body.mesh, axis
+                        )
+                        char_mm2 = base_mm2 if self.section_key == "SPRUE_BASE" else throat_mm2
                 else:
                     char_mm2 = _characteristic_cross_section_area(self.body.mesh, axis)
                 self.char_area = char_mm2 / 100.0

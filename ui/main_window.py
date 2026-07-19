@@ -40,6 +40,7 @@ BODY_TYPE_NAMES = {
     BodyType.COOLING_SPRUE: "SOĞUTUCU D.AĞZI",
     BodyType.FILTER: "FİLTRE",
     BodyType.POURING_BASIN: "DÖKÜM HAVZASI",
+    BodyType.SPRUE_THROAT: "D.AĞZI BOĞAZI",
 }
 
 
@@ -652,6 +653,7 @@ class MainWindow(QtWidgets.QMainWindow):
             BodyType.INGATE,
             BodyType.RUNNER,
             BodyType.SPRUE,
+            BodyType.SPRUE_THROAT,
             BodyType.COOLING_SPRUE,
             BodyType.FILTER,
             BodyType.POURING_BASIN,
@@ -738,7 +740,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bt = BodyType(body.body_type) if isinstance(body.body_type, int) else body.body_type
         except Exception:
             bt = body.body_type
-        if bt not in (BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE):
+        if bt not in (BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE, BodyType.SPRUE_THROAT):
             QtWidgets.QMessageBox.information(
                 self, "Tip Uyarısı",
                 "Kesit seçimi sadece YOLLUK, MEME veya DÖKÜM AĞZI tipindeki body'ler için geçerlidir.\n"
@@ -765,6 +767,8 @@ class MainWindow(QtWidgets.QMainWindow):
         bt = body_or_type.body_type if isinstance(body_or_type, Body) else body_or_type
         if bt == BodyType.SPRUE:
             return "SPRUE_BASE"
+        if bt == BodyType.SPRUE_THROAT:
+            return "SPRUE_THROAT"
         if bt == BodyType.RUNNER:
             return "RUNNER"
         if bt == BodyType.INGATE:
