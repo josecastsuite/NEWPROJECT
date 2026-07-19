@@ -337,14 +337,30 @@ class Analyzer3DViewer(QtInteractor):
         if high.n_cells == 0:
             return
 
-        cloud = high.cell_centers()
+        # cell_centers() drops arrays; convert point->cell data first and attach it.
+        try:
+            high_cells = high.point_data_to_cell_data(pass_point_data=False)
+            cloud = high_cells.cell_centers()
+            if scalar_name in high_cells.cell_data:
+                cloud.point_data[scalar_name] = high_cells.cell_data[scalar_name]
+        except Exception:
+            cloud = high.cell_centers()
+
         if cloud.n_points > max_points:
             idx = np.random.choice(cloud.n_points, max_points, replace=False)
-            cloud = pv.PolyData(cloud.points[idx])
+            points = cloud.points[idx]
+            if scalar_name in cloud.point_data:
+                vals = np.asarray(cloud.point_data[scalar_name])[idx]
+                cloud = pv.PolyData(points)
+                cloud.point_data[scalar_name] = vals
+            else:
+                cloud = pv.PolyData(points)
 
+        title = "Pore size (µm)" if scalar_name == "pore_size_um" else ("Solidification time" if scalar_name == "t_solid" else scalar_name)
         self._porosity_actor = self.add_mesh(
             cloud,
-            scalars=scalar_name,
+            scalars=scalar_name if scalar_name in cloud.array_names else None,
+            color="#ff0000" if scalar_name not in cloud.array_names else None,
             cmap="plasma",
             clim=[0.0, max(hi, 1.0)],
             style="points",
@@ -353,7 +369,7 @@ class Analyzer3DViewer(QtInteractor):
             opacity=1.0,
             lighting=False,
             show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Pore size (µm)", (0.82, 0.02)),
+            scalar_bar_args=_scalar_bar_args(title, (0.82, 0.02)),
         )
 
     def show_niyama_isosurfaces(self, result: Optional[AnalysisResult]):
