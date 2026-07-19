@@ -158,6 +158,7 @@ def _format_gate_table(result: AnalysisResult) -> str:
     auto_fill = getattr(gr, "auto_fill_time_s", gr.recommended_fill_time_s)
     campbell_fill = getattr(gr, "campbell_fill_time_s", 0.0)
     return f""""
+    <p><strong>Ana motor:</strong> parça kütlesi → dolum süresi → metal yüksekliği → sprue hızı → As:Ar:Ag oranıyla hedef alanlar. CAD ölçümleri sadece karşılaştırmadır.</p>
     <table>
         <tr><th>Parametre</th><th>Değer</th><th>Durum / Gerekli</th></tr>
         <tr><td>Seçili giriş kesiti</td><td>{selected_section}</td><td>v = {gr.ingate_velocity_m_s:.2f} m/s</td></tr>
