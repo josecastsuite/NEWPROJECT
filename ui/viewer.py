@@ -561,11 +561,19 @@ class Analyzer3DViewer(QtInteractor):
         def _on_pick(point):
             self._handle_section_pick(np.asarray(point, dtype=np.float64))
 
+        # Make sure a previous point-picking session is fully disabled before
+        # starting a new one, otherwise PyVista raises "Picking is already enabled".
+        try:
+            self.disable_picking()
+        except Exception:
+            pass
+        self._section_picker = None
+
         print(f"[section picker] '{section_key}' kesiti için 3D görünümde ilgili yüzeye tıklayın.")
         self._section_picker = self.enable_point_picking(
             _on_pick,
-            use_mesh=True,
             left_clicking=True,
+            picker=pv.PickerType.CELL,
             show_message=False,
             color="#ff00ff",
             point_size=12,

@@ -26,6 +26,7 @@ from core import (
 )
 from core.materials import chvorinov_c_from_properties
 from core.types import Body, BodyType, CastingParameters
+from ui.section_picker import SectionPickerDialog
 from ui.viewer import Analyzer3DViewer
 
 
@@ -391,9 +392,14 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Meme", "INGATE"),
         ]:
             self.section_type_combo.addItem(label, key)
-        self.pick_section_btn = QtWidgets.QPushButton("Kesit Seç (3D tıkla)")
+        self.pick_section_btn = QtWidgets.QPushButton("Kesit Seç (Ana Pencere)")
         self.pick_section_btn.setEnabled(False)
+        self.pick_section_btn.setToolTip("3D ana görünümde doğrudan tıklayarak ölç.")
         self.pick_section_btn.clicked.connect(self.on_pick_section)
+        self.correct_section_btn = QtWidgets.QPushButton("Kesit Düzelt (Yeni Pencere)")
+        self.correct_section_btn.setEnabled(False)
+        self.correct_section_btn.setToolTip("Ayrı bir 3D pencere açarak daha net kesit seç.")
+        self.correct_section_btn.clicked.connect(self.on_correct_section)
         self.clear_section_btn = QtWidgets.QPushButton("Kesit Seçimlerini Temizle")
         self.clear_section_btn.setEnabled(False)
         self.clear_section_btn.clicked.connect(self.on_clear_sections)
@@ -401,6 +407,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.section_status_label.setWordWrap(True)
         section_layout.addWidget(self.section_type_combo)
         section_layout.addWidget(self.pick_section_btn)
+        section_layout.addWidget(self.correct_section_btn)
         section_layout.addWidget(self.clear_section_btn)
         section_layout.addWidget(self.section_status_label)
         left_layout.addWidget(section_group)
@@ -705,6 +712,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self.voxelize_btn.setEnabled(True)
             self.pick_section_btn.setEnabled(True)
+            self.correct_section_btn.setEnabled(True)
             self.clear_section_btn.setEnabled(True)
             self.analyze_btn.setEnabled(False)
             self._analysis = None
@@ -744,6 +752,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self._bodies,
             callback=self._on_section_picked,
         )
+
+    def on_correct_section(self):
+        if not self._bodies:
+            return
+        section_key = self.section_type_combo.currentData()
+        dialog = SectionPickerDialog(
+            self._bodies,
+            section_key,
+            parent=self,
+        )
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            if dialog.area_cm2 is not None:
+                self._on_section_picked(section_key, dialog.area_cm2, dialog.body_name)
+        else:
+            self.aiLog("Kesit düzeltme iptal edildi.", "info")
 
     def on_clear_sections(self):
         self._user_section_areas_cm2.clear()
