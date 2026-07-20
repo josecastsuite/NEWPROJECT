@@ -329,7 +329,8 @@ class Analyzer3DViewer(QtInteractor):
         # Physical floor: avoid showing huge numbers of tiny baseline pores.
         if scalar_name == "pore_size_um":
             alloy = get_alloy(result.alloy_key)
-            lo = max(lo, alloy.micro_pore_limit_um * noise_percent / 100.0)
+            baseline_min = max(alloy.gas_pore_baseline_um, alloy.dendrite_spacing_mm * 1000.0 * 0.02)
+            lo = max(lo, baseline_min * 0.5)
         hi = finite_max
         if hi <= lo:
             return

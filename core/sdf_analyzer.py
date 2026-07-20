@@ -376,7 +376,18 @@ def compute_pore_size(
     d_micro_um = sdas_um * micro_factor * feed_factor
 
     # Real-life baseline: dissolved gas/oxides always leave some micro pores.
-    baseline_um = max(alloy.gas_pore_baseline_um, sdas_um * 0.02)
+    # Thicker/slower-solidifying sections and lower-Niyama regions retain larger
+    # gas pores, so the baseline is spatially modulated instead of uniform.
+    baseline_min_um = max(alloy.gas_pore_baseline_um, sdas_um * 0.02)
+    m_max = float(np.max(M_mod[part_mask])) if np.any(part_mask) else 1.0
+    m_rel = np.clip(M_mod / max(m_max, 1e-9), 0.0, 1.0)
+    # raw_micro already equals max(0, 1 - N/niyama_shrinkage)
+    baseline_factor = (
+        1.0
+        + alloy.gas_pore_time_factor * m_rel
+        + alloy.gas_pore_niyama_factor * raw_micro
+    )
+    baseline_um = baseline_min_um * np.clip(baseline_factor, 1.0, None)
     pore_size_um = np.where(
         part_mask,
         np.maximum(d_macro_mm * 1000.0 + d_micro_um, baseline_um),
@@ -465,13 +476,16 @@ def pore_size_threshold_um(
     pore_size_um: np.ndarray,
     noise_percent: float = 3.0,
     micro_pore_limit_um: float = 100.0,
+    baseline_um: Optional[float] = None,
 ) -> float:
     """Return the display threshold for porosity.
 
     It is the larger of (a) the ``noise_percent`` percentile of positive pore
-    sizes and (b) ``micro_pore_limit_um * noise_percent / 100``.  The floor
-    prevents showing huge numbers of tiny, physically unavoidable gas/oxide
-    pores when the distribution is almost flat.
+    sizes and (b) a material baseline floor.  The baseline floor is the material
+    ``gas_pore_baseline_um`` (or the SDAS-derived 0.02*SDAS minimum) halved, so
+    tiny gas pores are still represented without turning the whole part into a
+    cloud.  If ``baseline_um`` is not provided, ``micro_pore_limit_um`` is used
+    as a legacy fallback.
     """
     positive = np.asarray(pore_size_um[pore_size_um > 0.0], dtype=np.float64)
     if len(positive) == 0:
@@ -482,7 +496,10 @@ def pore_size_threshold_um(
         return float(np.max(positive)) + 1.0
     p = 100.0 - noise_percent
     perc = float(np.percentile(positive, p))
-    floor = micro_pore_limit_um * noise_percent / 100.0
+    if baseline_um is not None and baseline_um > 0.0:
+        floor = baseline_um * 0.5
+    else:
+        floor = micro_pore_limit_um * noise_percent / 100.0
     return max(perc, floor)
 
 
@@ -1812,8 +1829,12 @@ def analyze(
     )
     # v8.9: by default display only the top 3% of computed pore sizes to suppress noise.
     pore_noise_percent = 3.0
+    baseline_min_um = max(alloy.gas_pore_baseline_um, alloy.dendrite_spacing_mm * 1000.0 * 0.02)
     pore_threshold_um = pore_size_threshold_um(
-        pore_size_um, pore_noise_percent, micro_pore_limit_um=alloy.micro_pore_limit_um
+        pore_size_um,
+        pore_noise_percent,
+        micro_pore_limit_um=alloy.micro_pore_limit_um,
+        baseline_um=baseline_min_um,
     )
 
     # Assign pore-size estimate to each hot spot and re-evaluate feed_ok with

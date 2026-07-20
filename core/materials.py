@@ -74,8 +74,12 @@ class Alloy:
     gas_pore_baseline_um: float = 0.5
     # Porosity-shape exponent: (1 - N/N_thr)^n.  n>1 makes marginally-low-Niyama
     # regions much less porous, reflecting real-life feeding reservoirs/pressure.
-    pore_niyama_exponent: float = 2.0
-    feed_risk_exponent: float = 1.5
+    pore_niyama_exponent: float = 1.5
+    feed_risk_exponent: float = 1.2
+    # Unavoidable gas/oxide micro-porosity is modulated by local solidification
+    # time (thicker section -> larger gas pores) and local Niyama risk.
+    gas_pore_time_factor: float = 2.0
+    gas_pore_niyama_factor: float = 0.5
 
     def __post_init__(self):
         if self.density_g_cm3 == 0.0:
