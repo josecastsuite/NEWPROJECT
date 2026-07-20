@@ -339,8 +339,9 @@ def compute_pore_size(
     feed_risk: np.ndarray,
     alloy: Alloy,
     part_mask: np.ndarray,
-    macro_threshold_um: float = 1000.0,
-    micro_threshold_um: float = 100.0,
+    t_s: Optional[np.ndarray] = None,
+    feeder_mask: Optional[np.ndarray] = None,
+    dx: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Estimate pore size (µm) from Niyama, local modulus and feeding deficit.
 
@@ -349,39 +350,108 @@ def compute_pore_size(
     Interdendritic micro pore:
         d_micro [µm] = SDAS_um * (1 - N/N_shrinkage) * feed_risk
 
+    The shrinkage term is further reduced where the local solidification
+    gradient points toward a feeder (directional feeding efficiency).  An
+    unavoidable gas/oxide baseline is added so no region is artificially
+    declared "zero porosity".
+
     Returns pore_size_um, pore_size_mm, macro_mask, micro_mask, fine_mask.
     """
     t_section_mm = 2.0 * np.maximum(M_mod, 0.0)
 
-    macro_factor = np.clip(1.0 - niyama / max(alloy.niyama_macro, 1e-9), 0.0, 1.0)
-    micro_factor = np.clip(1.0 - niyama / max(alloy.niyama_shrinkage, 1e-9), 0.0, 1.0)
+    raw_macro = np.clip(1.0 - niyama / max(alloy.niyama_macro, 1e-9), 0.0, 1.0)
+    raw_micro = np.clip(1.0 - niyama / max(alloy.niyama_shrinkage, 1e-9), 0.0, 1.0)
+    exp_n = max(alloy.pore_niyama_exponent, 1e-3)
+    macro_factor = np.power(raw_macro, exp_n)
+    micro_factor = np.power(raw_micro, exp_n)
 
-    # No feeding deficit -> no shrinkage porosity can grow.
-    feed_factor = np.clip(feed_risk, 0.0, 1.0)
+    # Directional feeding: a feeder that is in the direction of the
+    # solidification front is much more effective, but never removes all risk.
+    _feeder = feeder_mask if feeder_mask is not None else np.zeros_like(part_mask)
+    feed_eff = directional_feed_efficiency(t_s, _feeder, part_mask, dx)
+    feed_factor = np.power(np.clip(feed_risk, 0.0, 1.0), alloy.feed_risk_exponent) * feed_eff
 
     d_macro_mm = t_section_mm * alloy.shrinkage_factor * macro_factor * feed_factor
     sdas_um = alloy.dendrite_spacing_mm * 1000.0
     d_micro_um = sdas_um * micro_factor * feed_factor
 
-    pore_size_mm = d_macro_mm + d_micro_um / 1000.0
-    pore_size_um = pore_size_mm * 1000.0
+    # Real-life baseline: dissolved gas/oxides always leave some micro pores.
+    baseline_um = max(alloy.gas_pore_baseline_um, sdas_um * 0.02)
+    pore_size_um = np.where(
+        part_mask,
+        np.maximum(d_macro_mm * 1000.0 + d_micro_um, baseline_um),
+        0.0,
+    )
+    pore_size_mm = pore_size_um / 1000.0
 
-    # Restrict to part; outside metal nothing is reported.
-    pore_size_um = np.where(part_mask, pore_size_um, 0.0)
-    pore_size_mm = np.where(part_mask, pore_size_mm, 0.0)
     pore_size_um = np.nan_to_num(pore_size_um, nan=0.0, posinf=0.0, neginf=0.0)
     pore_size_mm = np.nan_to_num(pore_size_mm, nan=0.0, posinf=0.0, neginf=0.0)
 
-    macro_mask = (pore_size_um >= macro_threshold_um) & part_mask
+    macro_thr = alloy.macro_pore_limit_um
+    micro_thr = alloy.micro_pore_limit_um
+    macro_mask = (pore_size_um >= macro_thr) & part_mask
     micro_mask = (
-        (pore_size_um >= micro_threshold_um) & (pore_size_um < macro_threshold_um) & part_mask
+        (pore_size_um >= micro_thr) & (pore_size_um < macro_thr) & part_mask
     )
-    fine_mask = (pore_size_um > 0.0) & (pore_size_um < micro_threshold_um) & part_mask
+    fine_mask = (pore_size_um > 0.0) & (pore_size_um < micro_thr) & part_mask
 
     return pore_size_um, pore_size_mm, macro_mask, micro_mask, fine_mask
 
 
-def _pore_size_class(pore_size_um: float, macro_threshold_um: float = 1000.0, micro_threshold_um: float = 100.0) -> str:
+def directional_feed_efficiency(
+    t_s: np.ndarray,
+    feeder_mask: np.ndarray,
+    part_mask: np.ndarray,
+    dx: float,
+    min_eff: float = 0.05,
+    max_reduction: float = 0.85,
+) -> np.ndarray:
+    """Return a per-voxel feeding-efficiency factor in [min_eff, 1.0].
+
+    The local solidification time gradient points toward the last-freezing
+    region.  A riser that lies in that direction can feed the voxel well, so
+    shrinkage risk is reduced.  Where no gradient exists (uniform) the factor
+    is neutral (0.5).  Far from any feeder the factor remains ~1.0.
+    """
+    if t_s is None or not feeder_mask.any():
+        return np.ones_like(part_mask, dtype=np.float64)
+
+    # Replace NaN/Inf in t_s so gradients are finite.
+    t_safe = np.nan_to_num(t_s, nan=np.nanmax(t_s) if np.isfinite(t_s).any() else 0.0, posinf=0.0, neginf=0.0)
+
+    gz, gy, gx = np.gradient(t_safe, dx)
+    grad = np.stack([gz, gy, gx], axis=-1)
+    grad_mag = np.linalg.norm(grad, axis=-1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        grad_dir = np.where(grad_mag[..., None] > 1e-12, grad / grad_mag[..., None], 0.0)
+
+    # Nearest feeder voxel for each voxel (feeder_mask True are features => pass inverted)
+    _, nearest = ndimage.distance_transform_edt(~feeder_mask, return_indices=True)
+    indices = np.indices(part_mask.shape)  # shape (3, *grid)
+    diff = (nearest - indices) * dx  # vector from voxel to nearest feeder, shape (3, *grid)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        diff_norm = np.linalg.norm(diff, axis=0)
+        diff_dir = np.where(diff_norm[None, ...] > 1e-9, diff / diff_norm[None, ...], 0.0)
+    # grad_dir has channel last; bring diff_dir to same shape.
+    diff_dir = np.moveaxis(diff_dir, 0, -1)
+
+    # If the riser is in the direction of the solidification front (+grad t_s),
+    # alignment is positive and feeding is more effective.
+    alignment = np.einsum("...i,...i->...", diff_dir, grad_dir)
+    alignment = np.where(grad_mag > 1e-12, alignment, 0.0)
+    alignment = np.clip(alignment, 0.0, 1.0)
+
+    # Strong alignment -> strong shrinkage reduction, but never zero (real life baseline).
+    efficiency = 1.0 - max_reduction * alignment
+    efficiency = np.clip(efficiency, min_eff, 1.0)
+    return np.where(part_mask, efficiency, 1.0)
+
+
+def _pore_size_class(
+    pore_size_um: float,
+    macro_threshold_um: float = 1000.0,
+    micro_threshold_um: float = 100.0,
+) -> str:
     if pore_size_um >= macro_threshold_um:
         return "macro"
     if pore_size_um >= micro_threshold_um:
@@ -391,10 +461,17 @@ def _pore_size_class(pore_size_um: float, macro_threshold_um: float = 1000.0, mi
     return ""
 
 
-def pore_size_threshold_um(pore_size_um: np.ndarray, noise_percent: float = 3.0) -> float:
-    """Return the value above which only the top ``noise_percent``% of positive pore sizes lie.
+def pore_size_threshold_um(
+    pore_size_um: np.ndarray,
+    noise_percent: float = 3.0,
+    micro_pore_limit_um: float = 100.0,
+) -> float:
+    """Return the display threshold for porosity.
 
-    Values below this threshold are treated as numerical/physical noise and hidden by default.
+    It is the larger of (a) the ``noise_percent`` percentile of positive pore
+    sizes and (b) ``micro_pore_limit_um * noise_percent / 100``.  The floor
+    prevents showing huge numbers of tiny, physically unavoidable gas/oxide
+    pores when the distribution is almost flat.
     """
     positive = np.asarray(pore_size_um[pore_size_um > 0.0], dtype=np.float64)
     if len(positive) == 0:
@@ -404,7 +481,9 @@ def pore_size_threshold_um(pore_size_um: np.ndarray, noise_percent: float = 3.0)
     if noise_percent >= 100.0:
         return float(np.max(positive)) + 1.0
     p = 100.0 - noise_percent
-    return float(np.percentile(positive, p))
+    perc = float(np.percentile(positive, p))
+    floor = micro_pore_limit_um * noise_percent / 100.0
+    return max(perc, floor)
 
 
 def _sdf_histogram(sdf: np.ndarray, mask: np.ndarray, bins: int = 50):
@@ -1692,11 +1771,13 @@ def analyze(
 
     # v8.8: estimate pore size from Niyama, local modulus and feeding deficit.
     pore_size_um, pore_size_mm, pore_macro_mask, pore_micro_mask, pore_fine_mask = compute_pore_size(
-        niyama, M_mod, feed_risk, alloy, part_mask
+        niyama, M_mod, feed_risk, alloy, part_mask, t_s=t_s, feeder_mask=feeder_mask, dx=dx
     )
     # v8.9: by default display only the top 3% of computed pore sizes to suppress noise.
     pore_noise_percent = 3.0
-    pore_threshold_um = pore_size_threshold_um(pore_size_um, pore_noise_percent)
+    pore_threshold_um = pore_size_threshold_um(
+        pore_size_um, pore_noise_percent, micro_pore_limit_um=alloy.micro_pore_limit_um
+    )
 
     # Assign pore-size estimate to each hot spot.
     for hs in hotspots:
@@ -1706,7 +1787,11 @@ def analyze(
             ps_um = float(pore_size_um[vox[0], vox[1], vox[2]])
             hs.pore_size_um = ps_um
             hs.pore_size_mm = ps_um / 1000.0
-            hs.pore_size_class = _pore_size_class(ps_um)
+            hs.pore_size_class = _pore_size_class(
+                ps_um,
+                macro_threshold_um=alloy.macro_pore_limit_um,
+                micro_threshold_um=alloy.micro_pore_limit_um,
+            )
 
     if progress_callback:
         progress_callback(95)

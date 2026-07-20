@@ -322,6 +322,10 @@ class Analyzer3DViewer(QtInteractor):
         # Noise filter: keep only the top noise_percent% of the displayed scalar.
         p = max(0.0, min(100.0 - noise_percent, 100.0))
         lo = float(np.percentile(finite_values, p))
+        # Physical floor: avoid showing huge numbers of tiny baseline pores.
+        if scalar_name == "pore_size_um":
+            alloy = get_alloy(result.alloy_key)
+            lo = max(lo, alloy.micro_pore_limit_um * noise_percent / 100.0)
         hi = finite_max
         if hi <= lo:
             return
