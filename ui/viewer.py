@@ -266,8 +266,8 @@ class Analyzer3DViewer(QtInteractor):
         Only the top ``noise_percent``% of the displayed scalar is rendered so
         that numerical / physical noise is suppressed.  ``pore_size_filter``
         restricts the cloud to ``macro``, ``micro`` or ``fine`` classes.
-        Falls back to the slowest-solidifying regions when pore-size data are
-        not available.
+        Falls back to the slowest-solidifying regions only when pore-size data
+        are not available or the user has not requested a specific class.
         """
         if self._porosity_actor is not None:
             self.remove_actor(self._porosity_actor)
@@ -291,6 +291,10 @@ class Analyzer3DViewer(QtInteractor):
             if class_mask is None or class_mask.size == 0:
                 class_mask = np.zeros_like(part_mask, dtype=bool)
             use_pore_size = class_mask.any()
+            # v9.1: if the user explicitly selected a class, do not fall back to
+            # solidification-time/risk clouds; show nothing for that class.
+            if not use_pore_size:
+                return
         elif has_pore_size and pore_size_filter in ("", "all"):
             class_mask = part_mask & (pore_size_um > 0.0)
             use_pore_size = class_mask.any()
@@ -299,7 +303,7 @@ class Analyzer3DViewer(QtInteractor):
             field = pore_size_um
             scalar_name = "pore_size_um"
         else:
-            # Fallback to the old behaviour if no pore-size field or no voxels.
+            # Fallback to the old behaviour if no pore-size field or no filter.
             solid_time = np.asarray(result.solidification_time) if result.solidification_time is not None else np.array([])
             risk = np.asarray(result.risk) if result.risk is not None else np.array([])
             if solid_time.size and np.isfinite(solid_time[part_mask]).any():
