@@ -124,21 +124,29 @@ def _format_riser_proposal_table(result: AnalysisResult) -> str:
     if result.riser_proposals:
         for rp in result.riser_proposals:
             pos = ",".join(f"{v:.1f}" for v in rp.placement_mm)
-            shape_text = "çıkıcı (chill)" if rp.shape == "chill" else _html_escape(rp.shape)
+            if rp.infeasible:
+                shape_text = "uyarı (sığmıyor)"
+                dims = f"M={rp.m_required_mm:.2f} mm, çap={rp.diameter_mm:.1f} mm, V={rp.volume_cm3:.2f} cm³"
+            elif rp.shape == "chill":
+                shape_text = "çıkıcı (chill)"
+                dims = f"çap={rp.diameter_mm:.1f} mm, yükseklik={rp.height_mm:.1f} mm, V={rp.volume_cm3:.2f} cm³"
+            elif rp.exothermic:
+                shape_text = "ekzotermik mini besleyici"
+                dims = f"çap={rp.diameter_mm:.1f} mm, yükseklik={rp.height_mm:.1f} mm, V={rp.volume_cm3:.2f} cm³, M={rp.m_required_mm:.2f} mm"
+            else:
+                shape_text = _html_escape(rp.shape)
+                dims = f"çap={rp.diameter_mm:.1f} mm, yükseklik={rp.height_mm:.1f} mm, V={rp.volume_cm3:.2f} cm³, M={rp.m_required_mm:.2f} mm"
             rows.append(
                 f"<tr>"
                 f"<td>{rp.target_hotspot_index + 1}</td>"
                 f"<td>{shape_text}</td>"
                 f"<td>({pos})</td>"
-                f"<td>{rp.diameter_mm:.1f}</td>"
-                f"<td>{rp.height_mm:.1f}</td>"
-                f"<td>{rp.volume_cm3:.2f}</td>"
-                f"<td>{rp.m_required_mm:.2f}</td>"
+                f"<td>{dims}</td>"
                 f"<td>{_html_escape(rp.reason)}</td>"
                 f"</tr>"
             )
     else:
-        rows.append('<tr><td colspan="8">Yeni besleyici/çıkıcı önerisi yok.</td></tr>')
+        rows.append('<tr><td colspan="5">Yeni besleyici/çıkıcı önerisi yok.</td></tr>')
     return "".join(rows)
 
 
@@ -368,7 +376,7 @@ def _render_html(result: AnalysisResult, screenshot_path: Optional[str] = None) 
 
     <h2>Otomatik Besleyici / Çıkıcı Önerileri</h2>
     <table>
-        <tr><th>Hot Spot</th><th>Şekil</th><th>Konum (mm)</th><th>Çap (mm)</th><th>Yükseklik (mm)</th><th>Hacim (cm³)</th><th>M (mm)</th><th>Neden</th></tr>
+        <tr><th>Hot Spot</th><th>Şekil</th><th>Konum (mm)</th><th>Boyutlar</th><th>Neden</th></tr>
         {_format_riser_proposal_table(result)}
     </table>
 
@@ -525,9 +533,17 @@ def _generate_report_fpdf2(
         pdf.set_font(font, "", 10)
         for i, rp in enumerate(result.riser_proposals, 1):
             pos = ",".join(f"{v:.1f}" for v in rp.placement_mm)
-            if rp.shape == "chill":
+            if rp.infeasible:
+                pdf.cell(0, 6, f"{i}. UYARI: Hotspot #{rp.target_hotspot_index + 1} icin onerilen besleyici/cikici parcaya sigmiyor.", ln=True)
+                pdf.cell(0, 6, f"   M={rp.m_required_mm:.2f} mm, cap={rp.diameter_mm:.1f} mm, V={rp.volume_cm3:.2f} cm3, konum=({pos}) mm.", ln=True)
+                warning_text = rp.warning if rp.warning else "Cozum kullanici kararidir."
+                pdf.cell(0, 6, f"   {warning_text}", ln=True)
+            elif rp.shape == "chill":
                 pdf.cell(0, 6, f"{i}. cikici (chill): cap={rp.diameter_mm:.1f} mm, yukseklik={rp.height_mm:.1f} mm, "
                                f"V={rp.volume_cm3:.2f} cm3, konum=({pos}) mm", ln=True)
+            elif rp.exothermic:
+                pdf.cell(0, 6, f"{i}. ekzotermik mini besleyici: cap={rp.diameter_mm:.1f} mm, yukseklik={rp.height_mm:.1f} mm, "
+                               f"V={rp.volume_cm3:.2f} cm3, M={rp.m_required_mm:.2f} mm, konum=({pos}) mm", ln=True)
             else:
                 pdf.cell(0, 6, f"{i}. {rp.shape}: cap={rp.diameter_mm:.1f} mm, yukseklik={rp.height_mm:.1f} mm, "
                                f"V={rp.volume_cm3:.2f} cm3, M={rp.m_required_mm:.2f} mm, konum=({pos}) mm", ln=True)

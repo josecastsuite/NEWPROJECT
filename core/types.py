@@ -174,6 +174,10 @@ class RiserProposal:
     volume_cm3: float
     neck_diameter_mm: float = 0.0
     neck_height_mm: float = 0.0
+    # v9.2: proposal metadata
+    exothermic: bool = False
+    infeasible: bool = False
+    warning: str = ""
 
 
 @dataclass

@@ -1356,6 +1356,24 @@ def analyze_gating(
         ratio = actual_cm2 / design_cm2
         return 0.6 <= ratio <= 1.5
 
+    # v9.2: gating fills the mould; it does not fix shrinkage hot spots.
+    # Remind the user when unfed hot spots remain so that riser/chill/exothermic
+    # decisions are not silently delegated to the gating system.
+    if getattr(result, "hotspots", None):
+        unfed = [hs for hs in result.hotspots if not hs.feed_ok]
+        if unfed:
+            has_riser = any(b.body_type == BodyType.RISER for b in bodies)
+            if not has_riser:
+                result.recommendations.append(
+                    f"UYARI: Gating sistemi doldurmayı sağlar; {len(unfed)} adet beslenmeyen "
+                    f"hot spot için ayrı riser, çıkıcı (chill) veya ekzotermik mini besleyici gerekebilir."
+                )
+            else:
+                result.recommendations.append(
+                    f"UYARI: Gating sistemi doldurmayı sağlar; {len(unfed)} adet hot spot "
+                    f"mevcut besleyicilerle beslenemiyor. Besleyici boyutunu/yerini veya ek bir chill değerlendirin."
+                )
+
     return GateResult(
         total_ingate_contact_area_cm2=actual_gate_total_cm2,
         runner_min_area_cm2=actual_runner_cm2,

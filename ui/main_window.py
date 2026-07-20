@@ -1014,6 +1014,37 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self.checklist_layout.addWidget(CheckListItem(text, rr.large_enough and rr.volume_ratio_ok))
 
+        for rp in self._analysis.riser_proposals:
+            pos = f"({rp.placement_mm[0]:.1f}, {rp.placement_mm[1]:.1f}, {rp.placement_mm[2]:.1f})"
+            if rp.infeasible:
+                text = (
+                    f"UYARI Hotspot #{rp.target_hotspot_index + 1}: besleyici/çıkıcı parçaya sığmıyor. "
+                    f"M={rp.m_required_mm:.2f} mm, çap={rp.diameter_mm:.1f} mm, V={rp.volume_cm3:.2f} cm³."
+                )
+                ok = False
+            elif rp.shape == "chill":
+                text = (
+                    f"ÖNERİ Hotspot #{rp.target_hotspot_index + 1}: çıkıcı (chill) ekle -> "
+                    f"çap={rp.diameter_mm:.1f} mm, yükseklik={rp.height_mm:.1f} mm, "
+                    f"V={rp.volume_cm3:.2f} cm³, konum={pos} mm"
+                )
+                ok = True
+            elif rp.exothermic:
+                text = (
+                    f"ÖNERİ Hotspot #{rp.target_hotspot_index + 1}: ekzotermik mini besleyici ekle -> "
+                    f"çap={rp.diameter_mm:.1f} mm, yükseklik={rp.height_mm:.1f} mm, "
+                    f"V={rp.volume_cm3:.2f} cm³, M={rp.m_required_mm:.2f} mm, konum={pos} mm"
+                )
+                ok = True
+            else:
+                text = (
+                    f"ÖNERİ Hotspot #{rp.target_hotspot_index + 1}: {rp.shape} besleyici ekle -> "
+                    f"çap={rp.diameter_mm:.1f} mm, yükseklik={rp.height_mm:.1f} mm, "
+                    f"V={rp.volume_cm3:.2f} cm³, M={rp.m_required_mm:.2f} mm, konum={pos} mm"
+                )
+                ok = True
+            self.checklist_layout.addWidget(CheckListItem(text, ok))
+
         if self._analysis.gate_result:
             gr = self._analysis.gate_result
             section_names = {

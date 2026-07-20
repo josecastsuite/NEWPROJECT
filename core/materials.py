@@ -57,6 +57,12 @@ class Alloy:
     # Riser sizing
     riser_m_factor: float = 1.2
     riser_volume_factor: float = 0.3
+    # Exothermic mini-riser correction: the delivered metal is kept liquid longer,
+    # so the required volume can be reduced while still supplying the same modulus.
+    # A 0.45 yield means ~45% of a normal riser volume is needed; the equivalent
+    # modulus boost (exothermic_head_factor) accounts for the extra liquid metal time.
+    exothermic_volume_yield: float = 0.45
+    exothermic_modulus_factor: float = 1.5
     # Niyama thresholds (dimensionless as used by engine)
     niyama_macro: float = 0.775
     niyama_shrinkage: float = 1.5

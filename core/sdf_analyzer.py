@@ -2098,21 +2098,35 @@ def _build_recommendations(
             )
 
     for idx, proposal in enumerate(result.riser_proposals):
-        if proposal.shape == "chill":
+        pos = f"({proposal.placement_mm[0]:.1f}, {proposal.placement_mm[1]:.1f}, {proposal.placement_mm[2]:.1f})"
+        if proposal.infeasible:
+            recs.append(
+                f"UYARI {idx + 1}: Hotspot #{proposal.target_hotspot_index + 1} için önerilen "
+                f"besleyici/çıkıcı parça geometrisine sığmıyor. "
+                f"M={proposal.m_required_mm:.2f} mm, çap={proposal.diameter_mm:.1f} mm, "
+                f"V={proposal.volume_cm3:.2f} cm³. Konum {pos} mm. "
+                f"{proposal.warning if proposal.warning else 'Çözüm kullanıcı kararıdır.'}"
+            )
+        elif proposal.shape == "chill":
             recs.append(
                 f"ÖNERİ {idx + 1}: çıkıcı (chill) ekle -> "
                 f"çap={proposal.diameter_mm:.1f} mm, yükseklik={proposal.height_mm:.1f} mm, "
                 f"V={proposal.volume_cm3:.2f} cm³. "
-                f"Konum ({proposal.placement_mm[0]:.1f}, {proposal.placement_mm[1]:.1f}, "
-                f"{proposal.placement_mm[2]:.1f}) mm. Neden: {proposal.reason}."
+                f"Konum {pos} mm. Neden: {proposal.reason}."
+            )
+        elif proposal.exothermic:
+            recs.append(
+                f"ÖNERİ {idx + 1}: ekzotermik mini besleyici ekle -> "
+                f"çap={proposal.diameter_mm:.1f} mm, yükseklik={proposal.height_mm:.1f} mm, "
+                f"V={proposal.volume_cm3:.2f} cm³, M={proposal.m_required_mm:.2f} mm. "
+                f"Konum {pos} mm. Neden: {proposal.reason}."
             )
         else:
             recs.append(
-                f"ÖNERİ {idx + 1}: {proposal.shape} besleyici ekle -> "
+                f"ÖNERİ {idx + 1}: konvansiyonel silindirik besleyici ekle -> "
                 f"çap={proposal.diameter_mm:.1f} mm, yükseklik={proposal.height_mm:.1f} mm, "
                 f"V={proposal.volume_cm3:.2f} cm³, M={proposal.m_required_mm:.2f} mm. "
-                f"Konum ({proposal.placement_mm[0]:.1f}, {proposal.placement_mm[1]:.1f}, "
-                f"{proposal.placement_mm[2]:.1f}) mm. Neden: {proposal.reason}."
+                f"Konum {pos} mm. Neden: {proposal.reason}."
             )
 
     all_feed_ok = all(hs.feed_ok for hs in result.hotspots)
