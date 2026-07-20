@@ -453,7 +453,20 @@ def directional_feed_efficiency(
     alignment = np.clip(alignment, 0.0, 1.0)
 
     # Strong alignment -> strong shrinkage reduction, but never zero (real life baseline).
-    efficiency = 1.0 - max_reduction * alignment
+    # Additionally, if the feeder solidifies before the part voxel it cannot feed it,
+    # so the risk reduction is weakened.
+    reduction = max_reduction * alignment
+    t_feeder_max = 0.0
+    if feeder_mask.any():
+        feeder_times = t_safe[feeder_mask]
+        finite_feeder_times = feeder_times[np.isfinite(feeder_times) & (feeder_times > 0.0)]
+        if finite_feeder_times.size > 0:
+            t_feeder_max = float(np.max(finite_feeder_times))
+    if t_feeder_max > 0.0:
+        time_factor = np.clip(t_feeder_max / np.maximum(t_safe, 1e-9), 0.0, 1.0)
+        reduction = reduction * time_factor
+
+    efficiency = 1.0 - reduction
     efficiency = np.clip(efficiency, min_eff, 1.0)
     return np.where(part_mask, efficiency, 1.0)
 
@@ -745,7 +758,7 @@ def feeding_distance_dijkstra(
     gx, gy, gz = gravity_vector
     norm = math.sqrt(gx * gx + gy * gy + gz * gz) + 1e-12
     gx, gy, gz = gx / norm, gy / norm, gz / norm
-    UPWARD_PENALTY = 1.0e9
+    UPWARD_PENALTY = 10.0
     DOWNWARD_BONUS = 0.7
 
     rows: List[np.ndarray] = []
@@ -823,7 +836,7 @@ def feeding_cost_dijkstra(
     gx, gy, gz = gravity_vector
     norm = math.sqrt(gx * gx + gy * gy + gz * gz) + 1e-12
     gx, gy, gz = gx / norm, gy / norm, gz / norm
-    UPWARD_PENALTY = 1.0e9
+    UPWARD_PENALTY = 10.0
     DOWNWARD_BONUS = 0.7
 
     rows, cols, vals = [], [], []
@@ -1294,11 +1307,12 @@ def _high_res_part_hotspots(
     chvorinov_c: float,
     progress_callback: Optional[callable] = None,
 ) -> Optional[List[HotSpot]]:
-    """Build a high-resolution grid containing only PART bodies and detect hot spots.
+    """Build a high-resolution grid containing the PART and connected casting-metal
+    bodies (gating/riser) and detect hot spots.
 
-    The feeder mask from the coarse global grid is resampled onto the part grid
-    so the pseudo-thermal CCL can still identify which liquid pockets are connected
-    to feeders/risers.
+    Including gating/riser geometry in the local high-resolution grid lets the
+    pseudo-thermal CCL see the real metal connectivity, so gate/riser-fed part
+    pockets are not reported as isolated hot spots.
     """
     try:
         part_grid, part_origin, part_dx, _ = build_part_grid(
@@ -1313,14 +1327,17 @@ def _high_res_part_hotspots(
         return None
 
     part_mask = part_grid == BodyType.PART
-    part_is_metal = np.isin(part_grid, [int(BodyType.PART)])
+    part_is_metal = np.isin(part_grid, [int(t) for t in BODY_METAL_TYPES])
     if not part_mask.any() or part_is_metal.sum() < 1000:
         return None
 
     if progress_callback:
         progress_callback(83)
 
-    # SDF and curvature on the part-only high-res grid (sub=1 to avoid 8x blowup).
+    # SDF and curvature on the casting-metal high-res grid (sub=1 to avoid 8x blowup).
+    # Using the union of part + gating/riser for the SDF means a thin part region
+    # that is directly attached to a thick runner/riser gets a larger effective
+    # modulus and stays connected longer during the pseudo-thermal CCL.
     part_sdf = compute_subvoxel_sdf(part_is_metal, part_dx, sub=1)
     mean_curv, _ = compute_curvature(part_sdf, part_dx)
     shape_factor_field = np.clip(
@@ -1328,23 +1345,29 @@ def _high_res_part_hotspots(
     )
     part_M_mod = part_sdf / shape_factor_field
 
-    # Resample coarse feeder_mask onto the part grid (nearest neighbour).
-    idx = np.indices(part_grid.shape, dtype=np.float64)
-    coarse_coords = (
-        part_origin[:, None, None, None]
-        + idx * part_dx
-        - origin_mm[:, None, None, None]
-    ) / coarse_dx
-    part_feeder_mask = (
-        ndimage.map_coordinates(
-            feeder_mask.astype(np.float32),
-            coarse_coords,
-            order=0,
-            mode="constant",
-            cval=0.0,
+    # Derive feeder mask directly from the high-res grid.  Only dedicated
+    # RISER bodies are true feeders; gates/runners/sprues are not.
+    part_feeder_mask = part_grid == BodyType.RISER
+
+    # Merge with the resampled coarse feeder mask as a safety net.
+    if feeder_mask is not None and feeder_mask.size:
+        idx = np.indices(part_grid.shape, dtype=np.float64)
+        coarse_coords = (
+            part_origin[:, None, None, None]
+            + idx * part_dx
+            - origin_mm[:, None, None, None]
+        ) / coarse_dx
+        coarse_resampled = (
+            ndimage.map_coordinates(
+                feeder_mask.astype(np.float32),
+                coarse_coords,
+                order=0,
+                mode="constant",
+                cval=0.0,
+            )
+            > 0.5
         )
-        > 0.5
-    )
+        part_feeder_mask = part_feeder_mask | coarse_resampled
 
     # Guard against a completely missing feeder: in that case the CCL cannot mark
     # anything as fed and every liquid pocket becomes isolated, which is fine.
@@ -1445,13 +1468,14 @@ def analyze(
     )
     part_volume_mm3 = float(part_mask.sum()) * dx ** 3
 
-    # v8.2: If there is no separate riser, use the gating system (sprue/runner/ingate)
-    # as the feeding source for distance/path calculations.
+    # Only dedicated risers are true feeding sources during solidification.
+    # Gating (sprue/runner/ingate) supplies metal during filling but is not a
+    # feeder; if no riser exists, the part is effectively un-fed.
     if riser_mask.any():
         feeder_mask = riser_mask
         no_riser = False
     else:
-        feeder_mask = np.isin(grid, BODY_FEEDER_TYPES)
+        feeder_mask = np.zeros_like(riser_mask)
         no_riser = True
 
     # AŞAMA 2: SDF (sub-voxel) + histogram + curvature + shape factor
@@ -1569,11 +1593,13 @@ def analyze(
             return (int(v[0]), int(v[1]), int(v[2]))
         return tuple(int(x) for x in nearest_part_vox[:, v[0], v[1], v[2]])
 
-    # v8.7: part voxels immediately adjacent to a feeder are fed by that feeder
+    # v8.7: part voxels within the feeder's feeding distance are fed by that feeder
     # and should not be reported as part hot spots (e.g., directly under a riser).
+    # Feeding distance FD = feed_k1 * t_section = feed_k1 * 2 * M_feeder.
     if feeder_mask.any():
         max_feeder_m = float(M_mod[feeder_mask & (M_mod > 0)].max()) if (feeder_mask & (M_mod > 0)).any() else 0.0
-        influence_mm = max(2.0 * dx, 0.3 * max_feeder_m, 2.0)
+        feeder_fd_mm = alloy.feed_k1 * 2.0 * max_feeder_m
+        influence_mm = max(2.0 * dx, feeder_fd_mm, 2.0)
         influence_vox = int(np.ceil(influence_mm / dx))
         dilated_feeder = ndimage.binary_dilation(feeder_mask, iterations=influence_vox)
         fed_zone = dilated_feeder & part_mask

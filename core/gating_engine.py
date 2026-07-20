@@ -34,6 +34,7 @@ from core.gating_calculator import (
     calc_campbell_parameters,
     effective_head,
 )
+from core.materials import get_alloy
 
 
 @dataclass
@@ -634,15 +635,26 @@ def _compute_n_gates(
     n_hot = max(1, (inp.hotspot_count + 1) // 2)
     n_geom = 2 if features["thickness_var"] > 3.0 else 1
 
-    n_gates = max(n_flow, n_hot, n_geom)
+    # Feeding-distance based spacing: gates should be close enough that the
+    # largest known hot spot can be fed from one of them. FD = feed_k1 * 2 * M_hot.
+    n_feed = 1
+    feed_distance_mm = 0.0
+    if inp.max_hotspot_m_mm > 0.0:
+        alloy = get_alloy(inp.alloy_key)
+        feed_distance_mm = alloy.feed_k1 * 2.0 * inp.max_hotspot_m_mm
+        n_feed = int(math.ceil(max_path / max(0.7 * feed_distance_mm, 1.0)))
+
+    n_gates = max(n_flow, n_hot, n_geom, n_feed)
 
     # Long unpressurized paths need more gates to avoid premature freezing
     if "basınçsız" in system and flow_ratio > 0.8:
         n_gates = max(n_gates, int(math.ceil(max_path / (0.55 * LF_mm))))
 
     n_gates = int(np.clip(n_gates, 1, max(1, inp.max_gates)))
+    fd_str = f"besleme mesafesi {feed_distance_mm:.0f} mm, " if feed_distance_mm > 0.0 else ""
     reason = (
         f"Akış yolu {max_path:.0f} mm / akışkanlık {LF_mm:.0f} mm, "
+        f"{fd_str}"
         f"{inp.hotspot_count} hot-spot, kalınlık varyasyonu={features['thickness_var']:.2f}."
     )
     return n_gates, reason

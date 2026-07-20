@@ -7,7 +7,7 @@ import numpy as np
 import trimesh
 from scipy import ndimage
 
-from core.types import Body, BodyType
+from core.types import Body, BodyType, BODY_METAL_TYPES
 
 BASE_RES = 160
 MAX_RES = 2040
@@ -368,17 +368,43 @@ def build_part_grid(
     max_dim: int = 600,
     margin_vox: int = 4,
 ) -> Tuple[np.ndarray, np.ndarray, float, List[Body]]:
-    """Build a high-resolution voxel grid containing only the PART bodies.
+    """Build a high-resolution voxel grid containing the PART and connected
+    casting-metal bodies (risers, runners, gates, sprues, pouring basin).
 
     The grid resolution is chosen so that the total number of voxels is close to
-    ``target_voxels`` while respecting the part's aspect ratio.  A small margin is
-    added around the part to avoid boundary clipping.
+    ``target_voxels`` while respecting the part's aspect ratio.  Including the
+    gating/riser geometry is essential for accurate hot-spot connectivity and
+    feeding-distance calculations at high resolution.
     """
     part_bodies = [b for b in bodies if b.body_type == BodyType.PART]
     if not part_bodies:
         return build_voxel_grid(bodies, target_dim=BASE_RES)
 
-    bbox_min, bbox_max = _global_bbox(part_bodies)
+    # Use the part bbox to anchor the resolution, then include nearby casting
+    # metal bodies so that sprue/runner/riser thermal mass and connectivity
+    # are visible to the high-resolution hotspot detector.
+    part_bbox_min, part_bbox_max = _global_bbox(part_bodies)
+    part_size = part_bbox_max - part_bbox_min
+    part_max_size = float(part_size.max())
+    if part_max_size <= 0.0:
+        return build_voxel_grid(bodies, target_dim=BASE_RES)
+
+    # Keep casting-metal bodies within one part-size of the part bbox.  This
+    # preserves the fine part resolution while still capturing connected gating.
+    padding = part_max_size
+    padded_min = part_bbox_min - padding
+    padded_max = part_bbox_max + padding
+    casting_bodies = [b for b in bodies if b.body_type in BODY_METAL_TYPES]
+    nearby_casting = [
+        b
+        for b in casting_bodies
+        if _bboxes_overlap_or_close(
+            padded_min, padded_max, b.mesh.bounds[0], b.mesh.bounds[1], tol=0.0
+        )
+    ]
+    all_bodies = part_bodies + [b for b in nearby_casting if b not in part_bodies]
+
+    bbox_min, bbox_max = _global_bbox(all_bodies)
     size = bbox_max - bbox_min
     max_size = float(size.max())
     if max_size <= 0.0:
@@ -399,5 +425,4 @@ def build_part_grid(
         part_dim = int(round(max_size / 0.05))
         part_dim = max(60, min(part_dim, max_dim))
 
-    # build_voxel_grid adds its own margin; pass only part bodies so the bbox is tight.
-    return build_voxel_grid(part_bodies, target_dim=part_dim, progress_callback=None)
+    return build_voxel_grid(all_bodies, target_dim=part_dim, progress_callback=None)

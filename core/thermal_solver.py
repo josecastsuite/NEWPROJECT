@@ -16,6 +16,7 @@ from scipy import ndimage, sparse
 from scipy.sparse import linalg as spla
 
 from core.materials import Alloy, MoldMaterial
+from core.types import BODY_METAL_TYPES
 
 
 def _scheil_fs(
@@ -170,9 +171,9 @@ def solve_3d_thermal(
     nx, ny, nz = grid_c.shape
     n = nx * ny * nz
 
-    # Casting metal: part + riser + ingate + runner + sprue + pouring basin.
-    # Chill (cooling sprue) and filter are NOT liquid metal and are handled below.
-    casting_metal_ids = [1, 3, 5, 6, 7, 15]
+    # Casting metal: all liquid-metal body types (PART, RISER, INGATE, RUNNER,
+    # SPRUE, SPRUE_THROAT, POURING_BASIN). Chill/filter are excluded.
+    casting_metal_ids = [int(t) for t in BODY_METAL_TYPES]
     is_metal_c = np.isin(grid_c, casting_metal_ids)
     chill_mask_3d = grid_c == 11  # COOLING_SPRUE
 
@@ -297,7 +298,7 @@ def solve_3d_thermal(
     R_fine = _upsample(R_at_ts, fine_shape)
     niyama_fine = _upsample(niyama_c, fine_shape)
 
-    is_metal_fine = np.isin(grid, [1, 3, 5, 6, 7])
+    is_metal_fine = np.isin(grid, casting_metal_ids)
     for arr in (niyama_fine, G_fine, R_fine, t_liq_fine, t_sol_fine, fs_fine):
         arr[:] = np.where(is_metal_fine, arr, 0.0)
 
