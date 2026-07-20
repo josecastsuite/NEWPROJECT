@@ -465,7 +465,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.porosity_noise_slider.setMinimum(1)    # 0.01%
         self.porosity_noise_slider.setMaximum(300)  # 3.00%
         self.porosity_noise_slider.setValue(300)    # default 3.00%
-        self.porosity_noise_slider.setToolTip("Porozite gürültü filtresi: sadece üst %X göster")
+        self.porosity_noise_slider.setToolTip("Porozite gürültü filtresi: tek slider, ama Makro/Mikro daha geniş, İnce daha dar gösterir")
         self.porosity_noise_slider.valueChanged.connect(self.on_porosity_noise_changed)
         self.porosity_noise_label = QtWidgets.QLabel("Filtre: %3.00")
         vis_layout.addWidget(self.porosity_noise_label)

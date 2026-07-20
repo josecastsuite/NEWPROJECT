@@ -324,7 +324,17 @@ class Analyzer3DViewer(QtInteractor):
         finite_values = values[finite]
         finite_max = float(np.max(finite_values))
         # Noise filter: keep only the top noise_percent% of the displayed scalar.
-        p = max(0.0, min(100.0 - noise_percent, 100.0))
+        # One slider drives all classes, but macro/micro are rare and important,
+        # so they get a wider percentile (more visible) while fine pores stay sparse.
+        if pore_size_filter == "macro":
+            effective_noise = min(50.0, noise_percent * 6.0)
+        elif pore_size_filter == "micro":
+            effective_noise = min(30.0, noise_percent * 4.0)
+        elif pore_size_filter == "fine":
+            effective_noise = max(0.01, noise_percent / 3.0)
+        else:
+            effective_noise = noise_percent
+        p = max(0.0, min(100.0 - effective_noise, 100.0))
         lo = float(np.percentile(finite_values, p))
         # Physical floor: avoid showing huge numbers of tiny baseline pores.
         if scalar_name == "pore_size_um":
