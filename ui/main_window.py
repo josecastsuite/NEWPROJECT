@@ -92,6 +92,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._body_section_buttons: Dict[str, QtWidgets.QPushButton] = {}
         self._body_feeder_buttons: Dict[str, QtWidgets.QPushButton] = {}
         self._body_feeder_labels: Dict[str, QtWidgets.QLabel] = {}
+        self._body_action_widgets: Dict[str, QtWidgets.QWidget] = {}
+        self._body_items: Dict[str, QtWidgets.QListWidgetItem] = {}
 
         self._build_ui()
         self._apply_dark_theme()
@@ -641,38 +643,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def _add_body_row(self, body: Body):
         item = QtWidgets.QListWidgetItem()
         widget = QtWidgets.QWidget()
-        row = QtWidgets.QHBoxLayout(widget)
-        row.setContentsMargins(4, 2, 4, 2)
+        vbox = QtWidgets.QVBoxLayout(widget)
+        vbox.setContentsMargins(4, 2, 4, 2)
+        vbox.setSpacing(2)
 
+        top = QtWidgets.QHBoxLayout()
+        top.setSpacing(4)
         label = QtWidgets.QLabel(f"{body.name} ({body.volume_cm3:.2f} cm³)")
         label.setToolTip(f"Merkez: {body.center}")
-        row.addWidget(label, stretch=1)
-
-        # Gating section button + area label
-        section_btn = QtWidgets.QPushButton("Kesit")
-        section_btn.setToolTip("Bu body'nin gating kesit alanını seç (sadece yolluk/meme/döküm ağzı)")
-        section_btn.clicked.connect(lambda _, b=body: self.on_body_section(b))
-        row.addWidget(section_btn)
-        self._body_section_buttons[body.name] = section_btn
-
-        area_label = QtWidgets.QLabel("A = ---")
-        area_label.setStyleSheet("color: #888888; font-size: 11px;")
-        area_label.setToolTip("Seçilen kesit alanı cm²")
-        row.addWidget(area_label)
-        self._body_section_labels[body.name] = area_label
-
-        # Feeder type button + summary label
-        feeder_btn = QtWidgets.QPushButton("Besleyici")
-        feeder_btn.setToolTip("Bu besleyicinin tipini ve opsiyonel modülünü ayarla")
-        feeder_btn.clicked.connect(lambda _, b=body: self.on_body_feeder(b))
-        row.addWidget(feeder_btn)
-        self._body_feeder_buttons[body.name] = feeder_btn
-
-        feeder_label = QtWidgets.QLabel("")
-        feeder_label.setStyleSheet("color: #888888; font-size: 11px;")
-        feeder_label.setToolTip("Seçilen besleyici tipi ve modül")
-        row.addWidget(feeder_label)
-        self._body_feeder_labels[body.name] = feeder_label
+        top.addWidget(label, stretch=1)
 
         combo = QtWidgets.QComboBox()
         for bt in (
@@ -692,14 +671,51 @@ class MainWindow(QtWidgets.QMainWindow):
         combo.currentIndexChanged.connect(
             lambda _, b=body, c=combo: self.on_body_type_changed(b, c)
         )
-        row.addWidget(combo)
+        top.addWidget(combo)
+        vbox.addLayout(top)
 
-        item.setSizeHint(widget.sizeHint())
+        # Second row: Kesit (gating) OR Besleyici (riser) controls
+        action_widget = QtWidgets.QWidget()
+        action_row = QtWidgets.QHBoxLayout(action_widget)
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(4)
+
+        section_btn = QtWidgets.QPushButton("Kesit")
+        section_btn.setToolTip("Bu body'nin gating kesit alanını seç (sadece yolluk/meme/döküm ağzı)")
+        section_btn.clicked.connect(lambda _, b=body: self.on_body_section(b))
+        action_row.addWidget(section_btn)
+        self._body_section_buttons[body.name] = section_btn
+
+        area_label = QtWidgets.QLabel("A = ---")
+        area_label.setStyleSheet("color: #888888; font-size: 11px;")
+        area_label.setToolTip("Seçilen kesit alanı cm²")
+        action_row.addWidget(area_label)
+        self._body_section_labels[body.name] = area_label
+
+        feeder_btn = QtWidgets.QPushButton("Besleyici")
+        feeder_btn.setToolTip("Bu besleyicinin tipini ve opsiyonel modülünü ayarla")
+        feeder_btn.clicked.connect(lambda _, b=body: self.on_body_feeder(b))
+        action_row.addWidget(feeder_btn)
+        self._body_feeder_buttons[body.name] = feeder_btn
+
+        feeder_label = QtWidgets.QLabel("")
+        feeder_label.setStyleSheet("color: #888888; font-size: 11px;")
+        feeder_label.setToolTip("Seçilen besleyici tipi ve modül")
+        action_row.addWidget(feeder_label)
+        self._body_feeder_labels[body.name] = feeder_label
+
+        action_row.addStretch()
+        vbox.addWidget(action_widget)
+
+        self._body_action_widgets[body.name] = action_widget
+        self._body_items[body.name] = item
+
         self.body_list.addItem(item)
         self.body_list.setItemWidget(item, widget)
         self._update_body_row_visibility(body)
         self._update_body_section_label(body.name)
         self._update_body_feeder_label(body.name)
+        item.setSizeHint(widget.sizeHint())
 
     def on_load_step(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -733,6 +749,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._body_section_buttons.clear()
             self._body_feeder_buttons.clear()
             self._body_feeder_labels.clear()
+            self._body_action_widgets.clear()
+            self._body_items.clear()
             self._clear_checklist()
             self.rec_text.clear()
             self._grid = None
@@ -848,6 +866,18 @@ class MainWindow(QtWidgets.QMainWindow):
             feeder_btn.setVisible(is_riser)
         if feeder_lbl is not None:
             feeder_lbl.setVisible(is_riser)
+
+        action_widget = self._body_action_widgets.get(body.name)
+        if action_widget is not None:
+            action_widget.setVisible(is_gating or is_riser)
+
+        item = self._body_items.get(body.name)
+        if item is not None and item.listWidget() is not None:
+            # Force a relayout so the item height matches the visible widgets.
+            widget = item.listWidget().itemWidget(item)
+            if widget is not None:
+                item.setSizeHint(widget.sizeHint())
+                widget.adjustSize()
 
     def _update_body_feeder_label(self, body_name: str):
         label = self._body_feeder_labels.get(body_name)
