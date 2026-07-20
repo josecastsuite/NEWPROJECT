@@ -78,8 +78,9 @@ class SectionDialog(QtWidgets.QDialog):
         )
         self.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
         self.body = body
-        self.section_key = section_key or self._default_key_for(body)
+        self.section_key = section_key or body.section_key or self._default_key_for(body)
         self.area_cm2: Optional[float] = None
+        self.initial_area_cm2: Optional[float] = body.section_area_cm2 if body.section_area_cm2 and body.section_area_cm2 > 0 else None
 
         self._build_ui()
         self._compute_candidates()
@@ -223,6 +224,8 @@ class SectionDialog(QtWidgets.QDialog):
         if self.char_area is None:
             self.manual_radio.setChecked(True)
 
+        self._restore_selection()
+
     def _set_radio_text(self, radio: QtWidgets.QRadioButton, label: str, value: Optional[float]):
         if value is not None and value > 0:
             d_mm = np.sqrt(4.0 * value * 100.0 / np.pi)
@@ -232,6 +235,30 @@ class SectionDialog(QtWidgets.QDialog):
         else:
             radio.setText(f"{label}: hesaplanamadı")
             radio.setEnabled(False)
+
+    def _restore_selection(self):
+        """Pre-select the radio that matches the previously stored area, if any."""
+        if self.initial_area_cm2 is None:
+            if self.char_area is not None and self.char_area > 0:
+                self.char_radio.setChecked(True)
+            else:
+                self.manual_radio.setChecked(True)
+            return
+
+        stored = float(self.initial_area_cm2)
+        candidates = [
+            (self.char_radio, self.char_area),
+            (self.x_radio, self.x_area),
+            (self.y_radio, self.y_area),
+            (self.z_radio, self.z_area),
+        ]
+        for radio, value in candidates:
+            if value is not None and value > 0 and abs(value - stored) <= 1e-4:
+                radio.setChecked(True)
+                return
+        # No candidate matched: it must have been a manual value.
+        self.manual_radio.setChecked(True)
+        self.manual_spin.setValue(stored)
 
     def _on_ok(self):
         if self.char_radio.isChecked():

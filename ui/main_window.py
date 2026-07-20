@@ -813,7 +813,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Lütfen önce body tipini değiştirin."
             )
             return
-        default_key = self._section_key_for_body(bt)
+        default_key = body.section_key or self._section_key_for_body(bt)
         try:
             dialog = SectionDialog(body, section_key=default_key, parent=self)
         except Exception as e:
