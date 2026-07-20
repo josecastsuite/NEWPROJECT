@@ -93,6 +93,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._body_feeder_buttons: Dict[str, QtWidgets.QPushButton] = {}
         self._body_feeder_labels: Dict[str, QtWidgets.QLabel] = {}
         self._body_items: Dict[str, QtWidgets.QListWidgetItem] = {}
+        self._body_action_stacks: Dict[str, QtWidgets.QStackedWidget] = {}
 
         self._build_ui()
         self._apply_dark_theme()
@@ -653,16 +654,33 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         label.setStyleSheet("font-size: 11px;")
         label.setMaximumWidth(90)
+        label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
+        )
         row.addWidget(label)
 
-        # Gating section controls
+        # Stacked action area: one of empty / Kesit / Besleyici.
+        # Using a QStackedWidget avoids setVisible toggling in the same layout,
+        # which can fail to update the QListWidget item geometry on Windows/DPI changes.
+        action_stack = QtWidgets.QStackedWidget()
+        action_stack.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
+        )
+
+        empty_page = QtWidgets.QWidget()
+
+        # Gating page: Kesit + area label
+        gating_page = QtWidgets.QWidget()
+        gating_layout = QtWidgets.QHBoxLayout(gating_page)
+        gating_layout.setContentsMargins(0, 0, 0, 0)
+        gating_layout.setSpacing(4)
         section_btn = QtWidgets.QPushButton("Kesit")
         section_btn.setToolTip("Bu body'nin gating kesit alanını seç (sadece yolluk/meme/döküm ağzı)")
         section_btn.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
         )
         section_btn.clicked.connect(lambda _, b=body: self.on_body_section(b))
-        row.addWidget(section_btn)
+        gating_layout.addWidget(section_btn)
         self._body_section_buttons[body.name] = section_btn
 
         area_label = QtWidgets.QLabel("A=---")
@@ -672,17 +690,21 @@ class MainWindow(QtWidgets.QMainWindow):
         area_label.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
         )
-        row.addWidget(area_label)
+        gating_layout.addWidget(area_label)
         self._body_section_labels[body.name] = area_label
 
-        # Feeder type controls
+        # Feeder page: Besleyici + feeder label
+        feeder_page = QtWidgets.QWidget()
+        feeder_layout = QtWidgets.QHBoxLayout(feeder_page)
+        feeder_layout.setContentsMargins(0, 0, 0, 0)
+        feeder_layout.setSpacing(4)
         feeder_btn = QtWidgets.QPushButton("Besleyici")
         feeder_btn.setToolTip("Bu besleyicinin tipini ve opsiyonel modülünü ayarla")
         feeder_btn.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
         )
         feeder_btn.clicked.connect(lambda _, b=body: self.on_body_feeder(b))
-        row.addWidget(feeder_btn)
+        feeder_layout.addWidget(feeder_btn)
         self._body_feeder_buttons[body.name] = feeder_btn
 
         feeder_label = QtWidgets.QLabel("")
@@ -692,8 +714,14 @@ class MainWindow(QtWidgets.QMainWindow):
         feeder_label.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
         )
-        row.addWidget(feeder_label)
+        feeder_layout.addWidget(feeder_label)
         self._body_feeder_labels[body.name] = feeder_label
+
+        action_stack.addWidget(empty_page)
+        action_stack.addWidget(gating_page)
+        action_stack.addWidget(feeder_page)
+        row.addWidget(action_stack)
+        self._body_action_stacks[body.name] = action_stack
 
         combo = QtWidgets.QComboBox()
         combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
@@ -762,6 +790,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._body_feeder_buttons.clear()
             self._body_feeder_labels.clear()
             self._body_items.clear()
+            self._body_action_stacks.clear()
             self._clear_checklist()
             self.rec_text.clear()
             self._grid = None
@@ -864,19 +893,17 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         is_riser = body.body_type == BodyType.RISER
 
-        section_btn = self._body_section_buttons.get(body.name)
-        section_lbl = self._body_section_labels.get(body.name)
-        feeder_btn = self._body_feeder_buttons.get(body.name)
-        feeder_lbl = self._body_feeder_labels.get(body.name)
-
-        if section_btn is not None:
-            section_btn.setVisible(is_gating)
-        if section_lbl is not None:
-            section_lbl.setVisible(is_gating)
-        if feeder_btn is not None:
-            feeder_btn.setVisible(is_riser)
-        if feeder_lbl is not None:
-            feeder_lbl.setVisible(is_riser)
+        stack = self._body_action_stacks.get(body.name)
+        if stack is not None:
+            if is_gating:
+                stack.setCurrentIndex(1)
+                stack.setVisible(True)
+            elif is_riser:
+                stack.setCurrentIndex(2)
+                stack.setVisible(True)
+            else:
+                stack.setCurrentIndex(0)
+                stack.setVisible(False)
 
         item = self._body_items.get(body.name)
         if item is not None and item.listWidget() is not None:
