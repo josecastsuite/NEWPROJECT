@@ -1642,24 +1642,6 @@ def analyze(
             return (int(v[0]), int(v[1]), int(v[2]))
         return tuple(int(x) for x in nearest_part_vox[:, v[0], v[1], v[2]])
 
-    # v8.7: part voxels within the feeder's feeding distance are fed by that feeder
-    # and should not be reported as part hot spots (e.g., directly under a riser).
-    # Feeding distance FD = feed_k1 * t_section = feed_k1 * 2 * M_feeder.
-    if feeder_mask.any():
-        max_feeder_m = float(M_mod[feeder_mask & (M_mod > 0)].max()) if (feeder_mask & (M_mod > 0)).any() else 0.0
-        feeder_fd_mm = alloy.feed_k1 * 2.0 * max_feeder_m
-        influence_mm = max(2.0 * dx, feeder_fd_mm, 2.0)
-        influence_vox = int(np.ceil(influence_mm / dx))
-        dilated_feeder = ndimage.binary_dilation(feeder_mask, iterations=influence_vox)
-        fed_zone = dilated_feeder & part_mask
-        filtered_hotspots: List[HotSpot] = []
-        for hs in hotspots:
-            vox_raw = np.round((hs.position_mm - origin_mm) / dx).astype(int)
-            vox = _snap_to_part(vox_raw)
-            if not fed_zone[vox[0], vox[1], vox[2]]:
-                filtered_hotspots.append(hs)
-        hotspots = filtered_hotspots
-
     # AŞAMA 7: Hot-spot physics
     feeder_voxels = np.argwhere(feeder_mask)
 
