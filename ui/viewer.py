@@ -324,12 +324,12 @@ class Analyzer3DViewer(QtInteractor):
         finite_values = values[finite]
         finite_max = float(np.max(finite_values))
         # Noise filter: keep only the top noise_percent% of the displayed scalar.
-        # One slider drives all classes, but macro/micro are rare and important,
-        # so they get a wider percentile (more visible) while fine pores stay sparse.
+        # One slider drives all classes. Macro/micro are rare and critical, so they
+        # are shown with a much wider percentile; fine pores stay sparse.
         if pore_size_filter == "macro":
-            effective_noise = min(50.0, noise_percent * 6.0)
+            effective_noise = min(80.0, noise_percent * 26.67)
         elif pore_size_filter == "micro":
-            effective_noise = min(30.0, noise_percent * 4.0)
+            effective_noise = min(60.0, noise_percent * 20.0)
         elif pore_size_filter == "fine":
             effective_noise = max(0.01, noise_percent / 3.0)
         else:
