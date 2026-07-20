@@ -391,6 +391,22 @@ def _pore_size_class(pore_size_um: float, macro_threshold_um: float = 1000.0, mi
     return ""
 
 
+def pore_size_threshold_um(pore_size_um: np.ndarray, noise_percent: float = 3.0) -> float:
+    """Return the value above which only the top ``noise_percent``% of positive pore sizes lie.
+
+    Values below this threshold are treated as numerical/physical noise and hidden by default.
+    """
+    positive = np.asarray(pore_size_um[pore_size_um > 0.0], dtype=np.float64)
+    if len(positive) == 0:
+        return 0.0
+    if noise_percent <= 0.0:
+        return 0.0
+    if noise_percent >= 100.0:
+        return float(np.max(positive)) + 1.0
+    p = 100.0 - noise_percent
+    return float(np.percentile(positive, p))
+
+
 def _sdf_histogram(sdf: np.ndarray, mask: np.ndarray, bins: int = 50):
     """Histogram and dominant interior modulus."""
     vals = sdf[mask]
@@ -1678,6 +1694,9 @@ def analyze(
     pore_size_um, pore_size_mm, pore_macro_mask, pore_micro_mask, pore_fine_mask = compute_pore_size(
         niyama, M_mod, feed_risk, alloy, part_mask
     )
+    # v8.9: by default display only the top 3% of computed pore sizes to suppress noise.
+    pore_noise_percent = 3.0
+    pore_threshold_um = pore_size_threshold_um(pore_size_um, pore_noise_percent)
 
     # Assign pore-size estimate to each hot spot.
     for hs in hotspots:
@@ -1758,6 +1777,8 @@ def analyze(
         pore_size_macro_mask=pore_macro_mask,
         pore_size_micro_mask=pore_micro_mask,
         pore_size_fine_mask=pore_fine_mask,
+        pore_size_noise_percent=pore_noise_percent,
+        pore_size_threshold_um=pore_threshold_um,
     )
 
     result.riser_proposals = propose_risers(result, alloy, existing_riser_count=len(riser_results))

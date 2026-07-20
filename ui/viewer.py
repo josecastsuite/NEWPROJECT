@@ -257,16 +257,15 @@ class Analyzer3DViewer(QtInteractor):
     def show_porosity_cloud(
         self,
         result: Optional[AnalysisResult],
-        percentile: float = 95.0,
-        max_points: int = 1500,
+        noise_percent: float = 3.0,
+        max_points: int = 5000,
         pore_size_filter: Optional[str] = None,
     ):
         """Porosity point cloud colored by estimated pore size.
 
-        If ``pore_size_filter`` is ``None`` or ``all`` and the result contains
-        pore-size arrays, the cloud shows all cells with a positive pore size,
-        colored by size (µm).  Valid filters are ``macro``, ``micro`` and
-        ``fine``; each restricts the cloud to the matching pore-size mask.
+        Only the top ``noise_percent``% of the displayed scalar is rendered so
+        that numerical / physical noise is suppressed.  ``pore_size_filter``
+        restricts the cloud to ``macro``, ``micro`` or ``fine`` classes.
         Falls back to the slowest-solidifying regions when pore-size data are
         not available.
         """
@@ -299,7 +298,6 @@ class Analyzer3DViewer(QtInteractor):
         if use_pore_size:
             field = pore_size_um
             scalar_name = "pore_size_um"
-            mask = class_mask
         else:
             # Fallback to the old behaviour if no pore-size field or no voxels.
             solid_time = np.asarray(result.solidification_time) if result.solidification_time is not None else np.array([])
@@ -312,22 +310,25 @@ class Analyzer3DViewer(QtInteractor):
                 scalar_name = "risk"
             else:
                 return
-            mask = part_mask
+            class_mask = part_mask
 
-        values = np.asarray(field[mask], dtype=np.float64)
-        finite = np.isfinite(values)
+        field = np.asarray(field, dtype=np.float64)
+        values = field[class_mask]
+        finite = np.isfinite(values) & (values > 0.0)
         if not finite.any():
             return
-        finite_max = float(np.max(values[finite]))
-        lo = float(np.percentile(values[finite], percentile))
-        if finite_max > 0.0:
-            inf_replace = finite_max * 1.5
-        else:
-            inf_replace = 1.0
-        clean_field = np.where(np.isfinite(field), field, inf_replace)
-        hi = float(np.max(clean_field[mask]))
+        finite_values = values[finite]
+        finite_max = float(np.max(finite_values))
+        # Noise filter: keep only the top noise_percent% of the displayed scalar.
+        p = max(0.0, min(100.0 - noise_percent, 100.0))
+        lo = float(np.percentile(finite_values, p))
+        hi = finite_max
         if hi <= lo:
             return
+
+        # Mask the field to the selected class so threshold only picks from there.
+        display_field = np.where(class_mask, field, 0.0)
+        clean_field = np.where(np.isfinite(display_field), display_field, hi * 1.5)
 
         grid = self._make_grid(result, clean_field, scalar_name)
         part = self._part_only(grid)
@@ -545,9 +546,9 @@ class Analyzer3DViewer(QtInteractor):
                 self.remove_actor(self._hotspot_label_actor)
                 self._hotspot_label_actor = None
 
-    def toggle_porosity(self, result: AnalysisResult, checked: bool, percentile: float = 95.0, max_points: int = 1500, pore_size_filter: Optional[str] = None):
+    def toggle_porosity(self, result: AnalysisResult, checked: bool, noise_percent: float = 3.0, max_points: int = 5000, pore_size_filter: Optional[str] = None):
         if checked:
-            self.show_porosity_cloud(result, percentile=percentile, max_points=max_points, pore_size_filter=pore_size_filter)
+            self.show_porosity_cloud(result, noise_percent=noise_percent, max_points=max_points, pore_size_filter=pore_size_filter)
         else:
             if self._porosity_actor is not None:
                 self.remove_actor(self._porosity_actor)

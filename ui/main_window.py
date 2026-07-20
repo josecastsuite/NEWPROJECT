@@ -461,13 +461,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.porosity_toggle.toggled.connect(self.on_toggle_porosity)
         vis_layout.addWidget(self.porosity_toggle)
 
-        self.porosity_detail_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.porosity_detail_slider.setMinimum(0)
-        self.porosity_detail_slider.setMaximum(100)
-        self.porosity_detail_slider.setValue(50)
-        self.porosity_detail_slider.setToolTip("Porozite bulutu detayı: 0 = az/sadece uç değerler, 100 = yoğun")
-        self.porosity_detail_slider.valueChanged.connect(self.on_porosity_detail_changed)
-        vis_layout.addWidget(self.porosity_detail_slider)
+        self.porosity_noise_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.porosity_noise_slider.setMinimum(1)    # 0.01%
+        self.porosity_noise_slider.setMaximum(300)  # 3.00%
+        self.porosity_noise_slider.setValue(300)    # default 3.00%
+        self.porosity_noise_slider.setToolTip("Porozite gürültü filtresi: sadece üst %X göster")
+        self.porosity_noise_slider.valueChanged.connect(self.on_porosity_noise_changed)
+        self.porosity_noise_label = QtWidgets.QLabel("Filtre: %3.00")
+        vis_layout.addWidget(self.porosity_noise_label)
+        vis_layout.addWidget(self.porosity_noise_slider)
 
         self.porosity_size_filter = QtWidgets.QComboBox()
         self.porosity_size_filter.addItem("Tüm poroziteler", "all")
@@ -1132,25 +1134,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_toggle_porosity(self, checked: bool):
         if self._analysis:
-            pct, mp, size_filter = self._porosity_cloud_params()
-            self.viewer.toggle_porosity(self._analysis, checked, percentile=pct, max_points=mp, pore_size_filter=size_filter)
+            noise, mp, size_filter = self._porosity_cloud_params()
+            self.viewer.toggle_porosity(self._analysis, checked, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
 
-    def on_porosity_detail_changed(self, value: int):
+    def on_porosity_noise_changed(self, value: int):
+        noise_percent = value / 100.0
+        self.porosity_noise_label.setText(f"Filtre: %{noise_percent:.2f}")
         if self._analysis and self.porosity_toggle.isChecked():
-            pct, mp, size_filter = self._porosity_cloud_params()
-            self.viewer.show_porosity_cloud(self._analysis, percentile=pct, max_points=mp, pore_size_filter=size_filter)
+            noise, mp, size_filter = self._porosity_cloud_params()
+            self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
 
     def on_porosity_size_filter_changed(self, index: int):
         if self._analysis and self.porosity_toggle.isChecked():
-            pct, mp, size_filter = self._porosity_cloud_params()
-            self.viewer.show_porosity_cloud(self._analysis, percentile=pct, max_points=mp, pore_size_filter=size_filter)
+            noise, mp, size_filter = self._porosity_cloud_params()
+            self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
 
     def _porosity_cloud_params(self) -> Tuple[float, int, str]:
-        detail = self.porosity_detail_slider.value() / 100.0
-        percentile = 99.5 - detail * 19.5  # 99.5 (az) .. 80.0 (yoğun)
-        max_points = int(500 + detail * 4500)  # 500 .. 5000 nokta
+        noise_percent = self.porosity_noise_slider.value() / 100.0  # 0.01 .. 3.00
+        max_points = 5000
         size_filter = str(self.porosity_size_filter.currentData() or "all")
-        return float(percentile), int(max_points), size_filter
+        return float(noise_percent), int(max_points), size_filter
 
     def on_toggle_niyama(self, checked: bool):
         if self._analysis:

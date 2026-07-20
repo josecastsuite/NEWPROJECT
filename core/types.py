@@ -336,5 +336,8 @@ class AnalysisResult:
     pore_size_macro_mask: np.ndarray = field(default_factory=lambda: np.array([]))
     pore_size_micro_mask: np.ndarray = field(default_factory=lambda: np.array([]))
     pore_size_fine_mask: np.ndarray = field(default_factory=lambda: np.array([]))
+    # v8.9: default noise filter (top % of computed porosity to display)
+    pore_size_noise_percent: float = 3.0
+    pore_size_threshold_um: float = 0.0
     # metadata
     bbox_size_mm: np.ndarray = field(default_factory=lambda: np.zeros(3))

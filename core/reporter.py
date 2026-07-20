@@ -21,29 +21,43 @@ def _html_escape(text: str) -> str:
 
 
 def _format_pore_size_summary(result: AnalysisResult) -> str:
-    """Return an HTML table summarising estimated pore size distribution."""
+    """Return an HTML table summarising estimated pore size distribution.
+
+    Only the top ``pore_size_noise_percent``% of computed porosity voxels are
+    shown; the rest is treated as numerical/physical noise.
+    """
     ps = result.pore_size_um
     if ps is None or ps.size == 0:
         return "<p>Gözenek boyutu hesabı mevcut değil.</p>"
-    pm = result.pore_size_macro_mask
-    pmi = result.pore_size_micro_mask
-    pf = result.pore_size_fine_mask
-    macro_vox = int(pm.sum()) if pm is not None and pm.size else 0
-    micro_vox = int(pmi.sum()) if pmi is not None and pmi.size else 0
-    fine_vox = int(pf.sum()) if pf is not None and pf.size else 0
+    ps = np.asarray(ps, dtype=np.float64)
+    threshold = float(result.pore_size_threshold_um)
+    if threshold <= 0.0:
+        # fallback: if no stored threshold, keep top 3%
+        from core.sdf_analyzer import pore_size_threshold_um
+        threshold = pore_size_threshold_um(ps, 3.0)
+    active = np.isfinite(ps) & (ps >= threshold)
+    if not active.any():
+        return f"<p>Filtre eşiği {threshold:.2f} µm üzerinde tahmini gözenek yok (gürültü engellendi).</p>"
+
+    pm = result.pore_size_macro_mask & active
+    pmi = result.pore_size_micro_mask & active
+    pf = result.pore_size_fine_mask & active
+    macro_vox = int(pm.sum())
+    micro_vox = int(pmi.sum())
+    fine_vox = int(pf.sum())
     total = macro_vox + micro_vox + fine_vox
     if total == 0:
         return "<p>Tahmini gözenek tespit edilmedi.</p>"
 
-    ps = np.asarray(ps, dtype=np.float64)
-    macro_vals = ps[pm & np.isfinite(ps) & (ps > 0)] if pm is not None and pm.size else np.array([])
-    micro_vals = ps[pmi & np.isfinite(ps) & (ps > 0)] if pmi is not None and pmi.size else np.array([])
-    fine_vals = ps[pf & np.isfinite(ps) & (ps > 0)] if pf is not None and pf.size else np.array([])
+    macro_vals = ps[pm]
+    micro_vals = ps[pmi]
+    fine_vals = ps[pf]
 
     def _max(a: np.ndarray) -> float:
         return float(np.max(a)) if len(a) else 0.0
 
-    return f"""<table>
+    return f"""<p>Filtre: üst %{result.pore_size_noise_percent:.2f} gösteriliyor (eşik = {threshold:.2f} µm).</p>
+    <table>
         <tr><th>Sınıf</th><th>Voxel sayısı</th><th>Oran</th><th>Max gözenek (µm)</th></tr>
         <tr><td>Makro (&gt;1000 µm)</td><td>{macro_vox}</td><td>{100.0*macro_vox/total:.1f}%</td><td>{_max(macro_vals):.1f}</td></tr>
         <tr><td>Mikro (100–1000 µm)</td><td>{micro_vox}</td><td>{100.0*micro_vox/total:.1f}%</td><td>{_max(micro_vals):.1f}</td></tr>
@@ -58,7 +72,10 @@ def _format_hotspot_table(result: AnalysisResult) -> str:
             pos = ",".join(f"{v:.1f}" for v in hs.position_mm)
             status = "OK" if hs.feed_ok else "UZAK/DARALMA"
             niy = ", ".join(f"{k}={v:.3f}" for k, v in hs.niyama_variants.items())
-            pore = f"{hs.pore_size_um:.1f} µm ({hs.pore_size_class})" if hs.pore_size_class else "-"
+            if hs.pore_size_class and hs.pore_size_um >= result.pore_size_threshold_um:
+                pore = f"{hs.pore_size_um:.1f} µm ({hs.pore_size_class})"
+            else:
+                pore = "-"
             rows.append(
                 f"<tr>"
                 f"<td>{i}</td>"
@@ -452,18 +469,23 @@ def _generate_report_fpdf2(
     pdf.set_font(font, "", 10)
     ps = result.pore_size_um
     if ps is not None and ps.size:
-        pm = result.pore_size_macro_mask
-        pmi = result.pore_size_micro_mask
-        pf = result.pore_size_fine_mask
-        macro_vox = int(pm.sum()) if pm is not None and pm.size else 0
-        micro_vox = int(pmi.sum()) if pmi is not None and pmi.size else 0
-        fine_vox = int(pf.sum()) if pf is not None and pf.size else 0
-        total = macro_vox + micro_vox + fine_vox
+        threshold = float(result.pore_size_threshold_um)
+        if threshold <= 0.0:
+            from core.sdf_analyzer import pore_size_threshold_um
+            threshold = pore_size_threshold_um(ps, 3.0)
         ps_arr = np.asarray(ps, dtype=np.float64)
-        macro_max = float(np.max(ps_arr[pm & np.isfinite(ps_arr) & (ps_arr > 0)])) if (pm is not None and pm.size and macro_vox) else 0.0
-        micro_max = float(np.max(ps_arr[pmi & np.isfinite(ps_arr) & (ps_arr > 0)])) if (pmi is not None and pmi.size and micro_vox) else 0.0
-        fine_max = float(np.max(ps_arr[pf & np.isfinite(ps_arr) & (ps_arr > 0)])) if (pf is not None and pf.size and fine_vox) else 0.0
-        pdf.cell(0, 6, f"Makro (>1000 um): {macro_vox} vox (max {macro_max:.1f} um) | Mikro (100-1000 um): {micro_vox} vox (max {micro_max:.1f} um) | Ince (<100 um): {fine_vox} vox (max {fine_max:.1f} um)", ln=True)
+        active = np.isfinite(ps_arr) & (ps_arr >= threshold)
+        pm = result.pore_size_macro_mask & active
+        pmi = result.pore_size_micro_mask & active
+        pf = result.pore_size_fine_mask & active
+        macro_vox = int(pm.sum())
+        micro_vox = int(pmi.sum())
+        fine_vox = int(pf.sum())
+        total = macro_vox + micro_vox + fine_vox
+        macro_max = float(np.max(ps_arr[pm])) if macro_vox else 0.0
+        micro_max = float(np.max(ps_arr[pmi])) if micro_vox else 0.0
+        fine_max = float(np.max(ps_arr[pf])) if fine_vox else 0.0
+        pdf.cell(0, 6, f"Filtre: ust %{result.pore_size_noise_percent:.2f} (esik {threshold:.1f} um). Makro (>1000 um): {macro_vox} vox (max {macro_max:.1f} um) | Mikro (100-1000 um): {micro_vox} vox (max {micro_max:.1f} um) | Ince (<100 um): {fine_vox} vox (max {fine_max:.1f} um)", ln=True)
     else:
         pdf.cell(0, 6, "Gözenek boyutu hesabi mevcut degil.", ln=True)
     pdf.ln(4)
@@ -475,7 +497,9 @@ def _generate_report_fpdf2(
         for i, hs in enumerate(result.hotspots, 1):
             pos = ",".join(f"{v:.1f}" for v in hs.position_mm)
             status = "OK" if hs.feed_ok else "UZAK/DARALMA"
-            pore = f" | Gozenek={hs.pore_size_um:.1f} um ({hs.pore_size_class})" if hs.pore_size_class else ""
+            pore = ""
+            if hs.pore_size_class and hs.pore_size_um >= result.pore_size_threshold_um:
+                pore = f" | Gozenek={hs.pore_size_um:.1f} um ({hs.pore_size_class})"
             pdf.cell(0, 6, f"{i}. Konum=({pos}) mm | M={hs.m_value_mm:.2f} ± {hs.m_uncertainty_mm:.2f} mm | "
                            f"t={hs.t_section_mm:.2f} mm | Besleme={hs.dist_to_riser_mm:.1f}/{hs.max_feeding_distance_mm:.1f} mm | "
                            f"Niyama={hs.niyama_ensemble:.2f} | Darcy={hs.darcy_resistance:.2f} | Heuver={'OK' if hs.heuvers_ok else 'FAIL'} | {status}{pore}", ln=True)
