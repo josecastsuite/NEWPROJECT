@@ -917,8 +917,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.risk_toggle.isChecked():
                 self.viewer.show_risk(self._analysis)
             if self.porosity_toggle.isChecked():
-                pct, mp, size_filter = self._porosity_cloud_params()
-                self.viewer.show_porosity_cloud(self._analysis, percentile=pct, max_points=mp, pore_size_filter=size_filter)
+                noise, mp, size_filter = self._porosity_cloud_params()
+                self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
             if self.niyama_toggle.isChecked():
                 self.viewer.show_niyama_isosurfaces(self._analysis)
             if self.path_toggle.isChecked():
