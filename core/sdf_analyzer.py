@@ -1650,6 +1650,16 @@ def analyze(
     # AŞAMA 8: Riser sufficiency with resistance-corrected modulus transfer
     riser_results: List[RiserResult] = []
     labeled, num = ndimage.label(riser_mask)
+    # v9.1: per-voxel riser-size factor for effective feeding distance.
+    # ID 0 means "no riser" and keeps the default factor 1.0.
+    riser_factor_map = np.zeros(grid.shape, dtype=np.int32)
+    factor_by_id = [1.0]
+    g_unit = np.asarray(gravity_vector, dtype=np.float64)
+    g_norm = float(np.linalg.norm(g_unit))
+    if g_norm > 1e-12:
+        g_unit = g_unit / g_norm
+    else:
+        g_unit = np.array([0.0, 0.0, -1.0])
     for body in bodies:
         if body.body_type != BodyType.RISER:
             continue
@@ -1672,7 +1682,9 @@ def analyze(
         volume_cm3 = volume_mm3 / 1000.0
 
         dilated = ndimage.binary_dilation(component_mask, iterations=1)
-        surface_mask = dilated & ~component_mask
+        # Cooling surface must exclude contact with part/runner/gating metal;
+        # only faces exposed to the mould count for Chvorinov/modulus.
+        surface_mask = dilated & (grid == 0)
         surface_mm2 = float(surface_mask.sum()) * dx * dx
         m_riser = volume_mm3 / surface_mm2 if surface_mm2 > 0 else 0.0
 
@@ -1697,13 +1709,33 @@ def analyze(
         local_m_required = alloy.riser_m_factor * nearest_m
         global_m_required = alloy.riser_m_factor * m_cast_mm
         m_required = max(local_m_required, global_m_required)
-        riser_z_mm = float((riser_centroid_vox[2] * dx) + origin_mm[2])
-        dz = (riser_z_mm - nearest_pos[2]) if nearest_hs is not None else 0.0
+        # v9.1: use the actual gravity vector, not only Z.
+        riser_centroid_mm = riser_centroid_vox * dx + origin_mm
+        if nearest_hs is not None:
+            dz = float(np.dot(nearest_pos - riser_centroid_mm, g_unit))
+        else:
+            dz = 0.0
         gravity = max(0.85, 1.0 - 0.005 * max(0, -dz))
-        resistance_correction = alloy.modulus_resistance_mm * nearest_resistance
+        # v9.1: convert Darcy pressure drop (Pa) to an equivalent metal head (mm).
+        rho_g = max(alloy.rho_kg_m3 * 9.81, 1e-6)
+        resistance_correction = (nearest_resistance / rho_g) * 1000.0
         effective_m_required = m_required * gravity + resistance_correction
         # Allow 5% engineering tolerance.
         large_enough = m_riser >= 0.95 * effective_m_required if m_required > 0 else True
+
+        # v9.1: larger-than-required risers extend effective feeding distance;
+        # undersized ones shorten it.  Store a per-component factor.
+        if effective_m_required > 0.0 and m_riser > 0.0:
+            ratio = m_riser / effective_m_required
+            if large_enough:
+                size_factor = min(2.0, 1.0 + 0.5 * max(0.0, ratio - 1.0))
+            else:
+                size_factor = max(0.5, min(1.0, ratio))
+        else:
+            size_factor = 1.0
+        factor_id = len(factor_by_id)
+        factor_by_id.append(float(size_factor))
+        riser_factor_map[component_mask] = factor_id
 
         required_volume_cm3 = 0.0
         volume_ratio_ok = True
@@ -1750,11 +1782,16 @@ def analyze(
     if progress_callback:
         progress_callback(92)
 
+    # v9.1: propagate nearest-riser size factor to every voxel.
+    _, nearest_riser = ndimage.distance_transform_edt(riser_factor_map == 0, return_indices=True)
+    nearest_riser_id = riser_factor_map[tuple(nearest_riser)]
+    riser_factor_field = np.asarray(factor_by_id, dtype=np.float64)[nearest_riser_id]
+
     # AŞAMA 9: Risk map (Niyama risk scaled by feeding deficit)
     # A low-Niyama region is dangerous only if it cannot be fed.  If a riser/
     # gating source is close enough, the Niyama risk is strongly suppressed.
     with np.errstate(divide="ignore", invalid="ignore"):
-        FD_field = alloy.feed_k1 * (2.0 * M_mod)
+        FD_field = alloy.feed_k1 * (2.0 * M_mod) * riser_factor_field
         # feed_risk -> 0 at the feeder, -> 1 far beyond the feeding distance.
         feed_risk = dist_feed / (dist_feed + np.maximum(FD_field, 1.0))
         feed_risk = np.clip(np.nan_to_num(feed_risk, nan=1.0, posinf=1.0, neginf=1.0), 0.0, 1.0)
@@ -1779,7 +1816,8 @@ def analyze(
         pore_size_um, pore_noise_percent, micro_pore_limit_um=alloy.micro_pore_limit_um
     )
 
-    # Assign pore-size estimate to each hot spot.
+    # Assign pore-size estimate to each hot spot and re-evaluate feed_ok with
+    # the riser-size-modulated feeding distance.
     for hs in hotspots:
         vox_raw = np.round((hs.position_mm - origin_mm) / dx).astype(int)
         vox = _snap_to_part(vox_raw)
@@ -1791,6 +1829,18 @@ def analyze(
                 ps_um,
                 macro_threshold_um=alloy.macro_pore_limit_um,
                 micro_threshold_um=alloy.micro_pore_limit_um,
+            )
+            # v9.1: effective feeding distance depends on the nearest riser size.
+            factor = float(riser_factor_field[vox[0], vox[1], vox[2]])
+            hs.max_feeding_distance_mm = hs.max_feeding_distance_mm * factor
+            feed_cost_ok = hs.feeding_cost < 30.0
+            hs.feed_ok = (
+                (not np.isinf(hs.dist_to_riser_mm))
+                and (hs.dist_to_riser_mm <= hs.max_feeding_distance_mm)
+                and hs.directional_ok
+                and hs.heuvers_ok
+                and feed_cost_ok
+                and hs.darcy_ok
             )
 
     if progress_callback:
