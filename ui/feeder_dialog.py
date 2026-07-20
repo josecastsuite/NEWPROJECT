@@ -32,6 +32,7 @@ class FeederDialog(QtWidgets.QDialog):
         self.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
 
         self.feeder_type = body.feeder_type or "conventional"
+        # The user enters modulus in cm (industry standard); internal storage is mm.
         self.feeder_m_mm = float(body.feeder_m_mm)
         self.feeder_note = body.feeder_note or ""
 
@@ -56,10 +57,10 @@ class FeederDialog(QtWidgets.QDialog):
         layout.addWidget(self.type_combo)
 
         self.m_spin = QtWidgets.QDoubleSpinBox()
-        self.m_spin.setRange(0.0, 9999.0)
+        self.m_spin.setRange(0.0, 999.0)
         self.m_spin.setDecimals(2)
-        self.m_spin.setValue(self.feeder_m_mm)
-        self.m_spin.setSuffix(" mm")
+        self.m_spin.setValue(self.feeder_m_mm / 10.0)
+        self.m_spin.setSuffix(" cm")
         layout.addWidget(QtWidgets.QLabel("Opsiyonel besleyici modülü (M):"))
         layout.addWidget(self.m_spin)
 
@@ -78,6 +79,7 @@ class FeederDialog(QtWidgets.QDialog):
 
     def _on_accept(self):
         self.feeder_type = self.type_combo.currentData() or "conventional"
-        self.feeder_m_mm = float(self.m_spin.value())
+        # Convert user input from cm to mm for internal calculations.
+        self.feeder_m_mm = float(self.m_spin.value()) * 10.0
         self.feeder_note = self.note_edit.text().strip()
         self.accept()

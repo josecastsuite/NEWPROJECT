@@ -250,8 +250,8 @@ def propose_risers(
                 if diameter > max_diameter_mm or volume > max_volume_cm3:
                     infeasible = True
                     warning = (
-                        f"Önerilen çıkıcı (chill) çap {diameter:.1f} mm, hacim {volume:.1f} cm³ "
-                        f"parça geometrisine sığmıyor (max çap ≈{max_diameter_mm:.1f} mm, "
+                        f"Önerilen çıkıcı (chill) çap {diameter / 10.0:.1f} cm, hacim {volume:.1f} cm³ "
+                        f"parça geometrisine sığmıyor (max çap ≈{max_diameter_mm / 10.0:.1f} cm, "
                         f"max hacim ≈{max_volume_cm3:.1f} cm³). "
                         f"Çözüm kullanıcı kararıdır: bölgeyi kalınlaştırın, farklı bir soğutucu "
                         f"yerleştirin veya geometriyi değiştirin."
@@ -275,9 +275,9 @@ def propose_risers(
                 else:
                     infeasible = True
                     warning = (
-                        f"Gerekli besleyici modülü M={m_required:.1f} mm, çap {diameter:.1f} mm, "
+                        f"Gerekli besleyici modülü M={m_required / 10.0:.1f} cm, çap {diameter / 10.0:.1f} cm, "
                         f"hacim {volume:.1f} cm³ parça geometrisine sığmıyor "
-                        f"(max çap ≈{max_diameter_mm:.1f} mm, max hacim ≈{max_volume_cm3:.1f} cm³). "
+                        f"(max çap ≈{max_diameter_mm / 10.0:.1f} cm, max hacim ≈{max_volume_cm3:.1f} cm³). "
                         f"Çözüm kullanıcı kararıdır: bölgeyi kalınlaştırın, soğutucu (chill) ekleyin, "
                         f"ekzotermik mini besleyici kullanın veya geometriyi değiştirin."
                     )
@@ -319,7 +319,7 @@ def propose_risers(
 
         reason = "; ".join(reason_parts) if reason_parts else "önlem amaçlı"
         reason += (
-            f" | bağlantı: ({surface_pos[0]:.1f}, {surface_pos[1]:.1f}, {surface_pos[2]:.1f}) mm, "
+            f" | bağlantı: ({surface_pos[0] / 10.0:.1f}, {surface_pos[1] / 10.0:.1f}, {surface_pos[2] / 10.0:.1f}) cm, "
             f"normal=({normal[0]:.2f},{normal[1]:.2f},{normal[2]:.2f})"
         )
 

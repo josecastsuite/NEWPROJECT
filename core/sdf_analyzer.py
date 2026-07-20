@@ -2178,7 +2178,7 @@ def _build_recommendations(
                 (rr.effective_m_required / max(eff_m, 1e-6) - 1.0) * 100.0
             )
             recs.append(
-                f"{rr.name}{type_text}: M_besleyici={eff_m:.2f} mm (gerçek {rr.m_value_mm:.2f} mm) < gerekli {rr.effective_m_required:.2f} mm. "
+                f"{rr.name}{type_text}: M_besleyici={eff_m / 10.0:.2f} cm (gerçek {rr.m_value_mm / 10.0:.2f} cm) < gerekli {rr.effective_m_required / 10.0:.2f} cm. "
                 f"Besleyici modülünü %{int(increase)} büyütün."
             )
         if not rr.volume_ratio_ok:
@@ -2189,35 +2189,35 @@ def _build_recommendations(
             )
 
     for idx, proposal in enumerate(result.riser_proposals):
-        pos = f"({proposal.placement_mm[0]:.1f}, {proposal.placement_mm[1]:.1f}, {proposal.placement_mm[2]:.1f})"
+        pos = f"({proposal.placement_mm[0] / 10.0:.1f}, {proposal.placement_mm[1] / 10.0:.1f}, {proposal.placement_mm[2] / 10.0:.1f})"
         if proposal.infeasible:
             recs.append(
                 f"UYARI {idx + 1}: Hotspot #{proposal.target_hotspot_index + 1} için önerilen "
                 f"besleyici/çıkıcı parça geometrisine sığmıyor. "
-                f"M={proposal.m_required_mm:.2f} mm, çap={proposal.diameter_mm:.1f} mm, "
-                f"V={proposal.volume_cm3:.2f} cm³. Konum {pos} mm. "
+                f"M={proposal.m_required_mm / 10.0:.2f} cm, çap={proposal.diameter_mm / 10.0:.1f} cm, "
+                f"V={proposal.volume_cm3:.2f} cm³. Konum {pos} cm. "
                 f"{proposal.warning if proposal.warning else 'Çözüm kullanıcı kararıdır.'}"
             )
         elif proposal.shape == "chill":
             recs.append(
                 f"ÖNERİ {idx + 1}: çıkıcı (chill) ekle -> "
-                f"çap={proposal.diameter_mm:.1f} mm, yükseklik={proposal.height_mm:.1f} mm, "
+                f"çap={proposal.diameter_mm / 10.0:.1f} cm, yükseklik={proposal.height_mm / 10.0:.1f} cm, "
                 f"V={proposal.volume_cm3:.2f} cm³. "
-                f"Konum {pos} mm. Neden: {proposal.reason}."
+                f"Konum {pos} cm. Neden: {proposal.reason}."
             )
         elif proposal.exothermic:
             recs.append(
                 f"ÖNERİ {idx + 1}: ekzotermik mini besleyici ekle -> "
-                f"çap={proposal.diameter_mm:.1f} mm, yükseklik={proposal.height_mm:.1f} mm, "
-                f"V={proposal.volume_cm3:.2f} cm³, M={proposal.m_required_mm:.2f} mm. "
-                f"Konum {pos} mm. Neden: {proposal.reason}."
+                f"çap={proposal.diameter_mm / 10.0:.1f} cm, yükseklik={proposal.height_mm / 10.0:.1f} cm, "
+                f"V={proposal.volume_cm3:.2f} cm³, M={proposal.m_required_mm / 10.0:.2f} cm. "
+                f"Konum {pos} cm. Neden: {proposal.reason}."
             )
         else:
             recs.append(
                 f"ÖNERİ {idx + 1}: konvansiyonel silindirik besleyici ekle -> "
-                f"çap={proposal.diameter_mm:.1f} mm, yükseklik={proposal.height_mm:.1f} mm, "
-                f"V={proposal.volume_cm3:.2f} cm³, M={proposal.m_required_mm:.2f} mm. "
-                f"Konum {pos} mm. Neden: {proposal.reason}."
+                f"çap={proposal.diameter_mm / 10.0:.1f} cm, yükseklik={proposal.height_mm / 10.0:.1f} cm, "
+                f"V={proposal.volume_cm3:.2f} cm³, M={proposal.m_required_mm / 10.0:.2f} cm. "
+                f"Konum {pos} cm. Neden: {proposal.reason}."
             )
 
     all_feed_ok = all(hs.feed_ok for hs in result.hotspots)

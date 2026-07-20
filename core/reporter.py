@@ -124,8 +124,8 @@ def _format_riser_table(result: AnalysisResult) -> str:
                 f"<td>{_html_escape(rr.name)}{type_text}</td>"
                 f"<td>{rr.volume_cm3:.2f}</td>"
                 f"<td>{rr.surface_area_cm2:.2f}</td>"
-                f"<td>{rr.m_value_mm:.2f} / etkin {eff_m:.2f}</td>"
-                f"<td>{rr.effective_m_required:.2f}</td>"
+                f"<td>{rr.m_value_mm / 10.0:.2f} / etkin {eff_m / 10.0:.2f}</td>"
+                f"<td>{rr.effective_m_required / 10.0:.2f}</td>"
                 f"<td>{rr.required_volume_cm3:.2f}</td>"
                 f"<td>{'Geçer' if rr.large_enough and rr.volume_ratio_ok else 'Geçersiz'}</td>"
                 f"</tr>"
@@ -139,19 +139,19 @@ def _format_riser_proposal_table(result: AnalysisResult) -> str:
     rows = []
     if result.riser_proposals:
         for rp in result.riser_proposals:
-            pos = ",".join(f"{v:.1f}" for v in rp.placement_mm)
+            pos = ",".join(f"{v / 10.0:.1f}" for v in rp.placement_mm)
             if rp.infeasible:
                 shape_text = "uyarı (sığmıyor)"
-                dims = f"M={rp.m_required_mm:.2f} mm, çap={rp.diameter_mm:.1f} mm, V={rp.volume_cm3:.2f} cm³"
+                dims = f"M={rp.m_required_mm / 10.0:.2f} cm, çap={rp.diameter_mm / 10.0:.1f} cm, V={rp.volume_cm3:.2f} cm³"
             elif rp.shape == "chill":
                 shape_text = "çıkıcı (chill)"
-                dims = f"çap={rp.diameter_mm:.1f} mm, yükseklik={rp.height_mm:.1f} mm, V={rp.volume_cm3:.2f} cm³"
+                dims = f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, V={rp.volume_cm3:.2f} cm³"
             elif rp.exothermic:
                 shape_text = "ekzotermik mini besleyici"
-                dims = f"çap={rp.diameter_mm:.1f} mm, yükseklik={rp.height_mm:.1f} mm, V={rp.volume_cm3:.2f} cm³, M={rp.m_required_mm:.2f} mm"
+                dims = f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, V={rp.volume_cm3:.2f} cm³, M={rp.m_required_mm / 10.0:.2f} cm"
             else:
                 shape_text = _html_escape(rp.shape)
-                dims = f"çap={rp.diameter_mm:.1f} mm, yükseklik={rp.height_mm:.1f} mm, V={rp.volume_cm3:.2f} cm³, M={rp.m_required_mm:.2f} mm"
+                dims = f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, V={rp.volume_cm3:.2f} cm³, M={rp.m_required_mm / 10.0:.2f} cm"
             rows.append(
                 f"<tr>"
                 f"<td>{rp.target_hotspot_index + 1}</td>"
@@ -386,13 +386,13 @@ def _render_html(result: AnalysisResult, screenshot_path: Optional[str] = None) 
 
     <h2>Besleyici (Riser) Değerlendirmesi</h2>
     <table>
-        <tr><th>İsim</th><th>Hacim (cm³)</th><th>Yüzey (cm²)</th><th>M (mm)</th><th>Gerekli M (mm)</th><th>Gerekli V (cm³)</th><th>Durum</th></tr>
+        <tr><th>İsim</th><th>Hacim (cm³)</th><th>Yüzey (cm²)</th><th>M (cm)</th><th>Gerekli M (cm)</th><th>Gerekli V (cm³)</th><th>Durum</th></tr>
         {_format_riser_table(result)}
     </table>
 
     <h2>Otomatik Besleyici / Çıkıcı Önerileri</h2>
     <table>
-        <tr><th>Hot Spot</th><th>Şekil</th><th>Konum (mm)</th><th>Boyutlar</th><th>Neden</th></tr>
+        <tr><th>Hot Spot</th><th>Şekil</th><th>Konum (cm)</th><th>Boyutlar</th><th>Neden</th></tr>
         {_format_riser_proposal_table(result)}
     </table>
 
@@ -550,7 +550,7 @@ def _generate_report_fpdf2(
             eff_m = max(rr.effective_m_value_mm, rr.m_value_mm)
             type_text = f" [{rr.feeder_type}]" if rr.feeder_type else ""
             pdf.cell(0, 6, f"{rr.name}{type_text}: V={rr.volume_cm3:.2f} cm³, A={rr.surface_area_cm2:.2f} cm², "
-                           f"M={rr.m_value_mm:.2f} / etkin {eff_m:.2f} mm (gerekli {rr.effective_m_required:.2f} mm), "
+                           f"M={rr.m_value_mm / 10.0:.2f} / etkin {eff_m / 10.0:.2f} cm (gerekli {rr.effective_m_required / 10.0:.2f} cm), "
                            f"V gerekli={rr.required_volume_cm3:.2f} cm³", ln=True)
     else:
         pdf.cell(0, 6, "Besleyici body atanmamış.", ln=True)
@@ -561,21 +561,21 @@ def _generate_report_fpdf2(
         pdf.cell(0, 8, "Otomatik Besleyici / Cikici Onerileri", ln=True)
         pdf.set_font(font, "", 10)
         for i, rp in enumerate(result.riser_proposals, 1):
-            pos = ",".join(f"{v:.1f}" for v in rp.placement_mm)
+            pos = ",".join(f"{v / 10.0:.1f}" for v in rp.placement_mm)
             if rp.infeasible:
                 pdf.cell(0, 6, f"{i}. UYARI: Hotspot #{rp.target_hotspot_index + 1} icin onerilen besleyici/cikici parcaya sigmiyor.", ln=True)
-                pdf.cell(0, 6, f"   M={rp.m_required_mm:.2f} mm, cap={rp.diameter_mm:.1f} mm, V={rp.volume_cm3:.2f} cm3, konum=({pos}) mm.", ln=True)
+                pdf.cell(0, 6, f"   M={rp.m_required_mm / 10.0:.2f} cm, cap={rp.diameter_mm / 10.0:.1f} cm, V={rp.volume_cm3:.2f} cm3, konum=({pos}) cm.", ln=True)
                 warning_text = rp.warning if rp.warning else "Cozum kullanici kararidir."
                 pdf.cell(0, 6, f"   {warning_text}", ln=True)
             elif rp.shape == "chill":
-                pdf.cell(0, 6, f"{i}. cikici (chill): cap={rp.diameter_mm:.1f} mm, yukseklik={rp.height_mm:.1f} mm, "
-                               f"V={rp.volume_cm3:.2f} cm3, konum=({pos}) mm", ln=True)
+                pdf.cell(0, 6, f"{i}. cikici (chill): cap={rp.diameter_mm / 10.0:.1f} cm, yukseklik={rp.height_mm / 10.0:.1f} cm, "
+                               f"V={rp.volume_cm3:.2f} cm3, konum=({pos}) cm", ln=True)
             elif rp.exothermic:
-                pdf.cell(0, 6, f"{i}. ekzotermik mini besleyici: cap={rp.diameter_mm:.1f} mm, yukseklik={rp.height_mm:.1f} mm, "
-                               f"V={rp.volume_cm3:.2f} cm3, M={rp.m_required_mm:.2f} mm, konum=({pos}) mm", ln=True)
+                pdf.cell(0, 6, f"{i}. ekzotermik mini besleyici: cap={rp.diameter_mm / 10.0:.1f} cm, yukseklik={rp.height_mm / 10.0:.1f} cm, "
+                               f"V={rp.volume_cm3:.2f} cm3, M={rp.m_required_mm / 10.0:.2f} cm, konum=({pos}) cm", ln=True)
             else:
-                pdf.cell(0, 6, f"{i}. {rp.shape}: cap={rp.diameter_mm:.1f} mm, yukseklik={rp.height_mm:.1f} mm, "
-                               f"V={rp.volume_cm3:.2f} cm3, M={rp.m_required_mm:.2f} mm, konum=({pos}) mm", ln=True)
+                pdf.cell(0, 6, f"{i}. {rp.shape}: cap={rp.diameter_mm / 10.0:.1f} cm, yukseklik={rp.height_mm / 10.0:.1f} cm, "
+                               f"V={rp.volume_cm3:.2f} cm3, M={rp.m_required_mm / 10.0:.2f} cm, konum=({pos}) cm", ln=True)
             pdf.cell(0, 6, f"   Neden: {_html_escape(rp.reason)}", ln=True)
         pdf.ln(4)
 
