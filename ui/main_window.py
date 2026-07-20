@@ -93,7 +93,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._body_feeder_buttons: Dict[str, QtWidgets.QPushButton] = {}
         self._body_feeder_labels: Dict[str, QtWidgets.QLabel] = {}
         self._body_items: Dict[str, QtWidgets.QListWidgetItem] = {}
-        self._body_action_stacks: Dict[str, QtWidgets.QStackedWidget] = {}
+
 
         self._build_ui()
         self._apply_dark_theme()
@@ -659,28 +659,14 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         row.addWidget(label)
 
-        # Stacked action area: one of empty / Kesit / Besleyici.
-        # Using a QStackedWidget avoids setVisible toggling in the same layout,
-        # which can fail to update the QListWidget item geometry on Windows/DPI changes.
-        action_stack = QtWidgets.QStackedWidget()
-        action_stack.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
-        )
-
-        empty_page = QtWidgets.QWidget()
-
-        # Gating page: Kesit + area label
-        gating_page = QtWidgets.QWidget()
-        gating_layout = QtWidgets.QHBoxLayout(gating_page)
-        gating_layout.setContentsMargins(0, 0, 0, 0)
-        gating_layout.setSpacing(4)
+        # Gating section controls (always visible; disabled when not applicable).
         section_btn = QtWidgets.QPushButton("Kesit")
         section_btn.setToolTip("Bu body'nin gating kesit alanını seç (sadece yolluk/meme/döküm ağzı)")
         section_btn.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
         )
         section_btn.clicked.connect(lambda _, b=body: self.on_body_section(b))
-        gating_layout.addWidget(section_btn)
+        row.addWidget(section_btn)
         self._body_section_buttons[body.name] = section_btn
 
         area_label = QtWidgets.QLabel("A=---")
@@ -690,21 +676,17 @@ class MainWindow(QtWidgets.QMainWindow):
         area_label.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
         )
-        gating_layout.addWidget(area_label)
+        row.addWidget(area_label)
         self._body_section_labels[body.name] = area_label
 
-        # Feeder page: Besleyici + feeder label
-        feeder_page = QtWidgets.QWidget()
-        feeder_layout = QtWidgets.QHBoxLayout(feeder_page)
-        feeder_layout.setContentsMargins(0, 0, 0, 0)
-        feeder_layout.setSpacing(4)
+        # Feeder type controls (always visible; disabled when not applicable).
         feeder_btn = QtWidgets.QPushButton("Besleyici")
         feeder_btn.setToolTip("Bu besleyicinin tipini ve opsiyonel modülünü ayarla")
         feeder_btn.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
         )
         feeder_btn.clicked.connect(lambda _, b=body: self.on_body_feeder(b))
-        feeder_layout.addWidget(feeder_btn)
+        row.addWidget(feeder_btn)
         self._body_feeder_buttons[body.name] = feeder_btn
 
         feeder_label = QtWidgets.QLabel("")
@@ -714,14 +696,8 @@ class MainWindow(QtWidgets.QMainWindow):
         feeder_label.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
         )
-        feeder_layout.addWidget(feeder_label)
+        row.addWidget(feeder_label)
         self._body_feeder_labels[body.name] = feeder_label
-
-        action_stack.addWidget(empty_page)
-        action_stack.addWidget(gating_page)
-        action_stack.addWidget(feeder_page)
-        row.addWidget(action_stack)
-        self._body_action_stacks[body.name] = action_stack
 
         combo = QtWidgets.QComboBox()
         combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
@@ -752,7 +728,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.body_list.addItem(item)
         self.body_list.setItemWidget(item, widget)
-        self._update_body_row_visibility(body)
+        self._update_body_row_state(body)
         self._update_body_section_label(body.name)
         self._update_body_feeder_label(body.name)
         item.setSizeHint(widget.sizeHint())
@@ -790,7 +766,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._body_feeder_buttons.clear()
             self._body_feeder_labels.clear()
             self._body_items.clear()
-            self._body_action_stacks.clear()
+
             self._clear_checklist()
             self.rec_text.clear()
             self._grid = None
@@ -839,7 +815,7 @@ class MainWindow(QtWidgets.QMainWindow):
             body.feeder_note = ""
             self._update_body_feeder_label(body.name)
 
-        self._update_body_row_visibility(body)
+        self._update_body_row_state(body)
         self.viewer.show_bodies(self._bodies)
 
     def on_body_section(self, body: Body):
@@ -887,36 +863,28 @@ class MainWindow(QtWidgets.QMainWindow):
             return "INGATE"
         return "INGATE"
 
-    def _update_body_row_visibility(self, body: Body):
+    def _update_body_row_state(self, body: Body):
+        # Keep both Kesit and Besleyici controls always visible but disable the irrelevant
+        # one. This avoids setVisible toggling across Windows/DPI, which can fail to update
+        # the QListWidget item geometry.
         is_gating = body.body_type in (
             BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE, BodyType.SPRUE_THROAT
         )
         is_riser = body.body_type == BodyType.RISER
 
-        stack = self._body_action_stacks.get(body.name)
-        if stack is not None:
-            if is_gating:
-                stack.setCurrentIndex(1)
-                stack.setVisible(True)
-            elif is_riser:
-                stack.setCurrentIndex(2)
-                stack.setVisible(True)
-            else:
-                stack.setCurrentIndex(0)
-                stack.setVisible(False)
+        section_btn = self._body_section_buttons.get(body.name)
+        section_lbl = self._body_section_labels.get(body.name)
+        feeder_btn = self._body_feeder_buttons.get(body.name)
+        feeder_lbl = self._body_feeder_labels.get(body.name)
 
-        item = self._body_items.get(body.name)
-        if item is not None and item.listWidget() is not None:
-            # Force an immediate relayout so the row width/height matches the visible controls.
-            widget = item.listWidget().itemWidget(item)
-            if widget is not None:
-                layout = widget.layout()
-                if layout is not None:
-                    layout.activate()
-                widget.updateGeometry()
-                widget.adjustSize()
-                item.setSizeHint(widget.sizeHint())
-                self.body_list.viewport().update()
+        if section_btn is not None:
+            section_btn.setEnabled(is_gating)
+        if section_lbl is not None:
+            section_lbl.setEnabled(is_gating)
+        if feeder_btn is not None:
+            feeder_btn.setEnabled(is_riser)
+        if feeder_lbl is not None:
+            feeder_lbl.setEnabled(is_riser)
 
     def _update_body_feeder_label(self, body_name: str):
         label = self._body_feeder_labels.get(body_name)
