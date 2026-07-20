@@ -644,8 +644,8 @@ class MainWindow(QtWidgets.QMainWindow):
         item = QtWidgets.QListWidgetItem()
         widget = QtWidgets.QWidget()
         row = QtWidgets.QHBoxLayout(widget)
-        row.setContentsMargins(2, 2, 2, 2)
-        row.setSpacing(4)
+        row.setContentsMargins(2, 1, 2, 1)
+        row.setSpacing(2)
 
         # Compact body label; full volume/centroid info in tooltip.
         label = QtWidgets.QLabel(body.name)
@@ -653,13 +653,13 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Hacim: {body.volume_cm3:.2f} cm³\nMerkez: {body.center}"
         )
         label.setStyleSheet("font-size: 11px;")
-        label.setMaximumWidth(90)
+        label.setMaximumWidth(80)
         label.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
         )
         row.addWidget(label)
 
-        # Gating section controls (always visible; disabled when not applicable).
+        # Gating section controls (always visible; dialog warns if wrong type).
         section_btn = QtWidgets.QPushButton("Kesit")
         section_btn.setToolTip("Bu body'nin gating kesit alanını seç (sadece yolluk/meme/döküm ağzı)")
         section_btn.setSizePolicy(
@@ -668,16 +668,6 @@ class MainWindow(QtWidgets.QMainWindow):
         section_btn.clicked.connect(lambda _, b=body: self.on_body_section(b))
         row.addWidget(section_btn)
         self._body_section_buttons[body.name] = section_btn
-
-        area_label = QtWidgets.QLabel("A=---")
-        area_label.setStyleSheet("color: #888888; font-size: 10px;")
-        area_label.setToolTip("Seçilen kesit alanı cm²")
-        area_label.setMaximumWidth(area_label.fontMetrics().horizontalAdvance("A=999.99") + 8)
-        area_label.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
-        )
-        row.addWidget(area_label)
-        self._body_section_labels[body.name] = area_label
 
         # Feeder type controls (always visible; dialog warns if not a RISER).
         feeder_btn = QtWidgets.QPushButton("Besleyici tipi")
@@ -689,22 +679,12 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(feeder_btn)
         self._body_feeder_buttons[body.name] = feeder_btn
 
-        feeder_label = QtWidgets.QLabel("")
-        feeder_label.setStyleSheet("color: #888888; font-size: 10px;")
-        feeder_label.setToolTip("Seçilen besleyici tipi ve modül")
-        feeder_label.setMaximumWidth(feeder_label.fontMetrics().horizontalAdvance("chill M=999.9") + 8)
-        feeder_label.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
-        )
-        row.addWidget(feeder_label)
-        self._body_feeder_labels[body.name] = feeder_label
-
         combo = QtWidgets.QComboBox()
         combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
         combo.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
         )
-        combo.setMaximumWidth(100)
+        combo.setMaximumWidth(120)
         for bt in (
             BodyType.PART,
             BodyType.RISER,

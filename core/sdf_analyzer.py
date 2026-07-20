@@ -1934,12 +1934,32 @@ def analyze(
     pore_size_um, pore_size_mm, pore_macro_mask, pore_micro_mask, pore_fine_mask = compute_pore_size(
         niyama, M_mod, feed_risk, alloy, part_mask, t_s=t_s, feeder_mask=feeder_mask, dx=dx
     )
-    # v8.9: by default display only the top 3% of computed pore sizes to suppress noise.
-    pore_noise_percent = 3.0
+    # v8.9: per-class display filters (macro top 60%, micro top 40%, fine top 20%).
     baseline_min_um = max(alloy.gas_pore_baseline_um, alloy.dendrite_spacing_mm * 1000.0 * 0.02)
+    pore_macro_percent = 60.0
+    pore_micro_percent = 40.0
+    pore_fine_percent = 20.0
     pore_threshold_um = pore_size_threshold_um(
         pore_size_um,
-        pore_noise_percent,
+        pore_macro_percent,
+        micro_pore_limit_um=alloy.micro_pore_limit_um,
+        baseline_um=baseline_min_um,
+    )
+    pore_macro_threshold_um = pore_size_threshold_um(
+        np.where(pore_macro_mask, pore_size_um, 0.0),
+        pore_macro_percent,
+        micro_pore_limit_um=alloy.micro_pore_limit_um,
+        baseline_um=baseline_min_um,
+    )
+    pore_micro_threshold_um = pore_size_threshold_um(
+        np.where(pore_micro_mask, pore_size_um, 0.0),
+        pore_micro_percent,
+        micro_pore_limit_um=alloy.micro_pore_limit_um,
+        baseline_um=baseline_min_um,
+    )
+    pore_fine_threshold_um = pore_size_threshold_um(
+        np.where(pore_fine_mask, pore_size_um, 0.0),
+        pore_fine_percent,
         micro_pore_limit_um=alloy.micro_pore_limit_um,
         baseline_um=baseline_min_um,
     )
@@ -2040,8 +2060,14 @@ def analyze(
         pore_size_macro_mask=pore_macro_mask,
         pore_size_micro_mask=pore_micro_mask,
         pore_size_fine_mask=pore_fine_mask,
-        pore_size_noise_percent=pore_noise_percent,
-        pore_size_threshold_um=pore_threshold_um,
+        pore_size_noise_percent=pore_macro_percent,
+        pore_size_threshold_um=pore_macro_threshold_um,
+        pore_size_macro_percent=pore_macro_percent,
+        pore_size_macro_threshold_um=pore_macro_threshold_um,
+        pore_size_micro_percent=pore_micro_percent,
+        pore_size_micro_threshold_um=pore_micro_threshold_um,
+        pore_size_fine_percent=pore_fine_percent,
+        pore_size_fine_threshold_um=pore_fine_threshold_um,
     )
 
     result.riser_proposals = propose_risers(result, alloy, existing_riser_count=len(riser_results))

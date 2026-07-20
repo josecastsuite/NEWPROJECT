@@ -23,25 +23,30 @@ def _html_escape(text: str) -> str:
 def _format_pore_size_summary(result: AnalysisResult) -> str:
     """Return an HTML table summarising estimated pore size distribution.
 
-    Only the top ``pore_size_noise_percent``% of computed porosity voxels are
-    shown; the rest is treated as numerical/physical noise.
+    Each porosity class now has its own display filter so macro and micro
+    shrinkage are not forced through the same top-% noise threshold.
     """
     ps = result.pore_size_um
     if ps is None or ps.size == 0:
         return "<p>Gözenek boyutu hesabı mevcut değil.</p>"
     ps = np.asarray(ps, dtype=np.float64)
-    threshold = float(result.pore_size_threshold_um)
-    if threshold <= 0.0:
-        # fallback: if no stored threshold, keep top 3%
-        from core.sdf_analyzer import pore_size_threshold_um
-        threshold = pore_size_threshold_um(ps, 3.0)
-    active = np.isfinite(ps) & (ps >= threshold)
-    if not active.any():
-        return f"<p>Filtre eşiği {threshold:.2f} µm üzerinde tahmini gözenek yok (gürültü engellendi).</p>"
 
-    pm = result.pore_size_macro_mask & active
-    pmi = result.pore_size_micro_mask & active
-    pf = result.pore_size_fine_mask & active
+    macro_thr = float(getattr(result, "pore_size_macro_threshold_um", 0.0))
+    micro_thr = float(getattr(result, "pore_size_micro_threshold_um", 0.0))
+    fine_thr = float(getattr(result, "pore_size_fine_threshold_um", 0.0))
+    if macro_thr <= 0.0:
+        from core.sdf_analyzer import pore_size_threshold_um
+        macro_thr = pore_size_threshold_um(ps, 60.0)
+    if micro_thr <= 0.0:
+        from core.sdf_analyzer import pore_size_threshold_um
+        micro_thr = pore_size_threshold_um(ps, 40.0)
+    if fine_thr <= 0.0:
+        from core.sdf_analyzer import pore_size_threshold_um
+        fine_thr = pore_size_threshold_um(ps, 20.0)
+
+    pm = result.pore_size_macro_mask & np.isfinite(ps) & (ps >= macro_thr)
+    pmi = result.pore_size_micro_mask & np.isfinite(ps) & (ps >= micro_thr)
+    pf = result.pore_size_fine_mask & np.isfinite(ps) & (ps >= fine_thr)
     macro_vox = int(pm.sum())
     micro_vox = int(pmi.sum())
     fine_vox = int(pf.sum())
@@ -56,7 +61,11 @@ def _format_pore_size_summary(result: AnalysisResult) -> str:
     def _max(a: np.ndarray) -> float:
         return float(np.max(a)) if len(a) else 0.0
 
-    return f"""<p>Filtre: üst %{result.pore_size_noise_percent:.2f} gösteriliyor (eşik = {threshold:.2f} µm).</p>
+    macro_pct = float(getattr(result, "pore_size_macro_percent", 60.0))
+    micro_pct = float(getattr(result, "pore_size_micro_percent", 40.0))
+    fine_pct = float(getattr(result, "pore_size_fine_percent", 20.0))
+
+    return f"""<p>Filtre oranları farklı: Makro üst %{macro_pct:.0f} (eşik {macro_thr:.2f} µm), Mikro üst %{micro_pct:.0f} (eşik {micro_thr:.2f} µm), İnce üst %{fine_pct:.0f} (eşik {fine_thr:.2f} µm).</p>
     <table>
         <tr><th>Sınıf</th><th>Voxel sayısı</th><th>Oran</th><th>Max gözenek (µm)</th></tr>
         <tr><td>Makro (&gt;1000 µm)</td><td>{macro_vox}</td><td>{100.0*macro_vox/total:.1f}%</td><td>{_max(macro_vals):.1f}</td></tr>
@@ -72,7 +81,12 @@ def _format_hotspot_table(result: AnalysisResult) -> str:
             pos = ",".join(f"{v:.1f}" for v in hs.position_mm)
             status = "OK" if hs.feed_ok else "UZAK/DARALMA"
             niy = ", ".join(f"{k}={v:.3f}" for k, v in hs.niyama_variants.items())
-            if hs.pore_size_class and hs.pore_size_um >= result.pore_size_threshold_um:
+            class_thr = {
+                "macro": getattr(result, "pore_size_macro_threshold_um", result.pore_size_threshold_um),
+                "micro": getattr(result, "pore_size_micro_threshold_um", result.pore_size_threshold_um),
+                "fine": getattr(result, "pore_size_fine_threshold_um", result.pore_size_threshold_um),
+            }.get(hs.pore_size_class, result.pore_size_threshold_um)
+            if hs.pore_size_class and hs.pore_size_um >= class_thr:
                 pore = f"{hs.pore_size_um:.1f} µm ({hs.pore_size_class})"
             else:
                 pore = "-"
@@ -479,23 +493,29 @@ def _generate_report_fpdf2(
     pdf.set_font(font, "", 10)
     ps = result.pore_size_um
     if ps is not None and ps.size:
-        threshold = float(result.pore_size_threshold_um)
-        if threshold <= 0.0:
-            from core.sdf_analyzer import pore_size_threshold_um
-            threshold = pore_size_threshold_um(ps, 3.0)
         ps_arr = np.asarray(ps, dtype=np.float64)
-        active = np.isfinite(ps_arr) & (ps_arr >= threshold)
-        pm = result.pore_size_macro_mask & active
-        pmi = result.pore_size_micro_mask & active
-        pf = result.pore_size_fine_mask & active
+        macro_thr = float(getattr(result, "pore_size_macro_threshold_um", 0.0))
+        micro_thr = float(getattr(result, "pore_size_micro_threshold_um", 0.0))
+        fine_thr = float(getattr(result, "pore_size_fine_threshold_um", 0.0))
+        if macro_thr <= 0.0:
+            from core.sdf_analyzer import pore_size_threshold_um
+            macro_thr = pore_size_threshold_um(ps, 60.0)
+        if micro_thr <= 0.0:
+            from core.sdf_analyzer import pore_size_threshold_um
+            micro_thr = pore_size_threshold_um(ps, 40.0)
+        if fine_thr <= 0.0:
+            from core.sdf_analyzer import pore_size_threshold_um
+            fine_thr = pore_size_threshold_um(ps, 20.0)
+        pm = result.pore_size_macro_mask & np.isfinite(ps_arr) & (ps_arr >= macro_thr)
+        pmi = result.pore_size_micro_mask & np.isfinite(ps_arr) & (ps_arr >= micro_thr)
+        pf = result.pore_size_fine_mask & np.isfinite(ps_arr) & (ps_arr >= fine_thr)
         macro_vox = int(pm.sum())
         micro_vox = int(pmi.sum())
         fine_vox = int(pf.sum())
-        total = macro_vox + micro_vox + fine_vox
         macro_max = float(np.max(ps_arr[pm])) if macro_vox else 0.0
         micro_max = float(np.max(ps_arr[pmi])) if micro_vox else 0.0
         fine_max = float(np.max(ps_arr[pf])) if fine_vox else 0.0
-        pdf.cell(0, 6, f"Filtre: ust %{result.pore_size_noise_percent:.2f} (esik {threshold:.1f} um). Makro (>1000 um): {macro_vox} vox (max {macro_max:.1f} um) | Mikro (100-1000 um): {micro_vox} vox (max {micro_max:.1f} um) | Ince (<100 um): {fine_vox} vox (max {fine_max:.1f} um)", ln=True)
+        pdf.cell(0, 6, f"Filtre oranlari farkli: Makro ust %60 (esik {macro_thr:.1f} um) | Mikro ust %40 (esik {micro_thr:.1f} um) | Ince ust %20 (esik {fine_thr:.1f} um). Makro (>1000 um): {macro_vox} vox (max {macro_max:.1f} um) | Mikro (100-1000 um): {micro_vox} vox (max {micro_max:.1f} um) | Ince (<100 um): {fine_vox} vox (max {fine_max:.1f} um)", ln=True)
     else:
         pdf.cell(0, 6, "Gözenek boyutu hesabi mevcut degil.", ln=True)
     pdf.ln(4)
@@ -508,7 +528,12 @@ def _generate_report_fpdf2(
             pos = ",".join(f"{v:.1f}" for v in hs.position_mm)
             status = "OK" if hs.feed_ok else "UZAK/DARALMA"
             pore = ""
-            if hs.pore_size_class and hs.pore_size_um >= result.pore_size_threshold_um:
+            class_thr = {
+                "macro": getattr(result, "pore_size_macro_threshold_um", result.pore_size_threshold_um),
+                "micro": getattr(result, "pore_size_micro_threshold_um", result.pore_size_threshold_um),
+                "fine": getattr(result, "pore_size_fine_threshold_um", result.pore_size_threshold_um),
+            }.get(hs.pore_size_class, result.pore_size_threshold_um)
+            if hs.pore_size_class and hs.pore_size_um >= class_thr:
                 pore = f" | Gozenek={hs.pore_size_um:.1f} um ({hs.pore_size_class})"
             pdf.cell(0, 6, f"{i}. Konum=({pos}) mm | M={hs.m_value_mm:.2f} ± {hs.m_uncertainty_mm:.2f} mm | "
                            f"t={hs.t_section_mm:.2f} mm | Besleme={hs.dist_to_riser_mm:.1f}/{hs.max_feeding_distance_mm:.1f} mm | "

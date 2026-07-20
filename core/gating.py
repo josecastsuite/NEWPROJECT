@@ -1266,6 +1266,26 @@ def analyze_gating(
         a_m2 = a / 1e4
         actual_v[k] = Q_design_m3_s / a_m2 if a_m2 > 0 else 0.0
 
+    # Velocity penalty: a section must be failed if its real velocity exceeds the
+    # recommended maximum, even if the area ratio looks acceptable on paper.
+    _section_names_tr = {
+        "sprue": "Döküm ağzı (sprue)",
+        "runner": "Yolluk",
+        "gate": "Meme",
+    }
+    _section_targets = {
+        "sprue": sprue_v_range,
+        "runner": runner_v_range,
+        "gate": gate_v_range,
+    }
+    for k, v in actual_v.items():
+        lo, hi = _section_targets[k]
+        if hi > 0 and v > hi:
+            result.recommendations.append(
+                f"UYARI: {_section_names_tr[k]} gerçek hızı {v:.2f} m/s, "
+                f"hedef maksimum {hi:.2f} m/s'yi aşıyor; kesit alanını büyütün veya sayısını artırın."
+            )
+
     # Fluidity length with the design gate velocity
     t_stream = max(ingate_thickness_mm, 2.0 * result.dominant_m_mm, 2.0)
     M_stream = t_stream / 2.0
@@ -1350,11 +1370,22 @@ def analyze_gating(
     actual_runner_cm2 = runner_min_area_cm2 if runner_min_area_cm2 > 0.0 else Ar_total_m2 * 1e4
     actual_gate_total_cm2 = gate_area_cm2 if gate_area_cm2 > 0.0 else Ag_total_m2 * 1e4
 
-    def _area_design_ok(actual_cm2: float, design_cm2: float) -> bool:
-        if actual_cm2 <= 0.0 or design_cm2 <= 0.0:
-            return True
-        ratio = actual_cm2 / design_cm2
-        return 0.6 <= ratio <= 1.5
+    def _section_ok(
+        actual_cm2: float,
+        design_cm2: float,
+        actual_v_m_s: float,
+        target_v_max_m_s: float,
+    ) -> bool:
+        """A gating section passes only if its area ratio is sane AND its real
+        velocity does not exceed the recommended maximum."""
+        area_ok = True
+        if actual_cm2 > 0.0 and design_cm2 > 0.0:
+            ratio = actual_cm2 / design_cm2
+            area_ok = 0.6 <= ratio <= 1.5
+        velocity_ok = True
+        if target_v_max_m_s > 0.0 and actual_v_m_s > target_v_max_m_s:
+            velocity_ok = False
+        return area_ok and velocity_ok
 
     # v9.2: gating fills the mould; it does not fix shrinkage hot spots.
     # Remind the user when unfed hot spots remain so that riser/chill/exothermic
@@ -1380,7 +1411,7 @@ def analyze_gating(
         sprue_base_area_cm2=actual_sprue_base_cm2,
         required_sprue_area_cm2=As_m2 * 1e4,
         campbell_ok=True,
-        bernoulli_ok=_area_design_ok(actual_sprue_base_cm2, As_m2 * 1e4) if As_m2 > 0 else True,
+        bernoulli_ok=_section_ok(actual_sprue_base_cm2, As_m2 * 1e4, actual_v['sprue'], sprue_v_range[1]) if As_m2 > 0 else True,
         ingate_on_thick_region=ingate_on_thick,
         ingate_avg_m_mm=ingate_avg_m,
         ingate_max_m_mm=ingate_max_m,
@@ -1388,8 +1419,8 @@ def analyze_gating(
         runner_thickness_mm=runner_thickness_mm,
         required_runner_area_cm2=Ar_total_m2 * 1e4,
         required_ingate_area_cm2=Ag_total_m2 * 1e4,
-        runner_ok=_area_design_ok(actual_runner_cm2, Ar_total_m2 * 1e4),
-        ingate_ok=_area_design_ok(actual_gate_total_cm2, Ag_total_m2 * 1e4),
+        runner_ok=_section_ok(actual_runner_cm2, Ar_total_m2 * 1e4, actual_v['runner'], runner_v_range[1]),
+        ingate_ok=_section_ok(actual_gate_total_cm2, Ag_total_m2 * 1e4, actual_v['gate'], gate_v_range[1]),
         elbow_count=elbow_count,
         head_loss_mm=head_loss_m * 1000.0,
         effective_head_mm=H_eff_m * 1000.0,
@@ -1398,12 +1429,16 @@ def analyze_gating(
         ingate_max_velocity_m_s=gate_v_range[1],
         reynolds=ingate_flow.reynolds,
         froude=ingate_flow.froude,
-        turbulent=ingate_flow.turbulent,
+        turbulent=(ingate_flow.turbulent or actual_v.get('gate', 0.0) > gate_v_range[1]),
         ingate_flow_rate_m3_s=Q_design_m3_s,
         ingate_fill_time_s=design_fill_time_s,
         velocity_fill_time_match_ok=True,
         required_ingate_area_for_velocity_cm2=Ag_each_m2 * 1e4,
-        velocity_area_ok=True,
+        velocity_area_ok=(
+            _section_ok(actual_sprue_base_cm2, As_m2 * 1e4, actual_v['sprue'], sprue_v_range[1])
+            and _section_ok(actual_runner_cm2, Ar_total_m2 * 1e4, actual_v['runner'], runner_v_range[1])
+            and _section_ok(actual_gate_total_cm2, Ag_total_m2 * 1e4, actual_v['gate'], gate_v_range[1])
+        ),
         fluidity_length_mm=fluidity_length_mm,
         sprue_throat_area_cm2=sprue_throat_cm2 if sprue_throat_cm2 > 0.0 else design.sprue_throat_area_cm2,
         sprue_base_bottom_area_cm2=actual_sprue_base_cm2,
@@ -1432,9 +1467,9 @@ def analyze_gating(
         design_gate_diameter_mm=d_ingate_each_mm,
         design_choke_velocity_m_s=Vc_ms,
         design_gating_ratio=final_ratio,
-        sprue_design_ok=_area_design_ok(actual_sprue_base_cm2, As_m2 * 1e4),
-        runner_design_ok=_area_design_ok(actual_runner_cm2, Ar_total_m2 * 1e4),
-        gate_design_ok=_area_design_ok(actual_gate_total_cm2, Ag_total_m2 * 1e4),
+        sprue_design_ok=_section_ok(actual_sprue_base_cm2, As_m2 * 1e4, actual_v['sprue'], sprue_v_range[1]),
+        runner_design_ok=_section_ok(actual_runner_cm2, Ar_total_m2 * 1e4, actual_v['runner'], runner_v_range[1]),
+        gate_design_ok=_section_ok(actual_gate_total_cm2, Ag_total_m2 * 1e4, actual_v['gate'], gate_v_range[1]),
         part_mass_kg=part_mass_kg,
         total_riser_mass_kg=total_riser_mass_kg,
         gating_mass_kg=gating_mass_kg,
