@@ -658,7 +658,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # Gating section controls
         section_btn = QtWidgets.QPushButton("Kesit")
         section_btn.setToolTip("Bu body'nin gating kesit alanını seç (sadece yolluk/meme/döküm ağzı)")
-        section_btn.setMinimumWidth(section_btn.sizeHint().width())
         section_btn.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
         )
@@ -679,7 +678,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # Feeder type controls
         feeder_btn = QtWidgets.QPushButton("Besleyici")
         feeder_btn.setToolTip("Bu besleyicinin tipini ve opsiyonel modülünü ayarla")
-        feeder_btn.setMinimumWidth(feeder_btn.sizeHint().width())
         feeder_btn.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
         )
@@ -698,6 +696,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._body_feeder_labels[body.name] = feeder_label
 
         combo = QtWidgets.QComboBox()
+        combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
+        )
         combo.setMaximumWidth(100)
         for bt in (
             BodyType.PART,
@@ -878,11 +880,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         item = self._body_items.get(body.name)
         if item is not None and item.listWidget() is not None:
-            # Force a relayout so the row width/height matches the visible controls.
+            # Force an immediate relayout so the row width/height matches the visible controls.
             widget = item.listWidget().itemWidget(item)
             if widget is not None:
-                item.setSizeHint(widget.sizeHint())
+                layout = widget.layout()
+                if layout is not None:
+                    layout.activate()
+                widget.updateGeometry()
                 widget.adjustSize()
+                item.setSizeHint(widget.sizeHint())
+                self.body_list.viewport().update()
 
     def _update_body_feeder_label(self, body_name: str):
         label = self._body_feeder_labels.get(body_name)
