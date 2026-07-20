@@ -21,6 +21,7 @@ from core.gating_calculator import (
 from core.gating_engine import (
     GatingEngineInput,
     _VELOCITY_RANGES as _ENGINE_VELOCITY_RANGES,
+    _section_velocity_limit,
     calculate_gating_design,
 )
 from core.materials import get_alloy, get_mold, chvorinov_c_from_properties
@@ -1098,6 +1099,31 @@ def analyze_gating(
         user_gate_velocity = float(getattr(casting_params, "ingate_velocity_m_s", 0.0) or 0.0)
         user_velocity_section = str(getattr(casting_params, "velocity_section_key", "INGATE") or "INGATE")
 
+    # v9.2: extended geometry features for the gating engine.
+    if result.subvoxel_sdf.size and part_mask.any():
+        part_sdf_vals = result.subvoxel_sdf[part_mask]
+        t_min_mm = 2.0 * float(np.percentile(part_sdf_vals, 5))
+        t_max_mm = 2.0 * float(np.percentile(part_sdf_vals, 95))
+    else:
+        t_min_mm = wall_thickness_mm * 0.5
+        t_max_mm = wall_thickness_mm * 1.2
+    surface_to_volume_ratio_1_mm = (
+        result.part_surface_area_mm2 / result.part_volume_mm3
+        if result.part_volume_mm3 > 0.0
+        else 0.0
+    )
+    hotspot_count = len(result.hotspots)
+    max_hotspot_m_mm = (
+        max([hs.m_value_mm for hs in result.hotspots], default=0.0)
+        if result.hotspots
+        else 0.0
+    )
+    pore_risk_max = (
+        float(result.risk[part_mask].max())
+        if result.risk.size and part_mask.any()
+        else 0.0
+    )
+
     engine_input = GatingEngineInput(
         total_metal_volume_m3=total_metal_volume_m3,
         total_mass_kg=total_mass_kg,
@@ -1107,6 +1133,12 @@ def analyze_gating(
         total_height_mm=total_height_mm,
         max_flow_path_mm=float(result.bbox_size_mm.max()),
         wall_thickness_mm=wall_thickness_mm,
+        wall_thickness_min_mm=t_min_mm,
+        wall_thickness_max_mm=t_max_mm,
+        surface_to_volume_ratio_1_mm=surface_to_volume_ratio_1_mm,
+        hotspot_count=hotspot_count,
+        max_hotspot_m_mm=max_hotspot_m_mm,
+        pore_risk_max=pore_risk_max,
         alloy_key=alloy.key,
         alloy_name=alloy.name,
         rho_kg_m3=alloy.rho_kg_m3,
@@ -1122,7 +1154,7 @@ def analyze_gating(
         measured_areas_cm2=engine_measured_cm2,
         n_gates=n_ingates if n_ingates > 1 else None,
         head_loss_m=head_loss_m,
-        max_gates=4,
+        max_gates=8,
     )
     design = calculate_gating_design(engine_input)
     H_eff_m = design.h_eff_mm / 1000.0  # engine's H_eff already includes losses
@@ -1161,11 +1193,21 @@ def analyze_gating(
     if design.warnings:
         gating_system_reason += " Uyarılar: " + "; ".join(design.warnings)
 
-    # Target ranges from the engine for SectionFlow / UI limits
-    velocity_targets = _ENGINE_VELOCITY_RANGES.get(
+    # Target ranges from the engine for SectionFlow / UI limits.
+    # Clamp the upper bound by material-specific safe velocity so steel/Al do not
+    # inherit gray-iron target ranges.
+    raw_targets = _ENGINE_VELOCITY_RANGES.get(
         detected_system,
         _ENGINE_VELOCITY_RANGES["yarı basınçlı (semi-pressurized)"],
     )
+    velocity_targets = {}
+    for section in ("sprue", "runner", "gate"):
+        lo, hi = raw_targets[section]
+        hi = min(hi, _section_velocity_limit(detected_system, alloy.key, section))
+        # Keep a valid min/max interval; if the raw lower bound exceeds the
+        # material-clamped upper bound, lower the lower bound proportionally.
+        lo = min(lo, hi * 0.8)
+        velocity_targets[section] = (lo, hi)
     sprue_v_range = velocity_targets["sprue"]
     runner_v_range = velocity_targets["runner"]
     gate_v_range = velocity_targets["gate"]
