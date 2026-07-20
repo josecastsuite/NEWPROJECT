@@ -194,7 +194,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ---------------- LEFT PANEL (scrollable) ----------------
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidgetResizable(True)
-        left_scroll.setMinimumWidth(500) 
+        left_scroll.setMinimumWidth(560) 
         
         left_panel = QtWidgets.QWidget()
         left_scroll.setWidget(left_panel)
@@ -544,7 +544,7 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([520, 700, 450]) 
+        splitter.setSizes([560, 680, 560]) 
         
         # Add splitter to main VBox
         main_vbox.addWidget(splitter, stretch=1)
@@ -679,8 +679,8 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(area_label)
         self._body_section_labels[body.name] = area_label
 
-        # Feeder type controls (always visible; disabled when not applicable).
-        feeder_btn = QtWidgets.QPushButton("Besleyici")
+        # Feeder type controls (always visible; dialog warns if not a RISER).
+        feeder_btn = QtWidgets.QPushButton("Besleyici tipi")
         feeder_btn.setToolTip("Bu besleyicinin tipini ve opsiyonel modülünü ayarla")
         feeder_btn.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
@@ -864,27 +864,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return "INGATE"
 
     def _update_body_row_state(self, body: Body):
-        # Keep both Kesit and Besleyici controls always visible but disable the irrelevant
-        # one. This avoids setVisible toggling across Windows/DPI, which can fail to update
-        # the QListWidget item geometry.
-        is_gating = body.body_type in (
-            BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE, BodyType.SPRUE_THROAT
-        )
-        is_riser = body.body_type == BodyType.RISER
-
-        section_btn = self._body_section_buttons.get(body.name)
-        section_lbl = self._body_section_labels.get(body.name)
-        feeder_btn = self._body_feeder_buttons.get(body.name)
-        feeder_lbl = self._body_feeder_labels.get(body.name)
-
-        if section_btn is not None:
-            section_btn.setEnabled(is_gating)
-        if section_lbl is not None:
-            section_lbl.setEnabled(is_gating)
-        if feeder_btn is not None:
-            feeder_btn.setEnabled(is_riser)
-        if feeder_lbl is not None:
-            feeder_lbl.setEnabled(is_riser)
+        # Buttons are always enabled; the dialog itself warns if the body type is wrong.
+        # Keeping this hook for any future row-specific updates.
+        pass
 
     def _update_body_feeder_label(self, body_name: str):
         label = self._body_feeder_labels.get(body_name)
