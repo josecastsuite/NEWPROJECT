@@ -26,6 +26,7 @@ from core import (
 )
 from core.materials import chvorinov_c_from_properties
 from core.types import Body, BodyType, CastingParameters
+from ui.feeder_dialog import FeederDialog, FEEDER_TYPE_NAMES
 from ui.section_dialog import SectionDialog
 from ui.viewer import Analyzer3DViewer
 
@@ -89,6 +90,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._body_section_areas_cm2: Dict[Tuple[str, str], float] = {}
         self._body_section_labels: Dict[str, QtWidgets.QLabel] = {}
         self._body_section_buttons: Dict[str, QtWidgets.QPushButton] = {}
+        self._body_feeder_buttons: Dict[str, QtWidgets.QPushButton] = {}
+        self._body_feeder_labels: Dict[str, QtWidgets.QLabel] = {}
 
         self._build_ui()
         self._apply_dark_theme()
@@ -645,6 +648,7 @@ class MainWindow(QtWidgets.QMainWindow):
         label.setToolTip(f"Merkez: {body.center}")
         row.addWidget(label, stretch=1)
 
+        # Gating section button + area label
         section_btn = QtWidgets.QPushButton("Kesit")
         section_btn.setToolTip("Bu body'nin gating kesit alanını seç (sadece yolluk/meme/döküm ağzı)")
         section_btn.clicked.connect(lambda _, b=body: self.on_body_section(b))
@@ -656,6 +660,19 @@ class MainWindow(QtWidgets.QMainWindow):
         area_label.setToolTip("Seçilen kesit alanı cm²")
         row.addWidget(area_label)
         self._body_section_labels[body.name] = area_label
+
+        # Feeder type button + summary label
+        feeder_btn = QtWidgets.QPushButton("Besleyici")
+        feeder_btn.setToolTip("Bu besleyicinin tipini ve opsiyonel modülünü ayarla")
+        feeder_btn.clicked.connect(lambda _, b=body: self.on_body_feeder(b))
+        row.addWidget(feeder_btn)
+        self._body_feeder_buttons[body.name] = feeder_btn
+
+        feeder_label = QtWidgets.QLabel("")
+        feeder_label.setStyleSheet("color: #888888; font-size: 11px;")
+        feeder_label.setToolTip("Seçilen besleyici tipi ve modül")
+        row.addWidget(feeder_label)
+        self._body_feeder_labels[body.name] = feeder_label
 
         combo = QtWidgets.QComboBox()
         for bt in (
@@ -680,6 +697,9 @@ class MainWindow(QtWidgets.QMainWindow):
         item.setSizeHint(widget.sizeHint())
         self.body_list.addItem(item)
         self.body_list.setItemWidget(item, widget)
+        self._update_body_row_visibility(body)
+        self._update_body_section_label(body.name)
+        self._update_body_feeder_label(body.name)
 
     def on_load_step(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -711,6 +731,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._body_section_areas_cm2.clear()
             self._body_section_labels.clear()
             self._body_section_buttons.clear()
+            self._body_feeder_buttons.clear()
+            self._body_feeder_labels.clear()
             self._clear_checklist()
             self.rec_text.clear()
             self._grid = None
@@ -734,13 +756,32 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_body_type_changed(self, body: Body, combo: QtWidgets.QComboBox):
         data = combo.currentData()
         try:
-            body.body_type = BodyType(data) if isinstance(data, int) else data
+            new_type = BodyType(data) if isinstance(data, int) else data
         except Exception:
-            body.body_type = BodyType.PART
-        # Kesit butonu her zaman tıklanabilir; yanlış tip seçilirse dialog uyarır.
-        btn = self._body_section_buttons.get(body.name)
-        if btn is not None:
-            btn.setEnabled(True)
+            new_type = BodyType.PART
+
+        old_type = body.body_type
+        body.body_type = new_type
+
+        # If the body is no longer a gating section, clear the stored section data.
+        if old_type != new_type and new_type not in (
+            BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE, BodyType.SPRUE_THROAT
+        ):
+            body.section_key = ""
+            body.section_area_cm2 = 0.0
+            keys_to_drop = [k for (b, k) in self._body_section_areas_cm2 if b == body.name]
+            for k in keys_to_drop:
+                del self._body_section_areas_cm2[(body.name, k)]
+            self._update_body_section_label(body.name)
+
+        # If the body is no longer a riser, clear feeder overrides.
+        if old_type != new_type and new_type != BodyType.RISER:
+            body.feeder_type = ""
+            body.feeder_m_mm = 0.0
+            body.feeder_note = ""
+            self._update_body_feeder_label(body.name)
+
+        self._update_body_row_visibility(body)
         self.viewer.show_bodies(self._bodies)
 
     def on_body_section(self, body: Body):
@@ -769,6 +810,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             if dialog.area_cm2 is not None and dialog.section_key is not None:
                 self._body_section_areas_cm2[(body.name, dialog.section_key)] = dialog.area_cm2
+                body.section_key = dialog.section_key
+                body.section_area_cm2 = dialog.area_cm2
                 self._update_body_section_label(body.name)
                 self.aiLog(
                     f"{body.name} - {dialog.section_key}: A = {dialog.area_cm2:.4f} cm²", "ok"
@@ -785,6 +828,71 @@ class MainWindow(QtWidgets.QMainWindow):
         if bt == BodyType.INGATE:
             return "INGATE"
         return "INGATE"
+
+    def _update_body_row_visibility(self, body: Body):
+        is_gating = body.body_type in (
+            BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE, BodyType.SPRUE_THROAT
+        )
+        is_riser = body.body_type == BodyType.RISER
+
+        section_btn = self._body_section_buttons.get(body.name)
+        section_lbl = self._body_section_labels.get(body.name)
+        feeder_btn = self._body_feeder_buttons.get(body.name)
+        feeder_lbl = self._body_feeder_labels.get(body.name)
+
+        if section_btn is not None:
+            section_btn.setVisible(is_gating)
+        if section_lbl is not None:
+            section_lbl.setVisible(is_gating)
+        if feeder_btn is not None:
+            feeder_btn.setVisible(is_riser)
+        if feeder_lbl is not None:
+            feeder_lbl.setVisible(is_riser)
+
+    def _update_body_feeder_label(self, body_name: str):
+        label = self._body_feeder_labels.get(body_name)
+        if label is None:
+            return
+        body = next((b for b in self._bodies if b.name == body_name), None)
+        if body is None or not body.feeder_type:
+            label.setText("")
+            return
+        m_text = f" M={body.feeder_m_mm:.1f}mm" if body.feeder_m_mm > 0 else " auto"
+        label.setText(f"{FEEDER_TYPE_NAMES.get(body.feeder_type, body.feeder_type)}{m_text}")
+
+    def on_body_feeder(self, body: Body):
+        """Open the per-riser feeder type / optional modulus dialog."""
+        if body is None:
+            return
+        try:
+            bt = BodyType(body.body_type) if isinstance(body.body_type, int) else body.body_type
+        except Exception:
+            bt = body.body_type
+        if bt != BodyType.RISER:
+            QtWidgets.QMessageBox.information(
+                self, "Tip Uyarısı",
+                "Besleyici tipi seçimi sadece BESLEYİCİ (RISER) tipindeki body'ler için geçerlidir.\n"
+                "Lütfen önce body tipini değiştirin."
+            )
+            return
+
+        try:
+            dialog = FeederDialog(body, parent=self)
+        except Exception as e:
+            self.aiLog(f"Besleyici dialogu açılamadı: {e}", "crit")
+            QtWidgets.QMessageBox.critical(self, "Hata", f"Besleyici dialogu açılamadı:\n{e}")
+            return
+
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            body.feeder_type = dialog.feeder_type or "conventional"
+            body.feeder_m_mm = float(dialog.feeder_m_mm)
+            body.feeder_note = dialog.feeder_note
+            self._update_body_feeder_label(body.name)
+            self.aiLog(
+                f"{body.name} - besleyici tipi: {FEEDER_TYPE_NAMES.get(body.feeder_type, body.feeder_type)}"
+                f"{', M=' + f'{body.feeder_m_mm:.2f} mm' if body.feeder_m_mm > 0 else ''}",
+                "ok",
+            )
 
     def on_clear_sections(self):
         self._body_section_areas_cm2.clear()
@@ -1008,8 +1116,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.checklist_layout.addWidget(CheckListItem(text, hs.feed_ok))
 
         for rr in self._analysis.riser_results:
+            eff_m = max(rr.effective_m_value_mm, rr.m_value_mm)
+            type_text = f" [{rr.feeder_type}]" if rr.feeder_type else ""
             text = (
-                f"{rr.name}: M={rr.m_value_mm:.1f} mm, "
+                f"{rr.name}{type_text}: M={rr.m_value_mm:.1f} / etkin {eff_m:.1f} mm, "
                 f"V={rr.volume_cm3:.2f} cm³ (gerekli {rr.required_volume_cm3:.2f} cm³)"
             )
             self.checklist_layout.addWidget(CheckListItem(text, rr.large_enough and rr.volume_ratio_ok))

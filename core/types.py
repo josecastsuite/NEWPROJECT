@@ -101,6 +101,12 @@ class Body:
     volume_cm3: float = 0.0
     surface_area_cm2: float = 0.0
     center: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    # v9.3: per-body user overrides from the GUI
+    section_key: str = ""  # INGATE / RUNNER / SPRUE_BASE / SPRUE_THROAT
+    section_area_cm2: float = 0.0
+    feeder_type: str = ""  # conventional / exothermic / insulated / chilled / sleeve
+    feeder_m_mm: float = 0.0
+    feeder_note: str = ""
 
 
 @dataclass
@@ -159,6 +165,10 @@ class RiserResult:
     mass_kg: float = 0.0
     feed_to_part_mass_ratio: float = 0.0
     feed_to_part_volume_ratio: float = 0.0
+    # v9.3: user feeder type / modulus and the effective modulus used in checks
+    feeder_type: str = ""
+    feeder_m_user_mm: float = 0.0
+    effective_m_value_mm: float = 0.0
 
 
 @dataclass

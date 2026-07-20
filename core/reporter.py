@@ -103,12 +103,14 @@ def _format_riser_table(result: AnalysisResult) -> str:
     rows = []
     if result.riser_results:
         for rr in result.riser_results:
+            eff_m = max(rr.effective_m_value_mm, rr.m_value_mm)
+            type_text = f" ({rr.feeder_type})" if rr.feeder_type else ""
             rows.append(
                 f"<tr>"
-                f"<td>{_html_escape(rr.name)}</td>"
+                f"<td>{_html_escape(rr.name)}{type_text}</td>"
                 f"<td>{rr.volume_cm3:.2f}</td>"
                 f"<td>{rr.surface_area_cm2:.2f}</td>"
-                f"<td>{rr.m_value_mm:.2f}</td>"
+                f"<td>{rr.m_value_mm:.2f} / etkin {eff_m:.2f}</td>"
                 f"<td>{rr.effective_m_required:.2f}</td>"
                 f"<td>{rr.required_volume_cm3:.2f}</td>"
                 f"<td>{'Geçer' if rr.large_enough and rr.volume_ratio_ok else 'Geçersiz'}</td>"
@@ -520,8 +522,10 @@ def _generate_report_fpdf2(
     pdf.set_font(font, "", 10)
     if result.riser_results:
         for rr in result.riser_results:
-            pdf.cell(0, 6, f"{rr.name}: V={rr.volume_cm3:.2f} cm³, A={rr.surface_area_cm2:.2f} cm², "
-                           f"M={rr.m_value_mm:.2f} mm (gerekli {rr.effective_m_required:.2f} mm), "
+            eff_m = max(rr.effective_m_value_mm, rr.m_value_mm)
+            type_text = f" [{rr.feeder_type}]" if rr.feeder_type else ""
+            pdf.cell(0, 6, f"{rr.name}{type_text}: V={rr.volume_cm3:.2f} cm³, A={rr.surface_area_cm2:.2f} cm², "
+                           f"M={rr.m_value_mm:.2f} / etkin {eff_m:.2f} mm (gerekli {rr.effective_m_required:.2f} mm), "
                            f"V gerekli={rr.required_volume_cm3:.2f} cm³", ln=True)
     else:
         pdf.cell(0, 6, "Besleyici body atanmamış.", ln=True)

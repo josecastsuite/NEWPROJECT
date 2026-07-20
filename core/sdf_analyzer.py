@@ -1394,6 +1394,49 @@ def _high_res_part_hotspots(
     return part_hotspots
 
 
+def _feeder_time_factor(body: Body) -> float:
+    """Return the solidification-time multiplier for a RISER body.
+
+    Values > 1 keep the feeder liquid longer; values < 1 solidify it faster.
+    """
+    ftype = (body.feeder_type or "conventional").lower().strip()
+    if not ftype:
+        ftype = "conventional"
+    return {
+        "conventional": 1.0,
+        "exothermic": 1.5,
+        "insulated": 1.2,
+        "sleeve": 1.1,
+        "chilled": 0.8,
+    }.get(ftype, 1.0)
+
+
+def _apply_feeder_sleeve_time_factor(
+    grid: np.ndarray,
+    t_liq: np.ndarray,
+    t_sol: np.ndarray,
+    bodies: List[Body],
+) -> None:
+    """Scale solidification times of RISER voxels by the weighted feeder type."""
+    riser_bodies = [b for b in bodies if b.body_type == BodyType.RISER]
+    if not riser_bodies:
+        return
+    total_volume = sum(max(b.volume_cm3, 1e-9) for b in riser_bodies)
+    if total_volume <= 0.0:
+        return
+    factor = sum(
+        _feeder_time_factor(b) * max(b.volume_cm3, 1e-9) / total_volume
+        for b in riser_bodies
+    )
+    riser_mask = grid == BodyType.RISER
+    if not riser_mask.any():
+        return
+    finite_liq = riser_mask & np.isfinite(t_liq)
+    finite_sol = riser_mask & np.isfinite(t_sol)
+    t_liq[finite_liq] = t_liq[finite_liq] * factor
+    t_sol[finite_sol] = t_sol[finite_sol] * factor
+
+
 def analyze(
     bodies: List[Body],
     grid: np.ndarray,
@@ -1513,6 +1556,12 @@ def analyze(
         downsample=thermal_downsample,
         progress_callback=progress_callback,
     )
+    # v9.3: account for feeder sleeves/exothermic/chilled type by scaling the
+    # solidification time of RISER voxels.  A single weighted factor per model is
+    # used because the voxel grid stores body-type IDs; per-body factors require
+    # a body-index grid.  This is a robust first-order correction.
+    _apply_feeder_sleeve_time_factor(grid, t_liq, t_s, bodies)
+
     # Fallback for thick regions that did not reach solidus within max_time_s:
     # use the analytical Chvorinov/Stefan Niyama so hot spots are not reported as 0.
     G_ana, R_ana, niyama_ana = compute_niyama(
@@ -1747,6 +1796,35 @@ def analyze(
             nearest_pos = nearest_hs.position_mm
             nearest_resistance = nearest_hs.darcy_resistance
 
+        # v9.3: apply user-defined feeder type / modulus and compute effective modulus.
+        feeder_type = (body.feeder_type or "conventional").lower().strip()
+        if not feeder_type or feeder_type == "":
+            feeder_type = "conventional"
+        # Multiplier on the riser modulus that accounts for exothermic/insulated sleeves.
+        # Chilled feeders lose metal quickly, so their effective modulus is reduced.
+        feeder_modulus_factor = {
+            "conventional": 1.0,
+            "exothermic": getattr(alloy, "exothermic_modulus_factor", 1.5),
+            "insulated": 1.2,
+            "sleeve": 1.1,
+            "chilled": 0.8,
+        }.get(feeder_type, 1.0)
+        # Volume yield: exothermic mini-risers supply the same modulus with less metal.
+        feeder_volume_yield = {
+            "conventional": 1.0,
+            "exothermic": getattr(alloy, "exothermic_volume_yield", 0.45),
+            "insulated": 0.8,
+            "sleeve": 0.9,
+            "chilled": 1.2,
+        }.get(feeder_type, 1.0)
+
+        # If the user entered an explicit feeder modulus, use it as the base modulus.
+        if body.feeder_m_mm > 0.0:
+            m_riser_base = float(body.feeder_m_mm)
+        else:
+            m_riser_base = m_riser
+        m_riser_eff = m_riser_base * feeder_modulus_factor
+
         # v8.6: existing riser must satisfy both the local hotspot and the global part modulus.
         m_cast_mm = part_volume_mm3 / part_surface_area_mm2 if part_surface_area_mm2 > 0 else 0.0
         local_m_required = alloy.riser_m_factor * nearest_m
@@ -1764,12 +1842,12 @@ def analyze(
         resistance_correction = (nearest_resistance / rho_g) * 1000.0
         effective_m_required = m_required * gravity + resistance_correction
         # Allow 5% engineering tolerance.
-        large_enough = m_riser >= 0.95 * effective_m_required if m_required > 0 else True
+        large_enough = m_riser_eff >= 0.95 * effective_m_required if m_required > 0 else True
 
         # v9.1: larger-than-required risers extend effective feeding distance;
         # undersized ones shorten it.  Store a per-component factor.
-        if effective_m_required > 0.0 and m_riser > 0.0:
-            ratio = m_riser / effective_m_required
+        if effective_m_required > 0.0 and m_riser_eff > 0.0:
+            ratio = m_riser_eff / effective_m_required
             if large_enough:
                 size_factor = min(2.0, 1.0 + 0.5 * max(0.0, ratio - 1.0))
             else:
@@ -1793,7 +1871,7 @@ def analyze(
             )
             feed_volume_mm3 = float(feed_region.sum()) * (dx ** 3)
             required_volume_cm3 = alloy.riser_volume_factor * feed_volume_mm3 / 1000.0
-            volume_ratio_ok = volume_cm3 >= required_volume_cm3
+            volume_ratio_ok = volume_cm3 >= required_volume_cm3 * feeder_volume_yield
 
         part_volume_cm3 = part_volume_mm3 / 1000.0
         riser_mass_kg = volume_cm3 * alloy.density_g_cm3 / 1000.0
@@ -1819,6 +1897,9 @@ def analyze(
                 mass_kg=riser_mass_kg,
                 feed_to_part_mass_ratio=feed_to_part_volume_ratio,
                 feed_to_part_volume_ratio=feed_to_part_volume_ratio,
+                feeder_type=feeder_type,
+                feeder_m_user_mm=body.feeder_m_mm,
+                effective_m_value_mm=m_riser_eff,
             )
         )
 
@@ -2082,18 +2163,20 @@ def _build_recommendations(
                 )
 
     for rr in result.riser_results:
+        eff_m = max(rr.effective_m_value_mm, rr.m_value_mm)
+        type_text = f" ({rr.feeder_type})" if rr.feeder_type else ""
         if not rr.large_enough:
             increase = (
-                (rr.effective_m_required / max(rr.m_value_mm, 1e-6) - 1.0) * 100.0
+                (rr.effective_m_required / max(eff_m, 1e-6) - 1.0) * 100.0
             )
             recs.append(
-                f"{rr.name}: M_besleyici={rr.m_value_mm:.2f} mm < gerekli {rr.effective_m_required:.2f} mm. "
+                f"{rr.name}{type_text}: M_besleyici={eff_m:.2f} mm (gerçek {rr.m_value_mm:.2f} mm) < gerekli {rr.effective_m_required:.2f} mm. "
                 f"Besleyici modülünü %{int(increase)} büyütün."
             )
         if not rr.volume_ratio_ok:
             short = rr.required_volume_cm3 - rr.volume_cm3
             recs.append(
-                f"{rr.name}: hacim yetersiz (V={rr.volume_cm3:.2f} cm³, gerekli {rr.required_volume_cm3:.2f} cm³). "
+                f"{rr.name}{type_text}: hacim yetersiz (V={rr.volume_cm3:.2f} cm³, gerekli {rr.required_volume_cm3:.2f} cm³). "
                 f"En az {short:.2f} cm³ daha hacim ekleyin."
             )
 
