@@ -322,32 +322,37 @@ class Analyzer3DViewer(QtInteractor):
                 return
             class_mask = part_mask
 
+        # v9.3: use the risk field to suppress low-probability shrinkage noise.
+        # The slider selects the top noise_percent% of risk within the chosen class;
+        # the displayed scalar remains the shrinkage pore size.
+        risk = np.asarray(result.risk) if result.risk is not None else np.array([])
+        has_risk = risk.size and risk.shape == part_mask.shape
+        if use_pore_size and has_risk:
+            if pore_size_filter in ("macro", "micro", "fine"):
+                target_percent = float(
+                    getattr(result, f"pore_size_{pore_size_filter}_percent", 0.0)
+                )
+                if target_percent <= 0.0:
+                    target_percent = {"macro": 60.0, "micro": 40.0, "fine": 20.0}[pore_size_filter]
+                effective_percent = min(100.0, target_percent * (noise_percent / 3.0))
+            else:
+                effective_percent = noise_percent
+            risk_values = risk[class_mask & (risk > 0.0)]
+            if risk_values.size == 0:
+                return
+            p = max(0.0, 100.0 - effective_percent)
+            risk_threshold = float(np.percentile(risk_values, p))
+            class_mask = class_mask & (risk >= risk_threshold)
+
         field = np.asarray(field, dtype=np.float64)
         values = field[class_mask]
         finite = np.isfinite(values) & (values > 0.0)
         if not finite.any():
             return
-        finite_values = values[finite]
-        finite_max = float(np.max(finite_values))
+        finite_max = float(np.max(values[finite]))
 
-        # v9.2: per-class top percentages (macro 60%, micro 40%, fine 20%).
-        # The slider scales these percentages for class filters; for "all" it is
-        # the top percentage directly.
-        if use_pore_size and pore_size_filter in ("macro", "micro", "fine"):
-            target_percent = float(
-                getattr(result, f"pore_size_{pore_size_filter}_percent", 0.0)
-            )
-            if target_percent <= 0.0:
-                target_percent = {"macro": 60.0, "micro": 40.0, "fine": 20.0}[pore_size_filter]
-            effective_percent = min(100.0, target_percent * (noise_percent / 3.0))
-            p = max(0.0, 100.0 - effective_percent)
-            lo = float(np.percentile(finite_values, p))
-        else:
-            p = max(0.0, min(100.0 - noise_percent, 100.0))
-            lo = float(np.percentile(finite_values, p))
-
-        # Physical floor: only positive shrinkage values.
-        lo = max(lo, 0.0)
+        # Keep all shrinkage selected by the risk filter; color by size.
+        lo = 0.0
         hi = finite_max
         if hi <= lo:
             return

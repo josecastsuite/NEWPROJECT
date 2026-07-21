@@ -75,8 +75,8 @@ class Alloy:
     # Secondary dendrite arm spacing [mm] for interdendritic permeability
     dendrite_spacing_mm: float = 0.12
     # Practical porosity acceptance limits [µm] and unavoidable gas/oxide baseline
-    micro_pore_limit_um: float = 100.0
-    macro_pore_limit_um: float = 1000.0
+    micro_pore_limit_um: float = 50.0
+    macro_pore_limit_um: float = 500.0
     gas_pore_baseline_um: float = 0.5
     # Porosity-shape exponent: (1 - N/N_thr)^n.  n>1 makes marginally-low-Niyama
     # regions much less porous, reflecting real-life feeding reservoirs/pressure.

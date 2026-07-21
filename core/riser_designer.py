@@ -352,9 +352,10 @@ def propose_risers(
         V = _cylinder_volume_mm3(D, h2d) / 1000.0  # cm³
         M_riser = _cylinder_m_for_d(D, h2d)
 
-        # Feasibility envelope.
+        # Feasibility envelope: a riser should not exceed the feeding-zone volume
+        # by too much, nor should it grow beyond a global fraction of the part.
         max_diameter_mm = max(t_zone * 2.0, part_smallest_dim_mm * 0.5, 20.0)
-        max_volume_cm3 = 0.30 * part_volume_cm3
+        max_volume_cm3 = min(0.30 * part_volume_cm3, max(1.5 * V_c_cm3, 0.0))
 
         shape = "cylinder"
         exothermic = False
