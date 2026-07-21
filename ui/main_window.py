@@ -26,6 +26,7 @@ from core import (
 from core.materials import chvorinov_c_from_properties
 from core.types import Body, BodyType, CastingParameters
 from ui.feeder_dialog import FeederDialog, FEEDER_TYPE_NAMES
+from ui.section_dialog import SectionDialog
 from ui.viewer import Analyzer3DViewer
 
 
@@ -86,6 +87,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._origin = None
         self._dx = None
         self._unit_scale = 1.0
+        # User-selected section area for the velocity inlet (sprue throat/top).
+        self._user_section_area_cm2 = 0.0
+        self._user_section_key = "SPRUE_THROAT"
+        self._user_section_body_name = ""
         self._body_feeder_buttons: Dict[str, QtWidgets.QPushButton] = {}
         self._body_feeder_labels: Dict[str, QtWidgets.QLabel] = {}
         self._body_items: Dict[str, QtWidgets.QListWidgetItem] = {}
@@ -342,7 +347,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.velocity_section_combo = QtWidgets.QComboBox()
         self.velocity_section_combo.addItem("Döküm ağzı boğazı (sprue throat)", "SPRUE_THROAT")
         self.velocity_section_combo.addItem("Döküm ağzı en üst noktası (sprue top)", "SPRUE_BASE")
-        _params_labeled(self.velocity_section_combo, "Hız kesiti:", "Kullanıcı girişi sadece sprue boğazı veya sprue en üst noktasıdır; program düzeltmez.")
+        self.velocity_section_combo.setCurrentIndex(self.velocity_section_combo.findData("SPRUE_THROAT"))
+        _params_labeled(self.velocity_section_combo, "Hız kesiti:", "Seçilen sprue kesitinin hızı girilir; program bu kesit alanından Q hesaplar, düzeltme yapmaz.")
+
+        self.section_pick_button = QtWidgets.QPushButton("Kesit seçiniz")
+        self.section_pick_button.setToolTip("Seçili sprue elemanının gerçek kesit alanını 3D modelden seç. 0 = otomatik CAD ölçümü.")
+        self.section_pick_button.clicked.connect(self.on_pick_section)
+        self.section_pick_label = QtWidgets.QLabel("A=otomatik")
+
+        pick_layout = QtWidgets.QHBoxLayout()
+        pick_layout.addWidget(self.section_pick_button)
+        pick_layout.addWidget(self.section_pick_label)
+        pick_layout.addStretch()
+        params_layout.addLayout(pick_layout)
 
         self.v_ingate_spin = QtWidgets.QDoubleSpinBox()
         self.v_ingate_spin.setRange(0.0, 20.0)
@@ -826,6 +843,53 @@ class MainWindow(QtWidgets.QMainWindow):
                 "ok",
             )
 
+    def on_pick_section(self):
+        """Open SectionDialog for the selected velocity-section body."""
+        if not self._bodies:
+            QtWidgets.QMessageBox.warning(self, "UYARI", "Önce STEP dosyası yükleyin.")
+            return
+        section_key = self.velocity_section_combo.currentData()
+        if section_key == "SPRUE_THROAT":
+            target_types = {BodyType.SPRUE_THROAT, BodyType.SPRUE}
+        elif section_key == "SPRUE_BASE":
+            target_types = {BodyType.SPRUE, BodyType.POURING_BASIN}
+        else:
+            target_types = {BodyType.SPRUE, BodyType.SPRUE_THROAT, BodyType.POURING_BASIN}
+        candidates = [b for b in self._bodies if b.body_type in target_types]
+        if not candidates:
+            QtWidgets.QMessageBox.warning(
+                self, "UYARI",
+                f"{section_key} tipinde body bulunamadı. Lütfen body tipini doğru atayın."
+            )
+            return
+        if len(candidates) == 1:
+            body = candidates[0]
+        else:
+            names = [b.name for b in candidates]
+            name, ok = QtWidgets.QInputDialog.getItem(
+                self, "Body Seçimi", f"{section_key} için body seçin:", names, 0, False
+            )
+            if not ok or not name:
+                return
+            body = next((b for b in candidates if b.name == name), None)
+            if body is None:
+                return
+        try:
+            dialog = SectionDialog(body, section_key=section_key, parent=self)
+        except Exception as e:
+            self.aiLog(f"Kesit dialogu açılamadı: {e}", "crit")
+            QtWidgets.QMessageBox.critical(self, "Hata", f"Kesit dialogu açılamadı:\n{e}")
+            return
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            if dialog.area_cm2 and dialog.area_cm2 > 0.0:
+                self._user_section_area_cm2 = float(dialog.area_cm2)
+                self._user_section_key = str(dialog.section_key)
+                self._user_section_body_name = body.name
+                self.section_pick_label.setText(f"A={self._user_section_area_cm2:.2f} cm² ({body.name})")
+                self.aiLog(
+                    f"{body.name} - {dialog.section_key}: A = {self._user_section_area_cm2:.4f} cm²", "ok"
+                )
+
     def on_voxelize(self):
         if not self._bodies:
             return
@@ -903,7 +967,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 thermal_downsample=3,
                 casting_params=casting_params,
                 progress_callback=self._set_progress,
-                user_section_areas_cm2=None,
+                user_section_areas_cm2=(
+                    {self._user_section_key: self._user_section_area_cm2}
+                    if self._user_section_area_cm2 > 0.0
+                    else None
+                ),
             )
             self._analysis.casting_params = casting_params
 

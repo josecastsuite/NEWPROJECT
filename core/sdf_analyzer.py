@@ -2137,13 +2137,47 @@ def analyze(
     try:
         from core.filling_solver import solve_filling_flow
 
-        design_v = float(
-            getattr(result.gate_result, "design_choke_velocity_m_s", 0.0) or 0.0
-        )
-        design_area_cm2 = float(
-            getattr(result.gate_result, "design_sprue_base_area_cm2", 0.0) or 0.0
-        )
         gate = result.gate_result
+        # Velocity/area inlet comes from user CastingParameters if supplied.
+        design_section_key = (
+            getattr(casting_params, "velocity_section_key", None) or "SPRUE_THROAT"
+        )
+        user_v = float(getattr(casting_params, "ingate_velocity_m_s", 0.0) or 0.0)
+        design_v = user_v if user_v > 0.0 else float(
+            getattr(gate, "design_choke_velocity_m_s", 0.0) or 0.0
+        )
+        # Use the user-selected section area if provided; otherwise use the
+        # measured area for the chosen section from the gating engine.
+        user_area_cm2 = (
+            user_section_areas_cm2.get(design_section_key, 0.0)
+            if user_section_areas_cm2
+            else 0.0
+        )
+        if user_area_cm2 > 0.0:
+            design_area_cm2 = float(user_area_cm2)
+        else:
+            sf = getattr(gate, "section_flows", {}) or {}
+            section_flow = sf.get(design_section_key)
+            if section_flow is not None:
+                design_area_cm2 = float(section_flow.area_cm2)
+            else:
+                attr_map = {
+                    "SPRUE_THROAT": "sprue_throat_area_cm2",
+                    "SPRUE_BASE": "sprue_base_area_cm2",
+                    "SPRUE": "sprue_base_area_cm2",
+                    "RUNNER": "runner_min_area_cm2",
+                    "INGATE": "total_ingate_contact_area_cm2",
+                    "DISTRIBUTOR": "distributor_area_cm2",
+                    "CURUFLUK": "curufluk_area_cm2",
+                }
+                design_area_cm2 = float(
+                    getattr(gate, attr_map.get(design_section_key, "sprue_base_area_cm2"), 0.0)
+                    or 0.0
+                )
+            if design_area_cm2 <= 0.0:
+                design_area_cm2 = float(
+                    getattr(gate, "design_sprue_base_area_cm2", 0.0) or 0.0
+                )
         section_areas_m2 = {
             "SPRUE": float(gate.sprue_base_area_cm2) * 1e-4 if gate.sprue_base_area_cm2 else 0.0,
             "RUNNER": float(gate.runner_min_area_cm2) * 1e-4 if gate.runner_min_area_cm2 else 0.0,
@@ -2160,7 +2194,7 @@ def analyze(
             bodies=bodies,
             progress_callback=None,
             design_velocity_m_s=design_v,
-            design_section_key="SPRUE_THROAT",
+            design_section_key=design_section_key,
             design_area_m2=design_area_cm2 * 1e-4,
             section_areas_m2=section_areas_m2,
         )
