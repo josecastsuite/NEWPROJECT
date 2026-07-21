@@ -21,6 +21,7 @@ from core.gating_calculator import (
 from core.gating_engine import (
     GatingEngineInput,
     _VELOCITY_RANGES as _ENGINE_VELOCITY_RANGES,
+    _classify_from_velocities,
     _section_velocity_limit,
     calculate_gating_design,
 )
@@ -67,12 +68,13 @@ def _apply_edge_mask(arr, di, dj, dk):
 def _gate_source_mask(grid: np.ndarray) -> np.ndarray:
     """Return gating bodies that can feed metal into the part.
 
-    Filter and pouring basin may also act as entry points; cooling sprue
-    is a chill and must not be treated as a feeder.
+    Filter, pouring basin, distributor and curufluk may also act as entry
+    points; cooling sprue is a chill and must not be treated as a feeder.
     """
     return np.isin(
         grid,
-        [BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE, BodyType.SPRUE_THROAT, BodyType.FILTER, BodyType.POURING_BASIN],
+        [BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE, BodyType.SPRUE_THROAT,
+         BodyType.DISTRIBUTOR, BodyType.CURUFLUK, BodyType.FILTER, BodyType.POURING_BASIN],
     )
 
 
@@ -360,55 +362,305 @@ def _sprue_circular_base_and_throat(
     return base, throat
 
 
+_GATING_BODY_TYPES = frozenset([
+    BodyType.SPRUE,
+    BodyType.SPRUE_THROAT,
+    BodyType.RUNNER,
+    BodyType.DISTRIBUTOR,
+    BodyType.CURUFLUK,
+    BodyType.INGATE,
+    BodyType.POURING_BASIN,
+])
+
+
+def _bboxes_overlap(
+    min_a: np.ndarray,
+    max_a: np.ndarray,
+    min_b: np.ndarray,
+    max_b: np.ndarray,
+    tol: float = 2.0,
+) -> bool:
+    """Return True if two bounding boxes overlap or are within ``tol`` of each other."""
+    return bool(np.all((max_a + tol) >= min_b) and np.all((max_b + tol) >= min_a))
+
+
+def _body_cross_section_mm2(
+    body: Body,
+    axis: Optional[np.ndarray] = None,
+) -> Tuple[float, Optional[float]]:
+    """Return (main area, optional throat area) [mm2] for a gating body.
+
+    SPRUE returns both base and throat; SPRUE_THROAT returns (throat, throat);
+    other body types return (characteristic area, None).
+    """
+    mesh = _repair_mesh(body.mesh)
+    if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+        return 0.0, None
+    if axis is None:
+        axis = _flow_axis(mesh)
+    else:
+        axis = np.asarray(axis, dtype=np.float64)
+        norm = float(np.linalg.norm(axis))
+        if norm <= 0.0:
+            axis = _flow_axis(mesh)
+        else:
+            axis = axis / norm
+    if body.body_type == BodyType.SPRUE:
+        base_mm2, throat_mm2 = _sprue_circular_base_and_throat(mesh, axis)
+        return base_mm2, throat_mm2
+    if body.body_type == BodyType.SPRUE_THROAT:
+        area_mm2 = _characteristic_cross_section_area(mesh, axis)
+        return area_mm2, area_mm2
+    area_mm2 = _characteristic_cross_section_area(mesh, axis)
+    return area_mm2, None
+
+
+def _build_gating_topology(
+    bodies: List[Body],
+    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
+    tol_mm: float = 2.0,
+) -> Dict[str, object]:
+    """Build a directed flow graph for the gating system.
+
+    Nodes are bodies of ``_GATING_BODY_TYPES``.  Edges point from the body with
+    the larger projection onto the ``up`` direction (opposite to gravity) toward
+    the lower one.  This gives an upstream -> downstream tree that preserves
+    series/parallel topology.
+    """
+    gating = [b for b in bodies if b.body_type in _GATING_BODY_TYPES]
+    empty = {
+        "bodies": [],
+        "parent": {},
+        "children": {},
+        "order": [],
+        "sources": [],
+        "up": np.array([0.0, 0.0, 1.0]),
+        "flow_axis": {},
+        "areas_mm2": {},
+        "centers": {},
+    }
+    if not gating:
+        return empty
+
+    n = len(gating)
+    mins = [b.mesh.bounds[0] for b in gating]
+    maxs = [b.mesh.bounds[1] for b in gating]
+    centers = np.vstack([b.center for b in gating])
+    g = np.asarray(gravity_vector, dtype=np.float64)
+    g_norm = float(np.linalg.norm(g)) + 1e-12
+    up = -g / g_norm
+    proj = centers @ up
+
+    # Adjacency from bounding-box proximity.
+    adj: List[List[int]] = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _bboxes_overlap(mins[i], maxs[i], mins[j], maxs[j], tol_mm):
+                adj[i].append(j)
+                adj[j].append(i)
+
+    # Direct edges from higher projection to lower projection.
+    incoming: List[List[int]] = [[] for _ in range(n)]
+    outgoing: List[List[int]] = [[] for _ in range(n)]
+    for i in range(n):
+        for j in adj[i]:
+            if i == j:
+                continue
+            if proj[i] > proj[j] + 1e-9:
+                outgoing[i].append(j)
+                incoming[j].append(i)
+            elif proj[j] > proj[i] + 1e-9:
+                outgoing[j].append(i)
+                incoming[i].append(j)
+            else:
+                # Equal projection: stable tie-break by index.
+                if i < j:
+                    outgoing[i].append(j)
+                    incoming[j].append(i)
+                else:
+                    outgoing[j].append(i)
+                    incoming[i].append(j)
+
+    sources = [i for i in range(n) if not incoming[i]]
+    if not sources:
+        sources = [int(np.argmax(proj))]
+
+    # Topological order: always expand the highest unprocessed node first.
+    in_degree = [len(incoming[i]) for i in range(n)]
+    ready = sorted(sources, key=lambda i: -proj[i])
+    order: List[int] = []
+    while ready:
+        u = ready.pop(0)
+        order.append(u)
+        for v in outgoing[u]:
+            in_degree[v] -= 1
+            if in_degree[v] == 0:
+                ready.append(v)
+        ready.sort(key=lambda i: -proj[i])
+
+    # Local flow direction per body: prefer direction to children; if leaf, from parent.
+    flow_axis: Dict[str, np.ndarray] = {}
+    for i, b in enumerate(gating):
+        if outgoing[i]:
+            dir_vec = np.mean([centers[v] - centers[i] for v in outgoing[i]], axis=0)
+        elif incoming[i]:
+            dir_vec = centers[i] - centers[incoming[i][0]]
+        else:
+            dir_vec = g
+        norm = float(np.linalg.norm(dir_vec)) + 1e-12
+        flow_axis[b.name] = dir_vec / norm
+
+    # Cross-sectional area of every body, measured perpendicular to its flow axis.
+    areas_mm2: Dict[str, float] = {}
+    for b in gating:
+        base, throat = _body_cross_section_mm2(b, axis=flow_axis[b.name])
+        areas_mm2[b.name] = float(base)
+        if throat is not None:
+            areas_mm2[b.name + ":throat"] = float(throat)
+
+    body_list = gating
+    return {
+        "bodies": body_list,
+        "parent": {
+            b.name: (gating[incoming[i][0]].name if incoming[i] else None)
+            for i, b in enumerate(body_list)
+        },
+        "children": {
+            b.name: [gating[v].name for v in outgoing[i]]
+            for i, b in enumerate(body_list)
+        },
+        "order": [gating[i].name for i in order],
+        "sources": [gating[i].name for i in sources],
+        "up": up,
+        "flow_axis": flow_axis,
+        "areas_mm2": areas_mm2,
+        "centers": {b.name: centers[i] for i, b in enumerate(body_list)},
+    }
+
+
 def _real_gating_areas_from_bodies(
     bodies: List[Body],
+    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
 ) -> Dict[str, float]:
-    """Compute real sprue/runner/ingate cross-section areas from CAD meshes.
+    """Compute real sprue/runner/distributor/curufluk/ingate cross-section areas from CAD meshes.
 
-    Returns areas in cm2:
-      runner_total, ingate_total, sprue_base, sprue_throat.
-    Runner and ingate areas are the characteristic cross-sections, summed when
-    multiple bodies are present.  Sprue base is the main circular cross-section;
-    sprue throat is the minimum reliable circular cross-section.
+    Series elements are not summed; the representative area for RUNNER and
+    DISTRIBUTOR is taken from the terminal body that feeds the next section
+    (gate / distributor / curufluk).  INGATE bodies are summed because they
+    usually represent parallel gates.
     """
-    runner_total_mm2 = 0.0
-    ingate_total_mm2 = 0.0
-    sprue_bases: List[float] = []
-    sprue_throats: List[float] = []
+    topology = _build_gating_topology(bodies, gravity_vector=gravity_vector)
+    if not topology["bodies"]:
+        return {
+            "runner_total_mm2": 0.0,
+            "runner_total_cm2": 0.0,
+            "distributor_total_mm2": 0.0,
+            "distributor_total_cm2": 0.0,
+            "curufluk_total_mm2": 0.0,
+            "curufluk_total_cm2": 0.0,
+            "ingate_total_mm2": 0.0,
+            "ingate_total_cm2": 0.0,
+            "sprue_base_mm2": 0.0,
+            "sprue_base_cm2": 0.0,
+            "sprue_throat_mm2": 0.0,
+            "sprue_throat_cm2": 0.0,
+            "n_ingates": 0,
+        }
 
-    for body in bodies:
-        if body.body_type not in (BodyType.SPRUE, BodyType.SPRUE_THROAT, BodyType.RUNNER, BodyType.INGATE):
-            continue
-        mesh = _repair_mesh(body.mesh)
-        if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
-            continue
-        axis = _flow_axis(mesh)
-        if body.body_type == BodyType.SPRUE:
-            base_mm2, throat_mm2 = _sprue_circular_base_and_throat(mesh, axis)
-            sprue_bases.append(base_mm2)
-            sprue_throats.append(throat_mm2)
-        elif body.body_type == BodyType.SPRUE_THROAT:
-            area_mm2 = _characteristic_cross_section_area(mesh, axis)
-            sprue_throats.append(area_mm2)
-        elif body.body_type == BodyType.RUNNER:
-            area_mm2 = _characteristic_cross_section_area(mesh, axis)
-            runner_total_mm2 += area_mm2
-        elif body.body_type == BodyType.INGATE:
-            area_mm2 = _characteristic_cross_section_area(mesh, axis)
-            ingate_total_mm2 += area_mm2
+    body_map = {b.name: b for b in topology["bodies"]}
+    areas = topology["areas_mm2"]
+    children = topology["children"]
+    order = topology["order"]
 
-    sprue_base_total_mm2 = float(np.sum(sprue_bases)) if sprue_bases else 0.0
-    sprue_throat_min_mm2 = float(np.min(sprue_throats)) if sprue_throats else 0.0
+    def _child_of_types(name: str, types: Tuple[BodyType, ...]) -> bool:
+        return any(body_map[c].body_type in types for c in children.get(name, []))
+
+    def _select_terminal(btype: BodyType, feed_types: Tuple[BodyType, ...]) -> List[str]:
+        candidates = [n for n in order if body_map[n].body_type == btype]
+        terminals = [n for n in candidates if _child_of_types(n, feed_types)]
+        if terminals:
+            return terminals
+        # Fallback: if all are in series, take the one closest to the gates.
+        if candidates:
+            return [candidates[-1]]
+        return []
+
+    # INGATE: always sum parallel gates.
+    ingate_names = [n for n in order if body_map[n].body_type == BodyType.INGATE]
+    ingate_total_mm2 = sum(areas[n] for n in ingate_names)
+    n_ingates = len(ingate_names)
+
+    # RUNNER: terminal runner feeding distributor/curufluk/ingate.
+    runner_names = _select_terminal(
+        BodyType.RUNNER,
+        (BodyType.DISTRIBUTOR, BodyType.CURUFLUK, BodyType.INGATE),
+    )
+    runner_total_mm2 = sum(areas[n] for n in runner_names)
+
+    # DISTRIBUTOR: terminal distributor feeding curufluk/ingate.
+    distributor_names = _select_terminal(
+        BodyType.DISTRIBUTOR,
+        (BodyType.CURUFLUK, BodyType.INGATE),
+    )
+    distributor_total_mm2 = sum(areas[n] for n in distributor_names)
+
+    # CURUFLUK: sum all curufluk bodies that are part of the flow path.
+    curufluk_names = [n for n in order if body_map[n].body_type == BodyType.CURUFLUK]
+    curufluk_total_mm2 = sum(areas[n] for n in curufluk_names)
+
+    # SPRUE/POURING_BASIN: collect base and throat along each source branch.
+    sprue_base_total_mm2 = 0.0
+    sprue_throat_min_mm2 = 0.0
+    has_sprue = any(body_map[n].body_type == BodyType.SPRUE for n in order)
+    visited: set = set()
+
+    def _collect_sprue(name: str) -> None:
+        nonlocal sprue_base_total_mm2, sprue_throat_min_mm2
+        if name in visited:
+            return
+        visited.add(name)
+        b = body_map[name]
+        if b.body_type == BodyType.SPRUE:
+            base = areas[name]
+            throat = areas.get(name + ":throat", base)
+            sprue_base_total_mm2 += base
+            if sprue_throat_min_mm2 == 0.0:
+                sprue_throat_min_mm2 = throat
+            else:
+                sprue_throat_min_mm2 = min(sprue_throat_min_mm2, throat)
+        elif b.body_type == BodyType.SPRUE_THROAT:
+            throat = areas[name]
+            if sprue_throat_min_mm2 == 0.0:
+                sprue_throat_min_mm2 = throat
+            else:
+                sprue_throat_min_mm2 = min(sprue_throat_min_mm2, throat)
+        elif b.body_type == BodyType.POURING_BASIN and not has_sprue:
+            # Only use pouring-basin area as a sprue fallback when no sprue exists.
+            base = areas[name]
+            if sprue_base_total_mm2 == 0.0:
+                sprue_base_total_mm2 = base
+                sprue_throat_min_mm2 = base
+        for c in children.get(name, []):
+            if body_map[c].body_type in _GATING_BODY_TYPES:
+                _collect_sprue(c)
+
+    for src in topology["sources"]:
+        _collect_sprue(src)
 
     return {
         "runner_total_mm2": runner_total_mm2,
         "runner_total_cm2": runner_total_mm2 / 100.0,
+        "distributor_total_mm2": distributor_total_mm2,
+        "distributor_total_cm2": distributor_total_mm2 / 100.0,
+        "curufluk_total_mm2": curufluk_total_mm2,
+        "curufluk_total_cm2": curufluk_total_mm2 / 100.0,
         "ingate_total_mm2": ingate_total_mm2,
         "ingate_total_cm2": ingate_total_mm2 / 100.0,
         "sprue_base_mm2": sprue_base_total_mm2,
         "sprue_base_cm2": sprue_base_total_mm2 / 100.0,
         "sprue_throat_mm2": sprue_throat_min_mm2,
         "sprue_throat_cm2": sprue_throat_min_mm2 / 100.0,
+        "n_ingates": n_ingates,
     }
 
 
@@ -918,7 +1170,14 @@ def analyze_gating(
     mold = get_mold(result.mold_key)
 
     use_bodies = bodies is not None and len(bodies) > 0
-    real_areas = _real_gating_areas_from_bodies(bodies) if use_bodies else {}
+    gravity_vector = (0.0, 0.0, -1.0)
+    if casting_params is not None and isinstance(casting_params, CastingParameters):
+        gravity_vector = getattr(casting_params, "gravity_vector", gravity_vector) or gravity_vector
+    real_areas = (
+        _real_gating_areas_from_bodies(bodies, gravity_vector=gravity_vector)
+        if use_bodies
+        else {}
+    )
 
     # User-supplied cross-section areas from the 3D viewer override automatic
     # mesh measurements so the engineer can correct ambiguous geometries.
@@ -927,6 +1186,8 @@ def analyze_gating(
             "SPRUE_BASE": "sprue_base_cm2",
             "SPRUE_THROAT": "sprue_throat_cm2",
             "RUNNER": "runner_total_cm2",
+            "DISTRIBUTOR": "distributor_total_cm2",
+            "CURUFLUK": "curufluk_total_cm2",
             "INGATE": "ingate_total_cm2",
         }
         for ui_key, real_key in key_map.items():
@@ -950,14 +1211,20 @@ def analyze_gating(
     is_metal = result.is_metal
     ingate = grid == BodyType.INGATE
     runner = grid == BodyType.RUNNER
+    distributor = grid == BodyType.DISTRIBUTOR
+    curufluk = grid == BodyType.CURUFLUK
     sprue = (grid == BodyType.SPRUE) | (grid == BodyType.SPRUE_THROAT)
     source = _gate_source_mask(grid)
     has_ingate = ingate.any()
+    has_distributor = distributor.any()
+    has_curufluk = curufluk.any()
 
     # CAD geometry areas (support / comparison only)
     if use_bodies:
         gate_area_cm2 = real_areas.get("ingate_total_cm2", 0.0)
         runner_min_area_cm2 = real_areas.get("runner_total_cm2", 0.0)
+        distributor_area_cm2 = real_areas.get("distributor_total_cm2", 0.0)
+        curufluk_area_cm2 = real_areas.get("curufluk_total_cm2", 0.0)
         sprue_base_cm2 = real_areas.get("sprue_base_cm2", 0.0)
         sprue_throat_cm2 = real_areas.get("sprue_throat_cm2", 0.0)
 
@@ -983,6 +1250,9 @@ def analyze_gating(
         runner_min_area_mm2 = _minimum_cross_section_area(runner, dx)
         runner_min_area_cm2 = runner_min_area_mm2 / 100.0
 
+        distributor_area_cm2 = 0.0
+        curufluk_area_cm2 = 0.0
+
         sprue_throat_mm2 = _minimum_cross_section_area(sprue, dx) if sprue.any() else 0.0
         sprue_throat_cm2 = sprue_throat_mm2 / 100.0
         sprue_base_bottom_mm2 = _sprue_base_area(sprue, dx) if sprue.any() else 0.0
@@ -995,6 +1265,8 @@ def analyze_gating(
         total_metal_volume_cm3 = total_metal_volume_mm3 / 1000.0
 
     runner_thickness_mm = _mean_thickness(runner, dx)
+    distributor_thickness_mm = _mean_thickness(distributor, dx)
+    curufluk_thickness_mm = _mean_thickness(curufluk, dx)
     sprue_thickness_mm = _mean_thickness(sprue, dx)
     ingate_thickness_mm = _mean_thickness(ingate if has_ingate else source, dx)
 
@@ -1020,7 +1292,9 @@ def analyze_gating(
     design_fill_time_s = user_fill_time_s
 
     # Number of ingate bodies
-    if has_ingate:
+    if use_bodies:
+        n_ingates = max(int(real_areas.get("n_ingates", 1)), 1)
+    elif has_ingate:
         _, n_ingates = ndimage.label(ingate)
     else:
         n_ingates = 1
@@ -1046,7 +1320,7 @@ def analyze_gating(
 
     channel_mask = np.isin(
         grid,
-        [BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE, BodyType.SPRUE_THROAT, BodyType.FILTER, BodyType.POURING_BASIN],
+        [BodyType.INGATE, BodyType.RUNNER, BodyType.DISTRIBUTOR, BodyType.CURUFLUK, BodyType.SPRUE, BodyType.SPRUE_THROAT, BodyType.FILTER, BodyType.POURING_BASIN],
     )
     sprue_mask = sprue & channel_mask
     elbow_count = 0
@@ -1259,6 +1533,8 @@ def analyze_gating(
     actual_area = {
         "sprue": sprue_base_cm2 if sprue_base_cm2 > 0 else As_m2 * 1e4,
         "runner": runner_min_area_cm2 if runner_min_area_cm2 > 0 else Ar_total_m2 * 1e4,
+        "distributor": distributor_area_cm2,
+        "curufluk": curufluk_area_cm2,
         "gate": gate_area_cm2 if gate_area_cm2 > 0 else Ag_total_m2 * 1e4,
     }
     actual_v = {}
@@ -1266,16 +1542,45 @@ def analyze_gating(
         a_m2 = a / 1e4
         actual_v[k] = Q_design_m3_s / a_m2 if a_m2 > 0 else 0.0
 
+    # Classify the real system from the measured velocities.
+    detected_system = _classify_from_velocities(
+        actual_v.get("sprue", 0.0),
+        actual_v.get("runner", 0.0),
+        actual_v.get("gate", 0.0),
+        v_distributor=actual_v.get("distributor", 0.0),
+        v_curufluk=actual_v.get("curufluk", 0.0),
+    )
+
+    # Recompute target ranges based on the measured system so warnings match
+    # the physical behaviour, not just the design assumption.
+    raw_targets = _ENGINE_VELOCITY_RANGES.get(
+        detected_system,
+        _ENGINE_VELOCITY_RANGES["yarı basınçlı (semi-pressurized)"],
+    )
+    velocity_targets = {}
+    for section in ("sprue", "runner", "gate"):
+        lo, hi = raw_targets[section]
+        hi = min(hi, _section_velocity_limit(detected_system, alloy.key, section))
+        lo = min(lo, hi * 0.8)
+        velocity_targets[section] = (lo, hi)
+    sprue_v_range = velocity_targets["sprue"]
+    runner_v_range = velocity_targets["runner"]
+    gate_v_range = velocity_targets["gate"]
+
     # Velocity penalty: a section must be failed if its real velocity exceeds the
     # recommended maximum, even if the area ratio looks acceptable on paper.
     _section_names_tr = {
         "sprue": "Döküm ağzı (sprue)",
         "runner": "Yolluk",
+        "distributor": "Dağıtıcı",
+        "curufluk": "Curufluk",
         "gate": "Meme",
     }
     _section_targets = {
         "sprue": sprue_v_range,
         "runner": runner_v_range,
+        "distributor": runner_v_range,
+        "curufluk": gate_v_range,
         "gate": gate_v_range,
     }
     for k, v in actual_v.items():
@@ -1285,6 +1590,50 @@ def analyze_gating(
                 f"UYARI: {_section_names_tr[k]} gerçek hızı {v:.2f} m/s, "
                 f"hedef maksimum {hi:.2f} m/s'yi aşıyor; kesit alanını büyütün veya sayısını artırın."
             )
+
+    # Update the gating system reason with the measured velocities and system.
+    gating_system_reason = (
+        f"Ölçülen gating sistemi: {detected_system} (önerilen: {recommended_system}). Parça: {wall_cat}. "
+        f"Hızlar (tasarım / ölçülen): sprue={v_sprue_design:.2f}/{actual_v.get('sprue', 0.0):.2f}, "
+        f"runner={v_runner_design:.2f}/{actual_v.get('runner', 0.0):.2f}, "
+        f"dağıtıcı={actual_v.get('distributor', 0.0):.2f}, curufluk={actual_v.get('curufluk', 0.0):.2f}, "
+        f"gate={v_gate_design:.2f}/{actual_v.get('gate', 0.0):.2f} m/s. "
+        f"Oran As:Ar:Ag ≈ {final_ratio[0]:.2f}:{final_ratio[1]:.2f}:{final_ratio[2]:.2f}."
+    )
+    if design.warnings:
+        gating_system_reason += " Uyarılar: " + "; ".join(design.warnings)
+
+    # Add measured distributor / curufluk flows to the section report.
+    if (has_distributor or distributor_area_cm2 > 0.0) and mu > 0.0:
+        d_distributor_mm = 1000.0 * math.sqrt(4.0 * max(distributor_area_cm2, 0.0) / math.pi)
+        section_flows["DISTRIBUTOR"] = _compute_section_flow(
+            "DISTRIBUTOR",
+            distributor_area_cm2,
+            d_distributor_mm,
+            Q_design_m3_s,
+            alloy.rho_kg_m3,
+            mu,
+            9.81,
+            runner_v_range[0],
+            runner_v_range[1],
+            runner_A_min,
+            runner_A_max,
+        )
+    if (has_curufluk or curufluk_area_cm2 > 0.0) and mu > 0.0:
+        d_curufluk_mm = 1000.0 * math.sqrt(4.0 * max(curufluk_area_cm2, 0.0) / math.pi)
+        section_flows["CURUFLUK"] = _compute_section_flow(
+            "CURUFLUK",
+            curufluk_area_cm2,
+            d_curufluk_mm,
+            Q_design_m3_s,
+            alloy.rho_kg_m3,
+            mu,
+            9.81,
+            gate_v_range[0],
+            gate_v_range[1],
+            gate_A_min,
+            gate_A_max,
+        )
 
     # Fluidity length with the design gate velocity
     t_stream = max(ingate_thickness_mm, 2.0 * result.dominant_m_mm, 2.0)
@@ -1461,6 +1810,7 @@ def analyze_gating(
         pouring_yield=pour_yield,
         design_sprue_base_area_cm2=As_m2 * 1e4,
         design_runner_area_cm2=Ar_total_m2 * 1e4,
+        design_distributor_area_cm2=(Ar_total_m2 + Ag_total_m2) / 2.0 * 1e4,
         design_gate_total_area_cm2=Ag_total_m2 * 1e4,
         design_gate_each_area_cm2=Ag_each_m2 * 1e4,
         design_sprue_diameter_mm=d_sprue_mm,
@@ -1470,6 +1820,10 @@ def analyze_gating(
         sprue_design_ok=_section_ok(actual_sprue_base_cm2, As_m2 * 1e4, actual_v['sprue'], sprue_v_range[1]),
         runner_design_ok=_section_ok(actual_runner_cm2, Ar_total_m2 * 1e4, actual_v['runner'], runner_v_range[1]),
         gate_design_ok=_section_ok(actual_gate_total_cm2, Ag_total_m2 * 1e4, actual_v['gate'], gate_v_range[1]),
+        distributor_area_cm2=distributor_area_cm2,
+        curufluk_area_cm2=curufluk_area_cm2,
+        distributor_velocity_m_s=actual_v.get("distributor", 0.0),
+        curufluk_velocity_m_s=actual_v.get("curufluk", 0.0),
         part_mass_kg=part_mass_kg,
         total_riser_mass_kg=total_riser_mass_kg,
         gating_mass_kg=gating_mass_kg,

@@ -42,6 +42,8 @@ BODY_TYPE_NAMES = {
     BodyType.FILTER: "FİLTRE",
     BodyType.POURING_BASIN: "DÖKÜM HAVZASI",
     BodyType.SPRUE_THROAT: "D.AĞZI BOĞAZI",
+    BodyType.DISTRIBUTOR: "DAĞITICI",
+    BodyType.CURUFLUK: "CURUFLUK",
 }
 
 
@@ -692,6 +694,8 @@ class MainWindow(QtWidgets.QMainWindow):
             BodyType.RUNNER,
             BodyType.SPRUE,
             BodyType.SPRUE_THROAT,
+            BodyType.DISTRIBUTOR,
+            BodyType.CURUFLUK,
             BodyType.COOLING_SPRUE,
             BodyType.FILTER,
             BodyType.POURING_BASIN,
@@ -779,7 +783,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # If the body is no longer a gating section, clear the stored section data.
         if old_type != new_type and new_type not in (
-            BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE, BodyType.SPRUE_THROAT
+            BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE, BodyType.SPRUE_THROAT, BodyType.DISTRIBUTOR, BodyType.CURUFLUK
         ):
             body.section_key = ""
             body.section_area_cm2 = 0.0
@@ -806,10 +810,10 @@ class MainWindow(QtWidgets.QMainWindow):
             bt = BodyType(body.body_type) if isinstance(body.body_type, int) else body.body_type
         except Exception:
             bt = body.body_type
-        if bt not in (BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE, BodyType.SPRUE_THROAT):
+        if bt not in (BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE, BodyType.SPRUE_THROAT, BodyType.DISTRIBUTOR, BodyType.CURUFLUK):
             QtWidgets.QMessageBox.information(
                 self, "Tip Uyarısı",
-                "Kesit seçimi sadece YOLLUK, MEME veya DÖKÜM AĞZI tipindeki body'ler için geçerlidir.\n"
+                "Kesit seçimi sadece YOLLUK, MEME, DÖKÜM AĞZI, DAĞITICI veya CURUFLUK tipindeki body'ler için geçerlidir.\n"
                 "Lütfen önce body tipini değiştirin."
             )
             return
@@ -839,6 +843,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return "SPRUE_THROAT"
         if bt == BodyType.RUNNER:
             return "RUNNER"
+        if bt == BodyType.DISTRIBUTOR:
+            return "DISTRIBUTOR"
+        if bt == BodyType.CURUFLUK:
+            return "CURUFLUK"
         if bt == BodyType.INGATE:
             return "INGATE"
         return "INGATE"

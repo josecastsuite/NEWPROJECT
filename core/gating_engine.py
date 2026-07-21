@@ -360,20 +360,34 @@ def _recommend_system(
     return _score_systems(inp, features)
 
 
-def _classify_from_velocities(v_s: float, v_r: float, v_g: float) -> str:
+def _classify_from_velocities(
+    v_s: float,
+    v_r: float,
+    v_g: float,
+    v_distributor: Optional[float] = None,
+    v_curufluk: Optional[float] = None,
+) -> str:
     """Classify the real system from actual velocities (Q/A).
 
     Pressurized  -> area shrinks: sprue slowest, gate fastest (v_s < v_r < v_g).
     Unpressurized -> area grows:   sprue fastest, gate slowest (v_s > v_r > v_g).
+    When a distributor and/or curufluk is present they sit between runner and
+    gate, so the ordering must be monotonic through that chain.
     """
-    if v_s < v_g:
-        if v_s <= v_r <= v_g:
-            return "basınçlı (pressurized)"
-        return "yarı basınçlı (semi-pressurized)"
-    if v_s > v_g:
-        if v_s >= v_r >= v_g:
-            return "basınçsız (unpressurized)"
-        return "yarı basınçlı (semi-pressurized)"
+    # Build the measured section velocity list in flow order.
+    velocities = [v_s, v_r]
+    if v_distributor is not None and v_distributor > 0.0:
+        velocities.append(v_distributor)
+    if v_curufluk is not None and v_curufluk > 0.0:
+        velocities.append(v_curufluk)
+    velocities.append(v_g)
+
+    # Pressurized: velocities strictly increase downstream (areas shrink).
+    if all(velocities[i] <= velocities[i + 1] for i in range(len(velocities) - 1)):
+        return "basınçlı (pressurized)"
+    # Unpressurized: velocities strictly decrease downstream (areas grow).
+    if all(velocities[i] >= velocities[i + 1] for i in range(len(velocities) - 1)):
+        return "basınçsız (unpressurized)"
     return "yarı basınçlı (semi-pressurized)"
 
 

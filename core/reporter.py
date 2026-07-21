@@ -180,6 +180,8 @@ def _section_flow_rows(gr) -> str:
     section_names = {
         "INGATE": "Meme",
         "RUNNER": "Yolluk",
+        "DISTRIBUTOR": "Dağıtıcı",
+        "CURUFLUK": "Curufluk",
         "SPRUE_THROAT": "Döküm ağzı boğazı",
         "SPRUE_BASE": "Döküm ağzı tabanı",
     }
@@ -253,6 +255,8 @@ def _format_gate_table(result: AnalysisResult) -> str:
         <tr><td>Döküm ağzı boğaz alanı (As)</td><td>{gr.sprue_throat_area_cm2:.2f} cm²</td><td>gerekli {gr.required_sprue_area_cm2:.2f} cm²</td></tr>
         <tr><td>Döküm ağzı taban alanı</td><td>{gr.sprue_base_area_cm2:.2f} cm²</td><td>-</td></tr>
         {_section_flow_rows(gr)}
+        <tr><td>Dağıtıcı alanı (Ad)</td><td>{gr.distributor_area_cm2:.2f} cm²</td><td>v = {gr.distributor_velocity_m_s:.2f} m/s</td></tr>
+        <tr><td>Curufluk alanı</td><td>{gr.curufluk_area_cm2:.2f} cm²</td><td>v = {gr.curufluk_velocity_m_s:.2f} m/s</td></tr>
         <tr><td>Toplam debi Q</td><td>{gr.ingate_flow_rate_m3_s*1e3:.2f} L/s</td><td>doldurma süresi {gr.ingate_fill_time_s:.2f} s</td></tr>
         <tr><td>Akışkanlık uzunluğu Lf</td><td>{gr.fluidity_length_mm:.1f} mm</td><td>parça boyutu ≤ Lf</td></tr>
         <tr><td>Hız için gerekli seçili kesit alanı</td><td>{gr.required_ingate_area_for_velocity_cm2:.2f} cm²</td><td>mevcut {selected_area:.2f} cm²</td></tr>

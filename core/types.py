@@ -43,6 +43,8 @@ class BodyType(IntEnum):
     FILTER = 13
     POURING_BASIN = 15
     SPRUE_THROAT = 17
+    DISTRIBUTOR = 19
+    CURUFLUK = 21
 
 
 BODY_TYPE_LABELS = {
@@ -56,6 +58,8 @@ BODY_TYPE_LABELS = {
     BodyType.FILTER: "FİLTRE",
     BodyType.POURING_BASIN: "DÖKÜM HAVZASI",
     BodyType.SPRUE_THROAT: "D.AĞZI BOĞAZI",
+    BodyType.DISTRIBUTOR: "DAĞITICI",
+    BodyType.CURUFLUK: "CURUFLUK",
 }
 
 # Body types that contain liquid metal during pouring (part + gating + riser).
@@ -69,6 +73,8 @@ BODY_CASTING_METAL_TYPES = [
     BodyType.SPRUE,
     BodyType.SPRUE_THROAT,
     BodyType.POURING_BASIN,
+    BodyType.DISTRIBUTOR,
+    BodyType.CURUFLUK,
 ]
 
 # Backwards-compatible alias; cooling sprue and filter are excluded from
@@ -83,6 +89,7 @@ BODY_FEEDER_TYPES = [
     BodyType.SPRUE,
     BodyType.SPRUE_THROAT,
     BodyType.POURING_BASIN,
+    BodyType.DISTRIBUTOR,
 ]
 
 # Inserts that accelerate local cooling and must never be treated as feeders.
@@ -267,6 +274,7 @@ class GateResult:
     pouring_yield: float = 0.0
     design_sprue_base_area_cm2: float = 0.0
     design_runner_area_cm2: float = 0.0
+    design_distributor_area_cm2: float = 0.0
     design_gate_total_area_cm2: float = 0.0
     design_gate_each_area_cm2: float = 0.0
     design_sprue_diameter_mm: float = 0.0
@@ -276,6 +284,11 @@ class GateResult:
     sprue_design_ok: bool = True
     runner_design_ok: bool = True
     gate_design_ok: bool = True
+    # P1: distributor / curufluk measured values
+    distributor_area_cm2: float = 0.0
+    curufluk_area_cm2: float = 0.0
+    distributor_velocity_m_s: float = 0.0
+    curufluk_velocity_m_s: float = 0.0
     # v9.0: part and feed metal masses for feeder/part ratio checks.
     part_mass_kg: float = 0.0
     total_riser_mass_kg: float = 0.0

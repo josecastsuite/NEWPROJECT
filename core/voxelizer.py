@@ -148,24 +148,57 @@ def _classify_casting_bodies(
     if not connected:
         return
 
-    # Identify the riser.  First try the gravity-opposite direction; if that
-    # fails, look for a body that is strongly off the main gating axis (e.g. a
-    # side/top riser in a horizontal gating system).
-    riser_idx: Optional[int] = None
-    max_up = 0.2 * part_min_dim
+    # Name-based first pass: many STEP assemblies name sprues/runners/gates
+    # explicitly; this lets us avoid treating a distributor/curufluk as a runner.
+    def _type_from_name(name: str) -> Optional[BodyType]:
+        n = name.lower().replace("ı", "i").replace("ğ", "g").replace("ü", "u").replace("ş", "s").replace("ö", "o").replace("ç", "c").replace(" ", "_").replace("-", "_")
+        if any(k in n for k in ("curuf", "slag", "trap", "tuzak", "curufluk")):
+            return BodyType.CURUFLUK
+        if any(k in n for k in ("dagitici", "distributor", "manifold", "meme_dagitici", "meme_dagitici", "subap")):
+            return BodyType.DISTRIBUTOR
+        if any(k in n for k in ("meme", "ingate", "gate", "cikis", "giris")) and "dagitici" not in n:
+            return BodyType.INGATE
+        if any(k in n for k in ("yolluk", "runner", "channel")):
+            return BodyType.RUNNER
+        if any(k in n for k in ("dokum_agzi", "dokumagzi", "sprue", "pouring_cup", "basin", "throat")):
+            return BodyType.SPRUE
+        if any(k in n for k in ("besleyici", "riser", "feeder", "feed")):
+            return BodyType.RISER
+        return None
+
+    name_assigned: set = set()
     for v in connected:
-        vec = bodies[v].center - part_center
-        proj = float(np.dot(vec, up))
-        if proj > max_up:
-            max_up = proj
+        t = _type_from_name(bodies[v].name)
+        if t is not None and t != BodyType.PART:
+            bodies[v].body_type = t
+            name_assigned.add(v)
+
+    # Identify the riser.  First respect any name-based riser, then try the
+    # gravity-opposite direction; if that fails, look for a body that is strongly
+    # off the main gating axis (e.g. a side/top riser in a horizontal gating system).
+    riser_idx: Optional[int] = None
+    for v in connected:
+        if bodies[v].body_type == BodyType.RISER:
             riser_idx = v
+            break
+
+    if riser_idx is None:
+        max_up = 0.2 * part_min_dim
+        for v in connected:
+            if bodies[v].body_type != BodyType.PART:
+                continue
+            vec = bodies[v].center - part_center
+            proj = float(np.dot(vec, up))
+            if proj > max_up:
+                max_up = proj
+                riser_idx = v
 
     if riser_idx is None:
         # Fallback: the riser is the outlier perpendicular to the dominant
         # direction of the remaining auxiliary bodies.
-        gating_candidates = [v for v in connected]
-        centered = np.vstack([bodies[v].center - part_center for v in gating_candidates])
-        if centered.shape[0] >= 2:
+        gating_candidates = [v for v in connected if bodies[v].body_type == BodyType.PART]
+        if len(gating_candidates) >= 2:
+            centered = np.vstack([bodies[v].center - part_center for v in gating_candidates])
             cov = np.cov(centered.T)
             eigvals, eigvecs = np.linalg.eigh(cov)
             main_axis = eigvecs[:, int(np.argmax(eigvals))]
@@ -181,7 +214,7 @@ def _classify_casting_bodies(
                         best_score = residual
                         riser_idx = v
 
-    gating = [v for v in connected if v != riser_idx]
+    gating = [v for v in connected if v != riser_idx and bodies[v].body_type == BodyType.PART]
     if riser_idx is not None:
         bodies[riser_idx].body_type = BodyType.RISER
 
@@ -207,8 +240,10 @@ def _classify_casting_bodies(
     else:
         bodies[gating_sorted[0]].body_type = BodyType.INGATE
         bodies[gating_sorted[-1]].body_type = BodyType.SPRUE
+        # Intermediate bodies that were not explicitly named default to runner.
         for idx in gating_sorted[1:-1]:
-            bodies[idx].body_type = BodyType.RUNNER
+            if bodies[idx].body_type == BodyType.PART:
+                bodies[idx].body_type = BodyType.RUNNER
 
 
 def _voxelize_at_dim(

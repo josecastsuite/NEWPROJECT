@@ -97,6 +97,10 @@ class SectionDialog(QtWidgets.QDialog):
             return "SPRUE_THROAT"
         if bt == BodyType.RUNNER:
             return "RUNNER"
+        if bt == BodyType.DISTRIBUTOR:
+            return "DISTRIBUTOR"
+        if bt == BodyType.CURUFLUK:
+            return "CURUFLUK"
         if bt == BodyType.INGATE:
             return "INGATE"
         return "INGATE"
@@ -122,6 +126,8 @@ class SectionDialog(QtWidgets.QDialog):
         for label, key in [
             ("Meme (INGATE)", "INGATE"),
             ("Yolluk (RUNNER)", "RUNNER"),
+            ("Dağıtıcı (DISTRIBUTOR)", "DISTRIBUTOR"),
+            ("Curufluk (CURUFLUK)", "CURUFLUK"),
             ("Döküm ağzı tabanı (SPRUE_BASE)", "SPRUE_BASE"),
             ("Döküm ağzı boğazı (SPRUE_THROAT)", "SPRUE_THROAT"),
         ]:
