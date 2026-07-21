@@ -18,12 +18,26 @@ def _diameter_for_sphere_m(m_mm: float) -> float:
 
 
 def _cylinder_diameter_for_m(m_mm: float, height_to_diameter: float = 1.0) -> float:
-    # Cylinder with H = h2d * D, top cooling only (bottom attached to casting)
-    # M = V/A = (pi D^2 H / 4) / (pi D H + 2 * pi D^2 / 4)
-    # Solve for D given M and h2d.
+    """Cylinder with H = h2d * D.  Bottom face is attached to the casting and
+    therefore does not cool; only side and top surfaces contribute to A."""
     h2d = float(height_to_diameter)
-    ratio = (h2d / 4.0) / (h2d + 0.5)
+    # V = pi D^2 H / 4
+    # A = pi D H + pi D^2 / 4
+    # M = V/A = ((h2d / 4) * D) / (h2d + 0.25)
+    ratio = (h2d / 4.0) / (h2d + 0.25)
     return m_mm / ratio
+
+
+def _cylinder_m_for_d(d_mm: float, height_to_diameter: float = 1.0) -> float:
+    """Geometric modulus M of a cylinder with H = h2d * D (bottom attached)."""
+    h2d = float(height_to_diameter)
+    ratio = (h2d / 4.0) / (h2d + 0.25)
+    return d_mm * ratio
+
+
+def _cylinder_volume_mm3(d_mm: float, height_to_diameter: float = 1.0) -> float:
+    h = height_to_diameter * d_mm
+    return np.pi * (d_mm ** 2) * h / 4.0
 
 
 def _surface_normal(
@@ -131,6 +145,99 @@ def _best_surface_attachment(
     return best_vox, best_pos, thicknesses[best_idx]
 
 
+def _sfsa_riser_volume_cm3(shape_factor: float, casting_volume_cm3: float) -> float:
+    """Bishop–Pellini / SFSA empirical relation for plate-like sections.
+
+    VR / VC = 2.51 * SF^(-0.74)
+    where SF = (L + W) / T and VR / VC is riser-to-casting volume ratio.
+    """
+    sf = max(float(shape_factor), 1.5)
+    ratio = 2.51 * (sf ** -0.74)
+    return ratio * casting_volume_cm3
+
+
+def _feeding_zone_geometry(
+    result: AnalysisResult,
+    hs: HotSpot,
+    threshold_ratio: float = 0.75,
+) -> Tuple[float, float, float, float, float, float]:
+    """Find the connected high-modulus region around a hotspot and compute
+    plate-like dimensions, volume and shape factor.
+
+    Returns (t_mm, w_mm, l_mm, shape_factor, V_c_cm3, M_zone_max_mm).
+    """
+    dx = result.dx_mm
+    origin = result.origin_mm
+    part_mask = result.grid == BodyType.PART
+    sdf = result.sdf
+
+    if result.curvature_mean is not None and result.curvature_mean.size == sdf.size:
+        sf_field = np.clip(1.0 - result.curvature_mean * sdf, 0.77, 3.0)
+    else:
+        sf_field = np.ones_like(sdf)
+    M_mod = sdf / sf_field
+
+    m_threshold = max(hs.m_value_mm * threshold_ratio, 1.0)
+    zone_mask = part_mask & (M_mod >= m_threshold)
+
+    # 26-connectivity for a natural blob
+    structure = np.ones((3, 3, 3), dtype=int)
+    labeled, num = ndimage.label(zone_mask, structure=structure)
+
+    hs_vox = np.round((hs.position_mm - origin) / dx).astype(int)
+    hs_vox = np.clip(hs_vox, 0, np.array(sdf.shape) - 1)
+
+    label_id = 0
+    if num > 0:
+        label_id = int(labeled[hs_vox[0], hs_vox[1], hs_vox[2]])
+
+    if label_id == 0:
+        # Fallback: sphere around the hotspot of radius ~2M
+        radius_vox = int(np.ceil(2.0 * hs.m_value_mm / dx))
+        fallback_mask = np.zeros_like(part_mask)
+        ranges = []
+        for i in range(3):
+            lo = max(0, hs_vox[i] - radius_vox)
+            hi = min(sdf.shape[i], hs_vox[i] + radius_vox + 1)
+            ranges.append((lo, hi))
+        x = np.arange(ranges[0][0], ranges[0][1])[:, None, None]
+        y = np.arange(ranges[1][0], ranges[1][1])[None, :, None]
+        z = np.arange(ranges[2][0], ranges[2][1])[None, None, :]
+        dist2 = (
+            ((x - hs_vox[0]) * dx) ** 2
+            + ((y - hs_vox[1]) * dx) ** 2
+            + ((z - hs_vox[2]) * dx) ** 2
+        )
+        fallback_mask[
+            ranges[0][0]:ranges[0][1],
+            ranges[1][0]:ranges[1][1],
+            ranges[2][0]:ranges[2][1],
+        ] = dist2 < (2.0 * hs.m_value_mm) ** 2
+        fallback_mask &= part_mask
+        comp_mask = fallback_mask
+    else:
+        comp_mask = labeled == label_id
+
+    comp_vox = np.argwhere(comp_mask)
+    if comp_vox.size == 0:
+        # Last resort single-voxel estimate
+        t = w = l = max(2.0 * hs.m_value_mm, dx)
+        V_c_cm3 = (dx ** 3) / 1000.0
+        M_zone_max = hs.m_value_mm
+        sf = 2.0
+        return t, w, l, sf, V_c_cm3, M_zone_max
+
+    dims_mm = (comp_vox.max(axis=0) - comp_vox.min(axis=0) + 1) * dx
+    dims_sorted = np.sort(dims_mm)
+    t, w, l = float(dims_sorted[0]), float(dims_sorted[1]), float(dims_sorted[2])
+
+    V_c_mm3 = float(comp_mask.sum()) * (dx ** 3)
+    V_c_cm3 = V_c_mm3 / 1000.0
+    M_zone_max = float(M_mod[comp_mask].max()) if comp_mask.any() else hs.m_value_mm
+    sf = (l + w) / max(t, 1e-3)
+    return t, w, l, sf, V_c_cm3, M_zone_max
+
+
 def propose_risers(
     result: AnalysisResult, alloy: Alloy, existing_riser_count: int = 0
 ) -> List[RiserProposal]:
@@ -139,12 +246,14 @@ def propose_risers(
 
     Strategy:
       * If a riser already exists and all hot spots are fed, nothing to do.
-      * For each failing hot spot, find the best part surface to attach a feeder
-        (upward-facing, close, reasonably thick).
-      * Small, isolated hot spots on thin walls are good chill candidates.
-      * If a conventional riser would be larger than the part, try an exothermic
-        mini-riser first; if that still does not fit, flag it infeasible and warn
-        the user explicitly instead of generating an unbuildable body.
+      * For each failing hot spot, find the connected high-modulus feeding zone
+        and size the riser using both the Caine modulus rule and the
+        Bishop–Pellini / SFSA shape-factor volume ratio.
+      * If the resulting conventional riser is larger than the part itself
+        (>30% of part volume or >0.5 of the smallest part dimension), do not
+        present giant modulus/diameter numbers; instead recommend a mini
+        exothermic riser or chill and hide the infeasible dimensions.
+      * Small, isolated hot spots on thin walls remain chill candidates.
     """
     proposals: List[RiserProposal] = []
     if not result.hotspots:
@@ -187,9 +296,11 @@ def propose_risers(
         )
 
     k_mod = getattr(alloy, "riser_m_factor", 1.2)
-    h2d = 1.5  # height / diameter ratio for cylindrical feeder
+    h2d = 1.5  # height / diameter ratio for a side-mounted cylindrical feeder
     exo_yield = getattr(alloy, "exothermic_volume_yield", 0.45)
-    exo_scale = float(exo_yield) ** (1.0 / 3.0)
+    exo_mod_factor = getattr(alloy, "exothermic_modulus_factor", 1.5)
+
+    ratio = (h2d / 4.0) / (h2d + 0.25)
 
     for idx, hs in enumerate(result.hotspots):
         # Hot spot already fed by an existing riser: nothing to propose.
@@ -219,12 +330,31 @@ def propose_risers(
             and t_attach <= 20.0
         )
 
-        # Feasibility envelope.  A feeder/chill that is larger than the part itself
-        # is unbuildable; exothermic mini-risers are tried before giving up.
-        max_diameter_mm = max(t_attach * 2.0, part_smallest_dim_mm * 0.5, 20.0)
-        max_volume_cm3 = 0.5 * part_volume_cm3
+        # Feeding zone geometry and SFSA shape-factor sizing.
+        t_zone, w_zone, l_zone, sf_zone, V_c_cm3, M_zone_max = _feeding_zone_geometry(
+            result, hs
+        )
 
+        # Caine modulus requirement.
         m_required = max(k_mod * hs.m_value_mm, 3.0)
+
+        # Diameter required by the modulus rule (bottom-attached cylinder).
+        D_modulus = m_required / ratio
+
+        # Volume required by the SFSA shape-factor / volume-ratio rule.
+        V_sfsa_cm3 = _sfsa_riser_volume_cm3(sf_zone, V_c_cm3)
+        V_sfsa_mm3 = V_sfsa_cm3 * 1000.0
+        D_volume = (4.0 * V_sfsa_mm3 / (np.pi * h2d)) ** (1.0 / 3.0)
+
+        # Use the larger of the two: must satisfy both modulus and feed volume.
+        D = max(D_modulus, D_volume)
+        H = h2d * D
+        V = _cylinder_volume_mm3(D, h2d) / 1000.0  # cm³
+        M_riser = _cylinder_m_for_d(D, h2d)
+
+        # Feasibility envelope.
+        max_diameter_mm = max(t_zone * 2.0, part_smallest_dim_mm * 0.5, 20.0)
+        max_volume_cm3 = 0.30 * part_volume_cm3
 
         shape = "cylinder"
         exothermic = False
@@ -237,61 +367,60 @@ def propose_risers(
             diameter = max(1.5 * hs.t_section_mm, 2.0 * hs.m_value_mm, 12.0)
             height = diameter
             volume = (np.pi * (diameter ** 2) * height / 4.0) / 1000.0
+            D, H, V = diameter, height, volume
+            M_riser = 0.0
 
-            if diameter > max_diameter_mm or volume > max_volume_cm3:
-                # Chill does not fit; fall back to an exothermic mini-riser.
-                shape = "exothermic"
-                exothermic = True
-                diameter = _cylinder_diameter_for_m(m_required, height_to_diameter=h2d)
-                diameter *= exo_scale
-                height = h2d * diameter
-                volume = (np.pi * (diameter ** 2) * height / 4.0) / 1000.0
-
-                if diameter > max_diameter_mm or volume > max_volume_cm3:
-                    infeasible = True
-                    warning = (
-                        f"Önerilen çıkıcı (chill) çap {diameter / 10.0:.1f} cm, hacim {volume:.1f} cm³ "
-                        f"parça geometrisine sığmıyor (max çap ≈{max_diameter_mm / 10.0:.1f} cm, "
-                        f"max hacim ≈{max_volume_cm3:.1f} cm³). "
-                        f"Çözüm kullanıcı kararıdır: bölgeyi kalınlaştırın, farklı bir soğutucu "
-                        f"yerleştirin veya geometriyi değiştirin."
-                    )
+            if D > max_diameter_mm or V > max_volume_cm3:
+                infeasible = True
+                warning = (
+                    "Önerilen çıkıcı (chill) parça geometrisine sığmıyor. "
+                    "Mini exotermik besleyici veya farklı bir soğutucu yerleştirmek gerekebilir; "
+                    "bölgeyi kalınlaştırmak veya geometriyi değiştirmek de düşünülebilir."
+                )
         else:
-            # Larger hot spots: try a conventional cylindrical feeder first.
-            diameter = _cylinder_diameter_for_m(m_required, height_to_diameter=h2d)
-            height = h2d * diameter
-            volume = (np.pi * (diameter ** 2) * height / 4.0) / 1000.0
+            if D > max_diameter_mm or V > max_volume_cm3:
+                # Try a mini exothermic riser first.
+                m_exo_physical = m_required / exo_mod_factor
+                D_exo = m_exo_physical / ratio
+                H_exo = h2d * D_exo
+                V_exo_mm3 = _cylinder_volume_mm3(D_exo, h2d)
+                V_exo = V_exo_mm3 * exo_yield / 1000.0
 
-            if diameter > max_diameter_mm or volume > max_volume_cm3:
-                # Try an exothermic mini-riser to reduce volume.
-                exo_diameter = diameter * exo_scale
-                exo_height = height * exo_scale
-                exo_volume = volume * exo_yield
-
-                if exo_diameter <= max_diameter_mm and exo_volume <= max_volume_cm3:
+                if D_exo <= max_diameter_mm and V_exo <= max_volume_cm3:
                     shape = "exothermic"
                     exothermic = True
-                    diameter, height, volume = exo_diameter, exo_height, exo_volume
+                    D, H, V = D_exo, H_exo, V_exo
+                    M_riser = _cylinder_m_for_d(D, h2d)
                 else:
-                    infeasible = True
-                    warning = (
-                        f"Gerekli besleyici modülü M={m_required / 10.0:.1f} cm, çap {diameter / 10.0:.1f} cm, "
-                        f"hacim {volume:.1f} cm³ parça geometrisine sığmıyor "
-                        f"(max çap ≈{max_diameter_mm / 10.0:.1f} cm, max hacim ≈{max_volume_cm3:.1f} cm³). "
-                        f"Çözüm kullanıcı kararıdır: bölgeyi kalınlaştırın, soğutucu (chill) ekleyin, "
-                        f"ekzotermik mini besleyici kullanın veya geometriyi değiştirin."
-                    )
+                    # Try a chill of the largest feasible size.
+                    D_chill = max(1.5 * t_zone, 2.0 * hs.m_value_mm, 12.0)
+                    H_chill = D_chill
+                    V_chill = (np.pi * D_chill ** 2 * H_chill / 4.0) / 1000.0
+
+                    if D_chill <= max_diameter_mm and V_chill <= max_volume_cm3:
+                        shape = "chill"
+                        D, H, V = D_chill, H_chill, V_chill
+                        M_riser = 0.0
+                    else:
+                        infeasible = True
+                        D = H = V = 0.0
+                        M_riser = 0.0
+                        warning = (
+                            "Konvansiyonel, mini exotermik veya çıkıcı (chill) besleyici "
+                            "parça geometrisine sığmıyor. Öneri: bölgeye soğutucu (chill) ekleyin, "
+                            "kalın bölgeyi inceltin, geçiş yarıçapını büyütün veya parçayı yeniden tasarlayın."
+                        )
 
         if shape in ("cylinder", "exothermic"):
             neck_diameter = max(
-                diameter * 0.5, t_attach * 0.8, hs.t_section_mm * 0.8, 5.0
+                D * 0.5, t_attach * 0.8, hs.t_section_mm * 0.8, 5.0
             )
             neck_height = max(t_attach * 0.5, hs.t_section_mm * 0.5, 3.0)
         else:
             neck_diameter = 0.0
             neck_height = 0.0
 
-        placement = surface_pos + normal * (height / 2.0)
+        placement = surface_pos + normal * (H / 2.0)
 
         reason_parts = []
         if not hs.feed_ok:
@@ -306,9 +435,9 @@ def propose_risers(
             reason_parts.append("sistemde riser yok")
 
         if shape == "chill":
-            reason_parts.append("ince cidarlı küçük hotspot -> çıkıcı (chill) önerildi")
+            reason_parts.append("çıkıcı (chill) önerildi")
         elif shape == "exothermic":
-            reason_parts.append("normal besleyici parçaya sığmadı -> ekzotermik mini besleyici önerildi")
+            reason_parts.append("konvansiyonel besleyici sığmadı -> mini exotermik besleyici önerildi")
         elif shape == "cylinder":
             reason_parts.append("konvansiyonel silindirik besleyici önerildi")
 
@@ -329,11 +458,11 @@ def propose_risers(
                 target_hotspot_position_mm=np.array(hs.position_mm, dtype=float),
                 placement_mm=placement,
                 reason=reason,
-                m_required_mm=m_required,
+                m_required_mm=float(M_riser if M_riser > 0 else m_required),
                 shape=shape,
-                diameter_mm=diameter,
-                height_mm=height,
-                volume_cm3=float(volume),
+                diameter_mm=float(D),
+                height_mm=float(H),
+                volume_cm3=float(V),
                 neck_diameter_mm=float(neck_diameter),
                 neck_height_mm=float(neck_height),
                 exothermic=exothermic,

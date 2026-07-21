@@ -142,13 +142,13 @@ def _format_riser_proposal_table(result: AnalysisResult) -> str:
             pos = ",".join(f"{v / 10.0:.1f}" for v in rp.placement_mm)
             if rp.infeasible:
                 shape_text = "uyarı (sığmıyor)"
-                dims = f"M={rp.m_required_mm / 10.0:.2f} cm, çap={rp.diameter_mm / 10.0:.1f} cm, V={rp.volume_cm3:.2f} cm³"
+                dims = "Mini exotermik besleyici veya çıkıcı (chill) önerilir"
             elif rp.shape == "chill":
                 shape_text = "çıkıcı (chill)"
                 dims = f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, V={rp.volume_cm3:.2f} cm³"
             elif rp.exothermic:
                 shape_text = "ekzotermik mini besleyici"
-                dims = f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, V={rp.volume_cm3:.2f} cm³, M={rp.m_required_mm / 10.0:.2f} cm"
+                dims = f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, V={rp.volume_cm3:.2f} cm³"
             else:
                 shape_text = _html_escape(rp.shape)
                 dims = f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, V={rp.volume_cm3:.2f} cm³, M={rp.m_required_mm / 10.0:.2f} cm"
@@ -564,7 +564,7 @@ def _generate_report_fpdf2(
             pos = ",".join(f"{v / 10.0:.1f}" for v in rp.placement_mm)
             if rp.infeasible:
                 pdf.cell(0, 6, f"{i}. UYARI: Hotspot #{rp.target_hotspot_index + 1} icin onerilen besleyici/cikici parcaya sigmiyor.", ln=True)
-                pdf.cell(0, 6, f"   M={rp.m_required_mm / 10.0:.2f} cm, cap={rp.diameter_mm / 10.0:.1f} cm, V={rp.volume_cm3:.2f} cm3, konum=({pos}) cm.", ln=True)
+                pdf.cell(0, 6, f"   Mini exotermik besleyici veya cikici (chill) onerilir; konum=({pos}) cm.", ln=True)
                 warning_text = rp.warning if rp.warning else "Cozum kullanici kararidir."
                 pdf.cell(0, 6, f"   {warning_text}", ln=True)
             elif rp.shape == "chill":
@@ -572,7 +572,7 @@ def _generate_report_fpdf2(
                                f"V={rp.volume_cm3:.2f} cm3, konum=({pos}) cm", ln=True)
             elif rp.exothermic:
                 pdf.cell(0, 6, f"{i}. ekzotermik mini besleyici: cap={rp.diameter_mm / 10.0:.1f} cm, yukseklik={rp.height_mm / 10.0:.1f} cm, "
-                               f"V={rp.volume_cm3:.2f} cm3, M={rp.m_required_mm / 10.0:.2f} cm, konum=({pos}) cm", ln=True)
+                               f"V={rp.volume_cm3:.2f} cm3, konum=({pos}) cm", ln=True)
             else:
                 pdf.cell(0, 6, f"{i}. {rp.shape}: cap={rp.diameter_mm / 10.0:.1f} cm, yukseklik={rp.height_mm / 10.0:.1f} cm, "
                                f"V={rp.volume_cm3:.2f} cm3, M={rp.m_required_mm / 10.0:.2f} cm, konum=({pos}) cm", ln=True)

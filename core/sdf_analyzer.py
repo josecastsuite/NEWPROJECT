@@ -2194,8 +2194,7 @@ def _build_recommendations(
             recs.append(
                 f"UYARI {idx + 1}: Hotspot #{proposal.target_hotspot_index + 1} için önerilen "
                 f"besleyici/çıkıcı parça geometrisine sığmıyor. "
-                f"M={proposal.m_required_mm / 10.0:.2f} cm, çap={proposal.diameter_mm / 10.0:.1f} cm, "
-                f"V={proposal.volume_cm3:.2f} cm³. Konum {pos} cm. "
+                f"Mini exotermik besleyici veya çıkıcı (chill) önerilir; konum {pos} cm. "
                 f"{proposal.warning if proposal.warning else 'Çözüm kullanıcı kararıdır.'}"
             )
         elif proposal.shape == "chill":
@@ -2209,7 +2208,7 @@ def _build_recommendations(
             recs.append(
                 f"ÖNERİ {idx + 1}: ekzotermik mini besleyici ekle -> "
                 f"çap={proposal.diameter_mm / 10.0:.1f} cm, yükseklik={proposal.height_mm / 10.0:.1f} cm, "
-                f"V={proposal.volume_cm3:.2f} cm³, M={proposal.m_required_mm / 10.0:.2f} cm. "
+                f"V={proposal.volume_cm3:.2f} cm³. "
                 f"Konum {pos} cm. Neden: {proposal.reason}."
             )
         else:

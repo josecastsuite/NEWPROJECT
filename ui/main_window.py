@@ -1136,7 +1136,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if rp.infeasible:
                 text = (
                     f"UYARI Hotspot #{rp.target_hotspot_index + 1}: besleyici/çıkıcı parçaya sığmıyor. "
-                    f"M={rp.m_required_mm / 10.0:.2f} cm, çap={rp.diameter_mm / 10.0:.1f} cm, V={rp.volume_cm3:.2f} cm³."
+                    f"Mini exotermik besleyici veya çıkıcı (chill) önerilir, konum={pos} cm."
                 )
                 ok = False
             elif rp.shape == "chill":
@@ -1150,7 +1150,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 text = (
                     f"ÖNERİ Hotspot #{rp.target_hotspot_index + 1}: ekzotermik mini besleyici ekle -> "
                     f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, "
-                    f"V={rp.volume_cm3:.2f} cm³, M={rp.m_required_mm / 10.0:.2f} cm, konum={pos} cm"
+                    f"V={rp.volume_cm3:.2f} cm³, konum={pos} cm"
                 )
                 ok = True
             else:
