@@ -237,6 +237,9 @@ class FillingResult:
     solver_dx_mm: float = 0.0
     pressure: Optional[np.ndarray] = None
     reason: str = ""
+    # Per-gate contact velocity / area when multiple INGATE bodies exist.
+    per_gate_contact_velocity_m_s: Dict[str, float] = field(default_factory=dict)
+    per_gate_contact_area_cm2: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass

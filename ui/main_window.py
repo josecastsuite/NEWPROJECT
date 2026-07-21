@@ -502,6 +502,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.niyama_toggle.toggled.connect(self.on_toggle_niyama)
         vis_layout.addWidget(self.niyama_toggle)
 
+        self.flow_toggle = QtWidgets.QCheckBox("Akış Hızı")
+        self.flow_toggle.setToolTip("3-B Darcy akış hızını metal yüzeylerinde göster")
+        self.flow_toggle.setChecked(False)
+        self.flow_toggle.toggled.connect(self.on_toggle_flow_velocity)
+        vis_layout.addWidget(self.flow_toggle)
+
         self.path_toggle = QtWidgets.QCheckBox("Besleme Yolları")
         self.path_toggle.setToolTip("Hot spot'tan besleyiciye/gating'e giden yol")
         self.path_toggle.setChecked(True)
@@ -993,9 +999,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.html_btn.setEnabled(True)
             self._update_checklist()
             self._update_recommendations()
-            # Opaque/translucent bodies first; markers are drawn afterwards so
-            # porosity, paths and hot-spots are visible inside the transparent part.
-            self.viewer.show_bodies(self._bodies, reset_camera=True)
+            # Post-analysis: all bodies are translucent so internal markers,
+            # porosity, paths, hot-spots and flow/Niyama overlays are visible.
+            self.viewer.show_bodies(self._bodies, reset_camera=True, analysis_mode=True)
             if self.risk_toggle.isChecked():
                 self.viewer.show_risk(self._analysis)
             if self.porosity_toggle.isChecked():
@@ -1003,6 +1009,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
             if self.niyama_toggle.isChecked():
                 self.viewer.show_niyama_isosurfaces(self._analysis)
+            if self.flow_toggle.isChecked():
+                self.viewer.show_flow_velocity(self._analysis)
             if self.path_toggle.isChecked():
                 self.viewer.show_feeding_paths(self._analysis)
             if self.local_toggle.isChecked():
@@ -1053,6 +1061,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"{name}: v={sf.velocity_m_s:.2f} m/s, Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, "
                 f"A={sf.area_cm2:.2f} cm²{turb_note}.{target}"
             )
+
+        # Per-gate velocities when multiple INGATE bodies are detected.
+        if gr.flow_result is not None:
+            per_gate = getattr(gr.flow_result, "per_gate_contact_velocity_m_s", {})
+            per_area = getattr(gr.flow_result, "per_gate_contact_area_cm2", {})
+            if per_gate:
+                gate_lines = []
+                for name, v in per_gate.items():
+                    a = per_area.get(name, 0.0)
+                    gate_lines.append(f"{name}: v={v:.2f} m/s, A={a:.2f} cm²")
+                if gate_lines:
+                    recs.append("Meme başına temas hızı/alan: " + " | ".join(gate_lines))
 
         if gr.ingate_velocity_m_s > 0:
             recs.append(
@@ -1312,6 +1332,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_toggle_niyama(self, checked: bool):
         if self._analysis:
             self.viewer.toggle_niyama(self._analysis, checked)
+
+    def on_toggle_flow_velocity(self, checked: bool):
+        if self._analysis:
+            self.viewer.toggle_flow_velocity(self._analysis, checked)
 
     def on_toggle_feeding_paths(self, checked: bool):
         if self._analysis:

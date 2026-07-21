@@ -28,7 +28,7 @@ from scipy import ndimage
 from scipy.sparse import csr_matrix
 from scipy.sparse import linalg as spla
 
-from core.types import BodyType, FillingResult
+from core.types import Body, BodyType, FillingResult
 
 
 def _downsample_grid(
@@ -705,6 +705,94 @@ def _ingate_contact_velocity(
     return float(Q_m3_s / area_m2) if area_m2 > 1e-18 else 0.0
 
 
+def _per_gate_ingate_velocities(
+    grid: np.ndarray,
+    velocity_magnitude: np.ndarray,
+    dx_m: float,
+    origin_mm: np.ndarray,
+    Q_total_m3_s: float,
+    bodies: Optional[List[Body]],
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Compute a contact velocity for each individual INGATE body.
+
+    The gate region (grid == BodyType.INGATE) is split into connected
+    components.  Each component is matched to the nearest `BodyType.INGATE`
+    body by centroid distance.  The local velocity is estimated from the
+    average Darcy speed inside the component, then re-normalised so that the
+    sum of `v_i * A_i` over all gates equals the global flow rate `Q`.
+    """
+    gate_vel: Dict[str, float] = {}
+    gate_area: Dict[str, float] = {}
+    if not bodies:
+        return gate_vel, gate_area
+    ingate_mask = grid == BodyType.INGATE
+    if not ingate_mask.any():
+        return gate_vel, gate_area
+
+    ingate_bodies = [b for b in bodies if b.body_type == BodyType.INGATE]
+    if not ingate_bodies:
+        return gate_vel, gate_area
+
+    labeled, n = ndimage.label(ingate_mask)
+    part_mask = grid == BodyType.PART
+    struct = ndimage.generate_binary_structure(3, 1)
+    contact_mask = ingate_mask & ndimage.binary_dilation(part_mask, structure=struct)
+
+    gate_raw: Dict[str, List[Tuple[float, float]]] = {}
+    dx_mm = dx_m * 1000.0
+    for label_id in range(1, n + 1):
+        comp = labeled == label_id
+        contact = comp & contact_mask
+        area_m2 = float(contact.sum()) * dx_m * dx_m
+        if area_m2 <= 1e-18:
+            area_m2 = float(comp.sum()) * dx_m * dx_m
+        if area_m2 <= 1e-18:
+            continue
+
+        vals = velocity_magnitude[comp]
+        v_avg = float(np.mean(vals)) if vals.size > 0 else 0.0
+
+        idx = np.argwhere(comp)
+        comp_centroid_vox = idx.mean(axis=0) if idx.size > 0 else np.zeros(3)
+        comp_centroid_mm = comp_centroid_vox * dx_mm + np.asarray(origin_mm)
+
+        best_body = None
+        best_dist = float("inf")
+        for b in ingate_bodies:
+            try:
+                bc = np.asarray(b.mesh.centroid, dtype=np.float64)
+            except Exception:
+                continue
+            dist = float(np.linalg.norm(comp_centroid_mm - bc))
+            if dist < best_dist:
+                best_dist = dist
+                best_body = b
+
+        name = best_body.name if best_body else f"INGATE_{label_id}"
+        if name in gate_raw:
+            gate_raw[name].append((area_m2, v_avg))
+        else:
+            gate_raw[name] = [(area_m2, v_avg)]
+
+    # Renormalise so sum(v_i * A_i) == Q_total.
+    raw_flow_sum = sum(
+        sum(a * v for a, v in entries) for entries in gate_raw.values()
+    )
+    for name, entries in gate_raw.items():
+        total_area = sum(a for a, _ in entries)
+        if total_area <= 1e-18:
+            continue
+        weighted_v = sum(a * v for a, v in entries) / total_area
+        if raw_flow_sum > 1e-18 and weighted_v > 1e-12:
+            v_eff = weighted_v * Q_total_m3_s / raw_flow_sum
+        else:
+            v_eff = Q_total_m3_s / total_area
+        gate_vel[name] = float(v_eff)
+        gate_area[name] = float(total_area * 1e4)
+
+    return gate_vel, gate_area
+
+
 def solve_filling_flow(
     grid: np.ndarray,
     origin: np.ndarray,
@@ -886,6 +974,32 @@ def solve_filling_flow(
         )
         fill_time_fine = np.where(grid > 0, fill_time_fine, 0.0)
 
+    # Upsample velocity magnitude to the (fine) input grid for surface overlay
+    # and per-gate velocity calculation.
+    if vmag.shape == grid.shape:
+        vmag_fine = vmag
+    else:
+        vmag_fine = ndimage.zoom(
+            vmag,
+            (
+                grid.shape[0] / vmag.shape[0],
+                grid.shape[1] / vmag.shape[1],
+                grid.shape[2] / vmag.shape[2],
+            ),
+            order=1,
+        )
+        vmag_fine = np.where(grid > 0, vmag_fine, 0.0)
+
+    # Per-gate contact velocities / areas when multiple INGATE bodies are present.
+    per_gate_v, per_gate_area = _per_gate_ingate_velocities(
+        grid,
+        vmag_fine,
+        dx / 1000.0,
+        origin,
+        Q_user,
+        bodies,
+    )
+
     # Node / section velocities and ingate contact velocity.
     # Use continuity Q / cross-sectional area; the pressure field is kept for
     # visualization and future transient filling front work.
@@ -927,10 +1041,12 @@ def solve_filling_flow(
         Q_m3_s=Q_user,
         inlet_area_m2=area_m2,
         fill_time_s=fill_time_s,
-        velocity_magnitude=vmag,
+        velocity_magnitude=vmag_fine,
         fill_time=fill_time_fine,
         solver_grid=grid_c,
         solver_dx_mm=dx_c,
         pressure=p,
         reason=reason,
+        per_gate_contact_velocity_m_s=per_gate_v,
+        per_gate_contact_area_cm2=per_gate_area,
     )

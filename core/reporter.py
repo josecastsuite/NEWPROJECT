@@ -284,6 +284,22 @@ def _format_flow_result(flow) -> str:
     except Exception:
         graph_html = ""
 
+    per_gate = getattr(flow, "per_gate_contact_velocity_m_s", {}) or {}
+    per_area = getattr(flow, "per_gate_contact_area_cm2", {}) or {}
+    per_gate_html = ""
+    if per_gate:
+        gate_rows = "".join(
+            f"<tr><td>{name}</td><td>{v:.3f}</td><td>{per_area.get(name, 0.0):.2f}</td></tr>"
+            for name, v in per_gate.items()
+        )
+        per_gate_html = f"""
+        <h4>Meme başına temas hızı</h4>
+        <table>
+            <tr><th>Gate</th><th>Hız (m/s)</th><th>Alan (cm²)</th></tr>
+            {gate_rows}
+        </table>
+        """
+
     return f"""
     <h3>3-B Darcy Akış Simülasyonu (v9.3)</h3>
     <p>Toplam debi Q = {flow.Q_m3_s*1e3:.3f} L/s | Giriş alanı = {flow.inlet_area_m2*1e4:.2f} cm² | Tahmini doldurma süresi = {flow.fill_time_s:.2f} s | Meme temas hızı = {flow.ingate_contact_velocity_m_s:.3f} m/s</p>
@@ -293,6 +309,7 @@ def _format_flow_result(flow) -> str:
         {rows}
     </table>
     <div style="margin-top:10px;"><strong>Kesit hızları (m/s):</strong><br/>{bars}</div>
+    {per_gate_html}
     """
 
 

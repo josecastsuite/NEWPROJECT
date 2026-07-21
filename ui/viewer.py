@@ -47,6 +47,23 @@ BODY_OPACITY = {
     BodyType.CURUFLUK: 1.0,
 }
 
+# Post-analysis transparency: all bodies become translucent so internal
+# hotspots, Niyama surfaces and flow fields are visible through the geometry.
+BODY_OPACITY_POST = {
+    BodyType.PART: 0.60,
+    BodyType.RISER: 0.35,
+    BodyType.INGATE: 0.35,
+    BodyType.RUNNER: 0.35,
+    BodyType.SPRUE: 0.35,
+    BodyType.CORE: 0.35,
+    BodyType.COOLING_SPRUE: 0.35,
+    BodyType.FILTER: 0.35,
+    BodyType.POURING_BASIN: 0.35,
+    BodyType.SPRUE_THROAT: 0.35,
+    BodyType.DISTRIBUTOR: 0.35,
+    BodyType.CURUFLUK: 0.35,
+}
+
 
 def _scalar_bar_args(title: str, pos: Tuple[float, float]) -> dict:
     return {
@@ -93,6 +110,7 @@ class Analyzer3DViewer(QtInteractor):
         self._local_actors: List = []
         self._section_actors: List = []
         self._section_picker = None
+        self._flow_actor = None
 
     def clear_scene(self):
         self.clear_actors()
@@ -106,21 +124,23 @@ class Analyzer3DViewer(QtInteractor):
         self._path_actors.clear()
         self._slice_actors.clear()
         self._local_actors.clear()
+        self._flow_actor = None
         self._clear_section_actors()
 
-    def show_bodies(self, bodies: List[Body], reset_camera: bool = True):
-        """Display original body meshes colored by type; part is semi-transparent."""
+    def show_bodies(self, bodies: List[Body], reset_camera: bool = True, analysis_mode: bool = False):
+        """Display original body meshes colored by type."""
         for actor in self._body_actors:
             self.remove_actor(actor)
         self._body_actors.clear()
 
+        opacity_map = BODY_OPACITY_POST if analysis_mode else BODY_OPACITY
         for body in bodies:
             if len(body.faces) == 0:
                 continue
             faces = np.c_[np.full(len(body.faces), 3, dtype=np.int64), body.faces].ravel()
             mesh = pv.PolyData(body.vertices, faces)
             color = BODY_COLORS.get(body.body_type, "#E0E0E0")
-            opacity = BODY_OPACITY.get(body.body_type, 1.0)
+            opacity = opacity_map.get(body.body_type, 1.0)
             actor = self.add_mesh(
                 mesh,
                 color=color,
@@ -445,6 +465,37 @@ class Analyzer3DViewer(QtInteractor):
         )
         self._niyama_actors.append(actor)
 
+    def show_flow_velocity(self, result: Optional[AnalysisResult]):
+        """Overlay the 3-D Darcy flow-velocity magnitude on the metal surfaces."""
+        if self._flow_actor is not None:
+            self.remove_actor(self._flow_actor)
+            self._flow_actor = None
+        self._remove_scalar_bar("Akış hızı (m/s)")
+        if result is None or result.flow_result is None:
+            return
+        fr = result.flow_result
+        vmag = fr.velocity_magnitude
+        if vmag is None or vmag.size == 0:
+            return
+        grid = self._make_grid(result, vmag, "velocity_magnitude")
+        metal = self._metal_only(grid)
+        if metal.n_cells == 0:
+            return
+        surf = self._smooth_surface(metal)
+        if surf.n_points == 0:
+            return
+        vmax = float(np.nanmax(vmag)) if np.isfinite(vmag).any() else 1.0
+        self._flow_actor = self.add_mesh(
+            surf,
+            scalars="velocity_magnitude",
+            cmap="turbo",
+            opacity=1.0,
+            clim=[0.0, max(vmax, 1e-3)],
+            show_scalar_bar=True,
+            scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.64, 0.02)),
+            smooth_shading=True,
+        )
+
     def show_feeding_paths(self, result: Optional[AnalysisResult]):
         for actor in self._path_actors:
             self.remove_actor(actor)
@@ -603,6 +654,15 @@ class Analyzer3DViewer(QtInteractor):
                 self.remove_actor(actor)
             self._niyama_actors.clear()
             self._remove_scalar_bar("Niyama")
+
+    def toggle_flow_velocity(self, result: AnalysisResult, checked: bool):
+        if checked:
+            self.show_flow_velocity(result)
+        else:
+            if self._flow_actor is not None:
+                self.remove_actor(self._flow_actor)
+                self._flow_actor = None
+            self._remove_scalar_bar("Akış hızı (m/s)")
 
     def toggle_feeding_paths(self, result: AnalysisResult, checked: bool):
         if checked:
