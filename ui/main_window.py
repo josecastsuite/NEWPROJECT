@@ -1027,8 +1027,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.aiLog(f"AŞAMA 6/6: Analiz tamamlandı ({elapsed:.1f} sn)", "ok")
 
             self.progress.setValue(100)
+            n_visible = sum(1 for hs in self._analysis.hotspots if not hs.solved)
             self.status_label.setText(
-                f"Analiz tamamlandı ({elapsed:.1f} sn). {len(self._analysis.hotspots)} hot spot."
+                f"Analiz tamamlandı ({elapsed:.1f} sn). {n_visible}/{len(self._analysis.hotspots)} hot spot görünür."
             )
             self.export_btn.setEnabled(True)
             self.html_btn.setEnabled(True)
@@ -1121,7 +1122,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._analysis is None:
             return
 
-        for hs in self._analysis.hotspots:
+        visible_hotspots = [hs for hs in self._analysis.hotspots if not hs.solved]
+        for hs in visible_hotspots:
             status = "OK" if hs.feed_ok else "DARALMA/UZAK"
             text = (
                 f"Hot spot M={hs.m_value_mm:.1f} mm, t={hs.t_section_mm:.1f} mm, "
@@ -1129,6 +1131,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Niyama={hs.niyama_ensemble:.2f}"
             )
             self.checklist_layout.addWidget(CheckListItem(text, hs.feed_ok))
+        if any(hs.solved for hs in self._analysis.hotspots):
+            n_total = len(self._analysis.hotspots)
+            n_hidden = n_total - len(visible_hotspots)
+            note = QtWidgets.QLabel(
+                f"{n_hidden} adet hot spot yeterli besleyici/çıkıcı ile çözüldü; "
+                "sadece çözülmemişler listeleniyor."
+            )
+            note.setStyleSheet("color: green;")
+            self.checklist_layout.addWidget(note)
 
         for rr in self._analysis.riser_results:
             eff_m = max(rr.effective_m_value_mm, rr.m_value_mm)

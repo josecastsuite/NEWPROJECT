@@ -83,10 +83,16 @@ def _format_hotspot_table(result: AnalysisResult) -> str:
     alloy = get_alloy(result.alloy_key)
     macro_limit = float(alloy.macro_pore_limit_um)
     micro_limit = float(alloy.micro_pore_limit_um)
-    if result.hotspots:
-        for i, hs in enumerate(result.hotspots, 1):
+    visible = [hs for hs in result.hotspots if not hs.solved]
+    if visible:
+        for i, hs in enumerate(visible, 1):
             pos = ",".join(f"{v:.1f}" for v in hs.position_mm)
-            status = "OK" if hs.feed_ok else "UZAK/DARALMA"
+            if hs.chill_ok:
+                status = "ÇIKICI (chill) ile çözüldü"
+            elif hs.feed_ok:
+                status = "OK"
+            else:
+                status = "UZAK/DARALMA"
             niy = ", ".join(f"{k}={v:.3f}" for k, v in hs.niyama_variants.items())
             # Hotspot pore display should use the class absolute lower bound,
             # not the percentile-based display threshold.
@@ -118,7 +124,7 @@ def _format_hotspot_table(result: AnalysisResult) -> str:
                 f"</tr>"
             )
     else:
-        rows.append('<tr><td colspan="14">Tespit edilmedi.</td></tr>')
+        rows.append('<tr><td colspan="14">Tespit edilmedi (çözülenler gizli).</td></tr>')
     return "".join(rows)
 
 
@@ -388,6 +394,7 @@ def _render_html(result: AnalysisResult, screenshot_path: Optional[str] = None) 
     {_format_pore_size_summary(result)}
 
     <h2>Sıcak Noktalar (Hot Spots)</h2>
+    <p>Yeterli besleyici/çıkıcı ile çözülen hot spot'lar ekranda gösterilmez; aşağıda sadece çözülmemişler listelenir.</p>
     <table>
         <tr>
             <th>#</th><th>Konum (mm)</th><th>M ± hata (mm)</th><th>t (mm)</th>
@@ -396,6 +403,7 @@ def _render_html(result: AnalysisResult, screenshot_path: Optional[str] = None) 
         </tr>
         {_format_hotspot_table(result)}
     </table>
+    <p><em>Genel önleme: kalın kesitlerde yatay yüzey değiştirin, yerel besleyici/çıkıcı ekleyin veya geometriyi inceltin.</em></p>
 
     <h2>Besleyici (Riser) Değerlendirmesi</h2>
     <table>
@@ -536,10 +544,17 @@ def _generate_report_fpdf2(
     pdf.set_font(font, "", 13)
     pdf.cell(0, 8, "Sıcak Noktalar", ln=True)
     pdf.set_font(font, "", 10)
-    if result.hotspots:
-        for i, hs in enumerate(result.hotspots, 1):
+    pdf.cell(0, 6, "Yeterli besleyici/çıkıcı ile çözülen hot spot'lar gizlendi; sadece çözülmemişler listeleniyor.", ln=True)
+    visible_hs = [hs for hs in result.hotspots if not hs.solved]
+    if visible_hs:
+        for i, hs in enumerate(visible_hs, 1):
             pos = ",".join(f"{v:.1f}" for v in hs.position_mm)
-            status = "OK" if hs.feed_ok else "UZAK/DARALMA"
+            if hs.chill_ok:
+                status = "CIKICI (chill) ile cozuldu"
+            elif hs.feed_ok:
+                status = "OK"
+            else:
+                status = "UZAK/DARALMA"
             pore = ""
             class_thr = {
                 "macro": macro_limit,
@@ -553,6 +568,7 @@ def _generate_report_fpdf2(
                            f"Niyama={hs.niyama_ensemble:.2f} | Darcy={hs.darcy_resistance:.2f} | Heuver={'OK' if hs.heuvers_ok else 'FAIL'} | {status}{pore}", ln=True)
     else:
         pdf.cell(0, 6, "Tespit edilmedi.", ln=True)
+    pdf.cell(0, 6, "Genel onleme: kalin kesitlerde yatay yuzey degistirin, yerel besleyici/cikici ekleyin veya geometriyi inceltin.", ln=True)
     pdf.ln(4)
 
     pdf.set_font(font, "", 13)

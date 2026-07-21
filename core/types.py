@@ -149,6 +149,12 @@ class HotSpot:
     pore_size_um: float = 0.0
     pore_size_mm: float = 0.0
     pore_size_class: str = ""
+    # P3: hotspot is considered solved if a feeder or chill is close/effective enough.
+    chill_ok: bool = False
+
+    @property
+    def solved(self) -> bool:
+        return self.feed_ok or self.chill_ok
 
 
 @dataclass

@@ -1546,6 +1546,7 @@ def analyze(
 
     part_mask = grid == BodyType.PART
     riser_mask = grid == BodyType.RISER
+    chill_mask = np.isin(grid, CHILL_BODY_TYPES)
 
     # v8.6: exposed part surface area (mold contact) and volume for modulus/riser calculations.
     part_pad = np.pad(part_mask, 1, constant_values=False)
@@ -1658,6 +1659,11 @@ def analyze(
     cost_feed, cost_pred, _ = feeding_cost_dijkstra(
         is_metal, feeder_mask, M_mod, dx, gravity_vector=gravity_vector
     )
+    # Distance to nearest chill insert for P3 filtering.
+    if chill_mask.any():
+        dist_chill_vox = ndimage.distance_transform_edt(~chill_mask)
+    else:
+        dist_chill_vox = None
     if progress_callback:
         progress_callback(82)
 
@@ -1766,8 +1772,15 @@ def analyze(
                 and feed_cost_ok
                 and hs.darcy_ok
             )
+            # A chill solves the hot spot if it is close enough to the local modulus.
+            if dist_chill_vox is not None:
+                d_chill = float(dist_chill_vox[vox[0], vox[1], vox[2]]) * dx
+                hs.chill_ok = d_chill <= 1.5 * hs.m_value_mm
+            else:
+                hs.chill_ok = False
         else:
             hs.feed_ok = False
+            hs.chill_ok = False
 
     if progress_callback:
         progress_callback(88)

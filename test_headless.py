@@ -120,12 +120,13 @@ def main():
         casting_params=params,
     )
     print(f"  analyze done in {time.time()-t0:.1f}s")
-    print(f"  hotspots: {len(result.hotspots)}")
+    visible = [hs for hs in result.hotspots if not hs.solved]
+    print(f"  hotspots: {len(visible)}/{len(result.hotspots)} visible")
     for i, hs in enumerate(result.hotspots):
         print(f"    HS{i}: pos={hs.position_mm}, M={hs.m_value_mm:.2f}, "
               f"t={hs.t_section_mm:.2f}, dist={hs.dist_to_riser_mm:.1f}, "
               f"FD={hs.max_feeding_distance_mm:.1f}, N={hs.niyama_ensemble:.2f}, "
-              f"feed_ok={hs.feed_ok}, dir_ok={hs.directional_ok}, heuver_ok={hs.heuvers_ok}, darcy_ok={hs.darcy_ok}, "
+              f"feed_ok={hs.feed_ok}, chill_ok={hs.chill_ok}, dir_ok={hs.directional_ok}, heuver_ok={hs.heuvers_ok}, darcy_ok={hs.darcy_ok}, "
               f"pore={hs.pore_size_um:.1f} um ({hs.pore_size_class})")
 
     print("Running gating ...")

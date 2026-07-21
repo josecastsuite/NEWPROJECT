@@ -184,7 +184,8 @@ class Analyzer3DViewer(QtInteractor):
         bbox_min = np.min(result.bbox_size_mm) if result.bbox_size_mm.any() else 100.0
         centers = []
         labels = []
-        for hs in result.hotspots:
+        visible_hotspots = [hs for hs in result.hotspots if not hs.solved]
+        for hs in visible_hotspots:
             # Radius proportional to local wall thickness, clamped to a sensible fraction of the part size.
             radius = max(1.2, min(hs.t_section_mm * 0.15, bbox_min * 0.02, 6.0))
             sphere = pv.Sphere(
@@ -453,6 +454,8 @@ class Analyzer3DViewer(QtInteractor):
 
         part_mask = result.grid == BodyType.PART
         for hs in result.hotspots:
+            if hs.solved:
+                continue
             vox = np.round((hs.position_mm - result.origin_mm) / result.dx_mm).astype(int)
             if not (
                 0 <= vox[0] < part_mask.shape[0]
