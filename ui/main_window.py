@@ -26,7 +26,6 @@ from core import (
 from core.materials import chvorinov_c_from_properties
 from core.types import Body, BodyType, CastingParameters
 from ui.feeder_dialog import FeederDialog, FEEDER_TYPE_NAMES
-from ui.section_dialog import SectionDialog
 from ui.viewer import Analyzer3DViewer
 
 
@@ -87,10 +86,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._origin = None
         self._dx = None
         self._unit_scale = 1.0
-        # per-body section areas keyed by (body.name, section_key)
-        self._body_section_areas_cm2: Dict[Tuple[str, str], float] = {}
-        self._body_section_labels: Dict[str, QtWidgets.QLabel] = {}
-        self._body_section_buttons: Dict[str, QtWidgets.QPushButton] = {}
         self._body_feeder_buttons: Dict[str, QtWidgets.QPushButton] = {}
         self._body_feeder_labels: Dict[str, QtWidgets.QLabel] = {}
         self._body_items: Dict[str, QtWidgets.QListWidgetItem] = {}
@@ -346,10 +341,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.velocity_section_combo = QtWidgets.QComboBox()
         self.velocity_section_combo.addItem("Döküm ağzı boğazı (sprue throat)", "SPRUE_THROAT")
-        self.velocity_section_combo.addItem("Döküm ağzı tabanı (sprue base)", "SPRUE_BASE")
-        self.velocity_section_combo.addItem("Yolluk (runner)", "RUNNER")
-        self.velocity_section_combo.addItem("Meme (ingate)", "INGATE")
-        _params_labeled(self.velocity_section_combo, "Hız kesiti:", "Giriş hızının uygulanacağı kesit.")
+        self.velocity_section_combo.addItem("Döküm ağzı en üst noktası (sprue top)", "SPRUE_BASE")
+        _params_labeled(self.velocity_section_combo, "Hız kesiti:", "Kullanıcı girişi sadece sprue boğazı veya sprue en üst noktasıdır; program düzeltmez.")
 
         self.v_ingate_spin = QtWidgets.QDoubleSpinBox()
         self.v_ingate_spin.setRange(0.0, 20.0)
@@ -359,7 +352,7 @@ class MainWindow(QtWidgets.QMainWindow):
         _params_labeled(
             self.v_ingate_spin,
             "Giriş hızı v (m/s):",
-            "0 = otomatik (tasarım debisi). >0 kullanıcı girişi; seçili sprue/yolluk/meme kesitinde geçerlidir.",
+            "0 = otomatik (tasarım debisi). >0 kullanıcı girişi; seçili sprue kesitinde geçerlidir. Program düzeltmez.",
         )
 
         left_layout.addWidget(params_group)
@@ -660,16 +653,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         row.addWidget(label)
 
-        # Gating section controls (always visible; dialog warns if wrong type).
-        section_btn = QtWidgets.QPushButton("Kesit")
-        section_btn.setToolTip("Bu body'nin gating kesit alanını seç (sadece yolluk/meme/döküm ağzı)")
-        section_btn.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
-        )
-        section_btn.clicked.connect(lambda _, b=body: self.on_body_section(b))
-        row.addWidget(section_btn)
-        self._body_section_buttons[body.name] = section_btn
-
         # Feeder type controls (always visible; dialog warns if not a RISER).
         feeder_btn = QtWidgets.QPushButton("Besleyici tipi")
         feeder_btn.setToolTip("Bu besleyicinin tipini ve opsiyonel modülünü ayarla")
@@ -712,7 +695,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.body_list.addItem(item)
         self.body_list.setItemWidget(item, widget)
         self._update_body_row_state(body)
-        self._update_body_section_label(body.name)
         self._update_body_feeder_label(body.name)
         item.setSizeHint(widget.sizeHint())
 
@@ -743,9 +725,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.voxelize_btn.setEnabled(True)
             self.analyze_btn.setEnabled(False)
             self._analysis = None
-            self._body_section_areas_cm2.clear()
-            self._body_section_labels.clear()
-            self._body_section_buttons.clear()
             self._body_feeder_buttons.clear()
             self._body_feeder_labels.clear()
             self._body_items.clear()
@@ -780,17 +759,6 @@ class MainWindow(QtWidgets.QMainWindow):
         old_type = body.body_type
         body.body_type = new_type
 
-        # If the body is no longer a gating section, clear the stored section data.
-        if old_type != new_type and new_type not in (
-            BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE, BodyType.SPRUE_THROAT, BodyType.DISTRIBUTOR, BodyType.CURUFLUK
-        ):
-            body.section_key = ""
-            body.section_area_cm2 = 0.0
-            keys_to_drop = [k for (b, k) in self._body_section_areas_cm2 if b == body.name]
-            for k in keys_to_drop:
-                del self._body_section_areas_cm2[(body.name, k)]
-            self._update_body_section_label(body.name)
-
         # If the body is no longer a riser, clear feeder overrides.
         if old_type != new_type and new_type != BodyType.RISER:
             body.feeder_type = ""
@@ -801,57 +769,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_body_row_state(body)
         self.viewer.show_bodies(self._bodies)
 
-    def on_body_section(self, body: Body):
-        """Open the per-body section-area selection dialog."""
-        if body is None:
-            return
-        try:
-            bt = BodyType(body.body_type) if isinstance(body.body_type, int) else body.body_type
-        except Exception:
-            bt = body.body_type
-        if bt not in (BodyType.RUNNER, BodyType.INGATE, BodyType.SPRUE, BodyType.SPRUE_THROAT, BodyType.DISTRIBUTOR, BodyType.CURUFLUK):
-            QtWidgets.QMessageBox.information(
-                self, "Tip Uyarısı",
-                "Kesit seçimi sadece YOLLUK, MEME, DÖKÜM AĞZI, DAĞITICI veya CURUFLUK tipindeki body'ler için geçerlidir.\n"
-                "Lütfen önce body tipini değiştirin."
-            )
-            return
-        default_key = body.section_key or self._section_key_for_body(bt)
-        try:
-            dialog = SectionDialog(body, section_key=default_key, parent=self)
-        except Exception as e:
-            self.aiLog(f"Kesit dialogu açılamadı: {e}", "crit")
-            QtWidgets.QMessageBox.critical(self, "Hata", f"Kesit dialogu açılamadı:\n{e}\n\nElle değer girebilirsiniz.")
-            return
-
-        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            if dialog.area_cm2 is not None and dialog.section_key is not None:
-                self._body_section_areas_cm2[(body.name, dialog.section_key)] = dialog.area_cm2
-                body.section_key = dialog.section_key
-                body.section_area_cm2 = dialog.area_cm2
-                self._update_body_section_label(body.name)
-                self.aiLog(
-                    f"{body.name} - {dialog.section_key}: A = {dialog.area_cm2:.4f} cm²", "ok"
-                )
-
-    def _section_key_for_body(self, body_or_type) -> str:
-        bt = body_or_type.body_type if isinstance(body_or_type, Body) else body_or_type
-        if bt == BodyType.SPRUE:
-            return "SPRUE_BASE"
-        if bt == BodyType.SPRUE_THROAT:
-            return "SPRUE_THROAT"
-        if bt == BodyType.RUNNER:
-            return "RUNNER"
-        if bt == BodyType.DISTRIBUTOR:
-            return "DISTRIBUTOR"
-        if bt == BodyType.CURUFLUK:
-            return "CURUFLUK"
-        if bt == BodyType.INGATE:
-            return "INGATE"
-        return "INGATE"
-
     def _update_body_row_state(self, body: Body):
-        # Buttons are always enabled; the dialog itself warns if the body type is wrong.
         # Keeping this hook for any future row-specific updates.
         pass
 
@@ -907,30 +825,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"{', M=' + f'{body.feeder_m_mm:.2f} mm' if body.feeder_m_mm > 0 else ''}",
                 "ok",
             )
-
-    def on_clear_sections(self):
-        self._body_section_areas_cm2.clear()
-        for label in self._body_section_labels.values():
-            label.setText("A=---")
-        self.aiLog("Kesit seçimleri temizlendi.", "info")
-
-    def _update_body_section_label(self, body_name: str):
-        label = self._body_section_labels.get(body_name)
-        if label is None:
-            return
-        keys = [k for (b, k), v in self._body_section_areas_cm2.items() if b == body_name]
-        if not keys:
-            label.setText("A=---")
-            return
-        texts = [f"{self._body_section_areas_cm2[(body_name, k)]:.2f}" for k in keys]
-        label.setText("A=" + ", ".join(texts))
-
-    def _aggregate_section_areas(self) -> Dict[str, float]:
-        """Sum runner/ingate areas; keep sprue base/throat per section key."""
-        totals: Dict[str, float] = {}
-        for (body_name, key), value in self._body_section_areas_cm2.items():
-            totals[key] = totals.get(key, 0.0) + value
-        return totals
 
     def on_voxelize(self):
         if not self._bodies:
@@ -1009,7 +903,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 thermal_downsample=3,
                 casting_params=casting_params,
                 progress_callback=self._set_progress,
-                user_section_areas_cm2=self._aggregate_section_areas(),
+                user_section_areas_cm2=None,
             )
             self._analysis.casting_params = casting_params
 
