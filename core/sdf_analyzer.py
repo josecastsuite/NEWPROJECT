@@ -1503,6 +1503,7 @@ def analyze(
     thermal_downsample: int = 2,
     casting_params: Optional[CastingParameters] = None,
     progress_callback: Optional[callable] = None,
+    user_section_areas_cm2: Optional[Dict[str, float]] = None,
     part_voxels_target: int = 10_000_000,
     part_max_dim: int = 600,
 ) -> AnalysisResult:
@@ -2124,7 +2125,10 @@ def analyze(
     try:
         from core.gating import analyze_gating
         result.gate_result = analyze_gating(
-            result, casting_params=casting_params, bodies=bodies
+            result,
+            casting_params=casting_params,
+            bodies=bodies,
+            user_section_areas_cm2=user_section_areas_cm2,
         )
     except Exception as exc:
         result.recommendations.append(f"Gating analizi atlandı: {exc}")

@@ -15,7 +15,6 @@ from core import (
     ALLOYS,
     MOLDS,
     analyze,
-    analyze_gating,
     apply_unit_scale,
     build_voxel_grid,
     detect_unit_suggestion,
@@ -1010,18 +1009,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 thermal_downsample=3,
                 casting_params=casting_params,
                 progress_callback=self._set_progress,
+                user_section_areas_cm2=self._aggregate_section_areas(),
             )
             self._analysis.casting_params = casting_params
 
-            self.aiLog("AŞAMA 5/6: Meme / yolluk / döküm ağzı kontrolleri yapılıyor...", "info")
-            gate_result = analyze_gating(
-                self._analysis,
-                casting_params=casting_params,
-                bodies=self._bodies,
-                user_section_areas_cm2=self._aggregate_section_areas(),
-            )
-            self._analysis.gate_result = gate_result
-            self._analysis.recommendations.extend(self._gating_recommendations(gate_result))
+            gate_result = self._analysis.gate_result
+            if gate_result:
+                self._analysis.recommendations.extend(
+                    self._gating_recommendations(gate_result)
+                )
 
             elapsed = time.time() - t0
             self.aiLog(f"AŞAMA 6/6: Analiz tamamlandı ({elapsed:.1f} sn)", "ok")
@@ -1278,6 +1274,34 @@ class MainWindow(QtWidgets.QMainWindow):
                     CheckListItem(
                         f"Gate toplam: gerçek {gr.total_ingate_contact_area_cm2:.2f} cm² / teorik {gr.design_gate_total_area_cm2:.2f} cm²",
                         gr.gate_design_ok,
+                    )
+                )
+
+        if self._analysis and self._analysis.flow_result:
+            fr = self._analysis.flow_result
+            self.checklist_layout.addWidget(
+                CheckListItem(
+                    f"3-B Akış: Q={fr.Q_m3_s*1e3:.2f} L/s, doldurma={fr.fill_time_s:.2f} s, meme temas v={fr.ingate_contact_velocity_m_s:.2f} m/s",
+                    True,
+                )
+            )
+            section_names = {
+                "SPRUE": "Döküm ağzı",
+                "RUNNER": "Yolluk",
+                "DISTRIBUTOR": "Dağıtıcı",
+                "CURUFLUK": "Curufluk",
+                "INGATE": "Meme",
+                "FILTER": "Filtre",
+                "RISER": "Besleyici",
+            }
+            for key, val in fr.node_velocities.items():
+                if val <= 1e-9:
+                    continue
+                name = section_names.get(key, key)
+                self.checklist_layout.addWidget(
+                    CheckListItem(
+                        f"  {name}: v={val:.3f} m/s ({val*100:.1f} cm/s)",
+                        True,
                     )
                 )
 
