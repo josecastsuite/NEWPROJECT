@@ -346,10 +346,10 @@ class MainWindow(QtWidgets.QMainWindow):
         _params_labeled(self.visc_spin, "Viskozite μ (Pa·s):")
 
         self.velocity_section_combo = QtWidgets.QComboBox()
-        self.velocity_section_combo.addItem("Meme (ingate)", "INGATE")
-        self.velocity_section_combo.addItem("Yolluk (runner)", "RUNNER")
         self.velocity_section_combo.addItem("Döküm ağzı boğazı (sprue throat)", "SPRUE_THROAT")
         self.velocity_section_combo.addItem("Döküm ağzı tabanı (sprue base)", "SPRUE_BASE")
+        self.velocity_section_combo.addItem("Yolluk (runner)", "RUNNER")
+        self.velocity_section_combo.addItem("Meme (ingate)", "INGATE")
         _params_labeled(self.velocity_section_combo, "Hız kesiti:", "Giriş hızının uygulanacağı kesit.")
 
         self.v_ingate_spin = QtWidgets.QDoubleSpinBox()
@@ -360,7 +360,7 @@ class MainWindow(QtWidgets.QMainWindow):
         _params_labeled(
             self.v_ingate_spin,
             "Giriş hızı v (m/s):",
-            "0 = otomatik (Q = V_parça / t_fill). >0 kullanıcı girişi; seçili kesitte Re/Fr hesaplanır.",
+            "0 = otomatik (tasarım debisi). >0 kullanıcı girişi; seçili sprue/yolluk/meme kesitinde geçerlidir.",
         )
 
         left_layout.addWidget(params_group)

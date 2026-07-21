@@ -15,13 +15,15 @@ class CastingParameters:
     t_liquidus_c: float = 1510.0
     t_solidus_c: float = 1410.0
     t_mold_c: float = 25.0
-    t_fill_s: float = 10.0
+    # v9.3: fill time defaults to 0 -> auto from gating design; user may override.
+    t_fill_s: float = 0.0
     rho_liquid_kg_m3: float = 7000.0
     viscosity_pa_s: float = 0.006
     # v8.1: user-specified inlet velocity (0 = auto from V_part / t_fill)
     ingate_velocity_m_s: float = 0.0
-    # v8.3: which gating section the velocity above refers to
-    velocity_section_key: str = "INGATE"
+    # v9.3: which gating section the user velocity refers to (sprue throat is
+    # the standard single inlet, but INGATE/RUNNER/SPRUE_BASE are still possible).
+    velocity_section_key: str = "SPRUE_THROAT"
     # v8.7: gravity direction for feeding and gating calculations (default -Z)
     gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0)
 
@@ -221,6 +223,23 @@ class SectionFlow:
 
 
 @dataclass
+class FillingResult:
+    """3-D Darcy-flow solver output (v9.3+)."""
+
+    node_velocities: Dict[str, float] = field(default_factory=dict)
+    ingate_contact_velocity_m_s: float = 0.0
+    Q_m3_s: float = 0.0
+    inlet_area_m2: float = 0.0
+    fill_time_s: float = 0.0
+    velocity_magnitude: Optional[np.ndarray] = None
+    fill_time: Optional[np.ndarray] = None
+    solver_grid: Optional[np.ndarray] = None
+    solver_dx_mm: float = 0.0
+    pressure: Optional[np.ndarray] = None
+    reason: str = ""
+
+
+@dataclass
 class GateResult:
     total_ingate_contact_area_cm2: float
     runner_min_area_cm2: float
@@ -301,6 +320,8 @@ class GateResult:
     gating_mass_kg: float = 0.0
     feed_to_part_mass_ratio: float = 0.0
     feed_to_part_volume_ratio: float = 0.0
+    # v9.3: 3-D Darcy filling-flow result (node velocities, gate contact velocity)
+    flow_result: Optional[FillingResult] = None
 
 
 @dataclass
@@ -363,6 +384,8 @@ class AnalysisResult:
     part_surface_area_mm2: float = 0.0
     thermal_divergence: np.ndarray = field(default_factory=lambda: np.array([]))
     riser_proposals: List[RiserProposal] = field(default_factory=list)
+    # v9.3: 3-D Darcy filling-flow result
+    flow_result: Optional[FillingResult] = None
     # v8.8: per-voxel estimated pore size (µm) and macro/micro/fine masks
     pore_size_um: np.ndarray = field(default_factory=lambda: np.array([]))
     pore_size_mm: np.ndarray = field(default_factory=lambda: np.array([]))

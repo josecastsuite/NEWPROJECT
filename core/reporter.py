@@ -212,6 +212,48 @@ def _section_flow_rows(gr) -> str:
     return "".join(rows)
 
 
+def _format_flow_result(flow) -> str:
+    """Render the 3-D filling-flow node velocities as a table and bar chart."""
+    if flow is None:
+        return ""
+    node_v = getattr(flow, "node_velocities", {}) or {}
+    if not node_v:
+        return ""
+    # Filter only sections that are present in the model.
+    items = [(k, float(v)) for k, v in node_v.items() if v > 1e-9]
+    if not items:
+        return ""
+    max_v = max(v for _, v in items) or 1.0
+    labels = {
+        "SPRUE": "Döküm ağzı",
+        "RUNNER": "Yolluk",
+        "DISTRIBUTOR": "Dağıtıcı",
+        "CURUFLUK": "Curufluk",
+        "INGATE": "Meme",
+        "FILTER": "Filtre",
+        "RISER": "Besleyici",
+    }
+    rows = ""
+    bars = ""
+    for key, val in items:
+        pct = 100.0 * val / max_v
+        rows += f"<tr><td>{labels.get(key, key)}</td><td>{val:.3f}</td><td>{val*100:.1f} cm/s</td></tr>"
+        bars += (
+            f'<div style="margin:2px 0;"><span style="display:inline-block;width:90px;">{labels.get(key, key)}</span>'
+            f'<span style="display:inline-block;background:#2a9d8f;height:16px;width:{pct:.1f}%;"></span>'
+            f'<span style="margin-left:6px;">{val:.3f} m/s</span></div>'
+        )
+    return f"""
+    <h3>3-B Darcy Akış Simülasyonu (v9.3)</h3>
+    <p>Toplam debi Q = {flow.Q_m3_s*1e3:.3f} L/s | Giriş alanı = {flow.inlet_area_m2*1e4:.2f} cm² | Tahmini doldurma süresi = {flow.fill_time_s:.2f} s</p>
+    <table>
+        <tr><th>Kesit</th><th>Hız (m/s)</th><th>Hız (cm/s)</th></tr>
+        {rows}
+    </table>
+    <div style="margin-top:10px;"><strong>Kesit hızları (m/s):</strong><br/>{bars}</div>
+    """
+
+
 def _format_gate_table(result: AnalysisResult) -> str:
     if result.gate_result is None:
         return "<p>Meme/yolluk/döküm ağzı body atanmamış.</p>"
@@ -248,8 +290,11 @@ def _format_gate_table(result: AnalysisResult) -> str:
 
     auto_fill = getattr(gr, "auto_fill_time_s", gr.recommended_fill_time_s)
     campbell_fill = getattr(gr, "campbell_fill_time_s", 0.0)
+    flow = getattr(result, "flow_result", None) or getattr(gr, "flow_result", None)
+    flow_html = _format_flow_result(flow)
     return f"""
     <p><strong>Ana motor:</strong> parça kütlesi → dolum süresi → metal yüksekliği → sprue hızı → As:Ar:Ag oranıyla hedef alanlar. CAD ölçümleri sadece karşılaştırmadır.</p>
+    {flow_html}
     <table>
         <tr><th>Parametre</th><th>Değer</th><th>Durum / Gerekli</th></tr>
         <tr><td>Seçili giriş kesiti</td><td>{selected_section}</td><td>v = {gr.ingate_velocity_m_s:.2f} m/s</td></tr>

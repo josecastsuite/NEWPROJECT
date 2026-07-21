@@ -2129,6 +2129,52 @@ def analyze(
     except Exception as exc:
         result.recommendations.append(f"Gating analizi atlandı: {exc}")
 
+    # AŞAMA 11b: 3-D Darcy doldurma akışı (hafif CFD) hesabı.
+    try:
+        from core.filling_solver import solve_filling_flow
+
+        design_v = float(
+            getattr(result.gate_result, "design_choke_velocity_m_s", 0.0) or 0.0
+        )
+        design_area_cm2 = float(
+            getattr(result.gate_result, "design_sprue_base_area_cm2", 0.0) or 0.0
+        )
+        gate = result.gate_result
+        section_areas_m2 = {
+            "SPRUE": float(gate.sprue_base_area_cm2) * 1e-4 if gate.sprue_base_area_cm2 else 0.0,
+            "RUNNER": float(gate.runner_min_area_cm2) * 1e-4 if gate.runner_min_area_cm2 else 0.0,
+            "INGATE": float(gate.total_ingate_contact_area_cm2) * 1e-4 if gate.total_ingate_contact_area_cm2 else 0.0,
+            "DISTRIBUTOR": float(gate.distributor_area_cm2) * 1e-4 if gate.distributor_area_cm2 else 0.0,
+            "CURUFLUK": float(gate.curufluk_area_cm2) * 1e-4 if gate.curufluk_area_cm2 else 0.0,
+        }
+        flow = solve_filling_flow(
+            result.grid,
+            result.origin_mm,
+            result.dx_mm,
+            casting_params,
+            alloy,
+            bodies=bodies,
+            progress_callback=None,
+            design_velocity_m_s=design_v,
+            design_section_key="SPRUE_THROAT",
+            design_area_m2=design_area_cm2 * 1e-4,
+            section_areas_m2=section_areas_m2,
+        )
+        result.flow_result = flow
+        if result.gate_result:
+            result.gate_result.flow_result = flow
+            result.gate_result.distributor_velocity_m_s = flow.node_velocities.get(
+                "DISTRIBUTOR", 0.0
+            )
+            result.gate_result.curufluk_velocity_m_s = flow.node_velocities.get(
+                "CURUFLUK", 0.0
+            )
+            if flow.Q_m3_s > 0.0:
+                result.gate_result.ingate_flow_rate_m3_s = flow.Q_m3_s
+                result.gate_result.ingate_fill_time_s = flow.fill_time_s
+    except Exception as exc:
+        result.recommendations.append(f"Akış simülasyonu atlandı: {exc}")
+
     result.recommendations = _build_recommendations(result, alloy, mold)
     if result.gate_result and result.gate_result.gating_system_reason:
         result.recommendations.append(result.gate_result.gating_system_reason)

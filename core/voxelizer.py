@@ -221,29 +221,112 @@ def _classify_casting_bodies(
     if not gating:
         return
 
-    # Main gating direction: from part centroid to the average gating centroid.
+    # Robust gating chain ordering: combine vertical position (metal flows
+    # along gravity) and horizontal distance from the part.  A gate is low and
+    # close to the part; a sprue is high and far.  This works for both vertical
+    # and horizontal gating layouts, and it naturally handles parallel gates.
     gating_centers = np.vstack([bodies[v].center for v in gating])
-    flow_vec = gating_centers.mean(axis=0) - part_center
-    flow_norm = float(np.linalg.norm(flow_vec))
-    if flow_norm > 1e-12:
-        flow_dir = flow_vec / flow_norm
-    else:
-        flow_dir = np.array([1.0, 0.0, 0.0])
+    centered = gating_centers - part_center
+    vert = centered @ up
+    v_min, v_max = float(vert.min()), float(vert.max())
+    v_range = max(v_max - v_min, 1e-9)
+    vert_score = {v: float((vert[i] - v_min) / v_range) for i, v in enumerate(gating)}
 
-    gating_sorted = sorted(
-        gating,
-        key=lambda i: float(np.dot(bodies[i].center - part_center, flow_dir)),
-    )
+    # Horizontal distance from the part centre, measured in the plane
+    # perpendicular to gravity.
+    horiz = centered - np.outer(vert, up)
+    r = np.linalg.norm(horiz, axis=1)
+    r_min, r_max = float(r.min()), float(r.max())
+    r_range = max(r_max - r_min, 1e-9)
+    r_score = {v: float((r[i] - r_min) / r_range) for i, v in enumerate(gating)}
 
-    if len(gating_sorted) == 1:
-        bodies[gating_sorted[0]].body_type = BodyType.INGATE
+    # Higher score -> farther upstream (sprue).  Lower score -> closer to part
+    # and downstream (gate).  70 % weight on height, 30 % on radial distance.
+    score = {v: 0.7 * vert_score[v] + 0.3 * r_score[v] for v in gating}
+    sorted_by_score = sorted(gating, key=lambda v: score[v])
+
+    gating_volumes = [bodies[v].volume_cm3 for v in sorted_by_score]
+    max_gating_vol = max(gating_volumes)
+    median_gating_vol = float(np.median(gating_volumes))
+    sprue_min_vol = max(0.05 * max_gating_vol, 1.0)
+    gate_max_vol = median_gating_vol
+
+    score_min = score[sorted_by_score[0]]
+    score_max = score[sorted_by_score[-1]]
+    score_range = max(score_max - score_min, 1e-9)
+    ingate_threshold = score_min + 0.40 * score_range
+
+    if len(gating) == 1:
+        bodies[sorted_by_score[0]].body_type = BodyType.INGATE
+        return
+
+    # The farthest upstream body is the sprue only if it is large enough to be
+    # the metal entry.  A tiny body at the far end is more likely a remote gate
+    # (or there is no distinct sprue in the model).
+    sprue_idx = None
+    if bodies[sorted_by_score[-1]].volume_cm3 >= sprue_min_vol:
+        sprue_idx = sorted_by_score[-1]
+        bodies[sprue_idx].body_type = BodyType.SPRUE
+
+    # Gate candidates are the small bodies within the downstream score band.
+    ingate_candidates = [
+        v
+        for v in sorted_by_score
+        if score[v] <= ingate_threshold and bodies[v].volume_cm3 <= gate_max_vol
+    ]
+
+    if ingate_candidates:
+        ingate_indices = ingate_candidates[:]
+    elif sprue_idx is not None:
+        # No small downstream body found; the closest candidate becomes the gate.
+        ingate_indices = [sorted_by_score[0]]
     else:
-        bodies[gating_sorted[0]].body_type = BodyType.INGATE
-        bodies[gating_sorted[-1]].body_type = BodyType.SPRUE
-        # Intermediate bodies that were not explicitly named default to runner.
-        for idx in gating_sorted[1:-1]:
-            if bodies[idx].body_type == BodyType.PART:
-                bodies[idx].body_type = BodyType.RUNNER
+        # No distinct sprue: the far-end small body is treated as the gate
+        # (runner -> remote gate layout).
+        ingate_indices = [
+            max(
+                sorted_by_score,
+                key=lambda v: score[v] if bodies[v].volume_cm3 <= gate_max_vol else -1e9,
+            )
+        ]
+        # If every body is larger than the median gate size, fall back to the
+        # smallest body overall.
+        if bodies[ingate_indices[0]].volume_cm3 > gate_max_vol:
+            ingate_indices = [min(sorted_by_score, key=lambda v: bodies[v].volume_cm3)]
+
+    for v in ingate_indices:
+        if bodies[v].body_type == BodyType.PART:
+            bodies[v].body_type = BodyType.INGATE
+
+    # Build adjacency among the gating bodies so a manifold feeding multiple
+    # gates can be recognized as a distributor.
+    gating_mins = [mins[v] for v in gating]
+    gating_maxs = [maxs[v] for v in gating]
+    gating_adj: List[List[int]] = [[] for _ in gating]
+    idx_in_gating = {v: i for i, v in enumerate(gating)}
+    for i, vi in enumerate(gating):
+        for j, vj in enumerate(gating[i + 1 :], start=i + 1):
+            if _bboxes_overlap_or_close(
+                gating_mins[i], gating_maxs[i], gating_mins[j], gating_maxs[j], tol_mm
+            ):
+                gating_adj[i].append(j)
+                gating_adj[j].append(i)
+
+    # Remaining intermediate bodies are runners; a body adjacent to two or more
+    # gates is treated as a distributor.
+    for v in sorted_by_score:
+        if bodies[v].body_type != BodyType.PART:
+            continue
+        i = idx_in_gating[v]
+        adj_ingates = sum(
+            1
+            for nb in gating_adj[i]
+            if bodies[gating[nb]].body_type == BodyType.INGATE
+        )
+        if adj_ingates >= 2:
+            bodies[v].body_type = BodyType.DISTRIBUTOR
+        else:
+            bodies[v].body_type = BodyType.RUNNER
 
 
 def _voxelize_at_dim(

@@ -11,7 +11,7 @@ import numpy as np
 from core.step_loader import load_step
 from core.voxelizer import build_voxel_grid, apply_unit_scale
 from core.sdf_analyzer import analyze
-from core.gating import analyze_gating
+
 from core.materials import get_alloy, get_mold, chvorinov_c_from_properties
 from core.types import CastingParameters, BodyType
 from core.reporter import _generate_html
@@ -48,7 +48,7 @@ def main():
     parser.add_argument("--gravity", default=None, help="Yerçekimi vektörü x,y,z (örn: 0,-1,0)")
     parser.add_argument("--section-area", default=None, help="Kullanıcı kesit alanları: KEY=cm2,... (RUNNER,INGATE,SPRUE_BASE,SPRUE_THROAT)")
     parser.add_argument("--velocity", default=None, type=float, help="Hedef kesit hızı v (m/s)")
-    parser.add_argument("--velocity-section", default="INGATE", help="Hedef hız kesiti (INGATE/RUNNER/SPRUE_BASE/SPRUE_THROAT)")
+    parser.add_argument("--velocity-section", default="SPRUE_THROAT", help="Hedef hız kesiti (INGATE/RUNNER/SPRUE_BASE/SPRUE_THROAT)")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -130,13 +130,7 @@ def main():
               f"pore={hs.pore_size_um:.1f} um ({hs.pore_size_class})")
 
     print("Running gating ...")
-    gate = analyze_gating(
-        result,
-        casting_params=params,
-        bodies=bodies,
-        user_section_areas_cm2=user_section_areas,
-    )
-    print(f"  gate: {gate}")
+    gate = result.gate_result
     if gate:
         print(f"    fluidity_length_mm={gate.fluidity_length_mm:.1f}")
         print(f"    ingate_velocity_m_s={gate.ingate_velocity_m_s:.2f}")
@@ -144,6 +138,12 @@ def main():
         print(f"    pour_yield={gate.pouring_yield:.3f}")
         for k, sf in gate.section_flows.items():
             print(f"    {k}: v={sf.velocity_m_s:.2f}, Re={sf.reynolds:.0f}, Fr={sf.froude:.2f}, A={sf.area_cm2:.2f}")
+
+    if result.flow_result:
+        fr = result.flow_result
+        print("  3-B Darcy flow result:")
+        print(f"    Q={fr.Q_m3_s*1e3:.3f} L/s, fill={fr.fill_time_s:.2f}s, inlet_area={fr.inlet_area_m2*1e4:.2f}cm2")
+        print(f"    node_v={fr.node_velocities}, contact_v={fr.ingate_contact_velocity_m_s:.3f}m/s")
 
     print("Generating HTML report ...")
     html_path = os.path.join(args.out_dir, "test_report.html")
