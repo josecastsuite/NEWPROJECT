@@ -312,21 +312,24 @@ def _classify_casting_bodies(
                 gating_adj[i].append(j)
                 gating_adj[j].append(i)
 
-    # Remaining intermediate bodies are runners; a body adjacent to two or more
-    # gates is treated as a distributor.
+    # Remaining intermediate bodies are runners by default.
+    # A body that lies upstream of two or more ingates is a distributor
+    # (manifold), regardless of strict bbox overlap.
+    ingate_set = set(ingate_indices)
     for v in sorted_by_score:
         if bodies[v].body_type != BodyType.PART:
             continue
-        i = idx_in_gating[v]
-        adj_ingates = sum(
-            1
-            for nb in gating_adj[i]
-            if bodies[gating[nb]].body_type == BodyType.INGATE
+        downstream_ingates = sum(
+            1 for ig in ingate_set if score[ig] < score[v]
         )
-        if adj_ingates >= 2:
+        if downstream_ingates >= 2:
             bodies[v].body_type = BodyType.DISTRIBUTOR
         else:
             bodies[v].body_type = BodyType.RUNNER
+
+    # Note: curufluk/slag-trap auto-detection is intentionally conservative.
+    # Use the body name ("curuf", "slag", "trap", "curufluk") or assign it
+    # explicitly in the STEP assembly; otherwise it defaults to RUNNER/DISTRIBUTOR.
 
 
 def _voxelize_at_dim(

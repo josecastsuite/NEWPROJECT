@@ -219,11 +219,6 @@ def _format_flow_result(flow) -> str:
     node_v = getattr(flow, "node_velocities", {}) or {}
     if not node_v:
         return ""
-    # Filter only sections that are present in the model.
-    items = [(k, float(v)) for k, v in node_v.items() if v > 1e-9]
-    if not items:
-        return ""
-    max_v = max(v for _, v in items) or 1.0
     labels = {
         "SPRUE": "Döküm ağzı",
         "RUNNER": "Yolluk",
@@ -233,6 +228,12 @@ def _format_flow_result(flow) -> str:
         "FILTER": "Filtre",
         "RISER": "Besleyici",
     }
+    order = ["SPRUE", "RUNNER", "DISTRIBUTOR", "CURUFLUK", "FILTER", "INGATE", "RISER"]
+    items = [(k, float(node_v.get(k, 0.0))) for k in order if node_v.get(k, 0.0) > 1e-9]
+    if not items:
+        return ""
+    max_v = max(v for _, v in items) or 1.0
+
     rows = ""
     bars = ""
     for key, val in items:
@@ -243,9 +244,49 @@ def _format_flow_result(flow) -> str:
             f'<span style="display:inline-block;background:#2a9d8f;height:16px;width:{pct:.1f}%;"></span>'
             f'<span style="margin-left:6px;">{val:.3f} m/s</span></div>'
         )
+
+    # Matplotlib node-velocity graph as a base64 PNG.
+    graph_html = ""
+    try:
+        import io
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        names = [labels.get(k, k) for k, _ in items]
+        values = [v for _, v in items]
+        colors = ["#2a9d8f" if v <= max_v * 0.8 else "#e76f51" for v in values]
+        fig, ax = plt.subplots(figsize=(max(6, len(items) * 1.2), 4.5))
+        bars2 = ax.bar(range(len(items)), values, color=colors, edgecolor="#264653")
+        ax.set_xticks(range(len(items)))
+        ax.set_xticklabels(names, rotation=30, ha="right")
+        ax.set_ylabel("Hız (m/s)")
+        ax.set_title(f"3-B Darcy Akış - Düğüm Hızları (Q={flow.Q_m3_s*1e3:.2f} L/s)")
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+        for bar, val in zip(bars2, values):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.01 * max_v,
+                f"{val:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+        ax.set_ylim(0, max_v * 1.15)
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png", dpi=120)
+        plt.close(fig)
+        buf.seek(0)
+        b64 = base64.b64encode(buf.read()).decode("ascii")
+        graph_html = f'<img src="data:image/png;base64,{b64}" style="max-width:100%;height:auto;margin-top:10px;" />'
+    except Exception:
+        graph_html = ""
+
     return f"""
     <h3>3-B Darcy Akış Simülasyonu (v9.3)</h3>
-    <p>Toplam debi Q = {flow.Q_m3_s*1e3:.3f} L/s | Giriş alanı = {flow.inlet_area_m2*1e4:.2f} cm² | Tahmini doldurma süresi = {flow.fill_time_s:.2f} s</p>
+    <p>Toplam debi Q = {flow.Q_m3_s*1e3:.3f} L/s | Giriş alanı = {flow.inlet_area_m2*1e4:.2f} cm² | Tahmini doldurma süresi = {flow.fill_time_s:.2f} s | Meme temas hızı = {flow.ingate_contact_velocity_m_s:.3f} m/s</p>
+    {graph_html}
     <table>
         <tr><th>Kesit</th><th>Hız (m/s)</th><th>Hız (cm/s)</th></tr>
         {rows}
