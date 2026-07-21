@@ -493,32 +493,41 @@ def _compute_user_flow_rate(
     a_cavity = fine_cavity if fine_cavity is not None else cavity
     a_dx = fine_dx_m if fine_dx_m is not None else dx_m
 
+    used_section = (section_key or "SPRUE").upper()
+    design_section = (design_section_key or used_section).upper()
+
     if velocity_m_s > 0.0:
-        face, used_section = _section_face_cells(a_grid, a_cavity, section_key, g)
+        # When the user supplies a velocity, honour the paired reference area
+        # (from the gating engine or from a manual SectionDialog pick) instead
+        # of the raw voxel face area, so Q = v × A_reference.
+        if design_area_m2 > 1e-18 and used_section == design_section:
+            area_m2 = float(design_area_m2)
+            face, _ = _section_face_cells(a_grid, a_cavity, section_key, g)
+        else:
+            face, used_section = _section_face_cells(a_grid, a_cavity, section_key, g)
+            area_m2 = float(face.sum()) * (a_dx * a_dx)
+        if area_m2 > 0.0:
+            Q = velocity_m_s * area_m2
+            return Q, area_m2, used_section
     elif fill_time_s > 0.0 and part_volume_m3 > 0.0:
         face, used_section = _section_face_cells(a_grid, a_cavity, section_key, g)
-    elif design_velocity_m_s > 0.0:
-        face, used_section = _section_face_cells(a_grid, a_cavity, design_section_key, g)
-    else:
-        face, used_section = _section_face_cells(a_grid, a_cavity, section_key, g)
-
-    area_m2 = float(face.sum()) * (a_dx * a_dx)
-    if velocity_m_s > 0.0 and area_m2 > 0.0:
-        Q = velocity_m_s * area_m2
-        return Q, area_m2, used_section
-
-    if fill_time_s > 0.0 and part_volume_m3 > 0.0:
+        area_m2 = float(face.sum()) * (a_dx * a_dx)
         Q = part_volume_m3 / fill_time_s
         return Q, area_m2, used_section
-
-    if design_velocity_m_s > 0.0:
+    elif design_velocity_m_s > 0.0:
+        used_section = design_section
+        face, _ = _section_face_cells(a_grid, a_cavity, design_section_key, g)
+        area_m2 = float(face.sum()) * (a_dx * a_dx)
         # Use the design reference area (e.g. choke area from the gating engine)
-        # instead of the raw voxel area, so Q is consistent with the design.
+        # instead of the raw voxel face area, so Q is consistent with the design.
         Q_area_m2 = design_area_m2 if design_area_m2 > 1e-18 else area_m2
         Q = design_velocity_m_s * Q_area_m2
         return Q, Q_area_m2, used_section
 
     # Last resort: a tiny flow to allow a solve; caller will report no user input.
+    if "area_m2" not in locals():
+        face, used_section = _section_face_cells(a_grid, a_cavity, section_key, g)
+        area_m2 = float(face.sum()) * (a_dx * a_dx)
     if area_m2 > 0.0:
         Q = 0.01 * area_m2
     else:
