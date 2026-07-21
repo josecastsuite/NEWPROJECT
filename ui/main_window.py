@@ -508,6 +508,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.flow_toggle.toggled.connect(self.on_toggle_flow_velocity)
         vis_layout.addWidget(self.flow_toggle)
 
+        self.flow_node_toggle = QtWidgets.QCheckBox("Düğüm Hızları")
+        self.flow_node_toggle.setToolTip("Her gating elemanında nokta + hız değeri göster")
+        self.flow_node_toggle.setChecked(True)
+        self.flow_node_toggle.toggled.connect(self.on_toggle_flow_node_labels)
+        vis_layout.addWidget(self.flow_node_toggle)
+
         self.path_toggle = QtWidgets.QCheckBox("Besleme Yolları")
         self.path_toggle.setToolTip("Hot spot'tan besleyiciye/gating'e giden yol")
         self.path_toggle.setChecked(True)
@@ -1011,6 +1017,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.viewer.show_niyama_isosurfaces(self._analysis)
             if self.flow_toggle.isChecked():
                 self.viewer.show_flow_velocity(self._analysis)
+            if self.flow_node_toggle.isChecked():
+                self.viewer.show_flow_node_labels(self._analysis)
             if self.path_toggle.isChecked():
                 self.viewer.show_feeding_paths(self._analysis)
             if self.local_toggle.isChecked():
@@ -1336,6 +1344,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_toggle_flow_velocity(self, checked: bool):
         if self._analysis:
             self.viewer.toggle_flow_velocity(self._analysis, checked)
+
+    def on_toggle_flow_node_labels(self, checked: bool):
+        if self._analysis:
+            self.viewer.toggle_flow_node_labels(self._analysis, checked)
 
     def on_toggle_feeding_paths(self, checked: bool):
         if self._analysis:

@@ -223,6 +223,18 @@ class SectionFlow:
 
 
 @dataclass
+class GatingNode:
+    """One discrete gating element (sprue, runner, gate, etc.) with its
+    throat velocity and cross-sectional area extracted from the 3-D flow field."""
+
+    name: str
+    body_type: str
+    velocity_m_s: float
+    section_area_cm2: float
+    centroid_mm: Tuple[float, float, float]
+
+
+@dataclass
 class FillingResult:
     """3-D Darcy-flow solver output (v9.3+)."""
 
@@ -240,6 +252,9 @@ class FillingResult:
     # Per-gate contact velocity / area when multiple INGATE bodies exist.
     per_gate_contact_velocity_m_s: Dict[str, float] = field(default_factory=dict)
     per_gate_contact_area_cm2: Dict[str, float] = field(default_factory=dict)
+    # Discrete gating nodes (sprue, runner, distributor, each INGATE, etc.)
+    # with their throat velocity, area and 3-D position for labelling/marker display.
+    gating_nodes: List[GatingNode] = field(default_factory=list)
 
 
 @dataclass

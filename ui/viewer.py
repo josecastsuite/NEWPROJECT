@@ -111,6 +111,7 @@ class Analyzer3DViewer(QtInteractor):
         self._section_actors: List = []
         self._section_picker = None
         self._flow_actor = None
+        self._flow_node_actor = None
 
     def clear_scene(self):
         self.clear_actors()
@@ -125,6 +126,7 @@ class Analyzer3DViewer(QtInteractor):
         self._slice_actors.clear()
         self._local_actors.clear()
         self._flow_actor = None
+        self._flow_node_actor = None
         self._clear_section_actors()
 
     def show_bodies(self, bodies: List[Body], reset_camera: bool = True, analysis_mode: bool = False):
@@ -496,6 +498,39 @@ class Analyzer3DViewer(QtInteractor):
             smooth_shading=True,
         )
 
+    def show_flow_node_labels(self, result: Optional[AnalysisResult]):
+        """Add a 3-D point + label at each gating contact (node) velocity."""
+        if self._flow_node_actor is not None:
+            self.remove_actor(self._flow_node_actor)
+            self._flow_node_actor = None
+        if result is None or result.flow_result is None:
+            return
+        nodes = result.flow_result.gating_nodes
+        if not nodes:
+            return
+        points = []
+        labels = []
+        for node in nodes:
+            if node.velocity_m_s <= 1e-12:
+                continue
+            points.append(node.centroid_mm)
+            labels.append(f"{node.name}\n{node.velocity_m_s:.2f} m/s")
+        if not points:
+            return
+        points = np.asarray(points, dtype=np.float64)
+        self._flow_node_actor = self.add_point_labels(
+            points,
+            labels,
+            font_size=10,
+            text_color="white",
+            point_color="red",
+            point_size=12,
+            shape=None,
+            always_visible=True,
+            shadow=False,
+            name="flow_node_labels",
+        )
+
     def show_feeding_paths(self, result: Optional[AnalysisResult]):
         for actor in self._path_actors:
             self.remove_actor(actor)
@@ -663,6 +698,14 @@ class Analyzer3DViewer(QtInteractor):
                 self.remove_actor(self._flow_actor)
                 self._flow_actor = None
             self._remove_scalar_bar("Akış hızı (m/s)")
+
+    def toggle_flow_node_labels(self, result: AnalysisResult, checked: bool):
+        if checked:
+            self.show_flow_node_labels(result)
+        else:
+            if self._flow_node_actor is not None:
+                self.remove_actor(self._flow_node_actor)
+                self._flow_node_actor = None
 
     def toggle_feeding_paths(self, result: AnalysisResult, checked: bool):
         if checked:
