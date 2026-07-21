@@ -388,25 +388,36 @@ def compute_pore_size(
         + alloy.gas_pore_niyama_factor * raw_micro
     )
     baseline_um = baseline_min_um * np.clip(baseline_factor, 1.0, None)
+
+    # v9.2: shrinkage-only pore size is the physically meaningful quantity for
+    # filtering/visualization.  The total pore size includes the unavoidable
+    # gas/oxide baseline, which would otherwise make every voxel positive and
+    # cause the porosity cloud to be dominated by baseline noise.
+    shrinkage_pore_size_um = np.where(part_mask, d_macro_mm * 1000.0 + d_micro_um, 0.0)
+    shrinkage_pore_size_um = np.nan_to_num(
+        shrinkage_pore_size_um, nan=0.0, posinf=0.0, neginf=0.0
+    )
     pore_size_um = np.where(
         part_mask,
-        np.maximum(d_macro_mm * 1000.0 + d_micro_um, baseline_um),
+        np.maximum(shrinkage_pore_size_um, baseline_um),
         0.0,
     )
     pore_size_mm = pore_size_um / 1000.0
+    shrinkage_pore_size_mm = shrinkage_pore_size_um / 1000.0
 
     pore_size_um = np.nan_to_num(pore_size_um, nan=0.0, posinf=0.0, neginf=0.0)
     pore_size_mm = np.nan_to_num(pore_size_mm, nan=0.0, posinf=0.0, neginf=0.0)
 
     macro_thr = alloy.macro_pore_limit_um
     micro_thr = alloy.micro_pore_limit_um
-    macro_mask = (pore_size_um >= macro_thr) & part_mask
+    # Class masks are based on the shrinkage component, not the gas baseline.
+    macro_mask = (shrinkage_pore_size_um >= macro_thr) & part_mask
     micro_mask = (
-        (pore_size_um >= micro_thr) & (pore_size_um < macro_thr) & part_mask
+        (shrinkage_pore_size_um >= micro_thr) & (shrinkage_pore_size_um < macro_thr) & part_mask
     )
-    fine_mask = (pore_size_um > 0.0) & (pore_size_um < micro_thr) & part_mask
+    fine_mask = (shrinkage_pore_size_um > 0.0) & (shrinkage_pore_size_um < micro_thr) & part_mask
 
-    return pore_size_um, pore_size_mm, macro_mask, micro_mask, fine_mask
+    return pore_size_um, pore_size_mm, macro_mask, micro_mask, fine_mask, shrinkage_pore_size_um
 
 
 def directional_feed_efficiency(
@@ -1913,7 +1924,7 @@ def analyze(
     risk_norm = risk
 
     # v8.8: estimate pore size from Niyama, local modulus and feeding deficit.
-    pore_size_um, pore_size_mm, pore_macro_mask, pore_micro_mask, pore_fine_mask = compute_pore_size(
+    pore_size_um, pore_size_mm, pore_macro_mask, pore_micro_mask, pore_fine_mask, pore_shrinkage_um = compute_pore_size(
         niyama, M_mod, feed_risk, alloy, part_mask, t_s=t_s, feeder_mask=feeder_mask, dx=dx
     )
     # v8.9: per-class display filters (macro top 60%, micro top 40%, fine top 20%).
@@ -1921,26 +1932,28 @@ def analyze(
     pore_macro_percent = 60.0
     pore_micro_percent = 40.0
     pore_fine_percent = 20.0
+    # v9.2: thresholds are computed on the shrinkage-only field so that the
+    # gas/oxide baseline does not dominate the percentile thresholds.
     pore_threshold_um = pore_size_threshold_um(
-        pore_size_um,
+        pore_shrinkage_um,
         pore_macro_percent,
         micro_pore_limit_um=alloy.micro_pore_limit_um,
         baseline_um=baseline_min_um,
     )
     pore_macro_threshold_um = pore_size_threshold_um(
-        np.where(pore_macro_mask, pore_size_um, 0.0),
+        np.where(pore_macro_mask, pore_shrinkage_um, 0.0),
         pore_macro_percent,
         micro_pore_limit_um=alloy.micro_pore_limit_um,
         baseline_um=baseline_min_um,
     )
     pore_micro_threshold_um = pore_size_threshold_um(
-        np.where(pore_micro_mask, pore_size_um, 0.0),
+        np.where(pore_micro_mask, pore_shrinkage_um, 0.0),
         pore_micro_percent,
         micro_pore_limit_um=alloy.micro_pore_limit_um,
         baseline_um=baseline_min_um,
     )
     pore_fine_threshold_um = pore_size_threshold_um(
-        np.where(pore_fine_mask, pore_size_um, 0.0),
+        np.where(pore_fine_mask, pore_shrinkage_um, 0.0),
         pore_fine_percent,
         micro_pore_limit_um=alloy.micro_pore_limit_um,
         baseline_um=baseline_min_um,
@@ -2039,6 +2052,8 @@ def analyze(
         part_surface_area_mm2=part_surface_area_mm2,
         pore_size_um=pore_size_um,
         pore_size_mm=pore_size_mm,
+        pore_size_shrinkage_um=pore_shrinkage_um,
+        pore_size_shrinkage_mm=pore_shrinkage_um / 1000.0,
         pore_size_macro_mask=pore_macro_mask,
         pore_size_micro_mask=pore_micro_mask,
         pore_size_fine_mask=pore_fine_mask,

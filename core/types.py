@@ -347,6 +347,9 @@ class AnalysisResult:
     # v8.8: per-voxel estimated pore size (µm) and macro/micro/fine masks
     pore_size_um: np.ndarray = field(default_factory=lambda: np.array([]))
     pore_size_mm: np.ndarray = field(default_factory=lambda: np.array([]))
+    # v9.2: shrinkage-only pore size (µm) for cloud filtering, excluding gas baseline
+    pore_size_shrinkage_um: np.ndarray = field(default_factory=lambda: np.array([]))
+    pore_size_shrinkage_mm: np.ndarray = field(default_factory=lambda: np.array([]))
     pore_size_macro_mask: np.ndarray = field(default_factory=lambda: np.array([]))
     pore_size_micro_mask: np.ndarray = field(default_factory=lambda: np.array([]))
     pore_size_fine_mask: np.ndarray = field(default_factory=lambda: np.array([]))

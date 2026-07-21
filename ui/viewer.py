@@ -281,7 +281,13 @@ class Analyzer3DViewer(QtInteractor):
             return
 
         pore_size_filter = (pore_size_filter or "").lower()
-        pore_size_um = np.asarray(result.pore_size_um) if result.pore_size_um is not None else np.array([])
+        # v9.2: visualize the shrinkage-only pore-size field; the gas/oxide
+        # baseline would otherwise make every voxel positive and dominate the cloud.
+        shrinkage_um = getattr(result, "pore_size_shrinkage_um", None)
+        if shrinkage_um is not None and shrinkage_um.size == part_mask.size:
+            pore_size_um = np.asarray(shrinkage_um)
+        else:
+            pore_size_um = np.asarray(result.pore_size_um) if result.pore_size_um is not None else np.array([])
         has_pore_size = pore_size_um.size and pore_size_um.shape == part_mask.shape
 
         class_mask = np.zeros_like(part_mask, dtype=bool)
@@ -323,24 +329,25 @@ class Analyzer3DViewer(QtInteractor):
             return
         finite_values = values[finite]
         finite_max = float(np.max(finite_values))
-        # Noise filter: keep only the top noise_percent% of the displayed scalar.
-        # One slider drives all classes. Macro/micro are rare and critical, so they
-        # are shown with a much wider percentile; fine pores stay sparse.
-        if pore_size_filter == "macro":
-            effective_noise = min(80.0, noise_percent * 26.67)
-        elif pore_size_filter == "micro":
-            effective_noise = min(60.0, noise_percent * 20.0)
-        elif pore_size_filter == "fine":
-            effective_noise = max(0.01, noise_percent / 3.0)
+
+        # v9.2: per-class top percentages (macro 60%, micro 40%, fine 20%).
+        # The slider scales these percentages for class filters; for "all" it is
+        # the top percentage directly.
+        if use_pore_size and pore_size_filter in ("macro", "micro", "fine"):
+            target_percent = float(
+                getattr(result, f"pore_size_{pore_size_filter}_percent", 0.0)
+            )
+            if target_percent <= 0.0:
+                target_percent = {"macro": 60.0, "micro": 40.0, "fine": 20.0}[pore_size_filter]
+            effective_percent = min(100.0, target_percent * (noise_percent / 3.0))
+            p = max(0.0, 100.0 - effective_percent)
+            lo = float(np.percentile(finite_values, p))
         else:
-            effective_noise = noise_percent
-        p = max(0.0, min(100.0 - effective_noise, 100.0))
-        lo = float(np.percentile(finite_values, p))
-        # Physical floor: avoid showing huge numbers of tiny baseline pores.
-        if scalar_name == "pore_size_um":
-            alloy = get_alloy(result.alloy_key)
-            baseline_min = max(alloy.gas_pore_baseline_um, alloy.dendrite_spacing_mm * 1000.0 * 0.02)
-            lo = max(lo, baseline_min * 0.5)
+            p = max(0.0, min(100.0 - noise_percent, 100.0))
+            lo = float(np.percentile(finite_values, p))
+
+        # Physical floor: only positive shrinkage values.
+        lo = max(lo, 0.0)
         hi = finite_max
         if hi <= lo:
             return
