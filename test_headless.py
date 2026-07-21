@@ -118,6 +118,7 @@ def main():
         thermal_max_time_s=300,
         thermal_downsample=2,
         casting_params=params,
+        user_section_areas_cm2=user_section_areas if user_section_areas else None,
     )
     print(f"  analyze done in {time.time()-t0:.1f}s")
     visible = [hs for hs in result.hotspots if not hs.solved]

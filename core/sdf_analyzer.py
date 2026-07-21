@@ -1553,6 +1553,16 @@ def _run_filling_flow(
         "DISTRIBUTOR": float(gate.distributor_area_cm2) * 1e-4 if gate.distributor_area_cm2 else 0.0,
         "CURUFLUK": float(gate.curufluk_area_cm2) * 1e-4 if gate.curufluk_area_cm2 else 0.0,
     }
+    # Ensure the selected section area in the flow solver matches the area used
+    # to compute Q_user; otherwise the first node velocity will not equal the
+    # user-entered sprue velocity.
+    if design_area_cm2 > 0.0:
+        section_areas_m2[design_section_key] = float(design_area_cm2) * 1e-4
+    # Allow the user to override any measured section area (cm2 -> m2).
+    if user_section_areas_cm2:
+        for key, val in user_section_areas_cm2.items():
+            if val and val > 0.0:
+                section_areas_m2[key.upper()] = float(val) * 1e-4
     return solve_filling_flow(
         grid,
         origin_mm,

@@ -705,6 +705,92 @@ def _ingate_contact_velocity(
     return float(Q_m3_s / area_m2) if area_m2 > 1e-18 else 0.0
 
 
+def _component_throat_area_m2(
+    cells: np.ndarray,
+    dx_mm: float,
+    dx_m: float,
+    g_u: np.ndarray,
+) -> float:
+    """Minimum cross-sectional area of a voxel component normal to gravity.
+
+    The component is sliced along the gravity direction; the smallest slice
+    (bottleneck) gives the throat area.  This is used instead of the raw voxel
+    contact face area, which can be much larger than the actual throat when the
+    CAD bodies overlap or are coarsely voxelised.
+    """
+    if cells.size == 0:
+        return 0.0
+    centers = (cells.astype(np.float64) + 0.5) * dx_mm
+    proj = -np.dot(centers, g_u)
+    if proj.size == 0:
+        return 0.0
+    bins = np.floor(proj / dx_mm).astype(np.int64)
+    bins = bins - int(bins.min())
+    counts = np.bincount(bins)
+    if counts.size == 0:
+        return 0.0
+    return float(counts.min()) * dx_m * dx_m
+
+
+def _aggregate_section_velocities(
+    gating_nodes: List[GatingNode],
+    Q_user: float,
+    inlet_area_m2: float,
+) -> Tuple[Dict[str, float], float]:
+    """Derive section-aggregate velocities and the ingate contact velocity.
+
+    The aggregate values are taken directly from the contact-node values so the
+    report and the 3-D labels always agree.  The source (SPRUE_THROAT) velocity
+    falls back to Q / inlet_area when no upstream contact exists.
+    """
+    section_velocities: Dict[str, List[float]] = {
+        "SPRUE_THROAT": [],
+        "SPRUE_BASE": [],
+        "RUNNER": [],
+        "DISTRIBUTOR": [],
+        "CURUFLUK": [],
+        "FILTER": [],
+        "INGATE": [],
+        "RISER": [],
+    }
+
+    for n in gating_nodes:
+        parts = n.body_type.split("→")
+        if len(parts) != 2:
+            continue
+        up, down = parts
+        if up == "SPRUE_THROAT":
+            section_velocities["SPRUE_THROAT"].append(n.velocity_m_s)
+        if up == "SPRUE" and down != "PART":
+            section_velocities["SPRUE_BASE"].append(n.velocity_m_s)
+        if up == "RUNNER":
+            section_velocities["RUNNER"].append(n.velocity_m_s)
+        if up == "DISTRIBUTOR":
+            section_velocities["DISTRIBUTOR"].append(n.velocity_m_s)
+        if up == "CURUFLUK":
+            section_velocities["CURUFLUK"].append(n.velocity_m_s)
+        if up == "FILTER":
+            section_velocities["FILTER"].append(n.velocity_m_s)
+        if up == "INGATE":
+            section_velocities["INGATE"].append(n.velocity_m_s)
+        if up == "RISER" or down == "RISER":
+            section_velocities["RISER"].append(n.velocity_m_s)
+
+    node_v: Dict[str, float] = {}
+    for key, vals in section_velocities.items():
+        if vals:
+            node_v[key] = float(np.mean(vals))
+
+    # No upstream contact for the source sprue: use Q / inlet area.
+    if "SPRUE_THROAT" not in node_v and inlet_area_m2 > 1e-18:
+        node_v["SPRUE_THROAT"] = float(Q_user / inlet_area_m2)
+
+    ingate_vals = section_velocities["INGATE"]
+    v_ingate_contact = float(np.mean(ingate_vals)) if ingate_vals else 0.0
+
+    return node_v, v_ingate_contact
+
+
 def _gating_node_velocities(
     grid: np.ndarray,
     p: np.ndarray,
@@ -713,16 +799,19 @@ def _gating_node_velocities(
     Q_user: float,
     g: np.ndarray,
     bodies: Optional[List[Body]],
+    design_section_key: str = "SPRUE_THROAT",
+    design_area_m2: float = 0.0,
+    section_areas_m2: Optional[Dict[str, float]] = None,
 ) -> List[GatingNode]:
     """Compute a contact-node velocity/area for every gating-gating and gating-part interface.
 
     A 'node' is the shared face between two neighbouring gating elements (or a
-    gate and the part).  The velocity at that node is the normal flux through the
-    contact face divided by the contact area.  The pressure field is upsampled to
-    the original (fine) voxel grid so that small gates and thin contacts are
-    resolved, then the resulting fine face-velocities are scaled to the total user
-    flow rate Q.  No manual flow split is performed: a model with 3 ingates simply
-    produces 3 independent `Meme_i → Parça` velocities from the pressure field.
+    gate/riser and the part).  The velocity at that node is the local flow rate
+    through the effective throat (minimum cross-section of the two contacting
+    components) divided by that throat area.  The total flow rate Q_user is
+    propagated from the inlet through the gating tree and split at branches
+    proportionally to the downstream gate throat areas.  No manual global
+    re-normalisation is performed.
     """
     if bodies is None:
         bodies = []
@@ -736,56 +825,25 @@ def _gating_node_velocities(
         BodyType.INGATE,
         BodyType.FILTER,
         BodyType.POURING_BASIN,
+        BodyType.RISER,
     ]
 
-    # Upsample the coarse pressure solution to the fine grid and compute face
-    # velocities there; this captures thin gate-part contacts lost in the coarse
-    # pressure-solve grid.
-    zoom = np.array(grid.shape, dtype=np.float64) / np.array(p.shape, dtype=np.float64)
-    p_fine = ndimage.zoom(p, zoom, order=1, mode="nearest")
-    if p_fine.shape != grid.shape:
-        tmp = np.zeros(grid.shape, dtype=np.float64)
-        sl = tuple(slice(0, min(p_fine.shape[d], grid.shape[d])) for d in range(3))
-        tmp[sl] = p_fine[sl]
-        p_fine = tmp
-
-    cavity = grid != BodyType.EMPTY
     dx_m = float(dx_mm) / 1000.0
     area_face = dx_m * dx_m
 
-    uf = np.zeros((grid.shape[0] + 1, grid.shape[1], grid.shape[2]), dtype=np.float64)
-    vf = np.zeros((grid.shape[0], grid.shape[1] + 1, grid.shape[2]), dtype=np.float64)
-    wf = np.zeros((grid.shape[0], grid.shape[1], grid.shape[2] + 1), dtype=np.float64)
-
-    uf[1:-1, :, :] = -(p_fine[1:, :, :] - p_fine[:-1, :, :]) / dx_m
-    vf[:, 1:-1, :] = -(p_fine[:, 1:, :] - p_fine[:, :-1, :]) / dx_m
-    wf[:, :, 1:-1] = -(p_fine[:, :, 1:] - p_fine[:, :, :-1]) / dx_m
-
-    u_valid = np.zeros_like(uf, dtype=bool)
-    u_valid[1:-1, :, :] = cavity[:-1, :, :] & cavity[1:, :, :]
-    uf *= u_valid
-    v_valid = np.zeros_like(vf, dtype=bool)
-    v_valid[:, 1:-1, :] = cavity[:, :-1, :] & cavity[:, 1:, :]
-    vf *= v_valid
-    w_valid = np.zeros_like(wf, dtype=bool)
-    w_valid[:, :, 1:-1] = cavity[:, :, :-1] & cavity[:, :, 1:]
-    wf *= w_valid
-
-    # Scale fine velocities so the total inlet flux matches Q_user.
-    inlet_cells, _ = _select_inlet_cells(grid, cavity, g, "SPRUE")
-    if inlet_cells.any():
-        Q_raw = _inlet_flux_m3_s(uf, vf, wf, inlet_cells, cavity, dx_m)
-        if abs(Q_raw) > 1e-18:
-            scale = Q_user / Q_raw
-            uf *= scale
-            vf *= scale
-            wf *= scale
+    g_u = np.asarray(g, dtype=np.float64)
+    if np.linalg.norm(g_u) > 1e-12:
+        g_u = g_u / np.linalg.norm(g_u)
+    else:
+        g_u = np.array([0.0, 0.0, -1.0])
 
     # Build component IDs on the fine grid and match them to bodies.
     part_id = 1
     comp_id = np.zeros(grid.shape, dtype=np.int32)
     comp_id[grid == BodyType.PART] = part_id
     comp_meta: Dict[int, Tuple[BodyType, str]] = {part_id: (BodyType.PART, "Parça")}
+    comp_centroids: Dict[int, np.ndarray] = {part_id: np.zeros(3)}
+    comp_cells: Dict[int, np.ndarray] = {}
 
     bodies_by_type: Dict[BodyType, List[Body]] = {}
     for b in bodies:
@@ -833,146 +891,331 @@ def _gating_node_velocities(
             else:
                 name = f"{gtype.name}_{label_id}"
             comp_meta[next_id] = (gtype, name)
+            idx = np.argwhere(comp_mask)
+            comp_centroids[next_id] = idx.mean(axis=0) * dx_mm + origin_mm if idx.size else np.zeros(3)
+            comp_cells[next_id] = idx
             next_id += 1
+
+    # Compute throat area for every gating component (part gets an infinite throat
+    # so it is never the bottleneck in a gating-part contact).
+    comp_throat_m2: Dict[int, float] = {part_id: float("inf")}
+    for cid, cells in comp_cells.items():
+        comp_throat_m2[cid] = _component_throat_area_m2(cells, dx_mm, dx_m, g_u)
+
+    # Scale per-component throat areas so the total for each section matches the
+    # design/reference value from section_areas_m2.  This keeps the sum of all
+    # gates, runners, etc. equal to the user/designer area while respecting the
+    # relative proportions seen in the voxel grid.
+    if section_areas_m2:
+        areas = section_areas_m2
+        throat_keys_for_type: Dict[BodyType, List[str]] = {
+            BodyType.SPRUE: ["SPRUE_THROAT", "SPRUE_BASE"],
+            BodyType.SPRUE_THROAT: ["SPRUE_THROAT"],
+            BodyType.RUNNER: ["RUNNER"],
+            BodyType.DISTRIBUTOR: ["DISTRIBUTOR"],
+            BodyType.CURUFLUK: ["CURUFLUK"],
+            BodyType.FILTER: ["FILTER"],
+            BodyType.POURING_BASIN: ["POURING_BASIN"],
+            BodyType.RISER: ["RISER"],
+            BodyType.INGATE: ["INGATE"],
+        }
+        for btype, keys in throat_keys_for_type.items():
+            design_total = 0.0
+            for key in keys:
+                if key in areas and areas[key] > 1e-18:
+                    design_total = float(areas[key])
+                    break
+            if design_total <= 1e-18:
+                continue
+            comp_ids = [
+                cid for cid, (bt, _) in comp_meta.items()
+                if bt == btype and cid != part_id and comp_throat_m2.get(cid, 0.0) > 1e-18
+            ]
+            if not comp_ids:
+                continue
+            voxel_total = sum(comp_throat_m2[cid] for cid in comp_ids)
+            if voxel_total <= 1e-18:
+                continue
+            scale = design_total / voxel_total
+            for cid in comp_ids:
+                comp_throat_m2[cid] = comp_throat_m2[cid] * scale
 
     max_id = int(comp_id.max())
     mult = max_id + 1
     n_keys = mult * mult
     area_b = np.zeros(n_keys, dtype=np.float64)
-    flux_b = np.zeros(n_keys, dtype=np.float64)
     cx_b = np.zeros(n_keys, dtype=np.float64)
     cy_b = np.zeros(n_keys, dtype=np.float64)
     cz_b = np.zeros(n_keys, dtype=np.float64)
 
-    def _accumulate_1d(
+    def _accumulate_contact_1d(
         id_a_1d: np.ndarray,
         id_b_1d: np.ndarray,
-        v_1d: np.ndarray,
         x_1d: np.ndarray,
         y_1d: np.ndarray,
         z_1d: np.ndarray,
     ) -> None:
-        nonlocal area_b, flux_b, cx_b, cy_b, cz_b
+        nonlocal area_b, cx_b, cy_b, cz_b
         if id_a_1d.size == 0:
             return
-        # Aggregate by unordered component pair so that opposite-facing contact
-        # faces (e.g. on a curved interface) contribute to one net node.
         up = np.minimum(id_a_1d, id_b_1d)
         down = np.maximum(id_a_1d, id_b_1d)
-        signed = np.where(id_a_1d == up, v_1d, -v_1d)
         key = up * mult + down
         area_b += np.bincount(key, minlength=n_keys) * area_face
-        flux_b += np.bincount(key, weights=signed * area_face, minlength=n_keys)
         cx_b += np.bincount(key, weights=x_1d * area_face, minlength=n_keys)
         cy_b += np.bincount(key, weights=y_1d * area_face, minlength=n_keys)
         cz_b += np.bincount(key, weights=z_1d * area_face, minlength=n_keys)
 
-    # x-faces: uf[1:-1] is the face between cells (i, j, k) and (i+1, j, k).
+    # x-faces: face between cells (i, j, k) and (i+1, j, k).
     id_a = comp_id[:-1, :, :]
     id_b = comp_id[1:, :, :]
     valid = (id_a != 0) & (id_b != 0) & (grid[:-1, :, :] != grid[1:, :, :])
     if valid.any():
         i, j, k = np.where(valid)
-        _accumulate_1d(
+        _accumulate_contact_1d(
             id_a[valid],
             id_b[valid],
-            uf[1:-1, :, :][valid],
             origin_mm[0] + (i + 1) * dx_mm,
             origin_mm[1] + (j + 0.5) * dx_mm,
             origin_mm[2] + (k + 0.5) * dx_mm,
         )
 
-    # y-faces: vf[:, 1:-1, :] is the face between cells (i, j, k) and (i, j+1, k).
+    # y-faces: face between cells (i, j, k) and (i, j+1, k).
     id_a = comp_id[:, :-1, :]
     id_b = comp_id[:, 1:, :]
     valid = (id_a != 0) & (id_b != 0) & (grid[:, :-1, :] != grid[:, 1:, :])
     if valid.any():
         i, j, k = np.where(valid)
-        _accumulate_1d(
+        _accumulate_contact_1d(
             id_a[valid],
             id_b[valid],
-            vf[:, 1:-1, :][valid],
             origin_mm[0] + (i + 0.5) * dx_mm,
             origin_mm[1] + (j + 1) * dx_mm,
             origin_mm[2] + (k + 0.5) * dx_mm,
         )
 
-    # z-faces: wf[:, :, 1:-1] is the face between cells (i, j, k) and (i, j, k+1).
+    # z-faces: face between cells (i, j, k) and (i, j, k+1).
     id_a = comp_id[:, :, :-1]
     id_b = comp_id[:, :, 1:]
     valid = (id_a != 0) & (id_b != 0) & (grid[:, :, :-1] != grid[:, :, 1:])
     if valid.any():
         i, j, k = np.where(valid)
-        _accumulate_1d(
+        _accumulate_contact_1d(
             id_a[valid],
             id_b[valid],
-            wf[:, :, 1:-1][valid],
             origin_mm[0] + (i + 0.5) * dx_mm,
             origin_mm[1] + (j + 0.5) * dx_mm,
             origin_mm[2] + (k + 1) * dx_mm,
         )
 
-    nodes: List[GatingNode] = []
+    contacts: List[Dict] = []
     for key in np.nonzero(area_b)[0]:
-        id1 = key // mult
-        id2 = key % mult
+        id1 = int(key // mult)
+        id2 = int(key % mult)
         if id1 == 0 or id2 == 0 or id1 == id2:
             continue
-        body_type_1, name_1 = comp_meta.get(int(id1), (BodyType.EMPTY, f"UNKNOWN_{id1}"))
-        body_type_2, name_2 = comp_meta.get(int(id2), (BodyType.EMPTY, f"UNKNOWN_{id2}"))
+        btype1, name1 = comp_meta.get(id1, (BodyType.EMPTY, f"UNKNOWN_{id1}"))
+        btype2, name2 = comp_meta.get(id2, (BodyType.EMPTY, f"UNKNOWN_{id2}"))
         area_m2 = float(area_b[key])
         if area_m2 <= 1e-18:
             continue
-        net_flux = float(flux_b[key])
-        if net_flux >= 0:
-            up_id, down_id = id1, id2
-            body_type_up, name_up = body_type_1, name_1
-            body_type_down, name_down = body_type_2, name_2
-        else:
-            up_id, down_id = id2, id1
-            body_type_up, name_up = body_type_2, name_2
-            body_type_down, name_down = body_type_1, name_1
-        v = abs(net_flux) / area_m2
         centroid = np.array(
-            [cx_b[key] / area_m2, cy_b[key] / area_m2, cz_b[key] / area_m2],
+            [cx_b[key] / area_b[key], cy_b[key] / area_b[key], cz_b[key] / area_b[key]],
             dtype=np.float64,
         )
-        nodes.append(
-            GatingNode(
-                name=f"{name_up} → {name_down}",
-                body_type=f"{body_type_up.name}→{body_type_down.name}",
-                velocity_m_s=float(v),
-                section_area_cm2=float(area_m2 * 1e4),
-                centroid_mm=tuple(float(x) for x in centroid),
-            )
+        contacts.append(
+            {
+                "id1": id1,
+                "id2": id2,
+                "type1": btype1,
+                "type2": btype2,
+                "name1": name1,
+                "name2": name2,
+                "area_m2": area_m2,
+                "centroid_mm": centroid,
+            }
         )
 
-    # If the pressure field has short-circuited (e.g. a vent near the inlet) and
-    # produces negligible flux through the INGATE <-> PART contacts, fall back to
-    # the physical continuity velocity v = Q_user / A_total over all gates.  This
-    # keeps per-gate node velocities non-zero and physically consistent when the
-    # Darcy potential alone cannot resolve the narrow gate throat.
-    gate_nodes = [
-        n for n in nodes
-        if {"INGATE", "PART"} == set(n.body_type.split("→"))
-    ]
-    if gate_nodes:
-        total_flux = sum(n.velocity_m_s * n.section_area_cm2 * 1e-4 for n in gate_nodes)
-        if abs(total_flux) < 0.05 * Q_user:
-            A_total_cm2 = sum(n.section_area_cm2 for n in gate_nodes)
-            if A_total_cm2 > 1e-12:
-                v_common = float(Q_user / (A_total_cm2 * 1e-4))
-                for n in gate_nodes:
-                    # Re-orient the node so it is always gate -> part.
-                    if n.body_type.startswith("INGATE"):
-                        gate_name = n.name.split(" → ")[0]
-                    else:
-                        gate_name = n.name.split(" → ")[1]
-                    n.name = f"{gate_name} → Parça"
-                    n.body_type = "INGATE→PART"
-                    n.velocity_m_s = v_common
+    if not contacts:
+        return []
 
-    # Sort so that upstream → downstream follows a likely fill path.
+    # Identify the inlet component: highest upstream point among pouring-basin,
+    # sprue-throat or sprue bodies.
+    source_type_priority = {
+        BodyType.POURING_BASIN,
+        BodyType.SPRUE_THROAT,
+        BodyType.SPRUE,
+    }
+    gating_ids = [cid for cid in comp_meta if cid != part_id]
+    source_candidates = [cid for cid in gating_ids if comp_meta[cid][0] in source_type_priority]
+    if not source_candidates:
+        source_candidates = gating_ids
+    if not source_candidates:
+        return []
+
+    def _upstream_rank(cid: int) -> float:
+        return float(-np.dot(comp_centroids[cid], g_u))
+
+    inlet_id = max(source_candidates, key=_upstream_rank)
+
+    # If the user provided a reference area for the inlet section, use it as the
+    # throat area for the source component so the first node matches the input.
+    if design_area_m2 > 1e-18 and comp_meta[inlet_id][0].name == design_section_key:
+        comp_throat_m2[inlet_id] = float(design_area_m2)
+
+    def _eff_area(cid1: int, cid2: int) -> float:
+        a1 = comp_throat_m2.get(cid1, 0.0)
+        a2 = comp_throat_m2.get(cid2, 0.0)
+        if a1 <= 1e-18 or a2 <= 1e-18:
+            return 0.0
+        return float(min(a1, a2))
+
+    # Split contacts into outlets (gating <-> part) and internal gating-gating contacts.
+    # The primary flow outlets are INGATE -> PART contacts; other gating -> PART
+    # contacts (riser, etc.) are secondary and do not steal flow from the gates.
+    outlet_contacts: List[Dict] = []
+    internal_contacts: List[Dict] = []
+    for c in contacts:
+        if part_id in (c["id1"], c["id2"]):
+            outlet_contacts.append(c)
+        else:
+            internal_contacts.append(c)
+
+    if not outlet_contacts:
+        return []
+
+    # Select primary outlets: INGATE -> PART when available, otherwise all gating -> PART.
+    primary_outlets: List[Dict] = [
+        c for c in outlet_contacts
+        if (c["type1"] == BodyType.INGATE and c["id2"] == part_id)
+        or (c["type2"] == BodyType.INGATE and c["id1"] == part_id)
+    ]
+    if not primary_outlets:
+        primary_outlets = outlet_contacts[:]
+
+    # Outlet (gating -> PART) nodes use the raw contact area, optionally scaled
+    # to the design total for that body type so per-gate areas match the user/
+    # designer values while preserving the raw geometric area ratios.
+    for c in outlet_contacts:
+        raw = c["area_m2"]
+        c["node_area_m2"] = raw if raw > 1e-18 else _eff_area(c["id1"], c["id2"])
+
+    primary_groups: Dict[BodyType, List[Dict]] = {}
+    for c in primary_outlets:
+        up_type = c["type1"] if c["id2"] == part_id else c["type2"]
+        primary_groups.setdefault(up_type, []).append(c)
+
+    def _design_total_for_type(btype: BodyType) -> float:
+        for key in throat_keys_for_type.get(btype, []):
+            if key in section_areas_m2 and section_areas_m2[key] > 1e-18:
+                return float(section_areas_m2[key])
+        return 0.0
+
+    for up_type, group in primary_groups.items():
+        design_total = _design_total_for_type(up_type)
+        raw_total = sum(c["node_area_m2"] for c in group)
+        if design_total > 1e-18 and raw_total > 1e-18:
+            scale = design_total / raw_total
+            for c in group:
+                c["node_area_m2"] *= scale
+
+    for c in internal_contacts:
+        c["eff_area_m2"] = _eff_area(c["id1"], c["id2"])
+
+    A_total = sum(c["node_area_m2"] for c in primary_outlets if c["node_area_m2"] > 1e-18)
+    if A_total <= 1e-18:
+        return []
+
+    outlet_Q: Dict[int, float] = {}
+    for i, c in enumerate(primary_outlets):
+        outlet_Q[i] = Q_user * c["node_area_m2"] / A_total
+
+    # Adjacency for internal gating contacts.
+    adj: Dict[int, List[Tuple[int, int]]] = {}
+    for i, c in enumerate(internal_contacts):
+        adj.setdefault(c["id1"], []).append((c["id2"], i))
+        adj.setdefault(c["id2"], []).append((c["id1"], i))
+
+    outlet_by_comp: Dict[int, List[int]] = {}
+    for i, c in enumerate(primary_outlets):
+        other = c["id1"] if c["id2"] == part_id else c["id2"]
+        outlet_by_comp.setdefault(other, []).append(i)
+
+    nodes: List[GatingNode] = []
+    visited: set = {inlet_id}
+
+    def _node_name(up_id: int, down_id: int) -> str:
+        return f"{comp_meta[up_id][1]} → {comp_meta[down_id][1]}"
+
+    def _node_body_type(up_id: int, down_id: int) -> str:
+        return f"{comp_meta[up_id][0].name}→{comp_meta[down_id][0].name}"
+
+    def _make_node(up_id: int, down_id: int, area_m2: float, Q: float, centroid: np.ndarray) -> GatingNode:
+        v = float(Q / area_m2) if area_m2 > 1e-18 else 0.0
+        return GatingNode(
+            name=_node_name(up_id, down_id),
+            body_type=_node_body_type(up_id, down_id),
+            velocity_m_s=v,
+            section_area_cm2=float(area_m2 * 1e4),
+            centroid_mm=tuple(float(x) for x in centroid),
+        )
+
+    def dfs(node: int, parent: int) -> float:
+        leaf_Q = 0.0
+        for idx in outlet_by_comp.get(node, []):
+            leaf_Q += outlet_Q[idx]
+        for nb, cidx in adj.get(node, []):
+            if nb == parent or nb in visited:
+                continue
+            visited.add(nb)
+            child_Q = dfs(nb, node)
+            c = internal_contacts[cidx]
+            if c["id1"] == node:
+                up_id, down_id = c["id1"], c["id2"]
+            else:
+                up_id, down_id = c["id2"], c["id1"]
+            nodes.append(_make_node(up_id, down_id, c["eff_area_m2"], child_Q, c["centroid_mm"]))
+            leaf_Q += child_Q
+        return leaf_Q
+
+    reached_Q = dfs(inlet_id, -1)
+
+    # If the gating graph is disconnected from the primary gates, fall back to
+    # assuming the full flow Q_user passes through every internal contact.  This
+    # keeps upstream node velocities non-zero when the voxel classification does
+    # not create a continuous path from the inlet to the gates.
+    if reached_Q < 0.5 * Q_user:
+        nodes = []
+        for c in internal_contacts:
+            if c["id1"] == inlet_id:
+                up_id, down_id = c["id1"], c["id2"]
+            elif c["id2"] == inlet_id:
+                up_id, down_id = c["id2"], c["id1"]
+            else:
+                # Direction from higher upstream rank to lower.
+                r1 = _upstream_rank(c["id1"])
+                r2 = _upstream_rank(c["id2"])
+                if r1 >= r2:
+                    up_id, down_id = c["id1"], c["id2"]
+                else:
+                    up_id, down_id = c["id2"], c["id1"]
+            nodes.append(_make_node(up_id, down_id, c["eff_area_m2"], Q_user, c["centroid_mm"]))
+
+    # Always create outlet nodes (gate/riser -> part).
+    for i, c in enumerate(outlet_contacts):
+        if c["id1"] == part_id:
+            up_id, down_id = c["id2"], c["id1"]
+        else:
+            up_id, down_id = c["id1"], c["id2"]
+        # Use the primary flow split for INGATE -> PART, otherwise local Q_user / A_node.
+        if c in primary_outlets:
+            idx = primary_outlets.index(c)
+            Q_out = outlet_Q[idx]
+        else:
+            Q_out = Q_user
+        nodes.append(_make_node(up_id, down_id, c["node_area_m2"], Q_out, c["centroid_mm"]))
+
+    # Sort so that upstream -> downstream follows a likely fill path.
     nodes.sort(key=lambda n: (-n.velocity_m_s, n.body_type))
     return nodes
 
@@ -1183,6 +1426,9 @@ def solve_filling_flow(
         Q_user,
         g,
         bodies,
+        design_section_key=design_section_key,
+        design_area_m2=design_area_m2,
+        section_areas_m2=section_areas_m2,
     )
     per_gate_v = {}
     per_gate_area = {}
@@ -1196,42 +1442,11 @@ def solve_filling_flow(
             per_gate_v[gate_name] = n.velocity_m_s
             per_gate_area[gate_name] = n.section_area_cm2
 
-    # Node / section velocities and ingate contact velocity.
-    # Use continuity Q / cross-sectional area; the pressure field is kept for
-    # visualization and future transient filling front work.
-    node_v = _node_velocities(
-        grid_c,
-        cavity,
-        g,
-        dx_m,
-        Q_user,
-        fine_grid=fine_grid,
-        fine_cavity=fine_cavity,
-        fine_dx_m=fine_dx_m,
-        section_areas_m2=section_areas_m2,
-    )
-    v_ingate_contact = _ingate_contact_velocity(
-        grid_c,
-        cavity,
-        dx_m,
-        g,
-        Q_user,
-        fine_grid=fine_grid,
-        fine_cavity=fine_cavity,
-        fine_dx_m=fine_dx_m,
-        section_areas_m2=section_areas_m2,
-    )
-
-    # When the per-gate INGATE -> PART nodes have a physically consistent total
-    # area, override the aggregate INGATE velocity with the true contact velocity
-    # (Q / total gate contact area).  This avoids the over-smoothed area used by
-    # the legacy section estimator.
+    # Aggregate section velocities and ingate contact velocity directly from
+    # the computed contact nodes so the report/viewer match the 3-D labels.
+    node_v, v_ingate_contact = _aggregate_section_velocities(gating_nodes, Q_user, area_m2)
     if per_gate_v:
-        A_total_cm2 = sum(per_gate_area.values())
-        if A_total_cm2 > 1e-12:
-            v_common = float(Q_user / (A_total_cm2 * 1e-4))
-            node_v["INGATE"] = v_common
-            v_ingate_contact = v_common
+        v_ingate_contact = float(np.mean(list(per_gate_v.values())))
 
     if progress_callback:
         progress_callback(95)
