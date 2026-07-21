@@ -333,6 +333,44 @@ def compute_niyama_ensemble(niyama: np.ndarray) -> np.ndarray:
     return niyama
 
 
+def _carlson_gp_pct(ny_star: np.ndarray, b0: float, key: str = "WCB") -> np.ndarray:
+    """Return shrinkage pore volume percentage from Carlson-Beckermann curve.
+
+    Carlson & Beckermann, Metall. Mater. Trans. A 40A (2009) 163.
+    The fits are evaluated as  -A log10(Ny*) + B  for the log branches and
+    C Ny*^{-D} for the power-law branches; gp is capped at the alloy total
+    solidification shrinkage b0 (percent).
+    """
+    safe = np.maximum(ny_star, 1e-12)
+    if key == "A356":
+        gp = np.where(
+            safe <= 1.43,
+            -2.068 * np.log10(safe) + 3.160,
+            np.where(
+                safe <= 18.0,
+                4.024 * np.power(safe, -0.9786),
+                7.771 * np.power(safe, -1.206),
+            ),
+        )
+    elif key == "AZ91D":
+        gp = np.where(
+            safe <= 41.0,
+            -1.671 * np.log10(safe) + 3.483,
+            np.where(
+                safe <= 45.2,
+                -10.81 * np.log10(safe) + 18.23,
+                73.01 * np.power(safe, -1.415),
+            ),
+        )
+    else:  # WCB default
+        gp = np.where(
+            safe <= 28.2,
+            -1.654 * np.log10(safe) + 3.052,
+            43.05 * np.power(safe, -1.254),
+        )
+    return np.clip(gp, 0.0, max(b0, 1e-9))
+
+
 def compute_pore_size(
     niyama: np.ndarray,
     M_mod: np.ndarray,
@@ -342,46 +380,49 @@ def compute_pore_size(
     t_s: Optional[np.ndarray] = None,
     feeder_mask: Optional[np.ndarray] = None,
     dx: float = 1.0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Estimate pore size (µm) from Niyama, local modulus and feeding deficit.
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Estimate pore size from the Carlson-Beckermann dimensionless Niyama model.
 
-    Macro shrinkage pore:
-        d_macro [mm] = t_section * shrinkage_factor * (1 - N/N_macro) * feed_risk
-    Interdendritic micro pore:
-        d_micro [µm] = SDAS_um * (1 - N/N_shrinkage) * feed_risk
+    The engine Niyama field is converted to the dimensionless Ny* via the alloy
+    niyama_star_scale, then the published Carlson-Beckermann curve gives the
+    shrinkage pore volume percentage gp.  gp is reduced by the directional
+    feeding efficiency and mapped to a size proxy (µm) using
+    pore_size_um_per_porosity_pct so the macro/micro/fine class thresholds
+    (500/50 µm) correspond to physically meaningful volume-fraction levels.
 
-    The shrinkage term is further reduced where the local solidification
-    gradient points toward a feeder (directional feeding efficiency).  An
-    unavoidable gas/oxide baseline is added so no region is artificially
-    declared "zero porosity".
-
-    Returns pore_size_um, pore_size_mm, macro_mask, micro_mask, fine_mask.
+    Returns pore_size_um, pore_size_mm, macro_mask, micro_mask, fine_mask,
+    shrinkage_pore_size_um, pore_volume_pct.
     """
-    t_section_mm = 2.0 * np.maximum(M_mod, 0.0)
+    valid = part_mask & np.isfinite(niyama) & (niyama > 0.0)
 
-    raw_macro = np.clip(1.0 - niyama / max(alloy.niyama_macro, 1e-9), 0.0, 1.0)
-    raw_micro = np.clip(1.0 - niyama / max(alloy.niyama_shrinkage, 1e-9), 0.0, 1.0)
-    exp_n = max(alloy.pore_niyama_exponent, 1e-3)
-    macro_factor = np.power(raw_macro, exp_n)
-    micro_factor = np.power(raw_micro, exp_n)
-
-    # Directional feeding: a feeder that is in the direction of the
-    # solidification front is much more effective, but never removes all risk.
+    # Directional feeding: a feeder aligned with the solidification front is
+    # much more effective, but never removes all risk.
     _feeder = feeder_mask if feeder_mask is not None else np.zeros_like(part_mask)
     feed_eff = directional_feed_efficiency(t_s, _feeder, part_mask, dx)
     feed_factor = np.power(np.clip(feed_risk, 0.0, 1.0), alloy.feed_risk_exponent) * feed_eff
 
-    d_macro_mm = t_section_mm * alloy.shrinkage_factor * macro_factor * feed_factor
-    sdas_um = alloy.dendrite_spacing_mm * 1000.0
-    d_micro_um = sdas_um * micro_factor * feed_factor
+    # Carlson-Beckermann dimensionless Niyama -> shrinkage pore volume %.
+    ny_star = niyama * alloy.niyama_star_scale
+    b0 = alloy.shrinkage_factor * 100.0  # total solidification shrinkage [%]
+    gp_pct = _carlson_gp_pct(ny_star, b0, key=alloy.carlson_curve_key)
+    # Apply feeding efficiency; keep zero for invalid (surface/boundary) voxels.
+    gp_pct = np.where(valid, gp_pct * feed_factor, 0.0)
+
+    # Convert predicted volume percentage to a size proxy for visualization/class.
+    size_scale = alloy.pore_size_um_per_porosity_pct
+    shrinkage_pore_size_um = gp_pct * size_scale
+    shrinkage_pore_size_um = np.nan_to_num(
+        shrinkage_pore_size_um, nan=0.0, posinf=0.0, neginf=0.0
+    )
 
     # Real-life baseline: dissolved gas/oxides always leave some micro pores.
     # Thicker/slower-solidifying sections and lower-Niyama regions retain larger
     # gas pores, so the baseline is spatially modulated instead of uniform.
+    sdas_um = alloy.dendrite_spacing_mm * 1000.0
     baseline_min_um = max(alloy.gas_pore_baseline_um, sdas_um * 0.02)
+    raw_micro = np.clip(1.0 - niyama / max(alloy.niyama_shrinkage, 1e-9), 0.0, 1.0)
     m_max = float(np.max(M_mod[part_mask])) if np.any(part_mask) else 1.0
     m_rel = np.clip(M_mod / max(m_max, 1e-9), 0.0, 1.0)
-    # raw_micro already equals max(0, 1 - N/niyama_shrinkage)
     baseline_factor = (
         1.0
         + alloy.gas_pore_time_factor * m_rel
@@ -389,21 +430,12 @@ def compute_pore_size(
     )
     baseline_um = baseline_min_um * np.clip(baseline_factor, 1.0, None)
 
-    # v9.2: shrinkage-only pore size is the physically meaningful quantity for
-    # filtering/visualization.  The total pore size includes the unavoidable
-    # gas/oxide baseline, which would otherwise make every voxel positive and
-    # cause the porosity cloud to be dominated by baseline noise.
-    shrinkage_pore_size_um = np.where(part_mask, d_macro_mm * 1000.0 + d_micro_um, 0.0)
-    shrinkage_pore_size_um = np.nan_to_num(
-        shrinkage_pore_size_um, nan=0.0, posinf=0.0, neginf=0.0
-    )
     pore_size_um = np.where(
         part_mask,
         np.maximum(shrinkage_pore_size_um, baseline_um),
         0.0,
     )
     pore_size_mm = pore_size_um / 1000.0
-    shrinkage_pore_size_mm = shrinkage_pore_size_um / 1000.0
 
     pore_size_um = np.nan_to_num(pore_size_um, nan=0.0, posinf=0.0, neginf=0.0)
     pore_size_mm = np.nan_to_num(pore_size_mm, nan=0.0, posinf=0.0, neginf=0.0)
@@ -417,7 +449,15 @@ def compute_pore_size(
     )
     fine_mask = (shrinkage_pore_size_um > 0.0) & (shrinkage_pore_size_um < micro_thr) & part_mask
 
-    return pore_size_um, pore_size_mm, macro_mask, micro_mask, fine_mask, shrinkage_pore_size_um
+    return (
+        pore_size_um,
+        pore_size_mm,
+        macro_mask,
+        micro_mask,
+        fine_mask,
+        shrinkage_pore_size_um,
+        gp_pct,
+    )
 
 
 def directional_feed_efficiency(
@@ -1904,29 +1944,27 @@ def analyze(
     nearest_riser_id = riser_factor_map[tuple(nearest_riser)]
     riser_factor_field = np.asarray(factor_by_id, dtype=np.float64)[nearest_riser_id]
 
-    # AŞAMA 9: Risk map (Niyama risk scaled by feeding deficit)
-    # A low-Niyama region is dangerous only if it cannot be fed.  If a riser/
-    # gating source is close enough, the Niyama risk is strongly suppressed.
+    # Feeding risk: 0 at the feeder, -> 1 far beyond the effective feeding distance.
     with np.errstate(divide="ignore", invalid="ignore"):
         FD_field = alloy.feed_k1 * (2.0 * M_mod) * riser_factor_field
-        # feed_risk -> 0 at the feeder, -> 1 far beyond the feeding distance.
         feed_risk = dist_feed / (dist_feed + np.maximum(FD_field, 1.0))
         feed_risk = np.clip(np.nan_to_num(feed_risk, nan=1.0, posinf=1.0, neginf=1.0), 0.0, 1.0)
-        # Macro shrinkage risk (Niyama < alloy.niyama_macro) scaled by feeding.
-        niyama_macro_risk = np.clip(1.0 - niyama / alloy.niyama_macro, 0.0, 1.0)
-        niyama_micro_risk = np.clip(1.0 - niyama / alloy.niyama_shrinkage, 0.0, 1.0)
-        macro_risk = niyama_macro_risk * feed_risk
-        micro_risk = niyama_micro_risk * feed_risk
-        risk = 1.0 - (1.0 - macro_risk) * (1.0 - micro_risk)
-        # v8.6: risk belongs to the part only; risers/gating/chills are not part porosity.
-        risk = np.where(part_mask, risk, 0.0)
-        risk = np.nan_to_num(risk, nan=0.0, posinf=0.0, neginf=0.0)
-    risk_norm = risk
 
-    # v8.8: estimate pore size from Niyama, local modulus and feeding deficit.
-    pore_size_um, pore_size_mm, pore_macro_mask, pore_micro_mask, pore_fine_mask, pore_shrinkage_um = compute_pore_size(
+    # v8.8: estimate pore size from the Carlson-Beckermann dimensionless Niyama model.
+    pore_size_um, pore_size_mm, pore_macro_mask, pore_micro_mask, pore_fine_mask, pore_shrinkage_um, pore_volume_pct = compute_pore_size(
         niyama, M_mod, feed_risk, alloy, part_mask, t_s=t_s, feeder_mask=feeder_mask, dx=dx
     )
+
+    # AŞAMA 9: Risk map aligned with the Carlson-Beckermann porosity volume.
+    # The predicted pore volume percentage is already reduced by feeding
+    # efficiency; convert it to a 0-1 risk field using the macro class limit
+    # (gp at macro limit -> ~63 % risk).
+    gp_ref = alloy.macro_pore_limit_um / max(alloy.pore_size_um_per_porosity_pct, 1e-9)
+    risk = 1.0 - np.exp(-np.clip(pore_volume_pct / max(gp_ref, 1e-9), 0.0, 50.0))
+    # v8.6: risk belongs to the part only; risers/gating/chills are not part porosity.
+    risk = np.where(part_mask, risk, 0.0)
+    risk = np.nan_to_num(risk, nan=0.0, posinf=0.0, neginf=0.0)
+    risk_norm = risk
     # v8.9: per-class display filters (macro top 60%, micro top 40%, fine top 20%).
     baseline_min_um = max(alloy.gas_pore_baseline_um, alloy.dendrite_spacing_mm * 1000.0 * 0.02)
     pore_macro_percent = 60.0
