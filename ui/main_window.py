@@ -1248,7 +1248,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             )
             section_names = {
-                "SPRUE": "Döküm ağzı",
+                "SPRUE_THROAT": "D.ağzı boğazı",
+                "SPRUE_BASE": "D.ağzı tabanı",
                 "RUNNER": "Yolluk",
                 "DISTRIBUTOR": "Dağıtıcı",
                 "CURUFLUK": "Curufluk",

@@ -19,6 +19,7 @@ High-level usage:
 `FillingResult` contains section-averaged velocities, the ingate contact
 velocity and an optional per-voxel fill-time estimate.
 """
+import heapq
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -462,7 +463,7 @@ def _section_face_cells(
 
     # Determine whether to use the upstream or downstream boundary.
     key = used_section.upper()
-    if key in ("INGATE", "SPRUE_BASE", "SPRUE_THROAT"):
+    if key in ("INGATE", "SPRUE_THROAT"):
         side = "down"
     else:
         side = "up"
@@ -533,6 +534,53 @@ def _compute_user_flow_rate(
     else:
         Q = 1.0
     return Q, area_m2, used_section
+
+
+def _compute_fill_time(
+    vmag: np.ndarray,
+    cavity: np.ndarray,
+    inlet_cells: np.ndarray,
+    dx_m: float,
+) -> np.ndarray:
+    """Approximate front-arrival time (s) for each voxel from the inlet.
+
+    A 6-neighbour fast marching with speed |v| is used: dt = dx / (0.5*(|v_i|+|v_j|)).
+    Unreached / stagnant cells are left at np.inf; non-cavity cells are 0.
+    """
+    shape = cavity.shape
+    fill = np.full(shape, np.inf, dtype=np.float64)
+    fill[inlet_cells] = 0.0
+    if not inlet_cells.any():
+        fill[~cavity] = 0.0
+        return fill
+
+    # Seed all inlet cells
+    heap = [(0.0, int(i), int(j), int(k)) for i, j, k in zip(*np.where(inlet_cells))]
+    heapq.heapify(heap)
+    visited = np.zeros(shape, dtype=bool)
+
+    while heap:
+        t, i, j, k = heapq.heappop(heap)
+        if visited[i, j, k]:
+            continue
+        visited[i, j, k] = True
+        if t > fill[i, j, k] + 1e-12:
+            continue
+        for di, dj, dk in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)):
+            ni, nj, nk = i + di, j + dj, k + dk
+            if not (0 <= ni < shape[0] and 0 <= nj < shape[1] and 0 <= nk < shape[2]):
+                continue
+            if visited[ni, nj, nk] or not cavity[ni, nj, nk]:
+                continue
+            v_avg = 0.5 * (max(vmag[i, j, k], 1e-6) + max(vmag[ni, nj, nk], 1e-6))
+            dt = dx_m / v_avg
+            t_new = t + dt
+            if t_new < fill[ni, nj, nk]:
+                fill[ni, nj, nk] = t_new
+                heapq.heappush(heap, (t_new, ni, nj, nk))
+
+    fill[~cavity] = 0.0
+    return fill
 
 
 def _section_downstream_flux(
@@ -606,7 +654,8 @@ def _node_velocities(
     g_dx = fine_dx_m if fine_dx_m is not None else dx_m
     areas = section_areas_m2 or {}
     section_keys = [
-        "SPRUE",
+        "SPRUE_THROAT",
+        "SPRUE_BASE",
         "RUNNER",
         "DISTRIBUTOR",
         "CURUFLUK",
@@ -806,6 +855,37 @@ def solve_filling_flow(
     if progress_callback:
         progress_callback(75)
 
+    # Total fill time estimate: part volume / user flow rate.
+    fill_time_s = part_volume_m3 / Q_user if Q_user > 1e-18 else 0.0
+
+    # Per-voxel front arrival time from the inlet.
+    fill_time_c = _compute_fill_time(vmag, cavity, inlet_cells, dx_m)
+    # Scale the raw fast-marching times so the last filled voxel equals the
+    # robust volume/Q fill time; local velocities can otherwise give unrealistically
+    # large times in stagnant pockets.
+    finite_fill = fill_time_c[np.isfinite(fill_time_c) & cavity]
+    if finite_fill.size > 0 and fill_time_s > 0.0:
+        raw_max = float(finite_fill.max())
+        if raw_max > 0.0:
+            fill_time_c = np.where(
+                cavity & np.isfinite(fill_time_c),
+                fill_time_c * (fill_time_s / raw_max),
+                fill_time_c,
+            )
+    if fill_time_c.shape == grid.shape:
+        fill_time_fine = fill_time_c
+    else:
+        fill_time_fine = ndimage.zoom(
+            fill_time_c,
+            (
+                grid.shape[0] / fill_time_c.shape[0],
+                grid.shape[1] / fill_time_c.shape[1],
+                grid.shape[2] / fill_time_c.shape[2],
+            ),
+            order=1,
+        )
+        fill_time_fine = np.where(grid > 0, fill_time_fine, 0.0)
+
     # Node / section velocities and ingate contact velocity.
     # Use continuity Q / cross-sectional area; the pressure field is kept for
     # visualization and future transient filling front work.
@@ -832,9 +912,6 @@ def solve_filling_flow(
         section_areas_m2=section_areas_m2,
     )
 
-    # Total fill time estimate: part volume / user flow rate.
-    fill_time_s = part_volume_m3 / Q_user if Q_user > 1e-18 else 0.0
-
     if progress_callback:
         progress_callback(95)
 
@@ -851,6 +928,7 @@ def solve_filling_flow(
         inlet_area_m2=area_m2,
         fill_time_s=fill_time_s,
         velocity_magnitude=vmag,
+        fill_time=fill_time_fine,
         solver_grid=grid_c,
         solver_dx_mm=dx_c,
         pressure=p,

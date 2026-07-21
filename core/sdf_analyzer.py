@@ -2,6 +2,7 @@
 
 import math
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -1488,6 +1489,85 @@ def _apply_feeder_sleeve_time_factor(
     t_sol[finite_sol] = t_sol[finite_sol] * factor
 
 
+def _run_filling_flow(
+    gate,
+    casting_params: Optional[CastingParameters],
+    user_section_areas_cm2: Optional[Dict[str, float]],
+    grid: np.ndarray,
+    origin_mm: np.ndarray,
+    dx_mm: float,
+    alloy,
+    bodies: List[Body],
+):
+    """Run the 3-D Darcy filling-flow solver using the gate design/user inputs."""
+    from core.filling_solver import solve_filling_flow
+
+    design_section_key = (
+        getattr(casting_params, "velocity_section_key", None) or "SPRUE_THROAT"
+    )
+    user_v = float(getattr(casting_params, "ingate_velocity_m_s", 0.0) or 0.0)
+    design_v = user_v if user_v > 0.0 else float(
+        getattr(gate, "design_choke_velocity_m_s", 0.0) or 0.0
+    )
+    user_area_cm2 = (
+        user_section_areas_cm2.get(design_section_key, 0.0)
+        if user_section_areas_cm2
+        else 0.0
+    )
+    if user_area_cm2 > 0.0:
+        design_area_cm2 = float(user_area_cm2)
+    else:
+        sf = getattr(gate, "section_flows", {}) or {}
+        section_flow = sf.get(design_section_key)
+        if section_flow is not None:
+            design_area_cm2 = float(section_flow.area_cm2)
+        else:
+            attr_map = {
+                "SPRUE_THROAT": "sprue_throat_area_cm2",
+                "SPRUE_BASE": "sprue_base_area_cm2",
+                "SPRUE": "sprue_base_area_cm2",
+                "RUNNER": "runner_min_area_cm2",
+                "INGATE": "total_ingate_contact_area_cm2",
+                "DISTRIBUTOR": "distributor_area_cm2",
+                "CURUFLUK": "curufluk_area_cm2",
+            }
+            design_area_cm2 = float(
+                getattr(gate, attr_map.get(design_section_key, "sprue_base_area_cm2"), 0.0)
+                or 0.0
+            )
+        if design_area_cm2 <= 0.0:
+            design_area_cm2 = float(
+                getattr(gate, "design_sprue_base_area_cm2", 0.0) or 0.0
+            )
+    sprue_throat_cm2 = float(gate.sprue_throat_area_cm2) if gate.sprue_throat_area_cm2 else 0.0
+    sprue_base_cm2 = float(gate.sprue_base_area_cm2) if gate.sprue_base_area_cm2 else 0.0
+    if sprue_throat_cm2 <= 0.0 and "SPRUE_THROAT" in (gate.section_flows or {}):
+        sprue_throat_cm2 = float(gate.section_flows["SPRUE_THROAT"].area_cm2)
+    if sprue_base_cm2 <= 0.0 and "SPRUE_BASE" in (gate.section_flows or {}):
+        sprue_base_cm2 = float(gate.section_flows["SPRUE_BASE"].area_cm2)
+    section_areas_m2 = {
+        "SPRUE_THROAT": sprue_throat_cm2 * 1e-4,
+        "SPRUE_BASE": sprue_base_cm2 * 1e-4,
+        "RUNNER": float(gate.runner_min_area_cm2) * 1e-4 if gate.runner_min_area_cm2 else 0.0,
+        "INGATE": float(gate.total_ingate_contact_area_cm2) * 1e-4 if gate.total_ingate_contact_area_cm2 else 0.0,
+        "DISTRIBUTOR": float(gate.distributor_area_cm2) * 1e-4 if gate.distributor_area_cm2 else 0.0,
+        "CURUFLUK": float(gate.curufluk_area_cm2) * 1e-4 if gate.curufluk_area_cm2 else 0.0,
+    }
+    return solve_filling_flow(
+        grid,
+        origin_mm,
+        dx_mm,
+        casting_params,
+        alloy,
+        bodies=bodies,
+        progress_callback=None,
+        design_velocity_m_s=design_v,
+        design_section_key=design_section_key,
+        design_area_m2=design_area_cm2 * 1e-4,
+        section_areas_m2=section_areas_m2,
+    )
+
+
 def analyze(
     bodies: List[Body],
     grid: np.ndarray,
@@ -1599,15 +1679,70 @@ def analyze(
     if progress_callback:
         progress_callback(28)
 
+    # AŞAMA 2.5: Gating / 3-D Darcy flow (needed for fill_time before thermal).
+    gate_result_for_flow = None
+    flow_result_for_thermal = None
+    try:
+        from core.gating import analyze_gating
+
+        tmp_result = SimpleNamespace(
+            grid=grid,
+            origin_mm=origin_mm,
+            dx_mm=dx,
+            is_metal=is_metal,
+            sdf=sdf,
+            subvoxel_sdf=sdf,
+            part_volume_mm3=part_volume_mm3,
+            part_surface_area_mm2=part_surface_area_mm2,
+            wall_thickness_mm=wall_thickness,
+            dominant_m_mm=dominant_m,
+            bbox_size_mm=bbox_size,
+            alloy_key=alloy_key,
+            mold_key=mold_key,
+            hotspots=[],
+            riser_results=[],
+            risk=np.zeros_like(grid, dtype=float),
+            recommendations=[],
+        )
+        gate_result_for_flow = analyze_gating(
+            tmp_result,
+            casting_params=casting_params,
+            bodies=bodies,
+            user_section_areas_cm2=user_section_areas_cm2,
+        )
+    except Exception as exc:
+        pass
+
+    if gate_result_for_flow is not None:
+        try:
+            flow_result_for_thermal = _run_filling_flow(
+                gate_result_for_flow,
+                casting_params,
+                user_section_areas_cm2,
+                grid,
+                origin_mm,
+                dx,
+                alloy,
+                bodies,
+            )
+        except Exception as exc:
+            pass
+
     # AŞAMA 3: Full 3-D transient enthalpy thermal solver (downsampled for speed)
     if progress_callback:
         progress_callback(30)
         progress_callback(31)
+    fill_time_s = (
+        flow_result_for_thermal.fill_time
+        if flow_result_for_thermal is not None and flow_result_for_thermal.fill_time is not None
+        else None
+    )
     temperature, solid_fraction, t_liq, t_s, G, cooling_rate, niyama = solve_3d_thermal(
         grid, alloy, mold, dx,
         max_time_s=thermal_max_time_s,
         downsample=thermal_downsample,
         progress_callback=progress_callback,
+        fill_time_s=fill_time_s,
     )
     # v9.3: account for feeder sleeves/exothermic/chilled type by scaling the
     # solidification time of RISER voxels.  A single weighted factor per model is
@@ -2121,7 +2256,7 @@ def analyze(
 
     result.riser_proposals = propose_risers(result, alloy, existing_riser_count=len(riser_results))
 
-    # AŞAMA 11: Connect gating solver so the report receives mass / sprue / runner data.
+    # AŞAMA 11: Gating result (flow already solved in stage 2.5 for fill_time).
     try:
         from core.gating import analyze_gating
         result.gate_result = analyze_gating(
@@ -2131,87 +2266,21 @@ def analyze(
             user_section_areas_cm2=user_section_areas_cm2,
         )
     except Exception as exc:
+        result.gate_result = gate_result_for_flow
         result.recommendations.append(f"Gating analizi atlandı: {exc}")
 
-    # AŞAMA 11b: 3-D Darcy doldurma akışı (hafif CFD) hesabı.
-    try:
-        from core.filling_solver import solve_filling_flow
-
-        gate = result.gate_result
-        # Velocity/area inlet comes from user CastingParameters if supplied.
-        design_section_key = (
-            getattr(casting_params, "velocity_section_key", None) or "SPRUE_THROAT"
+    result.flow_result = flow_result_for_thermal
+    if result.gate_result and result.flow_result:
+        result.gate_result.flow_result = result.flow_result
+        result.gate_result.distributor_velocity_m_s = result.flow_result.node_velocities.get(
+            "DISTRIBUTOR", 0.0
         )
-        user_v = float(getattr(casting_params, "ingate_velocity_m_s", 0.0) or 0.0)
-        design_v = user_v if user_v > 0.0 else float(
-            getattr(gate, "design_choke_velocity_m_s", 0.0) or 0.0
+        result.gate_result.curufluk_velocity_m_s = result.flow_result.node_velocities.get(
+            "CURUFLUK", 0.0
         )
-        # Use the user-selected section area if provided; otherwise use the
-        # measured area for the chosen section from the gating engine.
-        user_area_cm2 = (
-            user_section_areas_cm2.get(design_section_key, 0.0)
-            if user_section_areas_cm2
-            else 0.0
-        )
-        if user_area_cm2 > 0.0:
-            design_area_cm2 = float(user_area_cm2)
-        else:
-            sf = getattr(gate, "section_flows", {}) or {}
-            section_flow = sf.get(design_section_key)
-            if section_flow is not None:
-                design_area_cm2 = float(section_flow.area_cm2)
-            else:
-                attr_map = {
-                    "SPRUE_THROAT": "sprue_throat_area_cm2",
-                    "SPRUE_BASE": "sprue_base_area_cm2",
-                    "SPRUE": "sprue_base_area_cm2",
-                    "RUNNER": "runner_min_area_cm2",
-                    "INGATE": "total_ingate_contact_area_cm2",
-                    "DISTRIBUTOR": "distributor_area_cm2",
-                    "CURUFLUK": "curufluk_area_cm2",
-                }
-                design_area_cm2 = float(
-                    getattr(gate, attr_map.get(design_section_key, "sprue_base_area_cm2"), 0.0)
-                    or 0.0
-                )
-            if design_area_cm2 <= 0.0:
-                design_area_cm2 = float(
-                    getattr(gate, "design_sprue_base_area_cm2", 0.0) or 0.0
-                )
-        section_areas_m2 = {
-            "SPRUE": float(gate.sprue_base_area_cm2) * 1e-4 if gate.sprue_base_area_cm2 else 0.0,
-            "RUNNER": float(gate.runner_min_area_cm2) * 1e-4 if gate.runner_min_area_cm2 else 0.0,
-            "INGATE": float(gate.total_ingate_contact_area_cm2) * 1e-4 if gate.total_ingate_contact_area_cm2 else 0.0,
-            "DISTRIBUTOR": float(gate.distributor_area_cm2) * 1e-4 if gate.distributor_area_cm2 else 0.0,
-            "CURUFLUK": float(gate.curufluk_area_cm2) * 1e-4 if gate.curufluk_area_cm2 else 0.0,
-        }
-        flow = solve_filling_flow(
-            result.grid,
-            result.origin_mm,
-            result.dx_mm,
-            casting_params,
-            alloy,
-            bodies=bodies,
-            progress_callback=None,
-            design_velocity_m_s=design_v,
-            design_section_key=design_section_key,
-            design_area_m2=design_area_cm2 * 1e-4,
-            section_areas_m2=section_areas_m2,
-        )
-        result.flow_result = flow
-        if result.gate_result:
-            result.gate_result.flow_result = flow
-            result.gate_result.distributor_velocity_m_s = flow.node_velocities.get(
-                "DISTRIBUTOR", 0.0
-            )
-            result.gate_result.curufluk_velocity_m_s = flow.node_velocities.get(
-                "CURUFLUK", 0.0
-            )
-            if flow.Q_m3_s > 0.0:
-                result.gate_result.ingate_flow_rate_m3_s = flow.Q_m3_s
-                result.gate_result.ingate_fill_time_s = flow.fill_time_s
-    except Exception as exc:
-        result.recommendations.append(f"Akış simülasyonu atlandı: {exc}")
+        if result.flow_result.Q_m3_s > 0.0:
+            result.gate_result.ingate_flow_rate_m3_s = result.flow_result.Q_m3_s
+            result.gate_result.ingate_fill_time_s = result.flow_result.fill_time_s
 
     result.recommendations = _build_recommendations(result, alloy, mold)
     if result.gate_result and result.gate_result.gating_system_reason:

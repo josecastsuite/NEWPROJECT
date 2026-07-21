@@ -152,9 +152,14 @@ def solve_3d_thermal(
     max_time_s: float = 600.0,
     downsample: int = 2,
     progress_callback: Optional[callable] = None,
+    fill_time_s: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Implicit 3-D enthalpy thermal solver.
+
+    If ``fill_time_s`` is supplied it is interpreted as the per-voxel metal
+    arrival time (s).  Solidification/liquidus times are shifted by this amount,
+    so late-filled regions start cooling later.
 
     Returns fine-grid arrays:
     T_final, fs_final, t_liquidus, t_solidus, G_at_ts, R_at_ts, niyama
@@ -163,9 +168,27 @@ def solve_3d_thermal(
     if downsample > 1:
         grid_c = _downsample_grid(grid, downsample)
         dx_c_mm = dx * downsample
+        if fill_time_s is not None:
+            fill_c = ndimage.zoom(
+                fill_time_s,
+                (
+                    grid_c.shape[0] / fill_time_s.shape[0],
+                    grid_c.shape[1] / fill_time_s.shape[1],
+                    grid_c.shape[2] / fill_time_s.shape[2],
+                ),
+                order=0,
+            )
+        else:
+            fill_c = None
     else:
         grid_c = grid
         dx_c_mm = dx
+        fill_c = fill_time_s
+
+    # Extend the simulation so even the last-filled metal has time to solidify.
+    if fill_c is not None:
+        max_fill = float(np.nanmax(fill_c[np.isfinite(fill_c)])) if np.isfinite(fill_c).any() else 0.0
+        max_time_s = max(max_time_s, max_fill + max_time_s)
 
     dx_m = dx_c_mm / 1000.0  # SI metres
     nx, ny, nz = grid_c.shape
@@ -299,6 +322,23 @@ def solve_3d_thermal(
     niyama_fine = _upsample(niyama_c, fine_shape)
 
     is_metal_fine = np.isin(grid, casting_metal_ids)
+
+    # Shift liquidus/solidus times by the local metal arrival time.
+    if fill_c is not None:
+        fill_time_fine = _upsample(fill_c, fine_shape)
+        fill_time_fine = np.where(is_metal_fine, fill_time_fine, 0.0)
+        with np.errstate(invalid="ignore"):
+            t_liq_fine = np.where(
+                is_metal_fine & np.isfinite(t_liq_fine) & np.isfinite(fill_time_fine),
+                t_liq_fine + fill_time_fine,
+                t_liq_fine,
+            )
+            t_sol_fine = np.where(
+                is_metal_fine & np.isfinite(t_sol_fine) & np.isfinite(fill_time_fine),
+                t_sol_fine + fill_time_fine,
+                t_sol_fine,
+            )
+
     for arr in (niyama_fine, G_fine, R_fine, t_liq_fine, t_sol_fine, fs_fine):
         arr[:] = np.where(is_metal_fine, arr, 0.0)
 

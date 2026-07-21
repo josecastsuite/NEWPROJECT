@@ -220,7 +220,8 @@ def _format_flow_result(flow) -> str:
     if not node_v:
         return ""
     labels = {
-        "SPRUE": "Döküm ağzı",
+        "SPRUE_THROAT": "D.ağzı boğazı",
+        "SPRUE_BASE": "D.ağzı tabanı",
         "RUNNER": "Yolluk",
         "DISTRIBUTOR": "Dağıtıcı",
         "CURUFLUK": "Curufluk",
@@ -228,7 +229,7 @@ def _format_flow_result(flow) -> str:
         "FILTER": "Filtre",
         "RISER": "Besleyici",
     }
-    order = ["SPRUE", "RUNNER", "DISTRIBUTOR", "CURUFLUK", "FILTER", "INGATE", "RISER"]
+    order = ["SPRUE_THROAT", "SPRUE_BASE", "RUNNER", "DISTRIBUTOR", "CURUFLUK", "FILTER", "INGATE", "RISER"]
     items = [(k, float(node_v.get(k, 0.0))) for k in order if node_v.get(k, 0.0) > 1e-9]
     if not items:
         return ""
