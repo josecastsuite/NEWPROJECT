@@ -915,6 +915,29 @@ def _gating_node_velocities(
             comp_body[next_id] = matched.get(label_id)
             next_id += 1
 
+    # Match the part component to its CAD mesh too, so proximity fallback can
+    # find gates-to-part interfaces when the voxel resolution misses them.
+    part_mask = grid == BodyType.PART
+    if part_mask.any():
+        part_idx = np.argwhere(part_mask)
+        comp_centroids[part_id] = part_idx.mean(axis=0) * dx_mm + origin_mm
+        part_bodies = bodies_by_type.get(BodyType.PART, [])
+        if part_bodies:
+            pc_mm = comp_centroids[part_id]
+            best_body = None
+            best_dist = float("inf")
+            for b in part_bodies:
+                try:
+                    bc_mm = np.asarray(b.mesh.centroid, dtype=np.float64)
+                except Exception:
+                    continue
+                dist = float(np.linalg.norm(bc_mm - pc_mm))
+                if dist < best_dist:
+                    best_dist = dist
+                    best_body = b
+            if best_body is not None:
+                comp_body[part_id] = best_body
+
     # Discover shared faces between gating components and the part.
     max_id = int(comp_id.max())
     mult = max_id + 1
@@ -1035,6 +1058,161 @@ def _gating_node_velocities(
             }
         )
 
+    # Proximity fallback for components that are close in the original CAD mesh
+    # but do not share a voxel face (e.g., separate runner bodies with tiny gaps).
+    # This only creates graph edges; areas are still computed from the mesh section.
+    from scipy.spatial import cKDTree
+
+    def _sample_points(mesh, n=2000):
+        """Return (pts, normals) arrays sampled from the mesh surface."""
+        try:
+            pts = mesh.vertices.astype(np.float64)
+            normals = mesh.vertex_normals.astype(np.float64)
+        except Exception:
+            pts = np.empty((0, 3), dtype=np.float64)
+            normals = np.empty((0, 3), dtype=np.float64)
+        try:
+            centers = mesh.triangles_center.astype(np.float64)
+            center_normals = mesh.face_normals.astype(np.float64)
+            pts = np.vstack([pts, centers])
+            normals = np.vstack([normals, center_normals])
+        except Exception:
+            pass
+        try:
+            target = max(n, pts.shape[0] + 100)
+            extra_pts, extra_idx = mesh.sample(target - pts.shape[0], return_index=True)
+            extra_normals = mesh.face_normals[extra_idx].astype(np.float64)
+            pts = np.vstack([pts, extra_pts])
+            normals = np.vstack([normals, extra_normals])
+        except Exception:
+            pass
+        if pts.shape[0] <= n:
+            return pts.astype(np.float64), normals.astype(np.float64)
+        idx = np.random.choice(pts.shape[0], size=n, replace=False)
+        return pts[idx].astype(np.float64), normals[idx].astype(np.float64)
+
+    # Allow a gap of up to one voxel (or 0.5 mm, whichever is larger) to be
+    # treated as an interface.  This captures bodies that are drawn separately
+    # and just touch or have a tiny air gap, without linking diagonally
+    # separated parts.
+    tol_mm = max(float(dx_mm), 0.5)
+    existing_pairs = {
+        (min(c["id1"], c["id2"]), max(c["id1"], c["id2"])) for c in contacts
+    }
+    comp_ids = list(comp_meta.keys())
+    for ii in range(len(comp_ids)):
+        for jj in range(ii + 1, len(comp_ids)):
+            id1, id2 = comp_ids[ii], comp_ids[jj]
+            key = (min(id1, id2), max(id1, id2))
+            if key in existing_pairs:
+                continue
+            body1_obj = comp_body.get(id1)
+            body2_obj = comp_body.get(id2)
+            if body1_obj is None or body2_obj is None:
+                continue
+            try:
+                body1 = body1_obj.mesh
+                body2 = body2_obj.mesh
+            except Exception:
+                continue
+            if body1 is None or body2 is None or not len(body1.faces) or not len(body2.faces):
+                continue
+            # Cheap bbox rejection
+            try:
+                b1 = body1.bounds
+                b2 = body2.bounds
+            except Exception:
+                continue
+            # min distance between two AABBs
+            d_min = np.zeros(3, dtype=np.float64)
+            for ax in range(3):
+                d_min[ax] = max(b1[0, ax] - b2[1, ax], b2[0, ax] - b1[1, ax], 0.0)
+            if float(np.linalg.norm(d_min)) > tol_mm:
+                continue
+            # Direction body1 -> body2: nearest points on the two surfaces
+            pts2, norms2 = _sample_points(body2)
+            pts1, norms1 = _sample_points(body1)
+            if pts1.shape[0] == 0 or pts2.shape[0] == 0:
+                continue
+            best_dist = float("inf")
+            best_a = best_b = None
+            best_na = best_nb = -g_u
+            try:
+                tree1 = cKDTree(pts1)
+                dist, idx = tree1.query(pts2)
+                k = int(np.argmin(dist))
+                best_dist = float(dist[k])
+                best_a = pts1[idx[k]]
+                best_na = norms1[idx[k]]
+                best_b = pts2[k]
+                best_nb = norms2[k]
+            except Exception:
+                pass
+            try:
+                tree2 = cKDTree(pts2)
+                dist, idx = tree2.query(pts1)
+                k = int(np.argmin(dist))
+                if float(dist[k]) < best_dist:
+                    best_dist = float(dist[k])
+                    best_a = pts1[k]
+                    best_na = norms1[k]
+                    best_b = pts2[idx[k]]
+                    best_nb = norms2[idx[k]]
+            except Exception:
+                pass
+            if best_dist > tol_mm + 1e-9 or best_a is None or best_b is None:
+                continue
+            # Use the vector between the closest sample pair as the contact
+            # direction.  For face-to-face gaps this is perpendicular to the
+            # interface.  When the bodies just touch/overlap, fall back to the
+            # local face normals at the closest points.
+            diff = best_b - best_a
+            n_norm = float(np.linalg.norm(diff))
+            if n_norm > 1e-9:
+                normal = diff / n_norm
+            else:
+                normal_vec = best_na - best_nb
+                nv_norm = float(np.linalg.norm(normal_vec))
+                if nv_norm > 1e-12:
+                    normal = normal_vec / nv_norm
+                else:
+                    normal = -g_u / float(np.linalg.norm(-g_u)) if float(np.linalg.norm(-g_u)) > 1e-12 else -g_u
+            # Refine the contact origin with the centroid of all near-contact
+            # points so the section plane is not placed at an isolated corner.
+            eps = max(0.05 * dx_mm, 0.05)
+            try:
+                d1_to_2, _ = tree1.query(pts2)
+                near2 = pts2[d1_to_2 <= best_dist + eps]
+                d2_to_1, _ = tree2.query(pts1)
+                near1 = pts1[d2_to_1 <= best_dist + eps]
+            except Exception:
+                near1 = np.array([best_a])
+                near2 = np.array([best_b])
+            if near1.shape[0] == 0 or near2.shape[0] == 0:
+                near1 = np.array([best_a])
+                near2 = np.array([best_b])
+            centroid_a = near1.mean(axis=0)
+            centroid_b = near2.mean(axis=0)
+            mid = 0.5 * (centroid_a + centroid_b)
+            name1 = comp_meta[id1][1]
+            name2 = comp_meta[id2][1]
+            contacts.append(
+                {
+                    "id1": id1,
+                    "id2": id2,
+                    "type1": comp_meta[id1][0].name,
+                    "type2": comp_meta[id2][0].name,
+                    "name1": name1,
+                    "name2": name2,
+                    "voxel_area_m2": 0.0,
+                    "centroid_mm": tuple(float(x) for x in mid),
+                    "normal": normal,
+                    "point1": tuple(float(x) for x in best_a),
+                    "point2": tuple(float(x) for x in best_b),
+                }
+            )
+            existing_pairs.add(key)
+
     if not contacts:
         return []
 
@@ -1140,11 +1318,14 @@ def _gating_node_velocities(
         id1, id2 = c["id1"], c["id2"]
         body1 = comp_body.get(id1)
         body2 = comp_body.get(id2)
-        plane_origin = c["centroid_mm"]
+        # Voxel contacts share a centroid; proximity contacts store the closest
+        # point on each body so the section plane actually cuts the mesh.
+        plane_origin1 = c.get("point1", c["centroid_mm"])
+        plane_origin2 = c.get("point2", c["centroid_mm"])
         normal = c.get("normal", -g_u)
 
-        a1 = _mesh_section_area_m2(body1.mesh if body1 else None, plane_origin, normal)
-        a2 = _mesh_section_area_m2(body2.mesh if body2 else None, plane_origin, normal)
+        a1 = _mesh_section_area_m2(body1.mesh if body1 else None, plane_origin1, normal)
+        a2 = _mesh_section_area_m2(body2.mesh if body2 else None, plane_origin2, normal)
         if a1 > 1e-18 and a2 > 1e-18:
             a_mesh = float(min(a1, a2))
         elif a1 > 1e-18 or a2 > 1e-18:
@@ -1196,10 +1377,10 @@ def _gating_node_velocities(
         if throat > 1e-18:
             raw_throat_per_type[btype] = raw_throat_per_type.get(btype, 0.0) + float(throat)
 
-    # Design caps: source gets the user-selected throat area; every other
-    # component gets its type design total split proportionally by its measured
-    # throat area.  If no design value is available for a type the cap is inf
-    # (geometry-only).
+    # Design caps: source gets the user-selected throat area.  For all other
+    # component types the supplied design area is a per-component target, except
+    # INGATE where the design value is the TOTAL gate area to be split among the
+    # individual gate components by their measured throat ratio.
     comp_design_m2: Dict[int, float] = {}
     for cid in comp_meta:
         if cid == part_id:
@@ -1209,10 +1390,18 @@ def _gating_node_velocities(
             continue
         btype = comp_meta[cid][0]
         design_total = type_design_total.get(btype, 0.0)
-        raw_total = raw_throat_per_type.get(btype, 0.0)
-        if design_total > 1e-18 and raw_total > 1e-18:
-            raw_throat = comp_section_m2[cid][2]
-            comp_design_m2[cid] = design_total * (raw_throat / raw_total)
+        if btype == BodyType.INGATE and design_total > 1e-18:
+            # split total gate area across gate components
+            ingate_cids = [
+                c for c in comp_meta
+                if c != part_id and comp_meta[c][0] == BodyType.INGATE
+            ]
+            raw_total = sum(comp_section_m2[c][2] for c in ingate_cids)
+            if raw_total > 1e-18:
+                raw_throat = comp_section_m2[cid][2]
+                comp_design_m2[cid] = design_total * (raw_throat / raw_total)
+            else:
+                comp_design_m2[cid] = design_total
         elif design_total > 1e-18:
             comp_design_m2[cid] = design_total
         else:
