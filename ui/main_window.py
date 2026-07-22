@@ -555,9 +555,9 @@ class MainWindow(QtWidgets.QMainWindow):
         speed_layout.addWidget(speed_label)
         speed_layout.addWidget(self.flow_speed_spin)
 
-        count_label = QtWidgets.QLabel("Parçacık:")
+        count_label = QtWidgets.QLabel("Akış çizgisi:")
         self.flow_particle_label = QtWidgets.QLabel("—")
-        self.flow_particle_label.setToolTip("Metal hacmine göre otomatik hesaplanan parçacık sayısı")
+        self.flow_particle_label.setToolTip("Girişten üretilen ilerleyen akış çizgisi sayısı")
         speed_layout.addWidget(count_label)
         speed_layout.addWidget(self.flow_particle_label)
         anim_layout.addLayout(speed_layout)
@@ -1433,7 +1433,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.flow_time_label.setText(f"t: {t:.2f} s | dolma: %{fill_percent}")
             if animator:
                 self.flow_particle_label.setText(
-                    f"{animator.particle_count():,} adet (d ≈ {animator.particle_diameter_mm():.2f} mm)"
+                    f"{animator.particle_count():,} adet"
                 )
 
     def on_toggle_flow_animation(self, checked: bool):
