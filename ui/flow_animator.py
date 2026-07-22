@@ -13,7 +13,7 @@ import pyvista as pv
 from PyQt6 import QtCore
 from scipy import ndimage
 
-from core.types import AnalysisResult
+from core.types import AnalysisResult, BodyType
 
 
 class FlowAnimator(QtCore.QObject):
@@ -39,6 +39,11 @@ class FlowAnimator(QtCore.QObject):
         self._edt: Optional[np.ndarray] = None
         self._max_time: float = 0.0
 
+        self._part_grid: Optional[pv.ImageData] = None
+        self._part_fill_time: Optional[np.ndarray] = None
+        self._part_mask: Optional[np.ndarray] = None
+        self._part_factor: int = 1
+
         self._is_running: bool = False
         self._current_time: float = 0.0
         self._speed_multiplier: float = 1.0
@@ -46,15 +51,20 @@ class FlowAnimator(QtCore.QObject):
 
         self._streamline_actor = None
         self._marker_actor = None
+        self._part_actor = None
 
     def set_result(self, result: Optional[AnalysisResult]) -> None:
-        """Attach a completed analysis result and build the streamlines."""
+        """Attach a completed analysis result and build the flow animation."""
         self.stop()
         self._clear_actors()
         self._result = result
         self._streamlines = None
         self._tube_mesh = None
         self._edt = None
+        self._part_grid = None
+        self._part_fill_time = None
+        self._part_mask = None
+        self._part_factor = 1
 
         if result is None or result.flow_result is None:
             return
@@ -81,6 +91,10 @@ class FlowAnimator(QtCore.QObject):
         if not metal.any():
             return
 
+        self._metal_field = metal.astype(np.float32)
+        self._body_field = result.grid.astype(np.float32)
+        self._has_part = bool((result.grid == BodyType.PART).any())
+
         self._max_time = float(fr.fill_time_s or 0.0)
         if self._max_time <= 0.0:
             finite = np.isfinite(self._fill_time) & metal
@@ -89,27 +103,21 @@ class FlowAnimator(QtCore.QObject):
         if self._max_time <= 0.0:
             return
 
-        # Channel-thickness proxy for tube radius: distance to nearest non-metal.
+        # Part fill volume: always build, even if streamlines fail.
+        self._build_part_grid()
+
+        # Optional red streamlines through the gating.
         self._edt = ndimage.distance_transform_edt(metal) * self._dx
-
         source_pts = self._build_source_points()
-        if source_pts is None or source_pts.shape[0] == 0:
-            return
-
-        try:
-            self._streamlines = self._integrate_streamlines(source_pts)
-        except Exception:
-            self._streamlines = None
-
-        if self._streamlines is None or self._streamlines.n_points == 0:
-            return
-
-        self._streamlines = self._trim_streamlines(self._streamlines)
-        if self._streamlines is None or self._streamlines.n_points == 0:
-            return
-
-        self._compute_streamline_radius()
-        self._build_tube_mesh()
+        if source_pts is not None and source_pts.shape[0] > 0:
+            try:
+                self._streamlines = self._integrate_streamlines(source_pts)
+                if self._streamlines is not None and self._streamlines.n_points > 0:
+                    self._streamlines = self._trim_streamlines(self._streamlines)
+                    self._compute_streamline_radius()
+                    self._build_tube_mesh()
+            except Exception:
+                self._streamlines = None
 
         self._current_time = 0.0
         self._update_scene()
@@ -178,13 +186,29 @@ class FlowAnimator(QtCore.QObject):
         ijk = (pos - self._origin) * inv_dx - 0.5
         coords = np.stack([ijk[:, 0], ijk[:, 1], ijk[:, 2]], axis=0)
         sampled = ndimage.map_coordinates(
-            (self._result.grid > 0).astype(np.float32),
+            self._metal_field,
             coords,
             order=0,
             mode='constant',
             cval=0.0,
         )
         return sampled > 0.5
+
+    def _sample_body_type(self, pos: np.ndarray) -> np.ndarray:
+        """Nearest-neighbour body-type sampling at physical positions."""
+        if pos.shape[0] == 0:
+            return np.empty(0, dtype=np.int16)
+        inv_dx = 1.0 / self._dx
+        ijk = (pos - self._origin) * inv_dx - 0.5
+        coords = np.stack([ijk[:, 0], ijk[:, 1], ijk[:, 2]], axis=0)
+        sampled = ndimage.map_coordinates(
+            self._body_field,
+            coords,
+            order=0,
+            mode='constant',
+            cval=0.0,
+        )
+        return sampled.astype(np.int16)
 
     def _integrate_streamlines(self, source_pts: np.ndarray) -> Optional[pv.PolyData]:
         """Integrate streamlines from inlet seeds through the Darcy velocity field."""
@@ -242,16 +266,25 @@ class FlowAnimator(QtCore.QObject):
 
             new_pos = pos_active + v * (dt * 1000.0)
             inside = self._inside_metal(new_pos)
+            body_type = self._sample_body_type(new_pos) if self._has_part else None
 
             for local, global_idx in enumerate(active_indices):
-                if inside[local]:
+                if not inside[local]:
+                    active[global_idx] = False
+                elif self._has_part and body_type is not None and body_type[local] == BodyType.PART:
+                    # Stop at the part entry; the part fill volume takes over.
                     pos[global_idx] = new_pos[local]
                     line_points[global_idx].append(pos[global_idx].copy())
                     line_vel[global_idx].append(float(speed[local]))
                     t[global_idx] += dt
                     line_time[global_idx].append(t[global_idx])
-                else:
                     active[global_idx] = False
+                else:
+                    pos[global_idx] = new_pos[local]
+                    line_points[global_idx].append(pos[global_idx].copy())
+                    line_vel[global_idx].append(float(speed[local]))
+                    t[global_idx] += dt
+                    line_time[global_idx].append(t[global_idx])
 
             pos_active = pos[active]
 
@@ -367,6 +400,56 @@ class FlowAnimator(QtCore.QObject):
         except Exception:
             self._tube_mesh = None
 
+    def _build_part_grid(self) -> None:
+        """Create a downsampled ImageData for the part fill-time volume."""
+        if self._result is None or self._fill_time is None:
+            return
+
+        part = self._result.grid == BodyType.PART
+        if not part.any():
+            part = self._result.grid > 0
+        if not part.any():
+            return
+
+        # Crop to part bounding box + small padding.
+        idx = np.argwhere(part)
+        i0, j0, k0 = idx.min(axis=0)
+        i1, j1, k1 = idx.max(axis=0)
+        pad = 2
+        i0, j0, k0 = max(i0 - pad, 0), max(j0 - pad, 0), max(k0 - pad, 0)
+        i1, j1, k1 = min(i1 + pad, self._shape[0] - 1), min(j1 + pad, self._shape[1] - 1), min(k1 + pad, self._shape[2] - 1)
+
+        ft_crop = self._fill_time[i0 : i1 + 1, j0 : j1 + 1, k0 : k1 + 1].copy()
+        mask_crop = part[i0 : i1 + 1, j0 : j1 + 1, k0 : k1 + 1]
+
+        # Downsample only if the part region is very large.
+        target_voxels = 400_000
+        part_voxels = int(mask_crop.sum())
+        factor = max(1, int((part_voxels / target_voxels) ** (1.0 / 3.0)))
+        factor = min(factor, 4)
+        self._part_factor = factor
+
+        if factor > 1:
+            zoom = (1.0 / factor, 1.0 / factor, 1.0 / factor)
+            ft_crop = ndimage.zoom(ft_crop, zoom, order=0)
+            mask_crop = ndimage.zoom(mask_crop.astype(np.float64), zoom, order=0) > 0.5
+
+        sentinel = self._max_time + 1.0
+        ft_crop = np.where(mask_crop, ft_crop, sentinel)
+        nx, ny, nz = ft_crop.shape
+        image = pv.ImageData(dimensions=(nx, ny, nz))
+        image.origin = tuple(
+            self._origin + (np.array([i0, j0, k0]) + 0.5) * self._dx
+        )
+        spacing = self._dx * factor
+        image.spacing = (spacing, spacing, spacing)
+        image['fill_time'] = ft_crop.ravel(order='F').astype(np.float64)
+        image['filled'] = np.zeros(image.n_points, dtype=np.uint8)
+
+        self._part_grid = image
+        self._part_fill_time = ft_crop
+        self._part_mask = mask_crop
+
     def _marker_positions(self, t: float) -> Optional[np.ndarray]:
         """Return the current marker position on each streamline."""
         if self._streamlines is None:
@@ -416,7 +499,7 @@ class FlowAnimator(QtCore.QObject):
         self._update_scene()
 
     def play(self) -> None:
-        if self._streamlines is None:
+        if self._streamlines is None and self._part_grid is None:
             return
         if self._is_running:
             self._timer.stop()
@@ -448,9 +531,15 @@ class FlowAnimator(QtCore.QObject):
             except Exception:
                 pass
             self._marker_actor = None
+        if self._part_actor is not None:
+            try:
+                self._viewer.remove_actor(self._part_actor)
+            except Exception:
+                pass
+            self._part_actor = None
 
     def _on_timer(self) -> None:
-        if self._streamlines is None:
+        if self._streamlines is None and self._part_grid is None:
             return
         dt = self.FRAME_DT * self._speed_multiplier
         self._current_time = min(self._current_time + dt, self._max_time)
@@ -459,37 +548,48 @@ class FlowAnimator(QtCore.QObject):
             self.pause()
 
     def _update_scene(self) -> None:
-        if not self._show_streamlines or self._tube_mesh is None:
-            self._clear_actors()
-            self._viewer.render()
-            return
+        self._update_part_fill()
 
-        if self._streamline_actor is None:
-            self._streamline_actor = self._viewer.add_mesh(
-                self._tube_mesh,
-                color='red',
-                opacity=1.0,
-                show_scalar_bar=False,
-                name="flow_streamlines",
-            )
-        else:
-            self._streamline_actor.mapper.dataset = self._tube_mesh
-
-        markers = self._marker_positions(self._current_time)
-        if markers is not None and markers.shape[0] > 0:
-            poly = pv.PolyData(markers)
-            if self._marker_actor is None:
-                self._marker_actor = self._viewer.add_mesh(
-                    poly,
-                    render_points_as_spheres=True,
-                    point_size=self.MARKER_SIZE,
+        if self._show_streamlines and self._tube_mesh is not None:
+            if self._streamline_actor is None:
+                self._streamline_actor = self._viewer.add_mesh(
+                    self._tube_mesh,
                     color='red',
+                    opacity=1.0,
                     show_scalar_bar=False,
-                    name="flow_markers",
+                    name="flow_streamlines",
                 )
             else:
-                self._marker_actor.mapper.dataset = poly
+                self._streamline_actor.mapper.dataset = self._tube_mesh
+
+            markers = self._marker_positions(self._current_time)
+            if markers is not None and markers.shape[0] > 0:
+                poly = pv.PolyData(markers)
+                if self._marker_actor is None:
+                    self._marker_actor = self._viewer.add_mesh(
+                        poly,
+                        render_points_as_spheres=True,
+                        point_size=self.MARKER_SIZE,
+                        color='red',
+                        show_scalar_bar=False,
+                        name="flow_markers",
+                    )
+                else:
+                    self._marker_actor.mapper.dataset = poly
+            else:
+                if self._marker_actor is not None:
+                    try:
+                        self._viewer.remove_actor(self._marker_actor)
+                    except Exception:
+                        pass
+                    self._marker_actor = None
         else:
+            if self._streamline_actor is not None:
+                try:
+                    self._viewer.remove_actor(self._streamline_actor)
+                except Exception:
+                    pass
+                self._streamline_actor = None
             if self._marker_actor is not None:
                 try:
                     self._viewer.remove_actor(self._marker_actor)
@@ -498,6 +598,27 @@ class FlowAnimator(QtCore.QObject):
                 self._marker_actor = None
 
         self._viewer.render()
+
+    def _update_part_fill(self) -> None:
+        if self._part_grid is None or self._part_fill_time is None or self._part_mask is None:
+            return
+
+        filled = ((self._part_fill_time <= self._current_time) & self._part_mask).astype(np.uint8)
+        self._part_grid['filled'] = filled.ravel(order='F')
+        self._part_grid.Modified()
+
+        if self._part_actor is None:
+            # Hard step opacity: values below 0.5 transparent, above red.
+            opacity = np.where(np.linspace(0, 1, 256) < 0.5, 0.0, 0.7)
+            self._part_actor = self._viewer.add_volume(
+                self._part_grid,
+                scalars='filled',
+                cmap='Reds',
+                opacity=opacity,
+                show_scalar_bar=False,
+                name="flow_part_fill",
+            )
+            self._part_actor.prop.interpolation_type = 'linear'
 
     def particle_count(self) -> int:
         """Number of moving markers currently displayed."""
