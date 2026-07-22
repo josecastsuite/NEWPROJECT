@@ -710,19 +710,23 @@ def _component_section_areas_m2(
     cells: np.ndarray,
     dx_mm: float,
     dx_m: float,
-    g_u: np.ndarray,
+    axis: np.ndarray,
 ) -> Tuple[float, float, float]:
     """Return the inlet, outlet and throat areas of a voxel component.
 
-    The component is sliced along the gravity direction.  The first slice
-    (upstream) is the inlet, the last slice (downstream) is the outlet, and the
-    minimum non-zero slice is the throat.  This lets each contact use the correct
-    cross-section for the side the flow is entering or leaving.
+    The component is sliced perpendicular to its principal (flow) axis.
+    The first and last slices are the inlet/outlet and the minimum non-zero
+    slice is the throat.  This is independent of gravity, so horizontal runners
+    and angled sprues get the correct cross-sectional area.
     """
     if cells.size == 0:
         return (0.0, 0.0, 0.0)
     centers = (cells.astype(np.float64) + 0.5) * dx_mm
-    proj = -np.dot(centers, g_u)
+    a = np.asarray(axis, dtype=np.float64)
+    if np.linalg.norm(a) < 1e-18:
+        a = np.array([0.0, 0.0, -1.0])
+    a = a / np.linalg.norm(a)
+    proj = np.dot(centers, a)
     if proj.size == 0:
         return (0.0, 0.0, 0.0)
     bins = np.floor(proj / dx_mm).astype(np.int64)
@@ -819,14 +823,15 @@ def _gating_node_velocities(
     The algorithm is completely independent of the Darcy solver.
     - Q_user is computed once at the source (sprue/pouring-basin) from the user
       velocity and the selected source area.
-    - Voxels are used ONLY to build the element-to-element contact graph.
-    - The real throat/contact area of each interface is extracted from the
-      original CAD mesh with a plane-section (trimesh), giving a true polygon
-      area instead of the staircase/overlap-prone voxel face area.
-    - Q is propagated through the directed graph; at any branching element the
-      incoming Q is split among the outlet branches proportionally to their
-      throat areas: Q_i = Q_in * (A_i / sum(A_outlets)).
-    - Node velocity is v_i = Q_i / A_i.
+    - Voxels are used ONLY to discover which gating element touches which.
+    - Each element's flow direction is derived from the oriented contact graph, not
+      from gravity or from the longest geometric dimension.  This makes the
+      throat cross-section of gates and angled runners correct.
+    - The throat/contact area is taken from a trimesh plane-section on the CAD
+      mesh perpendicular to the element's flow direction, then capped only by the
+      user-defined source area and the total INGATE design area.
+    - Q is propagated through the directed graph; at any branch the incoming Q is
+      split proportionally to the outlet throat areas.
     """
     if bodies is None:
         bodies = []
@@ -910,13 +915,6 @@ def _gating_node_velocities(
             comp_body[next_id] = matched.get(label_id)
             next_id += 1
 
-    # Voxel throat area is kept as a fallback and to split design totals by component.
-    comp_section_m2: Dict[int, Tuple[float, float, float]] = {
-        part_id: (float("inf"), float("inf"), float("inf"))
-    }
-    for cid, cells in comp_cells.items():
-        comp_section_m2[cid] = _component_section_areas_m2(cells, dx_mm, dx_m, g_u)
-
     # Discover shared faces between gating components and the part.
     max_id = int(comp_id.max())
     mult = max_id + 1
@@ -925,6 +923,7 @@ def _gating_node_velocities(
     cx_b = np.zeros(n_keys, dtype=np.float64)
     cy_b = np.zeros(n_keys, dtype=np.float64)
     cz_b = np.zeros(n_keys, dtype=np.float64)
+
     nx_b = np.zeros(n_keys, dtype=np.float64)
     ny_b = np.zeros(n_keys, dtype=np.float64)
     nz_b = np.zeros(n_keys, dtype=np.float64)
@@ -942,7 +941,6 @@ def _gating_node_velocities(
         nonlocal area_b, cx_b, cy_b, cz_b, nx_b, ny_b, nz_b
         if id_a_1d.size == 0:
             return
-        sign = np.where(id_a_1d < id_b_1d, 1.0, -1.0)
         up = np.minimum(id_a_1d, id_b_1d)
         down = np.maximum(id_a_1d, id_b_1d)
         key = up * mult + down
@@ -950,14 +948,17 @@ def _gating_node_velocities(
         cx_b += np.bincount(key, weights=x_1d * area_face, minlength=n_keys)
         cy_b += np.bincount(key, weights=y_1d * area_face, minlength=n_keys)
         cz_b += np.bincount(key, weights=z_1d * area_face, minlength=n_keys)
-        nx_b += np.bincount(key, weights=sign * s_x * area_face, minlength=n_keys)
-        ny_b += np.bincount(key, weights=sign * s_y * area_face, minlength=n_keys)
-        nz_b += np.bincount(key, weights=sign * s_z * area_face, minlength=n_keys)
+        # The geometric face normal does not depend on id ordering; the sign is
+        # irrelevant because the section plane is the same for +/-n.
+        w_norm = np.ones(id_a_1d.shape[0], dtype=np.float64) * area_face
+        nx_b += np.bincount(key, weights=s_x * w_norm, minlength=n_keys)
+        ny_b += np.bincount(key, weights=s_y * w_norm, minlength=n_keys)
+        nz_b += np.bincount(key, weights=s_z * w_norm, minlength=n_keys)
 
     # x-faces
     id_a = comp_id[:-1, :, :]
     id_b = comp_id[1:, :, :]
-    valid = (id_a != 0) & (id_b != 0) & (grid[:-1, :, :] != grid[1:, :, :])
+    valid = (id_a != 0) & (id_b != 0) & (id_a != id_b)
     if valid.any():
         i, j, k = np.where(valid)
         _accumulate_contact_1d(
@@ -972,7 +973,7 @@ def _gating_node_velocities(
     # y-faces
     id_a = comp_id[:, :-1, :]
     id_b = comp_id[:, 1:, :]
-    valid = (id_a != 0) & (id_b != 0) & (grid[:, :-1, :] != grid[:, 1:, :])
+    valid = (id_a != 0) & (id_b != 0) & (id_a != id_b)
     if valid.any():
         i, j, k = np.where(valid)
         _accumulate_contact_1d(
@@ -987,7 +988,7 @@ def _gating_node_velocities(
     # z-faces
     id_a = comp_id[:, :, :-1]
     id_b = comp_id[:, :, 1:]
-    valid = (id_a != 0) & (id_b != 0) & (grid[:, :, :-1] != grid[:, :, 1:])
+    valid = (id_a != 0) & (id_b != 0) & (id_a != id_b)
     if valid.any():
         i, j, k = np.where(valid)
         _accumulate_contact_1d(
@@ -1037,8 +1038,138 @@ def _gating_node_velocities(
     if not contacts:
         return []
 
-    # Per-component design area: split the user/design section totals among the
-    # actual components proportional to their voxel throat areas.
+    # Source selection: prefer the component selected by the user.
+    source_candidates = [
+        cid for cid, (bt, _) in comp_meta.items()
+        if bt in {BodyType.POURING_BASIN, BodyType.SPRUE_THROAT, BodyType.SPRUE} and cid != part_id
+    ]
+
+    def _upstream_rank(cid: int) -> float:
+        return float(-np.dot(comp_centroids[cid], g_u))
+
+    if source_candidates:
+        source_id = max(source_candidates, key=_upstream_rank)
+    else:
+        source_id = max((cid for cid in comp_meta if cid != part_id), key=_upstream_rank)
+
+    # Build undirected adjacency and orient it by BFS from the source.
+    adj: Dict[int, List[Dict]] = {cid: [] for cid in comp_meta if cid != part_id}
+    for c in contacts:
+        adj.setdefault(c["id1"], []).append(c)
+        adj.setdefault(c["id2"], []).append(c)
+
+    parent: Dict[int, int] = {source_id: -1}
+    outgoing: Dict[int, List[Dict]] = {cid: [] for cid in comp_meta if cid != part_id}
+    queue = [source_id]
+    visited = {source_id}
+    order = [source_id]
+
+    while queue:
+        current = queue.pop(0)
+        for c in adj.get(current, []):
+            other = c["id1"] if c["id2"] == current else c["id2"]
+            if other == part_id:
+                outgoing[current].append(c)
+                c["up_id"] = current
+                c["down_id"] = part_id
+                continue
+            if other in visited:
+                continue
+            visited.add(other)
+            parent[other] = current
+            outgoing[current].append(c)
+            c["up_id"] = current
+            c["down_id"] = other
+            queue.append(other)
+            order.append(other)
+
+    # Component throat areas will be filled after the contact-based mesh
+    # sections are computed below.  Initialize with inf (part) and zero.
+    comp_section_m2: Dict[int, Tuple[float, float, float]] = {
+        part_id: (float("inf"), float("inf"), float("inf"))
+    }
+    for cid in comp_cells:
+        if cid != part_id:
+            comp_section_m2[cid] = (0.0, 0.0, 0.0)
+
+
+
+    def _mesh_section_area_m2(mesh, plane_origin, plane_normal) -> float:
+        """Return the throat area (m²) of a mesh near a contact plane.
+
+        The plane is oriented perpendicular to the component's flow axis and we
+        sweep a short distance around the contact to find the largest stable
+        polygon area.  The largest avoids the tiny slivers produced when a plane
+        just clips the body, while a small L prevents moving into an expanding
+        tapered section.
+        """
+        if mesh is None or len(mesh.faces) == 0:
+            return 0.0
+        try:
+            plane_origin = np.asarray(plane_origin, dtype=np.float64)
+            n = np.asarray(plane_normal, dtype=np.float64)
+            if np.linalg.norm(n) < 1e-18:
+                n = -g_u
+            n = n / np.linalg.norm(n)
+            L = max(dx_mm * 0.5, 0.05)
+            steps = np.concatenate([
+                np.linspace(-L, -0.1 * L, 4),
+                [0.0],
+                np.linspace(0.1 * L, L, 4),
+            ])
+            best = 0.0
+            for s in steps:
+                section = mesh.section(plane_origin=plane_origin + s * n, plane_normal=n)
+                if section is None:
+                    continue
+                path2d = section.to_2D()
+                if isinstance(path2d, tuple):
+                    path2d = path2d[0]
+                area_mm2 = float(path2d.area)
+                if area_mm2 > 1e-12:
+                    best = max(best, area_mm2)
+            return best * 1e-6
+        except Exception:
+            return 0.0
+
+    # Compute the real throat/contact area for each contact from the CAD mesh.
+    # Each contact area is the minimum of the two body cross-sections taken
+    # perpendicular to the contact normal.  We also record the smallest such
+    # cross-section for each component, which is its throat for design scaling.
+    for c in contacts:
+        id1, id2 = c["id1"], c["id2"]
+        body1 = comp_body.get(id1)
+        body2 = comp_body.get(id2)
+        plane_origin = c["centroid_mm"]
+        normal = c.get("normal", -g_u)
+
+        a1 = _mesh_section_area_m2(body1.mesh if body1 else None, plane_origin, normal)
+        a2 = _mesh_section_area_m2(body2.mesh if body2 else None, plane_origin, normal)
+        if a1 > 1e-18 and a2 > 1e-18:
+            a_mesh = float(min(a1, a2))
+        elif a1 > 1e-18 or a2 > 1e-18:
+            a_mesh = float(max(a1, a2))
+        else:
+            a_mesh = 0.0
+
+        # Update component throat (minimum self-section at any contact).
+        for cid, a_self in ((id1, a1), (id2, a2)):
+            if cid == part_id:
+                continue
+            if a_self > 1e-18:
+                old = comp_section_m2.get(cid, (0.0, 0.0, 0.0))
+                new_throat = min(old[2], a_self) if old[2] > 1e-18 else a_self
+                comp_section_m2[cid] = (new_throat, new_throat, new_throat)
+
+        # Voxel shared-face area is a robust fallback when the mesh section fails.
+        voxel_area_m2 = float(c.get("voxel_area_m2", 0.0))
+        a_contact = max(a_mesh, voxel_area_m2)
+
+        # The design caps are applied after comp_design_m2 is recomputed below,
+        # so we just store the raw physical contact area for now.
+        c["area_raw_m2"] = float(a_contact)
+
+    # Design caps: source area, and total INGATE area split by throat.
     section_key_to_type = {
         "SPRUE_THROAT": BodyType.SPRUE,
         "SPRUE_BASE": BodyType.SPRUE,
@@ -1066,142 +1197,30 @@ def _gating_node_velocities(
             raw_throat_per_type[btype] = raw_throat_per_type.get(btype, 0.0) + float(throat)
 
     comp_design_m2: Dict[int, float] = {}
+    ingate_design_total = type_design_total.get(BodyType.INGATE, 0.0)
+    ingate_raw_total = raw_throat_per_type.get(BodyType.INGATE, 0.0)
     for cid in comp_meta:
         if cid == part_id:
             continue
         btype = comp_meta[cid][0]
-        raw_throat = comp_section_m2[cid][2]
-        design_total = type_design_total.get(btype, 0.0)
-        raw_type = raw_throat_per_type.get(btype, 0.0)
-        if design_total > 1e-18 and raw_type > 1e-18:
-            comp_design_m2[cid] = design_total * (raw_throat / raw_type)
-        elif design_total > 1e-18:
-            comp_design_m2[cid] = design_total
+        if cid == source_id:
+            comp_design_m2[cid] = float(source_area_m2)
+        elif btype == BodyType.INGATE and ingate_design_total > 1e-18 and ingate_raw_total > 1e-18:
+            raw_throat = comp_section_m2[cid][2]
+            comp_design_m2[cid] = ingate_design_total * (raw_throat / ingate_raw_total)
         else:
-            comp_design_m2[cid] = float(raw_throat)
+            comp_design_m2[cid] = float("inf")
 
-    def _mesh_section_area_m2(mesh, plane_origin, plane_normal) -> float:
-        """Return the throat area (m²) of a mesh near a contact plane.
-
-        The plane may lie on a mesh boundary, so we sweep a small distance on both
-        sides of the plane and return the SMALLEST non-degenerate polygon area.
-        This gives the true throat at the contact without overestimating due to
-        the body expanding away from the interface.
-        """
-        if mesh is None or len(mesh.faces) == 0:
-            return 0.0
-        try:
-            plane_origin = np.asarray(plane_origin, dtype=np.float64)
-            n = np.asarray(plane_normal, dtype=np.float64)
-            if np.linalg.norm(n) < 1e-18:
-                n = -g_u
-            n = n / np.linalg.norm(n)
-            # Sweep up to two voxels in each direction; sample finer near the plane.
-            L = max(dx_mm * 2.0, 0.1)
-            steps = np.concatenate([
-                np.linspace(-L, -0.25 * L, 4),
-                np.linspace(-0.2 * L, 0.2 * L, 5),
-                np.linspace(0.25 * L, L, 4),
-            ])
-            best = 0.0
-            for s in steps:
-                section = mesh.section(plane_origin=plane_origin + s * n, plane_normal=n)
-                if section is None:
-                    continue
-                path2d = section.to_2D()
-                if isinstance(path2d, tuple):
-                    path2d = path2d[0]
-                area_mm2 = float(path2d.area)
-                if area_mm2 > 1e-12 and (best == 0.0 or area_mm2 < best):
-                    best = area_mm2
-            return best * 1e-6
-        except Exception:
-            return 0.0
-
-    def _voxel_fallback_area(cid1: int, cid2: int) -> float:
-        a1 = comp_section_m2.get(cid1, (0.0, 0.0, 0.0))[2]
-        a2 = comp_section_m2.get(cid2, (0.0, 0.0, 0.0))[2]
-        if a1 <= 1e-18 or a2 <= 1e-18:
-            return 0.0
-        return float(min(a1, a2))
-
-    # Source selection: prefer the component selected by the user.
-    source_candidates = [
-        cid for cid, (bt, _) in comp_meta.items()
-        if bt in {BodyType.POURING_BASIN, BodyType.SPRUE_THROAT, BodyType.SPRUE} and cid != part_id
-    ]
-
-    def _upstream_rank(cid: int) -> float:
-        return float(-np.dot(comp_centroids[cid], g_u))
-
-    if source_candidates:
-        source_id = max(source_candidates, key=_upstream_rank)
-    else:
-        source_id = max((cid for cid in comp_meta if cid != part_id), key=_upstream_rank)
-
-    # The user-selected source area always wins for the source component.
-    comp_design_m2[source_id] = float(source_area_m2)
-
-    # Compute mesh-section throat area for each contact and cap by component design areas.
+    # Apply design caps to the raw contact areas.
     for c in contacts:
         id1, id2 = c["id1"], c["id2"]
-        body1 = comp_body.get(id1)
-        body2 = comp_body.get(id2)
-        normal = c.get("normal", -g_u)
-        plane_origin = c["centroid_mm"]
-
-        a1 = _mesh_section_area_m2(body1.mesh if body1 else None, plane_origin, -normal)
-        a2 = _mesh_section_area_m2(body2.mesh if body2 else None, plane_origin, normal)
-        if a1 > 1e-18 and a2 > 1e-18:
-            a_mesh = float(min(a1, a2))
-        elif a1 > 1e-18 or a2 > 1e-18:
-            a_mesh = float(max(a1, a2))
-        else:
-            a_mesh = 0.0
-
-        # The voxel shared-face area is a robust contact area; the mesh section may
-        # fail when bodies overlap. Use the larger of the two, then cap by design.
-        voxel_area_m2 = float(c.get("voxel_area_m2", 0.0))
-        a_contact = max(a_mesh, voxel_area_m2)
-
+        a_contact = c["area_raw_m2"]
         design1 = comp_design_m2.get(id1, float("inf"))
         design2 = comp_design_m2.get(id2, float("inf"))
         if a_contact > 1e-18:
             c["area_m2"] = float(min(a_contact, design1, design2))
         else:
             c["area_m2"] = float(min(design1, design2))
-
-    # Build undirected adjacency and orient it by BFS from the source.
-    adj: Dict[int, List[Dict]] = {cid: [] for cid in comp_meta if cid != part_id}
-    for c in contacts:
-        adj.setdefault(c["id1"], []).append(c)
-        adj.setdefault(c["id2"], []).append(c)
-
-    parent: Dict[int, int] = {source_id: -1}
-    outgoing: Dict[int, List[Dict]] = {cid: [] for cid in comp_meta if cid != part_id}
-    queue = [source_id]
-    visited = {source_id}
-    order = [source_id]
-
-    while queue:
-        current = queue.pop(0)
-        for c in adj.get(current, []):
-            other = c["id1"] if c["id2"] == current else c["id2"]
-            if other == part_id:
-                # part is the sink; current is upstream
-                outgoing[current].append(c)
-                c["up_id"] = current
-                c["down_id"] = part_id
-                continue
-            if other in visited:
-                continue
-            visited.add(other)
-            parent[other] = current
-            outgoing[current].append(c)
-            c["up_id"] = current
-            c["down_id"] = other
-            queue.append(other)
-            order.append(other)
 
     # Propagate Q and compute velocities.
     Q_in: Dict[int, float] = {cid: 0.0 for cid in comp_meta if cid != part_id}
@@ -1261,6 +1280,7 @@ def _gating_node_velocities(
     rank_by_name = {comp_meta[cid][1]: _upstream_rank(cid) for cid in comp_meta if cid != part_id}
     nodes.sort(key=lambda n: (-rank_by_name.get(n.name.split(" → ")[0], 0.0), n.body_type))
     return nodes
+
 
 def solve_filling_flow(
     grid: np.ndarray,
