@@ -514,6 +514,66 @@ class MainWindow(QtWidgets.QMainWindow):
         self.flow_node_toggle.toggled.connect(self.on_toggle_flow_node_labels)
         vis_layout.addWidget(self.flow_node_toggle)
 
+        anim_group = QtWidgets.QGroupBox("Akış Animasyonu")
+        anim_layout = QtWidgets.QVBoxLayout(anim_group)
+
+        self.flow_anim_toggle = QtWidgets.QCheckBox("Gerçek Akış (Parçacık)")
+        self.flow_anim_toggle.setToolTip("Döküm ağzından parçaya akan sıvı metal animasyonu")
+        self.flow_anim_toggle.setChecked(False)
+        self.flow_anim_toggle.toggled.connect(self.on_toggle_flow_animation)
+        anim_layout.addWidget(self.flow_anim_toggle)
+
+        play_layout = QtWidgets.QHBoxLayout()
+        self.flow_play_btn = QtWidgets.QPushButton("▶ Oynat")
+        self.flow_play_btn.setEnabled(False)
+        self.flow_play_btn.clicked.connect(self.on_flow_play_clicked)
+        play_layout.addWidget(self.flow_play_btn)
+
+        self.flow_time_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.flow_time_slider.setMinimum(0)
+        self.flow_time_slider.setMaximum(1000)
+        self.flow_time_slider.setValue(0)
+        self.flow_time_slider.setEnabled(False)
+        self.flow_time_slider.valueChanged.connect(self.on_flow_time_changed)
+        play_layout.addWidget(self.flow_time_slider)
+        anim_layout.addLayout(play_layout)
+
+        self.flow_time_label = QtWidgets.QLabel("t: 0.00 s | dolma: %0")
+        self.flow_time_label.setEnabled(False)
+        anim_layout.addWidget(self.flow_time_label)
+
+        speed_layout = QtWidgets.QHBoxLayout()
+        speed_label = QtWidgets.QLabel("Hız:")
+        self.flow_speed_spin = QtWidgets.QDoubleSpinBox()
+        self.flow_speed_spin.setRange(0.1, 5.0)
+        self.flow_speed_spin.setValue(1.0)
+        self.flow_speed_spin.setSingleStep(0.25)
+        self.flow_speed_spin.setDecimals(2)
+        self.flow_speed_spin.setSuffix("x")
+        self.flow_speed_spin.valueChanged.connect(self.on_flow_speed_changed)
+        speed_layout.addWidget(speed_label)
+        speed_layout.addWidget(self.flow_speed_spin)
+
+        count_label = QtWidgets.QLabel("Parçacık:")
+        self.flow_particle_spin = QtWidgets.QSpinBox()
+        self.flow_particle_spin.setRange(1000, 25000)
+        self.flow_particle_spin.setValue(6000)
+        self.flow_particle_spin.setSingleStep(1000)
+        self.flow_particle_spin.setSuffix(" adet")
+        self.flow_particle_spin.valueChanged.connect(self.on_flow_particle_count_changed)
+        speed_layout.addWidget(count_label)
+        speed_layout.addWidget(self.flow_particle_spin)
+        anim_layout.addLayout(speed_layout)
+
+        self.flow_surface_check = QtWidgets.QCheckBox("Yoğunluk yüzeyi (deneysel)")
+        self.flow_surface_check.setToolTip("Parçacık bulutundan pürüzsüz akışkan yüzeyi oluştur")
+        self.flow_surface_check.setChecked(False)
+        self.flow_surface_check.setEnabled(False)
+        self.flow_surface_check.toggled.connect(self.on_flow_surface_toggled)
+        anim_layout.addWidget(self.flow_surface_check)
+
+        vis_layout.addWidget(anim_group)
+
         self.path_toggle = QtWidgets.QCheckBox("Besleme Yolları")
         self.path_toggle.setToolTip("Hot spot'tan besleyiciye/gating'e giden yol")
         self.path_toggle.setChecked(True)
@@ -1024,6 +1084,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.local_toggle.isChecked():
                 self.viewer.show_local_regions(self._analysis, self.slice_field.currentData())
             self.viewer.show_hotspots(self._analysis)
+            self._update_flow_controls()
+            if self.flow_anim_toggle.isChecked() and self._analysis.flow_result is not None:
+                self.viewer.toggle_flow_animation(self._analysis, True)
         except Exception as e:
             import traceback
             self.aiLog(f"Analiz hatası: {e}", "crit")
@@ -1348,6 +1411,70 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_toggle_flow_node_labels(self, checked: bool):
         if self._analysis:
             self.viewer.toggle_flow_node_labels(self._analysis, checked)
+
+    def _update_flow_controls(self):
+        enabled = bool(self._analysis and self._analysis.flow_result)
+        self.flow_anim_toggle.setEnabled(enabled)
+        if not self.flow_anim_toggle.isChecked():
+            self.flow_play_btn.setEnabled(False)
+            self.flow_time_slider.setEnabled(False)
+            self.flow_surface_check.setEnabled(False)
+            self.flow_time_label.setEnabled(False)
+        animator = self.viewer.flow_animator
+        if animator and animator._max_time > 0:
+            t = animator._current_time
+            ratio = t / animator._max_time
+            self.flow_time_slider.blockSignals(True)
+            self.flow_time_slider.setValue(int(round(ratio * 1000)))
+            self.flow_time_slider.blockSignals(False)
+            fill_percent = 0
+            if self._analysis and self._analysis.flow_result and self._analysis.flow_result.fill_time is not None:
+                ft = self._analysis.flow_result.fill_time
+                valid = np.isfinite(ft) & (ft > 0)
+                if valid.any():
+                    fill_percent = int((ft[valid] <= t).sum() / valid.sum() * 100)
+            self.flow_time_label.setText(f"t: {t:.2f} s | dolma: %{fill_percent}")
+
+    def on_toggle_flow_animation(self, checked: bool):
+        if self._analysis:
+            self.viewer.toggle_flow_animation(self._analysis, checked)
+        self.flow_play_btn.setEnabled(checked and bool(self._analysis and self._analysis.flow_result))
+        self.flow_time_slider.setEnabled(checked)
+        self.flow_surface_check.setEnabled(checked)
+        self.flow_time_label.setEnabled(checked)
+        if checked:
+            self._update_flow_controls()
+            # Do not auto-play; user presses the play button.
+        else:
+            self.flow_play_btn.setText("▶ Oynat")
+
+    def on_flow_play_clicked(self):
+        if self.viewer.flow_animator is None:
+            return
+        self.viewer.flow_animator.play()
+        self.flow_play_btn.setText(
+            "⏸ Duraklat" if self.viewer.flow_animator._is_running else "▶ Oynat"
+        )
+
+    def on_flow_time_changed(self, value: int):
+        if self.viewer.flow_animator is None or not self.flow_anim_toggle.isChecked():
+            return
+        ratio = value / 1000.0
+        t = ratio * self.viewer.flow_animator._max_time
+        self.viewer.flow_animator.set_current_time(t)
+        self._update_flow_controls()
+
+    def on_flow_speed_changed(self, value: float):
+        if self.viewer.flow_animator is not None:
+            self.viewer.flow_animator.set_speed_multiplier(value)
+
+    def on_flow_particle_count_changed(self, value: int):
+        if self.viewer.flow_animator is not None:
+            self.viewer.flow_animator.set_particle_count(value)
+
+    def on_flow_surface_toggled(self, checked: bool):
+        if self.viewer.flow_animator is not None:
+            self.viewer.flow_animator.set_show_surface(checked)
 
     def on_toggle_feeding_paths(self, checked: bool):
         if self._analysis:

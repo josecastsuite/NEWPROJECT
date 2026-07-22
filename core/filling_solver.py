@@ -1478,7 +1478,12 @@ def solve_filling_flow(
     v *= scale
     w *= scale
 
-    vmag = _cell_velocity_magnitude(u, v, w)
+    # Cell-centered velocity components on the solver (coarse) grid.
+    ux_c = 0.5 * (u[:-1] + u[1:])
+    vy_c = 0.5 * (v[:, :-1] + v[:, 1:])
+    wz_c = 0.5 * (w[:, :, :-1] + w[:, :, 1:])
+
+    vmag = np.sqrt(ux_c * ux_c + vy_c * vy_c + wz_c * wz_c)
     vmag = np.nan_to_num(vmag, posinf=0.0, neginf=0.0)
 
     if progress_callback:
@@ -1515,21 +1520,26 @@ def solve_filling_flow(
         )
         fill_time_fine = np.where(grid > 0, fill_time_fine, 0.0)
 
-    # Upsample velocity magnitude to the (fine) input grid for surface overlay
-    # and per-gate velocity calculation.
+    # Upsample the 3-D velocity vector and magnitude to the (fine) input grid
+    # for surface overlay, node velocity checks and particle animation.
     if vmag.shape == grid.shape:
-        vmag_fine = vmag
+        vx_f, vy_f, vz_f = ux_c, vy_c, wz_c
     else:
-        vmag_fine = ndimage.zoom(
-            vmag,
-            (
-                grid.shape[0] / vmag.shape[0],
-                grid.shape[1] / vmag.shape[1],
-                grid.shape[2] / vmag.shape[2],
-            ),
-            order=1,
-        )
-        vmag_fine = np.where(grid > 0, vmag_fine, 0.0)
+        zoom = tuple(grid.shape[i] / vmag.shape[i] for i in range(3))
+        vx_f = ndimage.zoom(ux_c, zoom, order=1)
+        vy_f = ndimage.zoom(vy_c, zoom, order=1)
+        vz_f = ndimage.zoom(wz_c, zoom, order=1)
+
+    fine_metal = grid > 0
+    velocity = np.stack(
+        [
+            np.where(fine_metal, vx_f, 0.0),
+            np.where(fine_metal, vy_f, 0.0),
+            np.where(fine_metal, vz_f, 0.0),
+        ],
+        axis=0,
+    ).astype(np.float32)
+    vmag_fine = np.linalg.norm(velocity, axis=0)
 
     # Contact-node velocities / areas for every gating-gating and gating-part interface.
     # Uses a pure hydraulic Q = vA network on the CAD mesh cross-sections; Darcy is
@@ -1580,6 +1590,7 @@ def solve_filling_flow(
         inlet_area_m2=area_m2,
         fill_time_s=fill_time_s,
         velocity_magnitude=vmag_fine,
+        velocity=velocity,
         fill_time=fill_time_fine,
         solver_grid=grid_c,
         solver_dx_mm=dx_c,

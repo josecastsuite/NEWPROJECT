@@ -15,6 +15,7 @@ from core.gating import (
 from core.materials import get_alloy
 from core.sdf_analyzer import _trace_path_to_riser
 from core.types import AnalysisResult, Body, BodyType, RefinementRegion
+from ui.flow_animator import FlowAnimator
 
 
 BODY_COLORS = {
@@ -112,8 +113,10 @@ class Analyzer3DViewer(QtInteractor):
         self._section_picker = None
         self._flow_actor = None
         self._flow_node_actor = None
+        self.flow_animator = FlowAnimator(self)
 
     def clear_scene(self):
+        self.flow_animator.stop()
         self.clear_actors()
         self.add_axes(line_width=2, color="#00ffff")
         self._body_actors.clear()
@@ -706,6 +709,12 @@ class Analyzer3DViewer(QtInteractor):
             if self._flow_node_actor is not None:
                 self.remove_actor(self._flow_node_actor)
                 self._flow_node_actor = None
+
+    def toggle_flow_animation(self, result: AnalysisResult, checked: bool):
+        if checked:
+            self.flow_animator.set_result(result)
+        else:
+            self.flow_animator.stop()
 
     def toggle_feeding_paths(self, result: AnalysisResult, checked: bool):
         if checked:

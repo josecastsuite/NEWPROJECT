@@ -253,6 +253,7 @@ class FillingResult:
     inlet_area_m2: float = 0.0
     fill_time_s: float = 0.0
     velocity_magnitude: Optional[np.ndarray] = None
+    velocity: Optional[np.ndarray] = None  # (3, nz, ny, nx) vector field (m/s)
     fill_time: Optional[np.ndarray] = None
     solver_grid: Optional[np.ndarray] = None
     solver_dx_mm: float = 0.0
