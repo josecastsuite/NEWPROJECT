@@ -557,7 +557,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         count_label = QtWidgets.QLabel("Akış:")
         self.flow_particle_label = QtWidgets.QLabel("—")
-        self.flow_particle_label.setToolTip("Akış hattı ve marker sayısı")
+        self.flow_particle_label.setToolTip("Akış hattı ve dolma noktası sayısı")
         speed_layout.addWidget(count_label)
         speed_layout.addWidget(self.flow_particle_label)
         anim_layout.addLayout(speed_layout)
@@ -1427,7 +1427,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.flow_time_label.setText(f"t: {t:.3f} s / {animator._max_time:.3f} s")
             if animator:
                 self.flow_particle_label.setText(
-                    f"{animator.line_count()} hat, {animator.particle_count()} marker"
+                    f"{animator.line_count()} hat, {animator.particle_count()} nokta"
                 )
 
     def on_toggle_flow_animation(self, checked: bool):
