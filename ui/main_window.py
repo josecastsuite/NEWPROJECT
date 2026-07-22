@@ -518,8 +518,8 @@ class MainWindow(QtWidgets.QMainWindow):
         anim_group = QtWidgets.QGroupBox("Akış Animasyonu")
         anim_layout = QtWidgets.QVBoxLayout(anim_group)
 
-        self.flow_anim_toggle = QtWidgets.QCheckBox("Gerçek Akış (Parçacık)")
-        self.flow_anim_toggle.setToolTip("Döküm ağzından parçaya akan sıvı metal animasyonu")
+        self.flow_anim_toggle = QtWidgets.QCheckBox("Akış Cephesi")
+        self.flow_anim_toggle.setToolTip("Metalin doldurma anında gerçek 3B cephe yüzeyi (fill_time izoyüzeyi)")
         self.flow_anim_toggle.setChecked(False)
         self.flow_anim_toggle.toggled.connect(self.on_toggle_flow_animation)
         anim_layout.addWidget(self.flow_anim_toggle)
@@ -555,16 +555,16 @@ class MainWindow(QtWidgets.QMainWindow):
         speed_layout.addWidget(speed_label)
         speed_layout.addWidget(self.flow_speed_spin)
 
-        count_label = QtWidgets.QLabel("Akış çizgisi:")
+        count_label = QtWidgets.QLabel("Cephe noktası:")
         self.flow_particle_label = QtWidgets.QLabel("—")
-        self.flow_particle_label.setToolTip("Girişten üretilen ilerleyen akış çizgisi sayısı")
+        self.flow_particle_label.setToolTip("Akış cephesi ve çizgilerinin toplam görsel eleman sayısı")
         speed_layout.addWidget(count_label)
         speed_layout.addWidget(self.flow_particle_label)
         anim_layout.addLayout(speed_layout)
 
-        self.flow_surface_check = QtWidgets.QCheckBox("Yoğunluk yüzeyi (deneysel)")
-        self.flow_surface_check.setToolTip("Parçacık bulutundan pürüzsüz akışkan yüzeyi oluştur")
-        self.flow_surface_check.setChecked(False)
+        self.flow_surface_check = QtWidgets.QCheckBox("Akış çizgileri")
+        self.flow_surface_check.setToolTip("Cephenin üzerine ilerleyen akış çizgileri ekler")
+        self.flow_surface_check.setChecked(True)
         self.flow_surface_check.setEnabled(False)
         self.flow_surface_check.toggled.connect(self.on_flow_surface_toggled)
         anim_layout.addWidget(self.flow_surface_check)
@@ -1471,7 +1471,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_flow_surface_toggled(self, checked: bool):
         if self.viewer.flow_animator is not None:
-            self.viewer.flow_animator.set_show_surface(checked)
+            self.viewer.flow_animator.set_show_streamlines(checked)
 
     def on_toggle_feeding_paths(self, checked: bool):
         if self._analysis:
