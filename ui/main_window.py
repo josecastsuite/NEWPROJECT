@@ -7,6 +7,7 @@ import webbrowser
 from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pyvista as pv
 from PyQt6 import QtCore, QtGui, QtWidgets
 
