@@ -1,9 +1,9 @@
-"""Flow-animation engine for JoséCast Analyzer.
+"""Lightweight flow-animation engine for JoséCast Analyzer.
 
-Renders the metal fill front as an animated isosurface of ``fill_time`` and,
-optionally, overlaid streamlines/pathlines.  The fill front is the commercial
-standard (used by ProCAST, MAGMASOFT, FLOW-3D CAST, Altair Inspire Cast) and
-is always consistent with the Darcy solver's ``velocity`` / ``fill_time`` field.
+Shows 20 red streamlines as thickness-matched tubes and a moving red marker
+along each path.  The Darcy solver's ``velocity`` / ``fill_time`` fields are
+used for the path and timing, so the visual is consistent with the engineering
+values but adds no extra physics of its own.
 """
 
 from typing import List, Optional
@@ -17,15 +17,15 @@ from core.types import AnalysisResult
 
 
 class FlowAnimator(QtCore.QObject):
-    """Animate metal flow as a 3-D fill front (isosurface of fill_time)."""
+    """Animate metal flow as 20 red streamlines with channel-aware thickness."""
 
-    TIMER_INTERVAL = 0.10
+    TIMER_INTERVAL = 0.05
     FRAME_DT = 0.02
-    MAX_STREAMLINES = 120
+    MAX_STREAMLINES = 20
     MAX_STEPS = 2000
     CFL_FRACTION = 0.5
-    LINE_WIDTH = 3
-    FRONT_OPACITY = 0.82
+    N_SIDES = 4
+    MARKER_SIZE = 10
 
     def __init__(self, viewer):
         super().__init__(parent=None)
@@ -34,28 +34,27 @@ class FlowAnimator(QtCore.QObject):
         self._timer.timeout.connect(self._on_timer)
 
         self._result: Optional[AnalysisResult] = None
-        self._flow_grid: Optional[pv.ImageData] = None
         self._streamlines: Optional[pv.PolyData] = None
+        self._tube_mesh: Optional[pv.PolyData] = None
+        self._edt: Optional[np.ndarray] = None
         self._max_time: float = 0.0
 
         self._is_running: bool = False
         self._current_time: float = 0.0
         self._speed_multiplier: float = 1.0
-        self._show_front: bool = True
         self._show_streamlines: bool = True
 
-        self._front_actor = None
         self._streamline_actor = None
-        self._current_front = None
-        self._current_vis = None
+        self._marker_actor = None
 
     def set_result(self, result: Optional[AnalysisResult]) -> None:
-        """Attach a completed analysis result and build the fill front."""
+        """Attach a completed analysis result and build the streamlines."""
         self.stop()
         self._clear_actors()
         self._result = result
-        self._flow_grid = None
         self._streamlines = None
+        self._tube_mesh = None
+        self._edt = None
 
         if result is None or result.flow_result is None:
             return
@@ -90,45 +89,33 @@ class FlowAnimator(QtCore.QObject):
         if self._max_time <= 0.0:
             return
 
-        self._flow_grid = self._build_flow_grid()
-        if self._flow_grid is None:
+        # Channel-thickness proxy for tube radius: distance to nearest non-metal.
+        self._edt = ndimage.distance_transform_edt(metal) * self._dx
+
+        source_pts = self._build_source_points()
+        if source_pts is None or source_pts.shape[0] == 0:
             return
 
-        # Optional streamlines for line-trace overlay.
-        source_pts = self._build_source_points()
-        if source_pts is not None and source_pts.shape[0] > 0:
-            try:
-                self._streamlines = self._integrate_streamlines(source_pts)
-            except Exception:
-                self._streamlines = None
+        try:
+            self._streamlines = self._integrate_streamlines(source_pts)
+        except Exception:
+            self._streamlines = None
+
+        if self._streamlines is None or self._streamlines.n_points == 0:
+            return
+
+        self._streamlines = self._trim_streamlines(self._streamlines)
+        if self._streamlines is None or self._streamlines.n_points == 0:
+            return
+
+        self._compute_streamline_radius()
+        self._build_tube_mesh()
 
         self._current_time = 0.0
         self._update_scene()
 
-    def _build_flow_grid(self) -> Optional[pv.ImageData]:
-        """Create a PyVista ImageData with the fill_time scalar.
-
-        Outside-metal cells are given a sentinel value larger than max_time so
-        the isosurface only appears inside the metal region and naturally stops
-        at the metal/air boundary.
-        """
-        nx, ny, nz = self._shape
-        ft = self._fill_time.copy()
-        # Use a sentinel comfortably above max_time; contour uses it as the
-        # outside domain value.
-        sentinel = self._max_time + 1.0
-        ft[self._result.grid == 0] = sentinel
-
-        image = pv.ImageData(dimensions=(nx, ny, nz))
-        image.origin = tuple(self._origin + 0.5 * self._dx)
-        image.spacing = (self._dx, self._dx, self._dx)
-        # PyVista/VTK ImageData point IDs use x-fastest (Fortran-order)
-        # ordering for the (nx, ny, nz) point array.
-        image['fill_time'] = ft.ravel(order='F').astype(np.float64)
-        return image
-
     def _build_source_points(self) -> Optional[np.ndarray]:
-        """Seed streamline start points uniformly across the inlet cells."""
+        """Seed up to MAX_STREAMLINES start points uniformly across the inlet."""
         metal = self._result.grid > 0
         finite_fill = np.isfinite(self._fill_time)
         inlet_mask = finite_fill & (self._fill_time <= 1e-9) & metal
@@ -149,11 +136,7 @@ class FlowAnimator(QtCore.QObject):
         return inlet_idx * self._dx + self._origin + 0.5 * self._dx
 
     def _sample_velocity(self, pos: np.ndarray) -> np.ndarray:
-        """Trilinear interpolation of the Darcy velocity field (m/s).
-
-        The velocity array is cell-centred, so we shift by half a voxel when
-        converting physical coordinates to map_coordinates indices.
-        """
+        """Trilinear interpolation of the Darcy velocity field (m/s)."""
         if pos.shape[0] == 0:
             return np.empty((0, 3), dtype=np.float64)
         inv_dx = 1.0 / self._dx
@@ -170,6 +153,22 @@ class FlowAnimator(QtCore.QObject):
                 cval=0.0,
             )
         return out
+
+    def _sample_scalar(self, pos: np.ndarray, field: np.ndarray) -> np.ndarray:
+        """Trilinear interpolation of a scalar voxel field at physical positions."""
+        if pos.shape[0] == 0:
+            return np.empty(0, dtype=np.float64)
+        inv_dx = 1.0 / self._dx
+        ijk = (pos - self._origin) * inv_dx - 0.5
+        ijk = np.ascontiguousarray(ijk, dtype=np.float64)
+        coords = np.stack([ijk[:, 0], ijk[:, 1], ijk[:, 2]], axis=0)
+        return ndimage.map_coordinates(
+            field,
+            coords,
+            order=1,
+            mode='constant',
+            cval=0.0,
+        )
 
     def _inside_metal(self, pos: np.ndarray) -> np.ndarray:
         """Nearest-neighbour metal mask check for streamline integration."""
@@ -188,7 +187,7 @@ class FlowAnimator(QtCore.QObject):
         return sampled > 0.5
 
     def _integrate_streamlines(self, source_pts: np.ndarray) -> Optional[pv.PolyData]:
-        """Integrate streamlines from inlet seeds through the velocity field."""
+        """Integrate streamlines from inlet seeds through the Darcy velocity field."""
         n = source_pts.shape[0]
         pos = source_pts.copy().astype(np.float64)
         active = np.ones(n, dtype=bool)
@@ -198,13 +197,11 @@ class FlowAnimator(QtCore.QObject):
         line_vel: List[List[float]] = [[] for _ in range(n)]
         line_time: List[List[float]] = [[] for _ in range(n)]
 
-        # Record source points at t=0.
         for i in range(n):
             line_points[i].append(pos[i].copy())
             line_vel[i].append(0.0)
             line_time[i].append(0.0)
 
-        # Adaptive step budget: ensure the fastest trajectory can reach max_time.
         vmag = np.linalg.norm(self._velocity, axis=0)
         max_speed = float(np.nanmax(vmag)) if vmag.size else 0.0
         if max_speed > 0.0:
@@ -225,7 +222,6 @@ class FlowAnimator(QtCore.QObject):
             v = self._sample_velocity(pos_active)
             speed = np.linalg.norm(v, axis=1)
 
-            # Stop stagnant lines individually.
             stop = speed <= 1e-9
             if stop.any():
                 stop_global = active_indices[stop]
@@ -238,7 +234,6 @@ class FlowAnimator(QtCore.QObject):
                     break
                 active_indices = np.nonzero(active)[0]
 
-            # Choose dt so the fastest point moves at most CFL_FRACTION voxels.
             dt_space = self.CFL_FRACTION * self._dx / (1000.0 * speed.max())
             dt_time = self._max_time / max_steps
             dt = float(min(dt_space, dt_time))
@@ -286,7 +281,7 @@ class FlowAnimator(QtCore.QObject):
         poly.lines = np.array(lines, dtype=np.int64)
         poly['velocity_magnitude'] = np.array(magnitudes, dtype=np.float64)
         poly['arrival_time'] = np.array(arrival, dtype=np.float64)
-        return self._trim_streamlines(poly)
+        return poly
 
     def _trim_streamlines(self, poly: pv.PolyData) -> Optional[pv.PolyData]:
         """Remove any trailing points of each line that fell just outside metal."""
@@ -332,81 +327,87 @@ class FlowAnimator(QtCore.QObject):
         trimmed['arrival_time'] = np.concatenate(out_arr)
         return trimmed
 
-    def _build_front(self, t: float) -> Optional[pv.PolyData]:
-        """Return the metal fill front as an isosurface of fill_time = t."""
-        if self._flow_grid is None:
-            return None
-        t = float(np.clip(t, 0.0, self._max_time))
-        # A tiny offset guarantees the inlet surface is visible at t=0.
-        t = max(t, 1e-9)
-        front = self._flow_grid.contour([t], scalars='fill_time')
-        if front.n_points == 0:
-            return None
-        # Color the front by the local Darcy velocity at its surface points.
-        v = self._sample_velocity(front.points)
-        mag = np.linalg.norm(v, axis=1)
-        front['velocity_magnitude'] = mag.astype(np.float64)
-        return front
+    def _compute_streamline_radius(self) -> None:
+        """Add a per-point tube radius based on the local channel thickness."""
+        if self._streamlines is None or self._edt is None:
+            return
 
-    def _visible_streamlines(self, t: float) -> Optional[pv.PolyData]:
-        """Return the portion of each streamline that has arrived by time t."""
+        radii = self._sample_scalar(self._streamlines.points, self._edt)
+        # Smooth a little so the radius follows the channel centreline rather
+        # than hugging wall bumps.
+        lines = self._streamlines.lines
+        out_radii = np.empty(self._streamlines.n_points, dtype=np.float64)
+        idx = 0
+        while idx < len(lines):
+            n = int(lines[idx])
+            inds = lines[idx + 1 : idx + 1 + n]
+            idx += 1 + n
+            seg = radii[inds]
+            seg = ndimage.maximum_filter1d(seg, size=5, mode='nearest')
+            seg = np.maximum(seg, self._dx)
+            out_radii[inds] = seg
+
+        self._streamlines['tube_radius'] = out_radii
+
+    def _build_tube_mesh(self) -> None:
+        """Convert the streamline network into a red tube mesh."""
+        if self._streamlines is None or self._streamlines.n_points == 0:
+            self._tube_mesh = None
+            return
+
+        try:
+            self._tube_mesh = self._streamlines.tube(
+                radius=0.1,
+                scalars='tube_radius',
+                absolute=True,
+                n_sides=self.N_SIDES,
+                capping=False,
+            )
+            self._tube_mesh.set_active_scalars(None)
+        except Exception:
+            self._tube_mesh = None
+
+    def _marker_positions(self, t: float) -> Optional[np.ndarray]:
+        """Return the current marker position on each streamline."""
         if self._streamlines is None:
             return None
-        if t >= self._max_time:
-            vis = self._streamlines.copy()
-            vis.set_active_scalars('velocity_magnitude')
-            return vis
 
+        t = float(np.clip(t, 0.0, self._max_time))
         pts = self._streamlines.points
-        mag = self._streamlines['velocity_magnitude']
         arr = self._streamlines['arrival_time']
         lines = self._streamlines.lines
 
-        out_pts = []
-        out_mag = []
-        out_lines = []
-        cursor = 0
-
+        markers = []
         idx = 0
         while idx < len(lines):
             n = int(lines[idx])
             inds = lines[idx + 1 : idx + 1 + n]
             idx += 1 + n
 
-            m = 0
-            while m < n and arr[inds[m]] <= t:
-                m += 1
-            # Always show at least the source + first step so streamlines are
-            # visible from the very start of the animation.
-            m = max(m, 2)
-            if m < 2 or m > n:
+            p = pts[inds]
+            a = arr[inds]
+            if a[-1] <= a[0]:
+                markers.append(p[-1])
                 continue
+            if t <= a[0]:
+                markers.append(p[0])
+            elif t >= a[-1]:
+                markers.append(p[-1])
+            else:
+                x = np.interp(t, a, p[:, 0])
+                y = np.interp(t, a, p[:, 1])
+                z = np.interp(t, a, p[:, 2])
+                markers.append([x, y, z])
 
-            out_lines.append(m)
-            out_lines.extend(range(cursor, cursor + m))
-            out_pts.append(pts[inds[:m]])
-            out_mag.append(mag[inds[:m]])
-            cursor += m
-
-        if not out_pts:
+        if not markers:
             return None
-
-        vis = pv.PolyData()
-        vis.points = np.concatenate(out_pts, axis=0)
-        vis.lines = np.array(out_lines, dtype=np.int64)
-        vis['velocity_magnitude'] = np.concatenate(out_mag)
-        return vis
+        return np.array(markers, dtype=np.float64)
 
     def set_speed_multiplier(self, speed: float) -> None:
         self._speed_multiplier = max(0.01, float(speed))
 
-    def set_show_surface(self, show: bool) -> None:
-        """Show/hide the animated fill-front surface."""
-        self._show_front = bool(show)
-        self._update_scene()
-
     def set_show_streamlines(self, show: bool) -> None:
-        """Show/hide overlaid streamlines."""
+        """Show/hide the red flow paths and moving markers."""
         self._show_streamlines = bool(show)
         self._update_scene()
 
@@ -415,7 +416,7 @@ class FlowAnimator(QtCore.QObject):
         self._update_scene()
 
     def play(self) -> None:
-        if self._flow_grid is None:
+        if self._streamlines is None:
             return
         if self._is_running:
             self._timer.stop()
@@ -435,21 +436,21 @@ class FlowAnimator(QtCore.QObject):
         self._current_time = 0.0
 
     def _clear_actors(self) -> None:
-        if self._front_actor is not None:
-            try:
-                self._viewer.remove_actor(self._front_actor)
-            except Exception:
-                pass
-            self._front_actor = None
         if self._streamline_actor is not None:
             try:
                 self._viewer.remove_actor(self._streamline_actor)
             except Exception:
                 pass
             self._streamline_actor = None
+        if self._marker_actor is not None:
+            try:
+                self._viewer.remove_actor(self._marker_actor)
+            except Exception:
+                pass
+            self._marker_actor = None
 
     def _on_timer(self) -> None:
-        if self._flow_grid is None:
+        if self._streamlines is None:
             return
         dt = self.FRAME_DT * self._speed_multiplier
         self._current_time = min(self._current_time + dt, self._max_time)
@@ -458,125 +459,53 @@ class FlowAnimator(QtCore.QObject):
             self.pause()
 
     def _update_scene(self) -> None:
-        # A tiny positive time guarantees the inlet surface/streamlines are
-        # visible at the very start of the animation.
-        t_eff = max(self._current_time, 1e-9)
-
-        front = None
-        if self._show_front:
-            front = self._build_front(t_eff)
-
-        vis = None
-        if self._show_streamlines and self._streamlines is not None:
-            vis = self._visible_streamlines(t_eff)
-
-        if (front is None or front.n_points == 0) and (vis is None or vis.n_points == 0):
+        if not self._show_streamlines or self._tube_mesh is None:
             self._clear_actors()
             self._viewer.render()
             return
 
-        scalar_bar_args = {
-            "color": "#00ffff",
-            "title_font_size": 10,
-            "label_font_size": 9,
-            "fmt": "%.2f",
-            "vertical": False,
-            "position_x": 0.02,
-            "position_y": 0.02,
-            "width": 0.12,
-            "height": 0.06,
-            "title": "Akış hızı (m/s)",
-        }
+        if self._streamline_actor is None:
+            self._streamline_actor = self._viewer.add_mesh(
+                self._tube_mesh,
+                color='red',
+                opacity=1.0,
+                show_scalar_bar=False,
+                name="flow_streamlines",
+            )
+        else:
+            self._streamline_actor.mapper.dataset = self._tube_mesh
 
-        if front is not None and front.n_points > 0:
-            try:
-                if self._front_actor is None:
-                    self._front_actor = self._viewer.add_mesh(
-                        front,
-                        scalars='velocity_magnitude',
-                        cmap='turbo',
-                        opacity=self.FRONT_OPACITY,
-                        smooth_shading=True,
-                        show_scalar_bar=True,
-                        scalar_bar_args=scalar_bar_args,
-                        name="flow_animation_front",
-                    )
-                else:
-                    self._front_actor.mapper.dataset = front
-            except Exception:
-                if self._front_actor is not None:
-                    try:
-                        self._viewer.remove_actor(self._front_actor)
-                    except Exception:
-                        pass
-                    self._front_actor = None
-                self._front_actor = self._viewer.add_mesh(
-                    front,
-                    scalars='velocity_magnitude',
-                    cmap='turbo',
-                    opacity=self.FRONT_OPACITY,
-                    smooth_shading=True,
+        markers = self._marker_positions(self._current_time)
+        if markers is not None and markers.shape[0] > 0:
+            poly = pv.PolyData(markers)
+            if self._marker_actor is None:
+                self._marker_actor = self._viewer.add_mesh(
+                    poly,
+                    render_points_as_spheres=True,
+                    point_size=self.MARKER_SIZE,
+                    color='red',
                     show_scalar_bar=False,
-                    name="flow_animation_front",
+                    name="flow_markers",
                 )
-        elif self._front_actor is not None:
-            try:
-                self._viewer.remove_actor(self._front_actor)
-            except Exception:
-                pass
-            self._front_actor = None
+            else:
+                self._marker_actor.mapper.dataset = poly
+        else:
+            if self._marker_actor is not None:
+                try:
+                    self._viewer.remove_actor(self._marker_actor)
+                except Exception:
+                    pass
+                self._marker_actor = None
 
-        if vis is not None and vis.n_points > 0:
-            try:
-                if self._streamline_actor is None:
-                    self._streamline_actor = self._viewer.add_mesh(
-                        vis,
-                        scalars='velocity_magnitude',
-                        cmap='turbo',
-                        line_width=self.LINE_WIDTH,
-                        render_lines_as_tubes=True,
-                        opacity=0.95,
-                        show_scalar_bar=False,
-                        name="flow_animation_streamlines",
-                    )
-                else:
-                    self._streamline_actor.mapper.dataset = vis
-            except Exception:
-                if self._streamline_actor is not None:
-                    try:
-                        self._viewer.remove_actor(self._streamline_actor)
-                    except Exception:
-                        pass
-                    self._streamline_actor = None
-                self._streamline_actor = self._viewer.add_mesh(
-                    vis,
-                    scalars='velocity_magnitude',
-                    cmap='turbo',
-                    line_width=self.LINE_WIDTH,
-                    render_lines_as_tubes=True,
-                    opacity=0.95,
-                    show_scalar_bar=False,
-                    name="flow_animation_streamlines",
-                )
-        elif self._streamline_actor is not None:
-            try:
-                self._viewer.remove_actor(self._streamline_actor)
-            except Exception:
-                pass
-            self._streamline_actor = None
-
-        self._current_front = front
-        self._current_vis = vis
         self._viewer.render()
 
     def particle_count(self) -> int:
-        """Return a representative element count for the UI label."""
-        count = 0
-        if self._current_front is not None:
-            count += self._current_front.n_points
-        if self._current_vis is not None:
-            count += self._current_vis.n_cells
-        return int(count)
+        """Number of moving markers currently displayed."""
+        markers = self._marker_positions(self._current_time)
+        return markers.shape[0] if markers is not None else 0
 
-    def particle_diameter_mm(self) -> float:
-        return 0.0
+    def line_count(self) -> int:
+        """Number of flow-path lines."""
+        if self._streamlines is None:
+            return 0
+        return int(self._streamlines.n_cells)

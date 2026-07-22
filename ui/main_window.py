@@ -518,8 +518,8 @@ class MainWindow(QtWidgets.QMainWindow):
         anim_group = QtWidgets.QGroupBox("Akış Animasyonu")
         anim_layout = QtWidgets.QVBoxLayout(anim_group)
 
-        self.flow_anim_toggle = QtWidgets.QCheckBox("Akış Cephesi")
-        self.flow_anim_toggle.setToolTip("Metalin doldurma anında gerçek 3B cephe yüzeyi (fill_time izoyüzeyi)")
+        self.flow_anim_toggle = QtWidgets.QCheckBox("Akış Animasyonu")
+        self.flow_anim_toggle.setToolTip("Döküm ağzından parçaya kırmızı akış yollarını oynatır")
         self.flow_anim_toggle.setChecked(False)
         self.flow_anim_toggle.toggled.connect(self.on_toggle_flow_animation)
         anim_layout.addWidget(self.flow_anim_toggle)
@@ -539,7 +539,7 @@ class MainWindow(QtWidgets.QMainWindow):
         play_layout.addWidget(self.flow_time_slider)
         anim_layout.addLayout(play_layout)
 
-        self.flow_time_label = QtWidgets.QLabel("t: 0.00 s | dolma: %0")
+        self.flow_time_label = QtWidgets.QLabel("t: 0.000 s / 0.000 s")
         self.flow_time_label.setEnabled(False)
         anim_layout.addWidget(self.flow_time_label)
 
@@ -555,15 +555,15 @@ class MainWindow(QtWidgets.QMainWindow):
         speed_layout.addWidget(speed_label)
         speed_layout.addWidget(self.flow_speed_spin)
 
-        count_label = QtWidgets.QLabel("Cephe noktası:")
+        count_label = QtWidgets.QLabel("Akış:")
         self.flow_particle_label = QtWidgets.QLabel("—")
-        self.flow_particle_label.setToolTip("Akış cephesi ve çizgilerinin toplam görsel eleman sayısı")
+        self.flow_particle_label.setToolTip("Akış hattı ve marker sayısı")
         speed_layout.addWidget(count_label)
         speed_layout.addWidget(self.flow_particle_label)
         anim_layout.addLayout(speed_layout)
 
-        self.flow_surface_check = QtWidgets.QCheckBox("Akış çizgileri")
-        self.flow_surface_check.setToolTip("Cephenin üzerine ilerleyen akış çizgileri ekler")
+        self.flow_surface_check = QtWidgets.QCheckBox("Akış Yolları")
+        self.flow_surface_check.setToolTip("Akış yollarını ve ilerleyen marker'ları göster/gizle")
         self.flow_surface_check.setChecked(True)
         self.flow_surface_check.setEnabled(False)
         self.flow_surface_check.toggled.connect(self.on_flow_surface_toggled)
@@ -1424,16 +1424,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.flow_time_slider.blockSignals(True)
             self.flow_time_slider.setValue(int(round(ratio * 1000)))
             self.flow_time_slider.blockSignals(False)
-            fill_percent = 0
-            if self._analysis and self._analysis.flow_result and self._analysis.flow_result.fill_time is not None:
-                ft = self._analysis.flow_result.fill_time
-                valid = np.isfinite(ft) & (ft > 0)
-                if valid.any():
-                    fill_percent = int((ft[valid] <= t).sum() / valid.sum() * 100)
-            self.flow_time_label.setText(f"t: {t:.2f} s | dolma: %{fill_percent}")
+            self.flow_time_label.setText(f"t: {t:.3f} s / {animator._max_time:.3f} s")
             if animator:
                 self.flow_particle_label.setText(
-                    f"{animator.particle_count():,} adet"
+                    f"{animator.line_count()} hat, {animator.particle_count()} marker"
                 )
 
     def on_toggle_flow_animation(self, checked: bool):
