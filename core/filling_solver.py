@@ -1196,18 +1196,25 @@ def _gating_node_velocities(
         if throat > 1e-18:
             raw_throat_per_type[btype] = raw_throat_per_type.get(btype, 0.0) + float(throat)
 
+    # Design caps: source gets the user-selected throat area; every other
+    # component gets its type design total split proportionally by its measured
+    # throat area.  If no design value is available for a type the cap is inf
+    # (geometry-only).
     comp_design_m2: Dict[int, float] = {}
-    ingate_design_total = type_design_total.get(BodyType.INGATE, 0.0)
-    ingate_raw_total = raw_throat_per_type.get(BodyType.INGATE, 0.0)
     for cid in comp_meta:
         if cid == part_id:
             continue
-        btype = comp_meta[cid][0]
         if cid == source_id:
             comp_design_m2[cid] = float(source_area_m2)
-        elif btype == BodyType.INGATE and ingate_design_total > 1e-18 and ingate_raw_total > 1e-18:
+            continue
+        btype = comp_meta[cid][0]
+        design_total = type_design_total.get(btype, 0.0)
+        raw_total = raw_throat_per_type.get(btype, 0.0)
+        if design_total > 1e-18 and raw_total > 1e-18:
             raw_throat = comp_section_m2[cid][2]
-            comp_design_m2[cid] = ingate_design_total * (raw_throat / ingate_raw_total)
+            comp_design_m2[cid] = design_total * (raw_throat / raw_total)
+        elif design_total > 1e-18:
+            comp_design_m2[cid] = design_total
         else:
             comp_design_m2[cid] = float("inf")
 
