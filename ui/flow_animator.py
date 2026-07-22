@@ -7,6 +7,7 @@ PyVistaQt `Analyzer3DViewer` and driven by a `QTimer` so play/pause/speed
 controls can be wired to the Qt UI.
 """
 
+import importlib.util
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -15,6 +16,10 @@ from PyQt6 import QtCore
 from scipy import ndimage
 
 from core.types import AnalysisResult
+
+
+def _taichi_available() -> bool:
+    return importlib.util.find_spec("taichi") is not None
 
 
 class FlowAnimator(QtCore.QObject):
@@ -53,6 +58,12 @@ class FlowAnimator(QtCore.QObject):
         self._emit_accumulator: float = 0.0
         self._show_surface: bool = False
 
+        # Optional real SPH flow simulator (Taichi).
+        self._sph = None
+        self._use_taichi: bool = _taichi_available()
+        self._taichi_radius_mm: float = 2.0
+        self._taichi_iters: int = 3
+
         self._particle_pos: np.ndarray = np.empty((0, 3), dtype=np.float64)
         self._particle_vel: np.ndarray = np.empty((0, 3), dtype=np.float64)
         self._particle_age: np.ndarray = np.empty(0, dtype=np.float64)
@@ -61,11 +72,45 @@ class FlowAnimator(QtCore.QObject):
         self._particle_actor = None
         self._surface_actor = None
 
+    def set_use_taichi(self, use: bool) -> None:
+        """Switch between Darcy advection and Taichi SPH."""
+        self._use_taichi = bool(use) and _taichi_available()
+
+    def set_taichi_params(self, radius_mm: float = 2.0, pbf_iters: int = 3) -> None:
+        """Set SPH particle radius and solver iterations."""
+        self._taichi_radius_mm = max(0.5, float(radius_mm))
+        self._taichi_iters = max(1, int(pbf_iters))
+
+    def _build_sph(self) -> None:
+        """Create a Taichi flow simulator from the current result."""
+        if self._result is None or self._result.flow_result is None or not self._use_taichi:
+            return
+        try:
+            from core.taichi_sph import TaichiFlowSimulator
+            self._sph = TaichiFlowSimulator(
+                self._result,
+                particle_radius_mm=self._taichi_radius_mm,
+                pbf_num_iters=self._taichi_iters,
+                max_fluid_particles=max(1000, self._target_particle_count),
+                max_boundary_particles=max(2000, self._target_particle_count * 2),
+            )
+            self._max_time = float(self._result.flow_result.fill_time_s or 1.0)
+            self._current_time = 0.0
+        except Exception:
+            self._sph = None
+
     def set_result(self, result: Optional[AnalysisResult]) -> None:
         """Attach a completed analysis result and pre-compute flow data."""
         self.stop()
         self._clear_actors()
         self._result = result
+        self._sph = None
+
+        if self._use_taichi and _taichi_available():
+            self._build_sph()
+            if self._sph is not None:
+                return
+
         if result is None or result.flow_result is None:
             self._velocity = None
             self._fill_time = None
@@ -135,6 +180,9 @@ class FlowAnimator(QtCore.QObject):
         """Set the number of particles to keep in the scene."""
         count = max(100, int(count))
         self._target_particle_count = count
+        if self._sph is not None:
+            # Rebuild the SPH simulator with the new particle budget.
+            self._build_sph()
         if self._max_time > 0:
             self._emit_rate = count / max(self._max_time, 1e-6)
         if self._particle_pos.shape[0] > count:
@@ -156,20 +204,31 @@ class FlowAnimator(QtCore.QObject):
     def set_current_time(self, t: float) -> None:
         """Jump to a specific fill time and update the view."""
         self._current_time = float(np.clip(t, 0.0, self._max_time))
+        if self._sph is not None:
+            # SPH cannot jump arbitrarily; restart the simulation at t=0.
+            if self._current_time <= 0.0:
+                self._build_sph()
+            elif not self._is_running:
+                self._update_scene_taichi()
+            return
         if not self._is_running:
             self._update_scene()
 
     def play(self) -> None:
         """Start/pause the timer."""
-        if self._velocity is None:
+        if self._velocity is None and self._sph is None:
             return
         if self._is_running:
             self._timer.stop()
             self._is_running = False
         else:
-            # One animation step per timer tick; speed multiplier changes dt.
-            self._timer.start(int(self.FRAME_DT * 1000))
             self._is_running = True
+            if self._sph is not None:
+                # Taichi substeps are heavier; use a single-shot schedule.
+                QtCore.QTimer.singleShot(1, self._on_timer)
+            else:
+                # One animation step per timer tick; speed multiplier changes dt.
+                self._timer.start(int(self.FRAME_DT * 1000))
 
     def pause(self) -> None:
         """Pause the animation."""
@@ -181,7 +240,10 @@ class FlowAnimator(QtCore.QObject):
         """Stop and remove all flow actors."""
         self.pause()
         self._clear_actors()
-        self._reset_particles()
+        if self._sph is not None:
+            self._build_sph()
+        else:
+            self._reset_particles()
 
     def _clear_actors(self) -> None:
         if self._particle_actor is not None:
@@ -199,6 +261,18 @@ class FlowAnimator(QtCore.QObject):
 
     def _on_timer(self) -> None:
         """Advance one animation frame."""
+        if not self._is_running:
+            return
+        if self._sph is not None:
+            dt = self.FRAME_DT * self._speed_multiplier
+            self._sph.step(dt)
+            self._current_time = min(self._current_time + dt, self._max_time)
+            self._update_scene_taichi()
+            if self._current_time < self._max_time and self._is_running:
+                QtCore.QTimer.singleShot(1, self._on_timer)
+            else:
+                self.pause()
+            return
         if self._velocity is None:
             return
         dt = self.FRAME_DT * self._speed_multiplier
@@ -339,13 +413,25 @@ class FlowAnimator(QtCore.QObject):
             cval=np.inf,
         )
 
+    def _update_scene_taichi(self) -> None:
+        """Render the active SPH particle cloud."""
+        if self._sph is None:
+            return
+        pts, vel = self._sph.get_fluid_particles_with_velocity()
+        if pts.shape[0] == 0:
+            self._clear_actors()
+            return
+        speed = np.linalg.norm(vel, axis=1) / 1000.0  # mm/s -> m/s
+        poly = pv.PolyData(pts)
+        poly["velocity_m_s"] = speed
+        self._render_particle_poly(poly)
+
     def _update_scene(self) -> None:
         """Render the particle cloud respecting the current fill front."""
         if self._particle_pos.shape[0] == 0:
             self._clear_actors()
             return
 
-        # A particle is visible only where the metal front has already passed.
         fill_t = self._sample_fill_time(self._particle_pos)
         visible = (
             self._particle_active
@@ -362,7 +448,10 @@ class FlowAnimator(QtCore.QObject):
 
         poly = pv.PolyData(pts)
         poly["velocity_m_s"] = speed
+        self._render_particle_poly(poly)
 
+    def _render_particle_poly(self, poly: pv.PolyData) -> None:
+        """Add or update the particle actor from a PolyData."""
         try:
             if self._particle_actor is None:
                 self._particle_actor = self._viewer.add_mesh(

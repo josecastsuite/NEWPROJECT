@@ -573,6 +573,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.flow_surface_check.toggled.connect(self.on_flow_surface_toggled)
         anim_layout.addWidget(self.flow_surface_check)
 
+        self.flow_taichi_check = QtWidgets.QCheckBox("Gerçek SPH akış (Taichi)")
+        self.flow_taichi_check.setToolTip("Darcy yerine Taichi tabanlı zayıf-sıkıştırılabilir SPH akış simülasyonu")
+        try:
+            import importlib.util
+            taichi_ok = importlib.util.find_spec("taichi") is not None
+        except Exception:
+            taichi_ok = False
+        self._taichi_available = taichi_ok
+        self.flow_taichi_check.setChecked(taichi_ok)
+        self.flow_taichi_check.setEnabled(taichi_ok)
+        self.flow_taichi_check.toggled.connect(self.on_flow_taichi_toggled)
+        anim_layout.addWidget(self.flow_taichi_check)
+
         vis_layout.addWidget(anim_group)
 
         self.path_toggle = QtWidgets.QCheckBox("Besleme Yolları")
@@ -1087,6 +1100,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.viewer.show_hotspots(self._analysis)
             self._update_flow_controls()
             if self.flow_anim_toggle.isChecked() and self._analysis.flow_result is not None:
+                if self.viewer.flow_animator is not None:
+                    self.viewer.flow_animator.set_use_taichi(self.flow_taichi_check.isChecked())
                 self.viewer.toggle_flow_animation(self._analysis, True)
         except Exception as e:
             import traceback
@@ -1437,12 +1452,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.flow_time_label.setText(f"t: {t:.2f} s | dolma: %{fill_percent}")
 
     def on_toggle_flow_animation(self, checked: bool):
+        if self._analysis and self.viewer.flow_animator is not None:
+            self.viewer.flow_animator.set_use_taichi(self.flow_taichi_check.isChecked())
         if self._analysis:
             self.viewer.toggle_flow_animation(self._analysis, checked)
         self.flow_play_btn.setEnabled(checked and bool(self._analysis and self._analysis.flow_result))
         self.flow_time_slider.setEnabled(checked)
         self.flow_surface_check.setEnabled(checked)
         self.flow_time_label.setEnabled(checked)
+        self.flow_taichi_check.setEnabled(checked and self._taichi_available)
         if checked:
             self._update_flow_controls()
             # Do not auto-play; user presses the play button.
@@ -1476,6 +1494,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_flow_surface_toggled(self, checked: bool):
         if self.viewer.flow_animator is not None:
             self.viewer.flow_animator.set_show_surface(checked)
+
+    def on_flow_taichi_toggled(self, checked: bool):
+        if self.viewer.flow_animator is not None:
+            self.viewer.flow_animator.set_use_taichi(checked)
+            if self.flow_anim_toggle.isChecked() and self._analysis:
+                self.viewer.flow_animator.set_result(self._analysis)
+                if self.viewer.flow_animator._sph is not None:
+                    self.viewer.flow_animator.play()
 
     def on_toggle_feeding_paths(self, checked: bool):
         if self._analysis:
