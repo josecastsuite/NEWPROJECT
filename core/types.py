@@ -98,6 +98,15 @@ BODY_FEEDER_TYPES = [
 CHILL_BODY_TYPES = [BodyType.COOLING_SPRUE]
 
 
+class GatingVelocityError(RuntimeError):
+    """Raised when the hydraulic node-velocity network cannot be solved.
+
+    The solver treats this as a fatal, user-visible error so that bad geometry
+    (missing contacts, unmeasurable throat sections, disconnected gating
+    components) stops the analysis instead of producing silent zero velocities.
+    """
+
+
 @dataclass
 class Body:
     """One solid body extracted from the STEP file."""

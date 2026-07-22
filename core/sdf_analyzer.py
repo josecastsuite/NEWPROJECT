@@ -35,6 +35,7 @@ from core.types import (
     Body,
     BodyType,
     CastingParameters,
+    GatingVelocityError,
     HotSpot,
     RefinementRegion,
     RiserResult,
@@ -1545,37 +1546,13 @@ def _run_filling_flow(
         sprue_throat_cm2 = float(gate.section_flows["SPRUE_THROAT"].area_cm2)
     if sprue_base_cm2 <= 0.0 and "SPRUE_BASE" in (gate.section_flows or {}):
         sprue_base_cm2 = float(gate.section_flows["SPRUE_BASE"].area_cm2)
-    # Use design/theoretical section areas as the target caps; the actual
-    # measured areas come from the mesh section in the solver.  The user can
-    # still override any of these through the section dialog.
-    design_sprue_base_cm2 = float(
-        getattr(gate, "design_sprue_base_area_cm2", 0.0) or 0.0
-    )
-    if design_sprue_base_cm2 <= 0.0:
-        design_sprue_base_cm2 = sprue_base_cm2
-    design_runner_cm2 = float(
-        getattr(gate, "design_runner_area_cm2", 0.0) or 0.0
-    )
-    if design_runner_cm2 <= 0.0:
-        design_runner_cm2 = float(gate.runner_min_area_cm2 or 0.0)
-    design_gate_cm2 = float(
-        getattr(gate, "design_gate_total_area_cm2", 0.0) or 0.0
-    )
-    if design_gate_cm2 <= 0.0:
-        design_gate_cm2 = float(gate.total_ingate_contact_area_cm2 or 0.0)
-    design_distributor_cm2 = float(
-        getattr(gate, "design_distributor_area_cm2", 0.0) or 0.0
-    )
-    if design_distributor_cm2 <= 0.0:
-        design_distributor_cm2 = float(gate.distributor_area_cm2 or 0.0)
-
     section_areas_m2 = {
         "SPRUE_THROAT": sprue_throat_cm2 * 1e-4,
-        "SPRUE_BASE": design_sprue_base_cm2 * 1e-4,
-        "RUNNER": design_runner_cm2 * 1e-4,
-        "INGATE": design_gate_cm2 * 1e-4,
-        "DISTRIBUTOR": design_distributor_cm2 * 1e-4,
-        "CURUFLUK": float(gate.curufluk_area_cm2 or 0.0) * 1e-4,
+        "SPRUE_BASE": sprue_base_cm2 * 1e-4,
+        "RUNNER": float(gate.runner_min_area_cm2) * 1e-4 if gate.runner_min_area_cm2 else 0.0,
+        "INGATE": float(gate.total_ingate_contact_area_cm2) * 1e-4 if gate.total_ingate_contact_area_cm2 else 0.0,
+        "DISTRIBUTOR": float(gate.distributor_area_cm2) * 1e-4 if gate.distributor_area_cm2 else 0.0,
+        "CURUFLUK": float(gate.curufluk_area_cm2) * 1e-4 if gate.curufluk_area_cm2 else 0.0,
     }
     # Ensure the selected section area in the flow solver matches the area used
     # to compute Q_user; otherwise the first node velocity will not equal the
@@ -1745,6 +1722,8 @@ def analyze(
             user_section_areas_cm2=user_section_areas_cm2,
         )
     except Exception as exc:
+        if isinstance(exc, GatingVelocityError):
+            raise
         pass
 
     if gate_result_for_flow is not None:
@@ -1760,6 +1739,8 @@ def analyze(
                 bodies,
             )
         except Exception as exc:
+            if isinstance(exc, GatingVelocityError):
+                raise
             pass
 
     # AŞAMA 3: Full 3-D transient enthalpy thermal solver (downsampled for speed)
@@ -2300,6 +2281,8 @@ def analyze(
             user_section_areas_cm2=user_section_areas_cm2,
         )
     except Exception as exc:
+        if isinstance(exc, GatingVelocityError):
+            raise
         result.gate_result = gate_result_for_flow
         result.recommendations.append(f"Gating analizi atlandı: {exc}")
 
