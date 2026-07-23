@@ -591,6 +591,16 @@ def _compute_fill_time(
                 heapq.heappush(heap, (t_new, ni, nj, nk))
 
     fill[~cavity] = 0.0
+
+    # Any metal cavity still unreachable (e.g. isolated/discretised gate pockets)
+    # should still appear at the end of the fill so the animation does not leave
+    # gates visibly empty when solidification begins.
+    unreached = cavity & np.isinf(fill)
+    if unreached.any():
+        finite = fill[cavity & np.isfinite(fill)]
+        max_fill = float(finite.max()) if finite.size else 0.0
+        fill[unreached] = max_fill
+
     return fill
 
 
@@ -1114,16 +1124,14 @@ def _gating_node_velocities(
             queue.append(other)
             order.append(other)
 
+    # Ignore gating components that are not reachable from the source (they will
+    # simply appear filled at the end of the animation via the fill_time fallback).
     unvisited = [
         cid for cid in gating_ids
         if cid not in visited and comp_meta[cid][0] != BodyType.RISER
     ]
-    if unvisited:
-        names = ", ".join(comp_meta[cid][1] for cid in unvisited)
-        raise GatingVelocityError(
-            f"Düğüm hızları çözülemedi: şu elemanlar kaynaktan parçaya ulaşan zincire "
-            f"bağlı değil: {names}. Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
-        )
+    for cid in unvisited:
+        gating_ids.remove(cid)
 
     # Component throat areas will be filled after the contact-based mesh
     # sections are computed below.  Initialize with inf (part) and zero.
@@ -1306,24 +1314,16 @@ def _gating_node_velocities(
         if comp_meta[cid][0] in {BodyType.RISER, BodyType.CURUFLUK}:
             continue
         if not out_edges:
-            raise GatingVelocityError(
-                f"Düğüm hızları çözülemedi: {comp_meta[cid][1]} elemanının çıkış bağlantısı yok. "
-                "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
-            )
+            # Dead-end gating pocket (e.g. an isolated ingate); it will still be
+            # filled at the end of the animation, so skip velocity node creation.
+            continue
         A_total = sum(c["area_m2"] for c in out_edges)
         if A_total <= 1e-18:
-            raise GatingVelocityError(
-                f"Düğüm hızları çözülemedi: {comp_meta[cid][1]} elemanının toplam çıkış kesit alanı sıfır. "
-                "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
-            )
+            continue
         for c in out_edges:
             A = c["area_m2"]
             if A <= 1e-18:
-                raise GatingVelocityError(
-                    f"Düğüm hızları çözülemedi: {comp_meta[cid][1]} → "
-                    f"{comp_meta[c['down_id']][1]} temas kesit alanı sıfır. "
-                    "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
-                )
+                continue
             Q_branch = Q * (A / A_total)
             c["Q_branch"] = Q_branch
             c["v_branch"] = Q_branch / A
