@@ -472,4 +472,31 @@ def propose_risers(
             )
         )
 
+    # Consolidate proposals whose placements are very close; they target the
+    # same physical hot region. Keep the highest-priority one (lowest Niyama /
+    # largest required modulus).
+    if len(proposals) > 1:
+        dominant_m = float(getattr(result, "dominant_m_mm", 0.0))
+        bbox_max = float(np.max(getattr(result, "bbox_size_mm", np.array([0.0]))))
+        dx = float(getattr(result, "dx_mm", 1.0))
+        cluster_mm = max(2.5 * dominant_m, 0.05 * bbox_max, 5.0 * dx)
+        dedup_mm = min(0.5 * cluster_mm, 0.10 * bbox_max)
+
+        def _proposal_priority(p: RiserProposal) -> Tuple[float, float]:
+            hs = result.hotspots[p.target_hotspot_index]
+            niy = hs.niyama_ensemble if hs.niyama_ensemble > 0.0 else 1e9
+            return (niy, -p.m_required_mm)
+
+        sorted_proposals = sorted(proposals, key=_proposal_priority)
+        kept: List[RiserProposal] = []
+        for p in sorted_proposals:
+            placement = np.asarray(p.placement_mm, dtype=np.float64)
+            too_close = any(
+                float(np.linalg.norm(np.asarray(kp.placement_mm, dtype=np.float64) - placement)) < dedup_mm
+                for kp in kept
+            )
+            if not too_close:
+                kept.append(p)
+        proposals = kept
+
     return proposals

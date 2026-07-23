@@ -623,6 +623,54 @@ def _shape_factor(mask: np.ndarray, dx: float) -> float:
     return (volume ** 2) / (area ** 3)
 
 
+def _hotspot_cluster_threshold(
+    dominant_m_mm: float,
+    bbox_size_mm: np.ndarray,
+    dx: float,
+) -> float:
+    """Return a scale-aware clustering distance for hot spots.
+
+    The threshold is anchored to the dominant local modulus (a hot-spot cloud
+    is typically a few moduli wide) and to a small percentage of the bounding
+    box so that very long/thin parts are not over-clustered.  It is bounded
+    below by a few voxels and above by 15 % of the largest box dimension.
+    """
+    bbox_max = float(np.max(bbox_size_mm))
+    cluster_mm = max(
+        2.5 * float(dominant_m_mm),
+        0.05 * bbox_max,
+        5.0 * float(dx),
+    )
+    return float(min(cluster_mm, 0.15 * bbox_max))
+
+
+def _sample_field_at_position(
+    position_mm: np.ndarray,
+    field: np.ndarray,
+    origin_mm: np.ndarray,
+    dx: float,
+    order: int = 1,
+    default: float = 0.0,
+) -> float:
+    """Interpolate a scalar field at an arbitrary physical position.
+
+    Replaces coarse-voxel rounding / _snap_to_part for scalar reads so that
+    adjacent hot spots no longer inherit the same voxel value.
+    """
+    vox = (np.asarray(position_mm, dtype=np.float64) - np.asarray(origin_mm, dtype=np.float64)) / float(dx)
+    coords = vox.reshape(3, 1)
+    return float(
+        ndimage.map_coordinates(
+            field,
+            coords,
+            order=order,
+            mode="constant",
+            cval=default,
+            prefilter=False,
+        )
+    )
+
+
 def find_hotspots(
     sdf: np.ndarray,
     part_mask: np.ndarray,
@@ -637,6 +685,7 @@ def find_hotspots(
     feeder_mask: Optional[np.ndarray] = None,
     chvorinov_c: Optional[float] = None,
     n_time_steps: int = 40,
+    niyama: Optional[np.ndarray] = None,
 ) -> List[HotSpot]:
     """Detect hot spots by pseudo-thermal solidification + CCL (Method 2).
 
@@ -756,7 +805,16 @@ def find_hotspots(
         cand = np.argwhere(mask)
         vals = comp_iso
         m_vals = M_mod[cand[:, 0], cand[:, 1], cand[:, 2]]
-        best_idx = int(np.argmax(vals * 1000.0 + m_vals))
+        # Pick the most critical voxel: late isolating, high modulus, low Niyama.
+        iso_score = vals / max(max_iso, 1e-9)
+        m_score = m_vals / max(float(m_vals.max()), 1e-9)
+        if niyama is not None:
+            n_vals = niyama[cand[:, 0], cand[:, 1], cand[:, 2]]
+            n_max = max(float(n_vals.max()), 1e-9)
+            n_score = n_vals / n_max
+        else:
+            n_score = np.ones_like(iso_score)
+        best_idx = int(np.argmax(iso_score + 0.5 * m_score - 0.5 * n_score))
         pos_vox = cand[best_idx]
         m_value = float(M_mod[pos_vox[0], pos_vox[1], pos_vox[2]])
         position_mm = origin_mm + pos_vox * dx
@@ -767,6 +825,7 @@ def find_hotspots(
                 dist_to_riser_mm=np.inf,
                 feed_ok=False,
                 max_feeding_distance_mm=0.0,
+                niyama_ensemble=float(niyama[pos_vox[0], pos_vox[1], pos_vox[2]]) if niyama is not None else 0.0,
             )
         )
 
@@ -781,7 +840,15 @@ def find_hotspots(
             if lbl == -1:
                 continue
             group = [hs for i, hs in enumerate(hotspots) if clustering.labels_[i] == lbl]
-            group.sort(key=lambda h: h.m_value_mm, reverse=True)
+            # Choose the most critical representative: high modulus, low Niyama.
+            m_max = max(float(h.m_value_mm) for h in group)
+            n_vals = [h.niyama_ensemble for h in group if h.niyama_ensemble > 0.0]
+            n_max = max(n_vals) if n_vals else 1.0
+            def _priority(h: HotSpot) -> float:
+                m_norm = float(h.m_value_mm) / max(m_max, 1e-9)
+                n_norm = h.niyama_ensemble / max(n_max, 1e-9) if h.niyama_ensemble > 0.0 else 1.0
+                return m_norm - 0.5 * n_norm
+            group.sort(key=_priority, reverse=True)
             merged.append(group[0])
         hotspots = merged
 
@@ -1358,6 +1425,9 @@ def _high_res_part_hotspots(
     part_voxels_target: int,
     part_max_dim: int,
     chvorinov_c: float,
+    alloy: Alloy,
+    mold: MoldMaterial,
+    cluster_eps_mm: Optional[float] = None,
     progress_callback: Optional[callable] = None,
 ) -> Optional[List[HotSpot]]:
     """Build a high-resolution grid containing the PART and connected casting-metal
@@ -1426,10 +1496,17 @@ def _high_res_part_hotspots(
     # anything as fed and every liquid pocket becomes isolated, which is fine.
     max_part_sdf = float(part_sdf[part_mask].max()) if part_mask.any() else 0.0
     hotspot_min_size_mm = min(2.0, max(0.5, 0.5 * max_part_sdf))
-    hotspot_cluster_mm = max(12.0, 2.0 * part_dx)
+    # Use the scale-aware caller-supplied cluster distance if available.
+    if cluster_eps_mm is None:
+        cluster_eps_mm = max(12.0, 2.0 * part_dx)
 
     if progress_callback:
         progress_callback(83)
+
+    # High-resolution Niyama so the representative point reflects the real field.
+    _, _, part_niyama = compute_niyama(
+        part_sdf, part_M_mod, alloy, mold, part_dx, is_metal=part_is_metal
+    )
 
     part_hotspots = find_hotspots(
         part_sdf,
@@ -1439,10 +1516,11 @@ def _high_res_part_hotspots(
         curvature=mean_curv,
         use_skeleton=True,
         min_size_mm=hotspot_min_size_mm,
-        cluster_eps_mm=hotspot_cluster_mm,
+        cluster_eps_mm=cluster_eps_mm,
         is_metal=part_is_metal,
         feeder_mask=part_feeder_mask,
         chvorinov_c=chvorinov_c,
+        niyama=part_niyama,
     )
     return part_hotspots
 
@@ -1793,7 +1871,7 @@ def analyze(
     # AŞAMA 5: Hot spot detection (medial axis + DBSCAN + curvature)
     max_part_sdf = float(sdf[part_mask].max()) if part_mask.any() else 0.0
     hotspot_min_size_mm = min(2.0, max(0.5, 0.5 * max_part_sdf))
-    hotspot_cluster_mm = max(12.0, 2.0 * dx)
+    hotspot_cluster_mm = _hotspot_cluster_threshold(dominant_m, bbox_size, dx)
     hotspots = find_hotspots(
         sdf, part_mask, dx, origin_mm, curvature=mean_curv, use_skeleton=True,
         min_size_mm=hotspot_min_size_mm,
@@ -1801,6 +1879,7 @@ def analyze(
         is_metal=is_metal,
         feeder_mask=feeder_mask,
         chvorinov_c=chvorinov_c,
+        niyama=niyama,
     )
     if progress_callback:
         progress_callback(75)
@@ -1831,7 +1910,10 @@ def analyze(
             part_voxels_target,
             part_max_dim,
             chvorinov_c,
-            progress_callback,
+            alloy,
+            mold,
+            cluster_eps_mm=hotspot_cluster_mm,
+            progress_callback=progress_callback,
         )
         if part_hotspots is not None and part_hotspots:
             hotspots = part_hotspots
@@ -1857,15 +1939,31 @@ def analyze(
         vox_raw = np.round((hs.position_mm - origin_mm) / dx).astype(int)
         vox = _snap_to_part(vox_raw)
         if 0 <= vox[0] < grid.shape[0] and 0 <= vox[1] < grid.shape[1] and 0 <= vox[2] < grid.shape[2]:
-            hs.dist_to_riser_mm = float(dist_feed[vox[0], vox[1], vox[2]])
-            hs.niyama_min = float(niyama[vox[0], vox[1], vox[2]])
+            # Scalar fields are sampled at the hot-spot's exact physical position
+            # instead of snapping to the nearest coarse voxel, eliminating the
+            # duplicated-value problem for adjacent hot spots.
+            hs.dist_to_riser_mm = _sample_field_at_position(
+                hs.position_mm, dist_feed, origin_mm, dx, order=1, default=np.inf
+            )
+            hs.niyama_min = _sample_field_at_position(
+                hs.position_mm, niyama, origin_mm, dx, order=1, default=0.0
+            )
             hs.niyama_variants = {
-                k: float(v[vox[0], vox[1], vox[2]]) for k, v in niyama_variants.items()
+                k: _sample_field_at_position(
+                    hs.position_mm, v, origin_mm, dx, order=1, default=0.0
+                )
+                for k, v in niyama_variants.items()
             }
-            hs.niyama_ensemble = float(niyama[vox[0], vox[1], vox[2]])
-            hs.local_sdf_max = float(sdf[vox[0], vox[1], vox[2]])
+            hs.niyama_ensemble = _sample_field_at_position(
+                hs.position_mm, niyama, origin_mm, dx, order=1, default=0.0
+            )
+            hs.local_sdf_max = _sample_field_at_position(
+                hs.position_mm, sdf, origin_mm, dx, order=1, default=0.0
+            )
             hs.m_uncertainty_mm = dx / 2.0
-            hs.feeding_cost = float(cost_feed[vox[0], vox[1], vox[2]])
+            hs.feeding_cost = _sample_field_at_position(
+                hs.position_mm, cost_feed, origin_mm, dx, order=1, default=0.0
+            )
 
             darcy, min_neck_m, t_hs, directional_ok, heuvers_ok, feeding_cost, darcy_ok = _path_darcy_and_directional(
                 sdf,
@@ -1886,8 +1984,12 @@ def analyze(
             hs.directional_ok = directional_ok
             hs.heuvers_ok = heuvers_ok
             hs.darcy_ok = darcy_ok
-            hs.curvature_mean = float(mean_curv[vox[0], vox[1], vox[2]])
-            hs.curvature_gaussian = float(gauss_curv[vox[0], vox[1], vox[2]])
+            hs.curvature_mean = _sample_field_at_position(
+                hs.position_mm, mean_curv, origin_mm, dx, order=1, default=0.0
+            )
+            hs.curvature_gaussian = _sample_field_at_position(
+                hs.position_mm, gauss_curv, origin_mm, dx, order=1, default=0.0
+            )
 
             # Section thickness = 2 * local modulus (equivalent wall thickness)
             hs.t_section_mm = 2.0 * hs.m_value_mm
@@ -1925,7 +2027,9 @@ def analyze(
             )
             # A chill solves the hot spot if it is close enough to the local modulus.
             if dist_chill_vox is not None:
-                d_chill = float(dist_chill_vox[vox[0], vox[1], vox[2]]) * dx
+                d_chill = _sample_field_at_position(
+                    hs.position_mm, dist_chill_vox, origin_mm, dx, order=1, default=np.inf
+                ) * dx
                 hs.chill_ok = d_chill <= 1.5 * hs.m_value_mm
             else:
                 hs.chill_ok = False
@@ -2164,29 +2268,32 @@ def analyze(
     # Assign pore-size estimate to each hot spot and re-evaluate feed_ok with
     # the riser-size-modulated feeding distance.
     for hs in hotspots:
-        vox_raw = np.round((hs.position_mm - origin_mm) / dx).astype(int)
-        vox = _snap_to_part(vox_raw)
-        if 0 <= vox[0] < grid.shape[0] and 0 <= vox[1] < grid.shape[1] and 0 <= vox[2] < grid.shape[2]:
-            ps_um = float(pore_size_um[vox[0], vox[1], vox[2]])
-            hs.pore_size_um = ps_um
-            hs.pore_size_mm = ps_um / 1000.0
-            hs.pore_size_class = _pore_size_class(
-                ps_um,
-                macro_threshold_um=alloy.macro_pore_limit_um,
-                micro_threshold_um=alloy.micro_pore_limit_um,
-            )
-            # v9.1: effective feeding distance depends on the nearest riser size.
-            factor = float(riser_factor_field[vox[0], vox[1], vox[2]])
-            hs.max_feeding_distance_mm = hs.max_feeding_distance_mm * factor
-            feed_cost_ok = hs.feeding_cost < 30.0
-            hs.feed_ok = (
-                (not np.isinf(hs.dist_to_riser_mm))
-                and (hs.dist_to_riser_mm <= hs.max_feeding_distance_mm)
-                and hs.directional_ok
-                and hs.heuvers_ok
-                and feed_cost_ok
-                and hs.darcy_ok
-            )
+        # Sample pore-size and nearest-riser factor at the exact hot-spot
+        # location instead of the coarse voxel centre.
+        ps_um = _sample_field_at_position(
+            hs.position_mm, pore_size_um, origin_mm, dx, order=1, default=0.0
+        )
+        hs.pore_size_um = ps_um
+        hs.pore_size_mm = ps_um / 1000.0
+        hs.pore_size_class = _pore_size_class(
+            ps_um,
+            macro_threshold_um=alloy.macro_pore_limit_um,
+            micro_threshold_um=alloy.micro_pore_limit_um,
+        )
+        # v9.1: effective feeding distance depends on the nearest riser size.
+        factor = _sample_field_at_position(
+            hs.position_mm, riser_factor_field, origin_mm, dx, order=0, default=1.0
+        )
+        hs.max_feeding_distance_mm = hs.max_feeding_distance_mm * factor
+        feed_cost_ok = hs.feeding_cost < 30.0
+        hs.feed_ok = (
+            (not np.isinf(hs.dist_to_riser_mm))
+            and (hs.dist_to_riser_mm <= hs.max_feeding_distance_mm)
+            and hs.directional_ok
+            and hs.heuvers_ok
+            and feed_cost_ok
+            and hs.darcy_ok
+        )
 
     if progress_callback:
         progress_callback(95)
@@ -2344,67 +2451,44 @@ def _build_recommendations(
         )
         return recs
 
-    for hs in result.hotspots:
-        t = hs.t_section_mm
-        W = hs.width_mm
-        fd = alloy.feed_k1 * t
-        unc = hs.m_uncertainty_mm
-        recs.append(
-            f"Hot spot M = {hs.m_value_mm:.2f} ± {unc:.2f} mm, t = {t:.2f} mm, "
-            f"W = {W:.2f} mm, şekil faktörü = {hs.shape_factor:.6f}"
-        )
+    for idx, hs in enumerate(result.hotspots, 1):
+        pos = ",".join(f"{v:.1f}" for v in hs.position_mm)
+        issues: List[str] = []
         if hs.dist_to_riser_mm > hs.max_feeding_distance_mm:
-            recs.append(
-                f"Hot spot: besleme mesafesi {hs.dist_to_riser_mm:.1f} mm > limit {hs.max_feeding_distance_mm:.1f} mm (FD={fd:.1f} mm). "
-                f"Besleyiciyi yakın taşı veya kesiti büyütün."
-            )
+            issues.append("besleme mesafesi yetersiz")
         if not hs.directional_ok:
-            recs.append(
-                f"Hot spot: yönlü katılaşma bozuk, yolda daralma (boyun M={hs.min_neck_m_mm:.1f} mm). "
-                f"Meme/besleyici arasındaki geometriyi kalınlaştırın."
-            )
+            issues.append("yönlü katılaşma bozuk")
         if not hs.heuvers_ok:
-            recs.append(
-                "Hot spot: Heuver çemberi kuralı ihlali - besleme yolunda kesit daralıyor, "
-                "ara bölge daha ince/sıcak. Meme konumunu/kalınlığını gözden geçirin."
-            )
+            issues.append("Heuver ihlali")
         if not hs.darcy_ok:
             if hs.darcy_resistance < 0.01:
-                recs.append(
-                    "Hot spot: Besleme yolunda eriyik oranı çok düşük, katılaşmış bölge geçilemiyor. "
-                    "Mesafeyi kısaltın, kesiti büyütün veya yerel besleyici ekleyin."
-                )
+                issues.append("Darcy: katılaşmış yol tıkalı")
             else:
-                recs.append(
-                    f"Hot spot: Darcy basınç kaybı ({hs.darcy_resistance:.2f} Pa) mevcut hidrostatik basıncı aşıyor. "
-                    f"Mushy-zone geçirgenliği yetersiz; meme/yol kesitini büyütün veya kısa yol seçin."
-                )
-
+                issues.append(f"Darcy basınç kaybı ({hs.darcy_resistance:.2f} Pa)")
         niy = hs.niyama_ensemble
         if niy < alloy.niyama_macro:
-            if hs.feed_ok and hs.darcy_ok:
-                recs.append(
-                    f"Hot spot: Niyama {niy:.2f} < {alloy.niyama_macro} ama "
-                    f"besleyici ile beslenebiliyor. Mikro çekinti/porozite için "
-                    f"besleyici hacim/boyun kontrolü yapın."
-                )
-            else:
-                recs.append(
-                    f"Hot spot: Niyama {niy:.2f} < {alloy.niyama_macro} -> "
-                    f"makro shrinkage / çekinti riski yüksek; besleme yetersiz."
-                )
+            issues.append(f"Niyama {niy:.2f} < {alloy.niyama_macro} (makro shrinkage riski)")
         elif niy < alloy.niyama_shrinkage:
-            if hs.feed_ok and hs.darcy_ok:
-                recs.append(
-                    f"Hot spot: Niyama {niy:.2f} < {alloy.niyama_shrinkage}; "
-                    f"besleyici var ancak mikro gözenek / shrinkage porozite riski "
-                    f"takip edilmeli."
-                )
-            else:
-                recs.append(
-                    f"Hot spot: Niyama {niy:.2f} < {alloy.niyama_shrinkage} -> "
-                    f"mikro gözenek / shrinkage porozite riski."
-                )
+            issues.append(f"Niyama {niy:.2f} < {alloy.niyama_shrinkage} (mikro gözenek riski)")
+        status = "; ".join(issues) if issues else "riskli ama beslenebilir"
+
+        if hs.chill_ok:
+            suggestion = "çıkıcı (chill) konumlandırın"
+        elif hs.feed_ok and hs.darcy_ok:
+            suggestion = "besleyici menzili içinde; besleyici boyun/hacim kontrolü yapın"
+        else:
+            suggestion = "mini ekzotermik besleyici veya çıkıcı (chill) kullanın; yolu kısaltın, kesiti büyütün veya geçiş yarıçapını büyütün"
+
+        pore_extra = ""
+        if hs.pore_size_class and hs.pore_size_um > 0:
+            pore_extra = f" | Gözenek tahmini: {hs.pore_size_um:.1f} µm ({hs.pore_size_class})"
+
+        recs.append(
+            f"Hata Bölgesi #{idx} ({pos} mm): Kritik Hotspot. "
+            f"M={hs.m_value_mm:.2f} mm, Niyama={niy:.2f}. "
+            f"Durum: {status}. "
+            f"Öneri: {suggestion}.{pore_extra}"
+        )
 
     for rr in result.riser_results:
         eff_m = max(rr.effective_m_value_mm, rr.m_value_mm)
