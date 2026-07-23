@@ -37,8 +37,8 @@ class FlowAnimator(QtCore.QObject):
     N_SIDES = 4
     MARKER_SIZE = 10
     MAX_ANIM_CELLS = 120_000
-    MAX_FRAMES = 600
-    MIN_FILL_FRAMES = 450  # most frames are allocated to the filling phase
+    MAX_FRAMES = 1350
+    MIN_FILL_FRAMES = 1200  # most frames are allocated to the filling phase
     PHI_SIGMA = 1.2  # voxels; controls how liquid surface is smoothed
     DECIMATE_TARGET = 0.5  # reduce triangle count per frame for GPU/CPU relief
 
@@ -82,6 +82,7 @@ class FlowAnimator(QtCore.QObject):
         self._frame_actor_scalar: str = ""
 
         self._max_velocity: float = 1.0
+        self._max_surface_velocity: float = 1.0
         self._t_pour: float = 1600.0
         self._t_liq: float = 1510.0
         self._t_sol: float = 1410.0
@@ -188,6 +189,7 @@ class FlowAnimator(QtCore.QObject):
         self._solid_time_d = None
         self._metal_d = None
         self._vmag_d = None
+        self._max_surface_velocity = 1.0
         self._outside_mask = None
         self._outside_idx = None
         self._frame_actor = None
@@ -353,6 +355,30 @@ class FlowAnimator(QtCore.QObject):
             self._base_image.point_data["temperature"] = np.full(
                 self._base_image.n_points, self._t_pour, dtype=np.float32
             )
+
+            # Estimate a surface-velocity colour range.  The global vmag max is
+            # often dominated by the gating and clips the part surface to a
+            # uniform dark blue; use the 95th percentile of the full-fill surface.
+            ft = self._fill_time_d
+            metal = ft < self._sentinel
+            filled = (ft <= self._max_fill_time) & metal
+            if filled.any():
+                phi = ndimage.gaussian_filter(
+                    filled.astype(np.float64),
+                    sigma=self.PHI_SIGMA,
+                    mode="constant",
+                    cval=0.0,
+                )
+                self._base_image.point_data["phi"] = phi.ravel(order="F")
+                surf = self._base_image.contour(
+                    isosurfaces=[0.5], scalars="phi"
+                )
+                if surf.n_points > 0:
+                    v = surf["velocity_magnitude"]
+                    if v.size > 0:
+                        self._max_surface_velocity = max(
+                            float(np.percentile(v, 95)), 0.01
+                        )
 
         # Phase 1: only store the phi scalar volume per frame.
         for i, t in enumerate(fill_times):
@@ -1006,7 +1032,7 @@ class FlowAnimator(QtCore.QObject):
                         self._frame_actor = self._viewer.add_mesh(
                             surface,
                             cmap="plasma",
-                            clim=(0.0, self._max_velocity),
+                            clim=(0.0, self._max_surface_velocity),
                             opacity=1.0,
                             scalars="velocity_magnitude",
                             show_scalar_bar=True,
