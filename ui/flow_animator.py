@@ -40,6 +40,8 @@ class FlowAnimator(QtCore.QObject):
     MAX_FRAMES = 48
     SMOOTH_ITER = 6
     SMOOTH_RELAX = 0.1
+    PHI_SIGMA = 1.2  # voxels; controls how liquid surface is smoothed
+    INWARD_OFFSET_VOXELS = 0.8  # sample colour slightly inside the liquid
 
     def __init__(self, viewer):
         super().__init__(parent=None)
@@ -292,11 +294,13 @@ class FlowAnimator(QtCore.QObject):
         """Return the liquid/mushy metal region at time t, coloured by temperature.
 
         A cell is visible when it has already filled (fill_time <= t) and is not
-        yet fully solidified (solid_time > t).  The scalar used for clipping is
-        solid_time inside filled cells and a large negative sentinel elsewhere.
-        This makes the solidification front (solid_time = t) smooth because the
-        scalar is continuous across the liquid/solid boundary, while the filling
-        front is simply the filled/not-filled boundary.
+        yet fully solidified (solid_time > t).  To avoid jagged voxel edges we
+        build a level-set volume fraction ``phi`` (1 inside the liquid, 0
+        outside), blur it with a small Gaussian, and extract the ``phi = 0.5``
+        isosurface using marching cubes.  The surface is then smoothed with a
+        VTK windowed-sinc filter and coloured by sampling the temperature array
+        a short distance *inward* along the normal, so the metal side temperature
+        is shown instead of an interpolation with the surrounding air/mould.
         """
         if self._base_image is None:
             return None
@@ -313,32 +317,41 @@ class FlowAnimator(QtCore.QObject):
         # the colour at the solidification front does not bleed cold during
         # interpolation.
         t_arr = np.where(filled & (~liquid), self._t_sol, t_arr)
-        self._base_image.point_data["temperature"] = t_arr.ravel(order="F")
 
-        # visible_scalar: use solid_time for filled cells, capped to just above
-        # max_time for very late/unsolidified cells.  This avoids a symmetric
-        # +/- sentinel scalar pair that puts the isosurface in the middle of an
-        # edge (and gives midpoint colours like (1600+25)/2).  Empty/mold
-        # cells get a large negative sentinel so they stay excluded.
-        vis_cap = self._max_time + 1.0
-        clipped_st = np.where(np.isfinite(st), st, vis_cap)
-        clipped_st = np.minimum(clipped_st, vis_cap)
-        visible_scalar = np.where(filled, clipped_st, -self._sentinel)
-        self._base_image.point_data["visible_scalar"] = visible_scalar.ravel(order="F")
+        # Extend the liquid-side colour into non-visible neighbours.  This stops
+        # the marching-cubes surface colour from averaging across the metal/air
+        # boundary and producing cold (mould) colours on the liquid surface.
+        t_color = t_arr.copy()
+        if liquid.any():
+            inv = ~liquid
+            nearest = ndimage.distance_transform_edt(
+                inv, return_indices=True, return_distances=False
+            )
+            z, y, x = nearest
+            t_color[inv] = t_arr[z[inv], y[inv], x[inv]]
 
-        # Keep cells whose effective solid time is >= current time; the
-        # isosurface visible_scalar = t is the solidification/filling front.
-        clipped = self._base_image.clip_scalar(
-            value=float(t), scalars="visible_scalar", invert=False
+        # Build a smooth liquid volume fraction field.
+        raw_phi = liquid.astype(np.float64)
+        phi = ndimage.gaussian_filter(
+            raw_phi, sigma=self.PHI_SIGMA, mode="constant", cval=0.0
         )
-        if clipped.n_cells == 0:
-            return None
 
-        surface = clipped.extract_surface(algorithm="dataset_surface")
+        self._base_image.point_data["phi"] = phi.ravel(order="F")
+        # The colour scalar is the liquid-side temperature extrapolated into
+        # non-visible neighbours, so the marching-cubes surface never samples
+        # cold mould/air values.
+        self._base_image.point_data["temperature"] = t_color.ravel(order="F")
+
+        # Marching-cubes extraction of the phi = 0.5 isosurface.
+        surface = self._base_image.contour(isosurfaces=[0.5], scalars="phi")
         if surface.n_points == 0:
             return None
 
-        surface.set_active_scalars("temperature")
+        # Optional windowed-sinc smoothing for a fluid-like surface.
+        surface = self._windowed_sinc_smooth(surface)
+
+        # Recompute normals for lighting; vtkContourFilter may have generated
+        # some, but a fresh pass guarantees consistency after smoothing.
         try:
             surface = surface.compute_normals(
                 auto_orient_normals=True, flip_normals=False
@@ -346,18 +359,45 @@ class FlowAnimator(QtCore.QObject):
         except Exception:
             pass
 
-        try:
-            surface = surface.smooth(
-                n_iter=self.SMOOTH_ITER,
-                relaxation_factor=self.SMOOTH_RELAX,
-                feature_angle=60.0,
-                boundary_smoothing=True,
-                feature_smoothing=False,
-            )
-        except Exception:
-            pass
-
+        surface.set_active_scalars("temperature")
         return surface
+
+    def _windowed_sinc_smooth(self, mesh: pv.PolyData) -> pv.PolyData:
+        """Apply a VTK windowed-sinc filter for fluid-like smooth surfaces."""
+        try:
+            import vtk
+
+            smooth = vtk.vtkWindowedSincPolyDataFilter()
+            smooth.SetInputData(mesh)
+            smooth.SetNumberOfIterations(20)
+            smooth.SetPassBand(0.1)
+            smooth.SetFeatureAngle(120.0)
+            smooth.BoundarySmoothingOn()
+            smooth.FeatureEdgeSmoothingOff()
+            smooth.NonManifoldSmoothingOff()
+            smooth.NormalizeCoordinatesOn()
+            smooth.Update()
+            out = pv.PolyData(smooth.GetOutput())
+            return out if out.n_points > 0 else mesh
+        except Exception:
+            return mesh
+
+    def _sample_scalar_at_points(
+        self, points: np.ndarray, field: np.ndarray, order: int = 1
+    ) -> np.ndarray:
+        """Sample a 3-D scalar field at physical point positions."""
+        origin = np.asarray(self._base_image.origin, dtype=np.float64)
+        spacing = np.asarray(self._base_image.spacing, dtype=np.float64)
+        ijk = (points - origin) / spacing
+        return np.asarray(
+            ndimage.map_coordinates(
+                field,
+                ijk.T,
+                order=order,
+                mode="nearest",
+            ),
+            dtype=np.float64,
+        )
 
     def _compute_temperature(self, t: float) -> np.ndarray:
         """Return a temperature field for the downsampled animation grid."""
