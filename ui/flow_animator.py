@@ -30,7 +30,7 @@ from ui.flow_velocity_graph import FlowVelocityGraph
 class FlowAnimator(QtCore.QObject):
     """Animate metal filling and solidification as a sequence of 3-D frames."""
 
-    TIMER_INTERVAL = 0.04  # base interval between live frames (s)
+    TIMER_INTERVAL = 0.10  # base interval between live frames (s) - slow cinematic
     MAX_STREAMLINES = 20
     MAX_STEPS = 2000
     CFL_FRACTION = 0.5
@@ -38,7 +38,7 @@ class FlowAnimator(QtCore.QObject):
     MARKER_SIZE = 10
     MAX_ANIM_CELLS = 120_000
     MAX_FRAMES = 400
-    MIN_FILL_FRAMES = 36  # ensure the filling phase is visibly smooth
+    MIN_FILL_FRAMES = 250  # most frames are allocated to the filling phase
     PHI_SIGMA = 1.2  # voxels; controls how liquid surface is smoothed
     DECIMATE_TARGET = 0.5  # reduce triangle count per frame for GPU/CPU relief
 
@@ -316,16 +316,10 @@ class FlowAnimator(QtCore.QObject):
         """Precompute lightweight scalar matrices; 3-D meshes are built live."""
         n_frames = max(2, self.MAX_FRAMES)
         has_solid = self._max_solid_time > self._max_fill_time
-        # Reserve at least 12 frames for the filling phase so the advancing
-        # liquid front is visibly smooth; the rest is for solidification.
+        # Fill phase gets the lion's share of frames so the liquid rise is
+        # cinematic and physically readable; remaining frames are for solidification.
         if has_solid:
-            self._n_fill = min(
-                n_frames - 2,
-                max(
-                    self.MIN_FILL_FRAMES,
-                    int(round(n_frames * self._max_fill_time / self._max_time)),
-                ),
-            )
+            self._n_fill = min(self.MIN_FILL_FRAMES, n_frames - 2)
             self._n_solid = n_frames - self._n_fill
         else:
             self._n_fill = n_frames
