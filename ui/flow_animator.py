@@ -1,9 +1,11 @@
 """Lightweight flow-animation engine for JoséCast Analyzer.
 
-Shows metal filling as red particles (voxel centres) appearing in the order
-predicted by the Darcy ``fill_time`` field.  Optionally adds a few red
-streamlines through the gating to indicate flow direction.  No extra physics is
-introduced: the timing comes directly from the engineering solver.
+Renders metal filling and solidification as a sequence of pre-computed,
+smooth isosurface frames.  The geometry of each frame comes from the Darcy
+``fill_time`` field, and the surface colour comes from a simple cooling model
+based on ``fill_time`` and ``solidification_time``.  No extra physics is
+introduced: the timing and solidification data come directly from the
+engineering solver.
 """
 
 from typing import List, Optional
@@ -13,11 +15,17 @@ import pyvista as pv
 from PyQt6 import QtCore
 from scipy import ndimage
 
+try:
+    from matplotlib.colors import LinearSegmentedColormap
+except Exception:  # pragma: no cover - fallback if matplotlib is missing
+    LinearSegmentedColormap = None  # type: ignore
+
+from core.materials import get_alloy, get_mold
 from core.types import AnalysisResult, BodyType
 
 
 class FlowAnimator(QtCore.QObject):
-    """Animate metal filling as Darcy-time-ordered red particles."""
+    """Animate metal filling and solidification as a sequence of 3-D frames."""
 
     TIMER_INTERVAL = 0.05
     FRAME_DT = 0.02
@@ -26,9 +34,10 @@ class FlowAnimator(QtCore.QObject):
     CFL_FRACTION = 0.5
     N_SIDES = 4
     MARKER_SIZE = 10
-    MAX_FILL_POINTS = 80_000
-    POINT_SIZE_MIN = 5
-    POINT_SIZE_MAX = 25
+    MAX_ANIM_CELLS = 120_000
+    MAX_FRAMES = 48
+    SMOOTH_ITER = 6
+    SMOOTH_RELAX = 0.1
 
     def __init__(self, viewer):
         super().__init__(parent=None)
@@ -37,47 +46,49 @@ class FlowAnimator(QtCore.QObject):
         self._timer.timeout.connect(self._on_timer)
 
         self._result: Optional[AnalysisResult] = None
-        self._streamlines: Optional[pv.PolyData] = None
-        self._tube_mesh: Optional[pv.PolyData] = None
-        self._edt: Optional[np.ndarray] = None
-        self._max_time: float = 0.0
-
-        self._metal_field: Optional[np.ndarray] = None
-        self._body_field: Optional[np.ndarray] = None
-        self._has_part: bool = False
-
-        # Filling particle cloud.
-        self._fill_points: Optional[np.ndarray] = None
-        self._fill_times: Optional[np.ndarray] = None
-        self._fill_point_size: int = self.POINT_SIZE_MIN
-        self._fill_actor = None
-
         self._is_running: bool = False
         self._current_time: float = 0.0
         self._speed_multiplier: float = 1.0
+        self._max_time: float = 0.0
         self._show_streamlines: bool = True
 
+        # Streamline data (optional overlay)
+        self._streamlines: Optional[pv.PolyData] = None
+        self._tube_mesh: Optional[pv.PolyData] = None
+        self._edt: Optional[np.ndarray] = None
         self._streamline_actor = None
         self._marker_actor = None
 
+        # Pre-computed volume frames
+        self._frame_meshes: List[Optional[pv.PolyData]] = []
+        self._frame_times: Optional[np.ndarray] = None
+        self._frame_actor = None
+        self._cmap = None
+        self._t_pour: float = 1600.0
+        self._t_liq: float = 1510.0
+        self._t_sol: float = 1410.0
+        self._t_mold: float = 25.0
+
+        # Downsampled animation grid
+        self._base_image: Optional[pv.ImageData] = None
+        self._fill_time_d: Optional[np.ndarray] = None
+        self._solid_time_d: Optional[np.ndarray] = None
+        self._metal_d: Optional[np.ndarray] = None
+        self._sentinel: float = 1e9
+
     def set_result(self, result: Optional[AnalysisResult]) -> None:
-        """Attach a completed analysis result and build the animation data."""
+        """Attach a completed analysis result and build the animation frames."""
         self.stop()
         self._clear_actors()
+        self._reset_data()
         self._result = result
-        self._streamlines = None
-        self._tube_mesh = None
-        self._edt = None
-        self._fill_points = None
-        self._fill_times = None
-        self._fill_actor = None
 
         if result is None or result.flow_result is None:
             return
 
         fr = result.flow_result
-        velocity = fr.velocity
         fill_time = fr.fill_time
+        velocity = fr.velocity
         if (
             velocity is None
             or fill_time is None
@@ -87,8 +98,8 @@ class FlowAnimator(QtCore.QObject):
         ):
             return
 
-        self._velocity = np.asarray(velocity, dtype=np.float64)
         self._fill_time = np.asarray(fill_time, dtype=np.float64)
+        self._velocity = np.asarray(velocity, dtype=np.float64)
         self._origin = np.asarray(result.origin_mm, dtype=np.float64)
         self._dx = float(result.dx_mm)
         self._shape = tuple(int(s) for s in result.grid.shape)
@@ -97,22 +108,30 @@ class FlowAnimator(QtCore.QObject):
         if not metal.any():
             return
 
-        self._metal_field = metal.astype(np.float32)
-        self._body_field = result.grid.astype(np.float32)
-        self._has_part = bool((result.grid == BodyType.PART).any())
+        # ---- animation time window ----
+        max_fill = self._finite_max(self._fill_time, metal)
+        solid_time = result.solidification_time
+        if solid_time is not None and solid_time.size == fill_time.size:
+            self._solid_time = np.asarray(solid_time, dtype=np.float64)
+            max_solid = self._finite_max(self._solid_time, metal)
+        else:
+            self._solid_time = np.full_like(self._fill_time, np.inf)
+            max_solid = -np.inf
 
-        self._max_time = float(fr.fill_time_s or 0.0)
-        if self._max_time <= 0.0:
-            finite = np.isfinite(self._fill_time) & metal
-            if finite.any():
-                self._max_time = float(np.max(self._fill_time[finite]))
+        self._max_time = float(max_fill)
+        if np.isfinite(max_solid) and max_solid > max_fill:
+            self._max_time = float(max_solid)
         if self._max_time <= 0.0:
             return
 
-        # Main filling particle cloud.
-        self._build_fill_points()
+        # ---- temperature bounds ----
+        self._load_temperature_bounds(result)
 
-        # Optional red streamlines through the gating.
+        # ---- build downsampled animation grid and precompute frames ----
+        if not self._build_animation_grid(metal):
+            return
+
+        # ---- optional red streamlines through the gating ----
         self._edt = ndimage.distance_transform_edt(metal) * self._dx
         source_pts = self._build_source_points()
         if source_pts is not None and source_pts.shape[0] > 0:
@@ -128,51 +147,217 @@ class FlowAnimator(QtCore.QObject):
         self._current_time = 0.0
         self._update_scene()
 
-    def _build_fill_points(self) -> None:
-        """Create the Darcy fill_time ordered particle cloud.
+    def _reset_data(self) -> None:
+        self._streamlines = None
+        self._tube_mesh = None
+        self._edt = None
+        self._frame_meshes = []
+        self._frame_times = None
+        self._base_image = None
+        self._fill_time_d = None
+        self._solid_time_d = None
+        self._metal_d = None
+        self._frame_actor = None
+        self._streamline_actor = None
+        self._marker_actor = None
+        self._cmap = None
 
-        Every metal voxel centre becomes a candidate red particle.  We keep only
-        a budgeted random subset so rendering stays light, then sort by
-        ``fill_time`` so particles appear in the correct filling order.
-        """
-        if self._result is None or self._fill_time is None:
-            return
+    def _finite_max(self, arr: np.ndarray, mask: np.ndarray) -> float:
+        finite = mask & np.isfinite(arr)
+        if finite.any():
+            return float(np.max(arr[finite]))
+        return -np.inf
 
-        metal = self._result.grid > 0
-        if not metal.any():
-            return
+    def _load_temperature_bounds(self, result: AnalysisResult) -> None:
+        cp = getattr(result, "casting_params", None)
+        alloy = get_alloy(getattr(result, "alloy_key", "42CrMo4"))
+        mold = get_mold(getattr(result, "mold_key", "sand"))
 
-        ijk = np.argwhere(metal)
-        ft = self._fill_time[metal]
-        finite = np.isfinite(ft)
-        if not finite.any():
-            return
-
-        ijk = ijk[finite]
-        ft = ft[finite]
-        n = ft.shape[0]
-
-        if n > self.MAX_FILL_POINTS:
-            rng = np.random.default_rng(0)
-            idx = rng.choice(n, self.MAX_FILL_POINTS, replace=False)
-            ijk = ijk[idx]
-            ft = ft[idx]
-
-        pts = (ijk.astype(np.float64) + 0.5) * self._dx + self._origin
-        order = np.argsort(ft, kind="mergesort")
-        self._fill_points = pts[order]
-        self._fill_times = ft[order]
-
-        # Rough screen-pixel size so the particles overlap at default zoom.
-        model_size = float(np.ptp(pts, axis=0).max())
-        if model_size > 0:
-            ps = int(1.5 * 1024 * self._dx / model_size)
+        if cp is not None:
+            self._t_pour = float(cp.t_pour_c)
+            self._t_mold = float(cp.t_mold_c)
+            self._t_liq = float(cp.t_liquidus_c)
+            self._t_sol = float(cp.t_solidus_c)
         else:
-            ps = self.POINT_SIZE_MIN
-        self._fill_point_size = max(
-            self.POINT_SIZE_MIN, min(self.POINT_SIZE_MAX, ps)
-        )
+            self._t_pour = float(alloy.t_pour_c)
+            self._t_mold = float(mold.t0_c)
+            self._t_liq = float(alloy.t_liquidus_c)
+            self._t_sol = float(alloy.t_solidus_c)
 
+    def _build_animation_grid(self, metal: np.ndarray) -> bool:
+        """Crop, downsample, and precompute the frame meshes."""
+        # Crop to the metal bounding box with a small pad.
+        idx = np.nonzero(metal)
+        if len(idx[0]) == 0:
+            return False
+
+        pad = 1
+        bbox = [
+            max(0, int(idx[0].min()) - pad),
+            min(self._shape[0], int(idx[0].max()) + 1 + pad),
+            max(0, int(idx[1].min()) - pad),
+            min(self._shape[1], int(idx[1].max()) + 1 + pad),
+            max(0, int(idx[2].min()) - pad),
+            min(self._shape[2], int(idx[2].max()) + 1 + pad),
+        ]
+
+        fill_c = self._fill_time[
+            bbox[0] : bbox[1], bbox[2] : bbox[3], bbox[4] : bbox[5]
+        ].copy()
+        solid_c = self._solid_time[
+            bbox[0] : bbox[1], bbox[2] : bbox[3], bbox[4] : bbox[5]
+        ].copy()
+        metal_c = metal[
+            bbox[0] : bbox[1], bbox[2] : bbox[3], bbox[4] : bbox[5]
+        ]
+
+        self._sentinel = max(10.0 * self._max_time, 1e6) + 1.0
+        fill_c = np.where(np.isfinite(fill_c) & metal_c, fill_c, self._sentinel)
+        solid_c = np.where(np.isfinite(solid_c) & metal_c, solid_c, self._sentinel)
+
+        crop_shape = fill_c.shape
+        cells = int(np.prod(crop_shape))
+        factor = 1
+        if cells > self.MAX_ANIM_CELLS:
+            factor = max(
+                1,
+                int(np.ceil((cells / self.MAX_ANIM_CELLS) ** (1.0 / 3.0))),
+            )
+
+        if factor > 1:
+            target_shape = tuple(max(1, crop_shape[i] // factor) for i in range(3))
+            ratios = tuple(
+                target_shape[i] / crop_shape[i] for i in range(3)
+            )
+            fill_d = ndimage.zoom(fill_c, ratios, order=1)
+            solid_d = ndimage.zoom(solid_c, ratios, order=1)
+            metal_d = ndimage.zoom(metal_c.astype(np.float32), ratios, order=0) > 0.5
+            fill_d = np.where(metal_d, fill_d, self._sentinel)
+            solid_d = np.where(metal_d, solid_d, self._sentinel)
+            spacing = tuple(self._dx * crop_shape[i] / target_shape[i] for i in range(3))
+            shape = target_shape
+        else:
+            fill_d, solid_d, metal_d = fill_c, solid_c, metal_c
+            spacing = (self._dx, self._dx, self._dx)
+            shape = crop_shape
+
+        origin_c = self._origin + np.array(
+            [bbox[0], bbox[2], bbox[4]], dtype=np.float64
+        ) * self._dx
+
+        self._fill_time_d = fill_d
+        self._solid_time_d = solid_d
+        self._metal_d = metal_d
+
+        img = pv.ImageData(
+            dimensions=shape, spacing=spacing, origin=origin_c
+        )
+        img.point_data["fill_time"] = fill_d.ravel(order="F")
+        img.point_data["solid_time"] = solid_d.ravel(order="F")
+        self._base_image = img
+
+        self._build_frames()
+        return bool(self._frame_meshes)
+
+    def _build_frames(self) -> None:
+        """Precompute a fixed number of volume frames."""
+        n_frames = max(2, self.MAX_FRAMES)
+        self._frame_times = np.linspace(0.0, self._max_time, n_frames)
+        self._frame_meshes = []
+
+        # Metal-like colour scale: cold/blue-grey -> dark red -> orange -> yellow-white.
+        if LinearSegmentedColormap is not None:
+            self._cmap = LinearSegmentedColormap.from_list(
+                "metal_flow",
+                [
+                    (0.10, 0.15, 0.25),  # cold solid / mould
+                    (0.60, 0.10, 0.05),  # cooling metal
+                    (1.00, 0.20, 0.00),  # red hot
+                    (1.00, 0.90, 0.40),  # pour / white hot
+                ],
+            )
+        else:
+            self._cmap = "coolwarm"
+
+        app = QtCore.QCoreApplication.instance()
+        for i, t in enumerate(self._frame_times):
+            mesh = self._build_frame(t)
+            self._frame_meshes.append(mesh)
+            if app is not None and i % 5 == 0:
+                app.processEvents()
+
+    def _build_frame(self, t: float) -> Optional[pv.PolyData]:
+        """Return the filled-metal boundary surface coloured by temperature."""
+        if self._base_image is None:
+            return None
+
+        t_arr = self._compute_temperature(t)
+        self._base_image.point_data["temperature"] = t_arr.ravel(order="F")
+
+        # Keep the region where fill_time <= t.
+        clipped = self._base_image.clip_scalar(
+            value=float(t), scalars="fill_time", invert=True
+        )
+        if clipped.n_cells == 0:
+            return None
+
+        surface = clipped.extract_surface(algorithm="dataset_surface")
+        if surface.n_points == 0:
+            return None
+
+        surface.set_active_scalars("temperature")
+        try:
+            surface = surface.compute_normals(
+                auto_orient_normals=True, flip_normals=False
+            )
+        except Exception:
+            pass
+
+        try:
+            surface = surface.smooth(
+                n_iter=self.SMOOTH_ITER,
+                relaxation_factor=self.SMOOTH_RELAX,
+                feature_angle=60.0,
+                boundary_smoothing=True,
+                feature_smoothing=False,
+            )
+        except Exception:
+            pass
+
+        return surface
+
+    def _compute_temperature(self, t: float) -> np.ndarray:
+        """Return a temperature field for the downsampled animation grid."""
+        ft = self._fill_time_d
+        st = self._solid_time_d
+
+        local = t - ft
+        metal = ft < self._sentinel
+        filled = (ft <= t) & metal
+
+        # Cooling time constant chosen so that T reaches solidus at solid_time.
+        local_solid = np.maximum(st - ft, 1e-9)
+        local_solid = np.where(np.isfinite(local_solid), local_solid, self._max_time)
+
+        ratio = (self._t_sol - self._t_mold) / max(
+            self._t_pour - self._t_mold, 1e-9
+        )
+        ratio = np.clip(ratio, 1e-6, 1.0 - 1e-6)
+        log_ratio = np.log(ratio)  # negative
+        tau = local_solid / np.maximum(-log_ratio, 1e-9)
+
+        T = self._t_mold + (self._t_pour - self._t_mold) * np.exp(
+            -np.maximum(local, 0.0) / tau
+        )
+        T = np.clip(T, self._t_mold, self._t_pour)
+        # Not-yet-filled metal stays at pour temperature so the advancing front
+        # appears hot; true empty space is cold.
+        T = np.where(filled, T, np.where(metal, self._t_pour, self._t_mold))
+        return T
+
+    # ------------------------------------------------------------------
+    # Streamline helpers (kept as an optional red overlay)
+    # ------------------------------------------------------------------
     def _build_source_points(self) -> Optional[np.ndarray]:
         """Seed up to MAX_STREAMLINES start points uniformly across the inlet."""
         metal = self._result.grid > 0
@@ -237,7 +422,7 @@ class FlowAnimator(QtCore.QObject):
         ijk = (pos - self._origin) * inv_dx - 0.5
         coords = np.stack([ijk[:, 0], ijk[:, 1], ijk[:, 2]], axis=0)
         sampled = ndimage.map_coordinates(
-            self._metal_field,
+            self._result.grid.astype(np.float32),
             coords,
             order=0,
             mode="constant",
@@ -253,7 +438,7 @@ class FlowAnimator(QtCore.QObject):
         ijk = (pos - self._origin) * inv_dx - 0.5
         coords = np.stack([ijk[:, 0], ijk[:, 1], ijk[:, 2]], axis=0)
         sampled = ndimage.map_coordinates(
-            self._body_field,
+            self._result.grid.astype(np.float32),
             coords,
             order=0,
             mode="constant",
@@ -317,13 +502,12 @@ class FlowAnimator(QtCore.QObject):
 
             new_pos = pos_active + v * (dt * 1000.0)
             inside = self._inside_metal(new_pos)
-            body_type = self._sample_body_type(new_pos) if self._has_part else None
+            body_type = self._sample_body_type(new_pos)
 
             for local, global_idx in enumerate(active_indices):
                 if not inside[local]:
                     active[global_idx] = False
-                elif self._has_part and body_type is not None and body_type[local] == BodyType.PART:
-                    # Stop at the part entry; the particle fill takes over there.
+                elif body_type[local] == BodyType.PART:
                     pos[global_idx] = new_pos[local]
                     line_points[global_idx].append(pos[global_idx].copy())
                     line_vel[global_idx].append(float(speed[local]))
@@ -417,8 +601,6 @@ class FlowAnimator(QtCore.QObject):
             return
 
         radii = self._sample_scalar(self._streamlines.points, self._edt)
-        # Smooth a little so the radius follows the channel centreline rather
-        # than hugging wall bumps.
         lines = self._streamlines.lines
         out_radii = np.empty(self._streamlines.n_points, dtype=np.float64)
         idx = 0
@@ -487,11 +669,14 @@ class FlowAnimator(QtCore.QObject):
             return None
         return np.array(markers, dtype=np.float64)
 
+    # ------------------------------------------------------------------
+    # Public control API
+    # ------------------------------------------------------------------
     def set_speed_multiplier(self, speed: float) -> None:
-        self._speed_multiplier = max(0.01, float(speed))
+        self._speed_multiplier = min(20.0, max(0.01, float(speed)))
 
     def set_show_streamlines(self, show: bool) -> None:
-        """Show/hide the red flow paths and moving markers."""
+        """Show/hide the red flow-path lines."""
         self._show_streamlines = bool(show)
         self._update_scene()
 
@@ -500,7 +685,7 @@ class FlowAnimator(QtCore.QObject):
         self._update_scene()
 
     def play(self) -> None:
-        if self._fill_points is None and self._streamlines is None:
+        if not self._frame_meshes:
             return
         if self._is_running:
             self._timer.stop()
@@ -532,15 +717,15 @@ class FlowAnimator(QtCore.QObject):
             except Exception:
                 pass
             self._marker_actor = None
-        if self._fill_actor is not None:
+        if self._frame_actor is not None:
             try:
-                self._viewer.remove_actor(self._fill_actor)
+                self._viewer.remove_actor(self._frame_actor)
             except Exception:
                 pass
-            self._fill_actor = None
+            self._frame_actor = None
 
     def _on_timer(self) -> None:
-        if self._fill_points is None and self._streamlines is None:
+        if not self._frame_meshes:
             return
         dt = self.FRAME_DT * self._speed_multiplier
         self._current_time = min(self._current_time + dt, self._max_time)
@@ -549,8 +734,40 @@ class FlowAnimator(QtCore.QObject):
             self.pause()
 
     def _update_scene(self) -> None:
-        self._update_fill_points()
+        if not self._frame_meshes or self._frame_times is None:
+            return
 
+        idx = max(
+            0,
+            int(np.searchsorted(self._frame_times, self._current_time, side="right")) - 1,
+        )
+        idx = min(idx, len(self._frame_meshes) - 1)
+        mesh = self._frame_meshes[idx]
+
+        if mesh is None:
+            # No geometry at this time step; hide the frame actor.
+            if self._frame_actor is not None:
+                try:
+                    self._viewer.remove_actor(self._frame_actor)
+                except Exception:
+                    pass
+                self._frame_actor = None
+        else:
+            if self._frame_actor is None:
+                self._frame_actor = self._viewer.add_mesh(
+                    mesh,
+                    cmap=self._cmap,
+                    clim=(self._t_mold, self._t_pour),
+                    opacity=1.0,
+                    scalars="temperature",
+                    show_scalar_bar=True,
+                    scalar_bar_args={"title": "Sıcaklık (°C)"},
+                    name="flow_frame",
+                )
+            else:
+                self._frame_actor.mapper.dataset = mesh
+
+        # Optional red streamlines overlay.
         if self._show_streamlines and self._tube_mesh is not None:
             if self._streamline_actor is None:
                 self._streamline_actor = self._viewer.add_mesh(
@@ -600,47 +817,24 @@ class FlowAnimator(QtCore.QObject):
 
         self._viewer.render()
 
-    def _update_fill_points(self) -> None:
-        """Show the metal particles whose fill_time has been reached."""
-        if self._fill_points is None or self._fill_times is None:
-            return
+    def frame_count(self) -> int:
+        return len(self._frame_meshes)
 
-        count = int(np.searchsorted(self._fill_times, self._current_time))
-        if count <= 0:
-            if self._fill_actor is not None:
-                try:
-                    self._viewer.remove_actor(self._fill_actor)
-                except Exception:
-                    pass
-                self._fill_actor = None
-            return
-
-        # Limit count to the precomputed budget.
-        count = min(count, self._fill_points.shape[0])
-        points = self._fill_points[:count]
-
-        if self._fill_actor is None:
-            self._fill_actor = self._viewer.add_mesh(
-                pv.PolyData(points),
-                render_points_as_spheres=True,
-                point_size=self._fill_point_size,
-                color="red",
-                opacity=0.9,
-                show_scalar_bar=False,
-                name="flow_fill_points",
-            )
-        else:
-            self._fill_actor.mapper.dataset = pv.PolyData(points)
-
-    def particle_count(self) -> int:
-        """Number of red fill particles currently displayed."""
-        if self._fill_points is None or self._fill_times is None:
-            return 0
-        count = int(np.searchsorted(self._fill_times, self._current_time))
-        return min(count, self._fill_points.shape[0])
+    def current_frame_index(self) -> int:
+        if not self._frame_meshes or self._frame_times is None or self._max_time <= 0:
+            return -1
+        idx = max(
+            0,
+            int(np.searchsorted(self._frame_times, self._current_time, side="right")) - 1,
+        )
+        return min(idx, len(self._frame_meshes) - 1)
 
     def line_count(self) -> int:
-        """Number of flow-path lines."""
+        """Number of flow-path lines (streamlines)."""
         if self._streamlines is None:
             return 0
         return int(self._streamlines.n_cells)
+
+    def particle_count(self) -> int:
+        """Kept for API compatibility; the new animator uses surface frames."""
+        return 0

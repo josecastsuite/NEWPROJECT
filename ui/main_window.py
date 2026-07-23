@@ -546,9 +546,9 @@ class MainWindow(QtWidgets.QMainWindow):
         speed_layout = QtWidgets.QHBoxLayout()
         speed_label = QtWidgets.QLabel("Hız:")
         self.flow_speed_spin = QtWidgets.QDoubleSpinBox()
-        self.flow_speed_spin.setRange(0.01, 5.0)
+        self.flow_speed_spin.setRange(0.01, 20.0)
         self.flow_speed_spin.setValue(1.0)
-        self.flow_speed_spin.setSingleStep(0.05)
+        self.flow_speed_spin.setSingleStep(0.1)
         self.flow_speed_spin.setDecimals(2)
         self.flow_speed_spin.setSuffix("x")
         self.flow_speed_spin.valueChanged.connect(self.on_flow_speed_changed)
@@ -557,7 +557,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         count_label = QtWidgets.QLabel("Akış:")
         self.flow_particle_label = QtWidgets.QLabel("—")
-        self.flow_particle_label.setToolTip("Akış hattı ve dolma noktası sayısı")
+        self.flow_particle_label.setToolTip("Dolum animasyonu kare sayısı")
         speed_layout.addWidget(count_label)
         speed_layout.addWidget(self.flow_particle_label)
         anim_layout.addLayout(speed_layout)
@@ -1427,7 +1427,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.flow_time_label.setText(f"t: {t:.3f} s / {animator._max_time:.3f} s")
             if animator:
                 self.flow_particle_label.setText(
-                    f"{animator.line_count()} hat, {animator.particle_count()} nokta"
+                    f"{animator.current_frame_index() + 1}/{animator.frame_count()} kare"
                 )
 
     def on_toggle_flow_animation(self, checked: bool):
