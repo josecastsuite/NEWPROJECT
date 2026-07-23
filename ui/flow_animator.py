@@ -8,6 +8,7 @@ introduced: the timing and solidification data come directly from the
 engineering solver.
 """
 
+import time
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -29,24 +30,23 @@ from ui.flow_velocity_graph import FlowVelocityGraph
 class FlowAnimator(QtCore.QObject):
     """Animate metal filling and solidification as a sequence of 3-D frames."""
 
-    TIMER_INTERVAL = 0.05
-    FRAME_DT = 0.02
+    TIMER_INTERVAL = 0.04  # base interval between live frames (s)
     MAX_STREAMLINES = 20
     MAX_STEPS = 2000
     CFL_FRACTION = 0.5
     N_SIDES = 4
     MARKER_SIZE = 10
     MAX_ANIM_CELLS = 120_000
-    MAX_FRAMES = 48
-    SMOOTH_ITER = 6
-    SMOOTH_RELAX = 0.1
+    MAX_FRAMES = 400
+    MIN_FILL_FRAMES = 36  # ensure the filling phase is visibly smooth
     PHI_SIGMA = 1.2  # voxels; controls how liquid surface is smoothed
-    INWARD_OFFSET_VOXELS = 0.8  # sample colour slightly inside the liquid
+    DECIMATE_TARGET = 0.5  # reduce triangle count per frame for GPU/CPU relief
 
     def __init__(self, viewer):
         super().__init__(parent=None)
         self._viewer = viewer
         self._timer = QtCore.QTimer(self)
+        self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._on_timer)
 
         self._result: Optional[AnalysisResult] = None
@@ -66,10 +66,11 @@ class FlowAnimator(QtCore.QObject):
         self._streamline_actor = None
         self._marker_actor = None
 
-        # Two-phase pre-computed frames
-        # Phase 1 (filling): geometry grows; colour = velocity magnitude.
-        self._phase1_meshes: List[Optional[pv.PolyData]] = []
-        # Phase 2 (solidification): fixed geometry; scalars change per frame.
+        # Two-phase pre-computed scalar matrices (NO full 3-D mesh geometry).
+        # Phase 1: one phi scalar volume per fill frame.
+        self._phase1_phi: List[np.ndarray] = []
+        self._phase1_times: List[float] = []
+        # Phase 2: fixed decimated mesh; per-frame temperature/solid-fraction.
         self._phase2_mesh: Optional[pv.PolyData] = None
         self._phase2_temps: List[np.ndarray] = []
         self._phase2_solids: List[np.ndarray] = []
@@ -92,6 +93,8 @@ class FlowAnimator(QtCore.QObject):
         self._solid_time_d: Optional[np.ndarray] = None
         self._metal_d: Optional[np.ndarray] = None
         self._vmag_d: Optional[np.ndarray] = None
+        self._outside_mask: Optional[np.ndarray] = None
+        self._outside_idx: Optional[np.ndarray] = None
         self._sentinel: float = 1e9
 
     def set_result(self, result: Optional[AnalysisResult]) -> None:
@@ -164,14 +167,15 @@ class FlowAnimator(QtCore.QObject):
 
         self._current_frame = 0
         self._current_time = 0.0
-        if self._phase1_meshes or self._phase2_mesh is not None:
+        if self._phase1_phi or self._phase2_mesh is not None:
             self._update_scene()
 
     def _reset_data(self) -> None:
         self._streamlines = None
         self._tube_mesh = None
         self._edt = None
-        self._phase1_meshes = []
+        self._phase1_phi = []
+        self._phase1_times = []
         self._phase2_mesh = None
         self._phase2_temps = []
         self._phase2_solids = []
@@ -184,6 +188,8 @@ class FlowAnimator(QtCore.QObject):
         self._solid_time_d = None
         self._metal_d = None
         self._vmag_d = None
+        self._outside_mask = None
+        self._outside_idx = None
         self._frame_actor = None
         self._frame_actor_scalar = ""
         self._streamline_actor = None
@@ -304,16 +310,10 @@ class FlowAnimator(QtCore.QObject):
         self._base_image = img
 
         self._build_frames()
-        return bool(self._phase1_meshes) or (self._phase2_mesh is not None)
+        return bool(self._phase1_phi) or (self._phase2_mesh is not None)
 
     def _build_frames(self) -> None:
-        """Precompute the two-phase animation frames.
-
-        Phase 1 (filling): geometry grows from empty part to full fill; colour
-        is the local Darcy velocity magnitude.
-        Phase 2 (solidification): geometry is the fully filled part; colour is
-        temperature / solid fraction as the metal cools.
-        """
+        """Precompute lightweight scalar matrices; 3-D meshes are built live."""
         n_frames = max(2, self.MAX_FRAMES)
         has_solid = self._max_solid_time > self._max_fill_time
         # Reserve at least 12 frames for the filling phase so the advancing
@@ -321,7 +321,10 @@ class FlowAnimator(QtCore.QObject):
         if has_solid:
             self._n_fill = min(
                 n_frames - 2,
-                max(12, int(round(n_frames * self._max_fill_time / self._max_time))),
+                max(
+                    self.MIN_FILL_FRAMES,
+                    int(round(n_frames * self._max_fill_time / self._max_time)),
+                ),
             )
             self._n_solid = n_frames - self._n_fill
         else:
@@ -334,26 +337,51 @@ class FlowAnimator(QtCore.QObject):
 
         app = QtCore.QCoreApplication.instance()
 
-        # Phase 1: growing liquid surface, velocity colour.
+        # Precompute nearest-metal extrapolation indices and static phase-1 colour.
+        inv = ~self._metal_d
+        if self._metal_d.any() and inv.any():
+            self._outside_idx = ndimage.distance_transform_edt(
+                inv, return_indices=True, return_distances=False
+            )
+            self._outside_mask = inv
+        else:
+            self._outside_idx = None
+            self._outside_mask = None
+
+        if self._base_image is not None:
+            vmag_color = self._extrapolate_metal_scalar(self._vmag_d).astype(
+                np.float32
+            )
+            self._base_image.point_data["velocity_magnitude"] = vmag_color.ravel(
+                order="F"
+            )
+            # Uniform hot colour for the filling phase (velocity is the visual scalar).
+            self._base_image.point_data["temperature"] = np.full(
+                self._base_image.n_points, self._t_pour, dtype=np.float32
+            )
+
+        # Phase 1: only store the phi scalar volume per frame.
         for i, t in enumerate(fill_times):
-            mesh = self._build_fill_frame(t)
-            self._phase1_meshes.append(mesh)
-            if app is not None and i % 5 == 0:
+            phi = self._build_fill_phi(t)
+            self._phase1_phi.append(phi)
+            self._phase1_times.append(float(t))
+            if app is not None and i % 20 == 0:
                 app.processEvents()
 
-        # Phase 2: fixed full-fill geometry, changing temperature/solid fraction.
-        if self._n_solid > 1:
+        # Phase 2: build the decimated base mesh once, then store per-frame
+        # temperature / solid-fraction surface arrays.
+        if self._n_solid > 0:
             self._build_solid_base()
-            for i, t in enumerate(solid_times):
-                t_arr, sf = self._solid_scalars_for_time(t)
-                self._phase2_temps.append(t_arr)
-                self._phase2_solids.append(sf)
+            for i, t in enumerate(solid_times[1:], start=1):
+                surf_t, surf_sf = self._solid_scalars_for_time(t)
+                self._phase2_temps.append(surf_t)
+                self._phase2_solids.append(surf_sf)
                 self._phase2_times.append(float(t))
-                if app is not None and i % 5 == 0:
+                if app is not None and i % 20 == 0:
                     app.processEvents()
 
-    def _build_fill_frame(self, t: float) -> Optional[pv.PolyData]:
-        """Return the filling liquid front at time t, coloured by velocity."""
+    def _build_fill_phi(self, t: float) -> Optional[np.ndarray]:
+        """Return the raveled phi level-set for the liquid front at time t."""
         if self._base_image is None:
             return None
 
@@ -363,52 +391,49 @@ class FlowAnimator(QtCore.QObject):
         if not filled.any():
             return None
 
-        # Smooth liquid volume fraction and velocity colour.
         phi = ndimage.gaussian_filter(
             filled.astype(np.float64), sigma=self.PHI_SIGMA, mode="constant", cval=0.0
         )
-        vmag_color = self._extrapolate_visible_scalar(self._vmag_d, filled, 0.0)
-        t_pour_color = np.full_like(self._vmag_d, self._t_pour)
-        t_color = self._extrapolate_visible_scalar(t_pour_color, filled, self._t_pour)
-
-        self._base_image.point_data["phi"] = phi.ravel(order="F")
-        self._base_image.point_data["velocity_magnitude"] = vmag_color.ravel(order="F")
-        self._base_image.point_data["temperature"] = t_color.ravel(order="F")
-
-        surface = self._base_image.contour(isosurfaces=[0.5], scalars="phi")
-        if surface.n_points == 0:
-            return None
-
-        surface = self._windowed_sinc_smooth(surface)
-        try:
-            surface = surface.compute_normals(
-                auto_orient_normals=True, flip_normals=False
-            )
-        except Exception:
-            pass
-
-        surface.set_active_scalars("velocity_magnitude")
-        return surface
+        return phi.astype(np.float32).ravel(order="F")
 
     def _build_solid_base(self) -> None:
-        """Build the fixed geometry for the solidification phase."""
+        """Build the decimated fixed geometry for the solidification phase."""
         if self._base_image is None:
             return
 
         ft = self._fill_time_d
         metal = ft < self._sentinel
         filled = (ft <= self._max_fill_time) & metal
+        if not filled.any():
+            self._phase2_mesh = None
+            return
 
         phi = ndimage.gaussian_filter(
             filled.astype(np.float64), sigma=self.PHI_SIGMA, mode="constant", cval=0.0
         )
         self._base_image.point_data["phi"] = phi.ravel(order="F")
+        # Placeholder so contour copies a "temperature" array; overwritten below.
+        self._base_image.point_data["temperature"] = np.full(
+            self._base_image.n_points, self._t_pour, dtype=np.float32
+        )
 
         surface = self._base_image.contour(isosurfaces=[0.5], scalars="phi")
         if surface.n_points == 0:
             self._phase2_mesh = None
             return
 
+        surface = self._finalize_surface(surface, active_scalars="temperature")
+        self._phase2_mesh = surface
+        surf_t, surf_sf = self._solid_scalars_for_time(self._max_fill_time)
+        self._phase2_mesh.point_data["temperature"] = surf_t
+        self._phase2_mesh.point_data["solid_fraction"] = surf_sf
+        self._phase2_mesh.set_active_scalars("temperature")
+        self._phase2_times.append(float(self._max_fill_time))
+
+    def _finalize_surface(
+        self, surface: pv.PolyData, active_scalars: str = "velocity_magnitude"
+    ) -> pv.PolyData:
+        """Smooth, decimate and normalise a surface mesh."""
         surface = self._windowed_sinc_smooth(surface)
         try:
             surface = surface.compute_normals(
@@ -416,12 +441,24 @@ class FlowAnimator(QtCore.QObject):
             )
         except Exception:
             pass
+        surface = self._decimate(surface)
+        surface.set_active_scalars(active_scalars)
+        return surface
 
-        self._phase2_mesh = surface
-        surf_t, surf_sf = self._solid_scalars_for_time(self._max_fill_time)
-        self._phase2_mesh.point_data["temperature"] = surf_t
-        self._phase2_mesh.point_data["solid_fraction"] = surf_sf
-        self._phase2_mesh.set_active_scalars("temperature")
+    def _decimate(self, mesh: pv.PolyData) -> pv.PolyData:
+        """Reduce polygon count to keep GPU/CPU usage low."""
+        try:
+            if mesh.n_cells == 0:
+                return mesh
+            dec = mesh.decimate(
+                target_reduction=self.DECIMATE_TARGET,
+                volume_preserving=True,
+                attribute_error_bound=0.5,
+                preserve_topology=True,
+            )
+            return dec if dec.n_points > 0 else mesh
+        except Exception:
+            return mesh
 
     def _solid_scalars_for_time(self, t: float) -> Tuple[np.ndarray, np.ndarray]:
         """Return per-surface temperature and solid-fraction for a solid phase time."""
@@ -430,14 +467,11 @@ class FlowAnimator(QtCore.QObject):
 
         ft = self._fill_time_d
         st = self._solid_time_d
-        metal = ft < self._sentinel
-        filled = (ft <= self._max_fill_time) & metal
 
         t_arr = self._compute_temperature(t)
-        # Keep non-filled/void cells at a neutral outside value; they will be
-        # overwritten by the nearest filled value so the surface colour stays clean.
-        t_arr[~metal] = self._t_pour
-        t_color = self._extrapolate_visible_scalar(t_arr, filled, self._t_pour)
+        # Extrapolate metal values into the surrounding void so the isosurface
+        # never interpolates cold mould/air values.
+        t_color = self._extrapolate_metal_scalar(t_arr)
 
         dt = t - ft
         solid_span = st - ft
@@ -446,37 +480,28 @@ class FlowAnimator(QtCore.QObject):
             0.0,
             1.0,
         )
-        sf[~metal] = 0.0
-        sf = self._extrapolate_visible_scalar(sf, filled, 0.0)
+        sf = self._extrapolate_metal_scalar(sf)
 
-        # Sample the volume scalars onto the fixed surface.
-        surf_t = self._sample_scalar_at_points(self._phase2_mesh.points, t_color, order=1)
-        surf_sf = self._sample_scalar_at_points(self._phase2_mesh.points, sf, order=1)
+        # Sample the volume scalars onto the fixed decimated surface.
+        surf_t = self._sample_scalar_at_points(
+            self._phase2_mesh.points, t_color, order=1
+        )
+        surf_sf = self._sample_scalar_at_points(
+            self._phase2_mesh.points, sf, order=1
+        )
         return surf_t, surf_sf
 
-    def _extrapolate_visible_scalar(
-        self,
-        field: np.ndarray,
-        visible: np.ndarray,
-        outside_default: float,
-    ) -> np.ndarray:
-        """Extrapolate ``field[visible]`` into the non-visible neighbours.
+    def _extrapolate_metal_scalar(self, field: np.ndarray) -> np.ndarray:
+        """Copy the nearest metal value into every void/off-metal cell.
 
-        The marching-cubes surface sits exactly on the visible/non-visible
-        boundary; without this, VTK linear interpolation would average the
-        liquid-side value with the mould/air value and produce incorrect colours.
+        This is precomputed once via distance_transform_edt and reused for every
+        solid-phase frame, so per-frame extrapolation stays cheap.
         """
         color = field.copy()
-        inv = ~visible
-        if not visible.any():
-            color[inv] = outside_default
-            return color
-        if inv.any():
-            nearest = ndimage.distance_transform_edt(
-                inv, return_indices=True, return_distances=False
-            )
-            z, y, x = nearest
-            color[inv] = field[z[inv], y[inv], x[inv]]
+        if self._outside_idx is not None and self._outside_mask is not None:
+            z, y, x = self._outside_idx
+            mask = self._outside_mask
+            color[mask] = field[z[mask], y[mask], x[mask]]
         return color
 
     def _windowed_sinc_smooth(self, mesh: pv.PolyData) -> pv.PolyData:
@@ -869,8 +894,6 @@ class FlowAnimator(QtCore.QObject):
 
     def set_speed_multiplier(self, speed: float) -> None:
         self._speed_multiplier = min(20.0, max(0.01, float(speed)))
-        if self._is_running:
-            self._timer.setInterval(self._interval_ms())
 
     def set_show_streamlines(self, show: bool) -> None:
         """Show/hide the red flow-path lines."""
@@ -890,26 +913,27 @@ class FlowAnimator(QtCore.QObject):
         if self._frame_times is None or len(self._frame_times) == 0:
             return
         if self._is_running:
-            self._timer.stop()
-            self._is_running = False
-        else:
-            # Restart from the beginning if already at the end.
-            if self._current_frame >= len(self._frame_times) - 1:
-                self._current_frame = 0
-            self._timer.setInterval(self._interval_ms())
-            self._timer.start()
-            self._is_running = True
+            # Already playing -> toggle pause.
+            self.pause()
+            return
+        # Restart from the beginning if already at the end.
+        if self._current_frame >= len(self._frame_times) - 1:
+            self._current_frame = 0
+        self._is_running = True
+        self._timer.start(self._interval_ms())
 
     def pause(self) -> None:
         if self._is_running:
-            self._timer.stop()
             self._is_running = False
+            self._timer.stop()
 
     def stop(self) -> None:
         self.pause()
         self._clear_actors()
         self._current_frame = 0
         self._current_time = 0.0
+        if self._frame_times is not None and len(self._frame_times) > 0:
+            self._update_scene()
 
     def _clear_actors(self) -> None:
         if self._streamline_actor is not None:
@@ -932,13 +956,17 @@ class FlowAnimator(QtCore.QObject):
             self._frame_actor = None
 
     def _on_timer(self) -> None:
-        if self._frame_times is None or len(self._frame_times) == 0:
+        if not self._is_running or self._frame_times is None or len(self._frame_times) == 0:
             return
         if self._current_frame >= len(self._frame_times) - 1:
             self.pause()
             return
+        t0 = time.perf_counter()
         self._current_frame += 1
         self._update_scene()
+        if self._is_running:
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            self._timer.start(max(10, self._interval_ms() - elapsed_ms))
 
     def _update_scene(self) -> None:
         if self._frame_times is None or len(self._frame_times) == 0:
@@ -950,11 +978,9 @@ class FlowAnimator(QtCore.QObject):
         self._current_time = float(self._frame_times[frame])
 
         if frame < self._n_fill:
-            # Phase 1: growing liquid front, colour by velocity magnitude.
-            meshes = self._phase1_meshes
-            idx = frame
-            mesh = meshes[idx] if 0 <= idx < len(meshes) else None
-            if mesh is None or mesh.n_points == 0:
+            # Phase 1: build the liquid surface live from the stored phi matrix.
+            phi = self._phase1_phi[frame] if 0 <= frame < len(self._phase1_phi) else None
+            if phi is None or self._base_image is None:
                 if self._frame_actor is not None:
                     try:
                         self._viewer.remove_actor(self._frame_actor)
@@ -963,25 +989,39 @@ class FlowAnimator(QtCore.QObject):
                     self._frame_actor = None
                     self._frame_actor_scalar = ""
             else:
-                if self._frame_actor is None or self._frame_actor_scalar != "velocity_magnitude":
+                self._base_image.point_data["phi"] = phi
+                surface = self._base_image.contour(isosurfaces=[0.5], scalars="phi")
+                if surface.n_points == 0:
                     if self._frame_actor is not None:
                         try:
                             self._viewer.remove_actor(self._frame_actor)
                         except Exception:
                             pass
-                    self._frame_actor = self._viewer.add_mesh(
-                        mesh,
-                        cmap="plasma",
-                        clim=(0.0, self._max_velocity),
-                        opacity=1.0,
-                        scalars="velocity_magnitude",
-                        show_scalar_bar=True,
-                        scalar_bar_args={"title": "Akış hızı (m/s)"},
-                        name="flow_frame",
-                    )
-                    self._frame_actor_scalar = "velocity_magnitude"
+                        self._frame_actor = None
+                        self._frame_actor_scalar = ""
                 else:
-                    self._frame_actor.mapper.dataset = mesh
+                    surface = self._finalize_surface(
+                        surface, active_scalars="velocity_magnitude"
+                    )
+                    if self._frame_actor is None or self._frame_actor_scalar != "velocity_magnitude":
+                        if self._frame_actor is not None:
+                            try:
+                                self._viewer.remove_actor(self._frame_actor)
+                            except Exception:
+                                pass
+                        self._frame_actor = self._viewer.add_mesh(
+                            surface,
+                            cmap="plasma",
+                            clim=(0.0, self._max_velocity),
+                            opacity=1.0,
+                            scalars="velocity_magnitude",
+                            show_scalar_bar=True,
+                            scalar_bar_args={"title": "Akış hızı (m/s)"},
+                            name="flow_frame",
+                        )
+                        self._frame_actor_scalar = "velocity_magnitude"
+                    else:
+                        self._frame_actor.mapper.dataset = surface
         else:
             # Phase 2: fixed geometry, colour by temperature / solid fraction.
             s_idx = frame - self._n_fill
