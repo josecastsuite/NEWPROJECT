@@ -659,16 +659,17 @@ def _sample_field_at_position(
     """
     vox = (np.asarray(position_mm, dtype=np.float64) - np.asarray(origin_mm, dtype=np.float64)) / float(dx)
     coords = vox.reshape(3, 1)
-    return float(
-        ndimage.map_coordinates(
-            field,
-            coords,
-            order=order,
-            mode="constant",
-            cval=default,
-            prefilter=False,
-        )
+    sampled = ndimage.map_coordinates(
+        field,
+        coords,
+        order=order,
+        mode="constant",
+        cval=default,
+        prefilter=False,
     )
+    # map_coordinates with a (3, 1) coordinate array returns a 1-element
+    # ndarray; .flat[0] works for both 0-d and 1-d returns.
+    return float(np.asarray(sampled).flat[0])
 
 
 def find_hotspots(

@@ -101,15 +101,14 @@ class FlowVelocityGraph(QtWidgets.QDialog):
                 pos = np.asarray(gn.centroid_mm, dtype=np.float64)
                 ijk = (pos - origin) / dx
                 try:
-                    t_arrival = float(
-                        ndimage.map_coordinates(
-                            ft,
-                            ijk[:, None],
-                            order=1,
-                            mode="constant",
-                            cval=np.nan,
-                        )
+                    sampled = ndimage.map_coordinates(
+                        ft,
+                        ijk[:, None],
+                        order=1,
+                        mode="constant",
+                        cval=np.nan,
                     )
+                    t_arrival = float(np.asarray(sampled).flat[0])
                 except Exception:
                     t_arrival = np.nan
                 if np.isfinite(t_arrival):
