@@ -188,7 +188,7 @@ def _select_inlet_cells(
     type_map = {
         "SPRUE": BodyType.SPRUE,
         "SPRUE_BASE": BodyType.SPRUE,
-        "SPRUE_THROAT": BodyType.SPRUE,
+        "SPRUE_THROAT": BodyType.SPRUE_THROAT,
         "POURING_BASIN": BodyType.POURING_BASIN,
         "RUNNER": BodyType.RUNNER,
         "DISTRIBUTOR": BodyType.DISTRIBUTOR,
@@ -199,6 +199,10 @@ def _select_inlet_cells(
     body_type = type_map.get(key_lower, BodyType.SPRUE)
 
     mask = (grid == body_type) & cavity
+    # For SPRUE_THROAT, if no dedicated throat body exists, fall back to the
+    # top of the SPRUE body below it.
+    if key_lower == "SPRUE_THROAT" and not mask.any():
+        mask = (grid == BodyType.SPRUE) & cavity
     chosen_name = BodyType(body_type).name
 
     if not mask.any():
@@ -418,7 +422,7 @@ def _mask_inlet_by_section(
     type_map = {
         "SPRUE": [BodyType.SPRUE, BodyType.POURING_BASIN],
         "SPRUE_BASE": [BodyType.SPRUE],
-        "SPRUE_THROAT": [BodyType.SPRUE],
+        "SPRUE_THROAT": [BodyType.SPRUE_THROAT, BodyType.SPRUE, BodyType.POURING_BASIN],
         "POURING_BASIN": [BodyType.POURING_BASIN],
         "RUNNER": [BodyType.RUNNER],
         "DISTRIBUTOR": [BodyType.DISTRIBUTOR],
@@ -463,8 +467,14 @@ def _section_face_cells(
                 break
 
     # Determine whether to use the upstream or downstream boundary.
+    # The user-specified velocity is measured at the entrance, so for the
+    # sprue throat / sprue / runner / distributor we use the upstream face.
+    # For the ingate the velocity is usually quoted at the ingate exit into
+    # the part, hence the downstream face.
     key = used_section.upper()
-    if key in ("INGATE", "SPRUE_THROAT"):
+    if key in ("INGATE",):
+        side = "down"
+    elif key == "SPRUE_BASE":
         side = "down"
     else:
         side = "up"
@@ -1407,9 +1417,9 @@ def solve_filling_flow(
     if progress_callback:
         progress_callback(10)
 
-    # Identify inlet (always the sprue/pouring-basin top) and vent (top of part/riser).
+    # Identify inlet (the user-selected velocity section) and vent (top of part/riser).
     section_key = getattr(casting_params, "velocity_section_key", "SPRUE")
-    inlet_cells, inlet_name = _select_inlet_cells(grid_c, cavity, g, "SPRUE")
+    inlet_cells, inlet_name = _select_inlet_cells(grid_c, cavity, g, section_key)
     vent_cells = _select_vent_cells(grid_c, cavity, g)
 
     if not inlet_cells.any():

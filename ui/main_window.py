@@ -503,12 +503,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.niyama_toggle.toggled.connect(self.on_toggle_niyama)
         vis_layout.addWidget(self.niyama_toggle)
 
-        self.flow_toggle = QtWidgets.QCheckBox("Akış Hızı")
-        self.flow_toggle.setToolTip("3-B Darcy akış hızını metal yüzeylerinde göster")
-        self.flow_toggle.setChecked(False)
-        self.flow_toggle.toggled.connect(self.on_toggle_flow_velocity)
-        vis_layout.addWidget(self.flow_toggle)
-
         self.flow_node_toggle = QtWidgets.QCheckBox("Düğüm Hızları")
         self.flow_node_toggle.setToolTip("Her gating elemanında nokta + hız değeri göster")
         self.flow_node_toggle.setChecked(True)
@@ -560,12 +554,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.flow_particle_label.setToolTip("Dolum + katılaşma kare sayısı")
         speed_layout.addWidget(count_label)
         speed_layout.addWidget(self.flow_particle_label)
-
-        self.flow_graph_btn = QtWidgets.QPushButton("Hız Grafiği")
-        self.flow_graph_btn.setToolTip("Darcy ön cephe hızı - dolum zamanı grafiğini aç")
-        self.flow_graph_btn.setEnabled(False)
-        self.flow_graph_btn.clicked.connect(self.on_flow_graph_clicked)
-        speed_layout.addWidget(self.flow_graph_btn)
         anim_layout.addLayout(speed_layout)
 
         self.flow_surface_check = QtWidgets.QCheckBox("Akış Yolları")
@@ -1078,8 +1066,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
             if self.niyama_toggle.isChecked():
                 self.viewer.show_niyama_isosurfaces(self._analysis)
-            if self.flow_toggle.isChecked():
-                self.viewer.show_flow_velocity(self._analysis)
             if self.flow_node_toggle.isChecked():
                 self.viewer.show_flow_node_labels(self._analysis)
             if self.path_toggle.isChecked():
@@ -1407,10 +1393,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._analysis:
             self.viewer.toggle_niyama(self._analysis, checked)
 
-    def on_toggle_flow_velocity(self, checked: bool):
-        if self._analysis:
-            self.viewer.toggle_flow_velocity(self._analysis, checked)
-
     def on_toggle_flow_node_labels(self, checked: bool):
         if self._analysis:
             self.viewer.toggle_flow_node_labels(self._analysis, checked)
@@ -1418,7 +1400,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_flow_controls(self):
         has_flow = bool(self._analysis and self._analysis.flow_result)
         self.flow_anim_toggle.setEnabled(has_flow)
-        self.flow_graph_btn.setEnabled(has_flow)
         if not self.flow_anim_toggle.isChecked():
             self.flow_play_btn.setEnabled(False)
             self.flow_time_slider.setEnabled(False)
@@ -1469,10 +1450,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_flow_speed_changed(self, value: float):
         if self.viewer.flow_animator is not None:
             self.viewer.flow_animator.set_speed_multiplier(value)
-
-    def on_flow_graph_clicked(self):
-        if self.viewer.flow_animator is not None:
-            self.viewer.flow_animator.show_velocity_graph(self)
 
     def on_flow_surface_toggled(self, checked: bool):
         if self.viewer.flow_animator is not None:

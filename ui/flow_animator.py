@@ -81,8 +81,6 @@ class FlowAnimator(QtCore.QObject):
         self._frame_actor = None
         self._frame_actor_scalar: str = ""
 
-        self._max_velocity: float = 1.0
-        self._max_surface_velocity: float = 1.0
         self._t_pour: float = 1600.0
         self._t_liq: float = 1510.0
         self._t_sol: float = 1410.0
@@ -188,8 +186,6 @@ class FlowAnimator(QtCore.QObject):
         self._fill_time_d = None
         self._solid_time_d = None
         self._metal_d = None
-        self._vmag_d = None
-        self._max_surface_velocity = 1.0
         self._outside_mask = None
         self._outside_idx = None
         self._frame_actor = None
@@ -246,14 +242,6 @@ class FlowAnimator(QtCore.QObject):
             bbox[0] : bbox[1], bbox[2] : bbox[3], bbox[4] : bbox[5]
         ]
 
-        # Crop the velocity vector field the same way.
-        velocity_c = self._velocity[
-            :,
-            bbox[0] : bbox[1],
-            bbox[2] : bbox[3],
-            bbox[4] : bbox[5],
-        ].copy()
-
         self._sentinel = max(10.0 * self._max_time, 1e6) + 1.0
         fill_c = np.where(np.isfinite(fill_c) & metal_c, fill_c, self._sentinel)
         solid_c = np.where(np.isfinite(solid_c) & metal_c, solid_c, self._sentinel)
@@ -275,24 +263,14 @@ class FlowAnimator(QtCore.QObject):
             fill_d = ndimage.zoom(fill_c, ratios, order=1)
             solid_d = ndimage.zoom(solid_c, ratios, order=1)
             metal_d = ndimage.zoom(metal_c.astype(np.float32), ratios, order=0) > 0.5
-            velocity_d = np.stack(
-                [ndimage.zoom(velocity_c[i], ratios, order=1) for i in range(3)],
-                axis=0,
-            )
             fill_d = np.where(metal_d, fill_d, self._sentinel)
             solid_d = np.where(metal_d, solid_d, self._sentinel)
             spacing = tuple(self._dx * crop_shape[i] / target_shape[i] for i in range(3))
             shape = target_shape
         else:
             fill_d, solid_d, metal_d = fill_c, solid_c, metal_c
-            velocity_d = velocity_c
             spacing = (self._dx, self._dx, self._dx)
             shape = crop_shape
-
-        vmag_d = np.linalg.norm(velocity_d, axis=0)
-        self._max_velocity = float(np.nanmax(vmag_d[metal_d])) if metal_d.any() else 1.0
-        if self._max_velocity <= 0.0:
-            self._max_velocity = 1.0
 
         origin_c = self._origin + np.array(
             [bbox[0], bbox[2], bbox[4]], dtype=np.float64
@@ -301,8 +279,6 @@ class FlowAnimator(QtCore.QObject):
         self._fill_time_d = fill_d
         self._solid_time_d = solid_d
         self._metal_d = metal_d
-        self._velocity_d = velocity_d
-        self._vmag_d = vmag_d
 
         img = pv.ImageData(
             dimensions=shape, spacing=spacing, origin=origin_c
@@ -345,40 +321,11 @@ class FlowAnimator(QtCore.QObject):
             self._outside_mask = None
 
         if self._base_image is not None:
-            vmag_color = self._extrapolate_metal_scalar(self._vmag_d).astype(
-                np.float32
-            )
-            self._base_image.point_data["velocity_magnitude"] = vmag_color.ravel(
-                order="F"
-            )
-            # Uniform hot colour for the filling phase (velocity is the visual scalar).
+            # The base image carries a placeholder temperature array; each frame
+            # overwrites it with the actual temperature field before contouring.
             self._base_image.point_data["temperature"] = np.full(
                 self._base_image.n_points, self._t_pour, dtype=np.float32
             )
-
-            # Estimate a surface-velocity colour range.  The global vmag max is
-            # often dominated by the gating and clips the part surface to a
-            # uniform dark blue; use the 95th percentile of the full-fill surface.
-            ft = self._fill_time_d
-            metal = ft < self._sentinel
-            filled = (ft <= self._max_fill_time) & metal
-            if filled.any():
-                phi = ndimage.gaussian_filter(
-                    filled.astype(np.float64),
-                    sigma=self.PHI_SIGMA,
-                    mode="constant",
-                    cval=0.0,
-                )
-                self._base_image.point_data["phi"] = phi.ravel(order="F")
-                surf = self._base_image.contour(
-                    isosurfaces=[0.5], scalars="phi"
-                )
-                if surf.n_points > 0:
-                    v = surf["velocity_magnitude"]
-                    if v.size > 0:
-                        self._max_surface_velocity = max(
-                            float(np.percentile(v, 95)), 0.01
-                        )
 
         # Phase 1: only store the phi scalar volume per frame.
         for i, t in enumerate(fill_times):
@@ -998,7 +945,8 @@ class FlowAnimator(QtCore.QObject):
         self._current_time = float(self._frame_times[frame])
 
         if frame < self._n_fill:
-            # Phase 1: build the liquid surface live from the stored phi matrix.
+            # Phase 1: build the liquid surface live from the stored phi matrix
+            # and colour it by temperature (hot red -> cold blue).
             phi = self._phase1_phi[frame] if 0 <= frame < len(self._phase1_phi) else None
             if phi is None or self._base_image is None:
                 if self._frame_actor is not None:
@@ -1009,6 +957,9 @@ class FlowAnimator(QtCore.QObject):
                     self._frame_actor = None
                     self._frame_actor_scalar = ""
             else:
+                t = self._frame_times[frame]
+                T = self._compute_temperature(t).astype(np.float32).ravel(order="F")
+                self._base_image.point_data["temperature"] = T
                 self._base_image.point_data["phi"] = phi
                 surface = self._base_image.contour(isosurfaces=[0.5], scalars="phi")
                 if surface.n_points == 0:
@@ -1021,9 +972,9 @@ class FlowAnimator(QtCore.QObject):
                         self._frame_actor_scalar = ""
                 else:
                     surface = self._finalize_surface(
-                        surface, active_scalars="velocity_magnitude"
+                        surface, active_scalars="temperature"
                     )
-                    if self._frame_actor is None or self._frame_actor_scalar != "velocity_magnitude":
+                    if self._frame_actor is None or self._frame_actor_scalar != "temperature":
                         if self._frame_actor is not None:
                             try:
                                 self._viewer.remove_actor(self._frame_actor)
@@ -1031,15 +982,15 @@ class FlowAnimator(QtCore.QObject):
                                 pass
                         self._frame_actor = self._viewer.add_mesh(
                             surface,
-                            cmap="plasma",
-                            clim=(0.0, self._max_surface_velocity),
+                            cmap=self._metal_cmap(),
+                            clim=(self._t_mold, self._t_pour),
                             opacity=1.0,
-                            scalars="velocity_magnitude",
+                            scalars="temperature",
                             show_scalar_bar=True,
-                            scalar_bar_args={"title": "Akış hızı (m/s)"},
+                            scalar_bar_args={"title": "Sıcaklık (°C)"},
                             name="flow_frame",
                         )
-                        self._frame_actor_scalar = "velocity_magnitude"
+                        self._frame_actor_scalar = "temperature"
                     else:
                         self._frame_actor.mapper.dataset = surface
         else:
@@ -1059,7 +1010,7 @@ class FlowAnimator(QtCore.QObject):
                 self._frame_actor = self._viewer.add_mesh(
                     self._phase2_mesh,
                     cmap=self._metal_cmap(),
-                    clim=(self._t_sol, self._t_pour),
+                    clim=(self._t_mold, self._t_pour),
                     opacity=1.0,
                     scalars="temperature",
                     show_scalar_bar=True,
@@ -1121,16 +1072,7 @@ class FlowAnimator(QtCore.QObject):
         self._viewer.render()
 
     def _metal_cmap(self):
-        if LinearSegmentedColormap is not None:
-            return LinearSegmentedColormap.from_list(
-                "metal_flow",
-                [
-                    (0.10, 0.15, 0.25),  # cold solid / mould
-                    (0.60, 0.10, 0.05),  # cooling metal
-                    (1.00, 0.20, 0.00),  # red hot
-                    (1.00, 0.90, 0.40),  # pour / white hot
-                ],
-            )
+        # Hot metal = red (high scalar), cold/solid = blue (low scalar).
         return "coolwarm"
 
     def frame_count(self) -> int:
