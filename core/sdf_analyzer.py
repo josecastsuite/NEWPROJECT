@@ -769,8 +769,16 @@ def find_hotspots(
     )
     markers, n_markers = ndimage.label(regional_max, structure=structure)
     if n_markers == 0:
-        # fallback: use the single highest-isolation voxel
-        pos_vox = np.argwhere(isolation_time == isolation_time[candidate_mask].max())[0]
+        # fallback: pick the most critical voxel within the candidate mask
+        # (highest isolation time, then highest modulus).  Avoids selecting a
+        # voxel outside the intended region when no regional maximum is found.
+        cand = np.argwhere(candidate_mask)
+        if len(cand) == 0:
+            return []
+        vals = isolation_time[candidate_mask]
+        m_vals = M_mod[candidate_mask]
+        best_idx = int(np.argmax(vals * 1000.0 + m_vals))
+        pos_vox = cand[best_idx]
         m_value = float(M_mod[pos_vox[0], pos_vox[1], pos_vox[2]])
         return [
             HotSpot(
@@ -779,6 +787,7 @@ def find_hotspots(
                 dist_to_riser_mm=np.inf,
                 feed_ok=False,
                 max_feeding_distance_mm=0.0,
+                niyama_ensemble=float(niyama[pos_vox[0], pos_vox[1], pos_vox[2]]) if niyama is not None else 0.0,
             )
         ]
 
@@ -1918,6 +1927,32 @@ def analyze(
         if part_hotspots is not None and part_hotspots:
             hotspots = part_hotspots
 
+    # v9.4: detect hot spots inside risers/feeders separately.  They are not part
+    # defects, but they are useful for riser sizing and verification.
+    feeder_hotspots: List[HotSpot] = []
+    if riser_mask is not None and riser_mask.any():
+        # Disable feeder-touch suppression so pockets inside feeders are reported.
+        no_suppress = np.zeros_like(riser_mask)
+        feeder_hotspots = find_hotspots(
+            sdf,
+            riser_mask,
+            dx,
+            origin_mm,
+            curvature=mean_curv,
+            use_skeleton=True,
+            min_size_mm=hotspot_min_size_mm,
+            cluster_eps_mm=hotspot_cluster_mm,
+            is_metal=is_metal,
+            feeder_mask=no_suppress,
+            chvorinov_c=chvorinov_c,
+            niyama=niyama,
+        )
+        for fhs in feeder_hotspots:
+            fhs.feed_ok = True
+            fhs.directional_ok = True
+            fhs.heuvers_ok = True
+            fhs.darcy_ok = True
+
     if progress_callback:
         progress_callback(84)
 
@@ -2331,6 +2366,7 @@ def analyze(
         niyama=niyama,
         gradient_magnitude=G,
         hotspots=hotspots,
+        feeder_hotspots=feeder_hotspots,
         riser_results=riser_results,
         gate_result=None,
         local_regions=local_regions,
@@ -2489,6 +2525,15 @@ def _build_recommendations(
             f"Durum: {status}. "
             f"Öneri: {suggestion}.{pore_extra}"
         )
+
+    if result.feeder_hotspots:
+        recs.append("Besleyici/Riser içi sıcak noktalar (parça hatası değil, referans için):")
+        for idx, fhs in enumerate(result.feeder_hotspots, 1):
+            pos = ",".join(f"{v:.1f}" for v in fhs.position_mm)
+            recs.append(
+                f"  Riser Bölgesi #{idx} ({pos} mm): M={fhs.m_value_mm:.2f} mm, "
+                f"Niyama={fhs.niyama_ensemble:.2f}. Besleyici içindedir."
+            )
 
     for rr in result.riser_results:
         eff_m = max(rr.effective_m_value_mm, rr.m_value_mm)

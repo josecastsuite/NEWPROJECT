@@ -515,11 +515,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.flow_node_toggle.toggled.connect(self.on_toggle_flow_node_labels)
         vis_layout.addWidget(self.flow_node_toggle)
 
-        anim_group = QtWidgets.QGroupBox("Akış Animasyonu")
+        anim_group = QtWidgets.QGroupBox("Akış & Katılaşma")
         anim_layout = QtWidgets.QVBoxLayout(anim_group)
 
-        self.flow_anim_toggle = QtWidgets.QCheckBox("Akış Animasyonu")
-        self.flow_anim_toggle.setToolTip("Döküm ağzından parçaya kırmızı akış yollarını oynatır")
+        self.flow_anim_toggle = QtWidgets.QCheckBox("Katılaşma Cephesi")
+        self.flow_anim_toggle.setToolTip("Dolum + katılaşma cephesini zaman kaydırıcıyla oynatır")
         self.flow_anim_toggle.setChecked(False)
         self.flow_anim_toggle.toggled.connect(self.on_toggle_flow_animation)
         anim_layout.addWidget(self.flow_anim_toggle)
@@ -555,11 +555,17 @@ class MainWindow(QtWidgets.QMainWindow):
         speed_layout.addWidget(speed_label)
         speed_layout.addWidget(self.flow_speed_spin)
 
-        count_label = QtWidgets.QLabel("Akış:")
+        count_label = QtWidgets.QLabel("Kare:")
         self.flow_particle_label = QtWidgets.QLabel("—")
-        self.flow_particle_label.setToolTip("Dolum animasyonu kare sayısı")
+        self.flow_particle_label.setToolTip("Katılaşma cephesi kare sayısı")
         speed_layout.addWidget(count_label)
         speed_layout.addWidget(self.flow_particle_label)
+
+        self.flow_graph_btn = QtWidgets.QPushButton("Hız Grafiği")
+        self.flow_graph_btn.setToolTip("Darcy ön cephe hızı - dolum zamanı grafiğini aç")
+        self.flow_graph_btn.setEnabled(False)
+        self.flow_graph_btn.clicked.connect(self.on_flow_graph_clicked)
+        speed_layout.addWidget(self.flow_graph_btn)
         anim_layout.addLayout(speed_layout)
 
         self.flow_surface_check = QtWidgets.QCheckBox("Akış Yolları")
@@ -1410,8 +1416,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.viewer.toggle_flow_node_labels(self._analysis, checked)
 
     def _update_flow_controls(self):
-        enabled = bool(self._analysis and self._analysis.flow_result)
-        self.flow_anim_toggle.setEnabled(enabled)
+        has_flow = bool(self._analysis and self._analysis.flow_result)
+        self.flow_anim_toggle.setEnabled(has_flow)
+        self.flow_graph_btn.setEnabled(has_flow)
         if not self.flow_anim_toggle.isChecked():
             self.flow_play_btn.setEnabled(False)
             self.flow_time_slider.setEnabled(False)
@@ -1462,6 +1469,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_flow_speed_changed(self, value: float):
         if self.viewer.flow_animator is not None:
             self.viewer.flow_animator.set_speed_multiplier(value)
+
+    def on_flow_graph_clicked(self):
+        if self.viewer.flow_animator is not None:
+            self.viewer.flow_animator.show_velocity_graph(self)
 
     def on_flow_surface_toggled(self, checked: bool):
         if self.viewer.flow_animator is not None:

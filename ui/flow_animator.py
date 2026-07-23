@@ -12,7 +12,7 @@ from typing import List, Optional
 
 import numpy as np
 import pyvista as pv
-from PyQt6 import QtCore
+from PyQt6 import QtCore, QtWidgets
 from scipy import ndimage
 
 try:
@@ -22,6 +22,8 @@ except Exception:  # pragma: no cover - fallback if matplotlib is missing
 
 from core.materials import get_alloy, get_mold
 from core.types import AnalysisResult, BodyType
+
+from ui.flow_velocity_graph import FlowVelocityGraph
 
 
 class FlowAnimator(QtCore.QObject):
@@ -287,16 +289,47 @@ class FlowAnimator(QtCore.QObject):
                 app.processEvents()
 
     def _build_frame(self, t: float) -> Optional[pv.PolyData]:
-        """Return the filled-metal boundary surface coloured by temperature."""
+        """Return the liquid/mushy metal region at time t, coloured by temperature.
+
+        A cell is visible when it has already filled (fill_time <= t) and is not
+        yet fully solidified (solid_time > t).  The scalar used for clipping is
+        solid_time inside filled cells and a large negative sentinel elsewhere.
+        This makes the solidification front (solid_time = t) smooth because the
+        scalar is continuous across the liquid/solid boundary, while the filling
+        front is simply the filled/not-filled boundary.
+        """
         if self._base_image is None:
             return None
 
+        ft = self._fill_time_d
+        st = self._solid_time_d
+        metal = ft < self._sentinel
+        filled = (ft <= t) & metal
+        liquid = filled & (st > t)
+
+        # Base temperature from the Darcy fill + thermal solid-time model.
         t_arr = self._compute_temperature(t)
+        # Clamp already-solidified (filled but not liquid) cells to solidus so
+        # the colour at the solidification front does not bleed cold during
+        # interpolation.
+        t_arr = np.where(filled & (~liquid), self._t_sol, t_arr)
         self._base_image.point_data["temperature"] = t_arr.ravel(order="F")
 
-        # Keep the region where fill_time <= t.
+        # visible_scalar: use solid_time for filled cells, capped to just above
+        # max_time for very late/unsolidified cells.  This avoids a symmetric
+        # +/- sentinel scalar pair that puts the isosurface in the middle of an
+        # edge (and gives midpoint colours like (1600+25)/2).  Empty/mold
+        # cells get a large negative sentinel so they stay excluded.
+        vis_cap = self._max_time + 1.0
+        clipped_st = np.where(np.isfinite(st), st, vis_cap)
+        clipped_st = np.minimum(clipped_st, vis_cap)
+        visible_scalar = np.where(filled, clipped_st, -self._sentinel)
+        self._base_image.point_data["visible_scalar"] = visible_scalar.ravel(order="F")
+
+        # Keep cells whose effective solid time is >= current time; the
+        # isosurface visible_scalar = t is the solidification/filling front.
         clipped = self._base_image.clip_scalar(
-            value=float(t), scalars="fill_time", invert=True
+            value=float(t), scalars="visible_scalar", invert=False
         )
         if clipped.n_cells == 0:
             return None
@@ -757,7 +790,7 @@ class FlowAnimator(QtCore.QObject):
                 self._frame_actor = self._viewer.add_mesh(
                     mesh,
                     cmap=self._cmap,
-                    clim=(self._t_mold, self._t_pour),
+                    clim=(self._t_sol, self._t_pour),
                     opacity=1.0,
                     scalars="temperature",
                     show_scalar_bar=True,
@@ -838,3 +871,12 @@ class FlowAnimator(QtCore.QObject):
     def particle_count(self) -> int:
         """Kept for API compatibility; the new animator uses surface frames."""
         return 0
+
+    def show_velocity_graph(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        """Open a popup with the Darcy velocity vs. fill-time graph."""
+        if self._result is None or self._result.flow_result is None:
+            return
+        dialog = FlowVelocityGraph(self._result, parent)
+        dialog.show()
+        # Keep a reference so the dialog isn't garbage-collected while open.
+        self._velocity_graph_dialog = dialog

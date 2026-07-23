@@ -432,5 +432,7 @@ class AnalysisResult:
     pore_size_micro_threshold_um: float = 0.0
     pore_size_fine_percent: float = 20.0
     pore_size_fine_threshold_um: float = 0.0
+    # v9.4: hot spots detected inside risers/feeders (shown separately, not part defects)
+    feeder_hotspots: List[HotSpot] = field(default_factory=list)
     # metadata
     bbox_size_mm: np.ndarray = field(default_factory=lambda: np.zeros(3))
