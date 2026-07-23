@@ -518,8 +518,8 @@ class MainWindow(QtWidgets.QMainWindow):
         anim_group = QtWidgets.QGroupBox("Akış & Katılaşma")
         anim_layout = QtWidgets.QVBoxLayout(anim_group)
 
-        self.flow_anim_toggle = QtWidgets.QCheckBox("Katılaşma Cephesi")
-        self.flow_anim_toggle.setToolTip("Dolum + katılaşma cephesini zaman kaydırıcıyla oynatır")
+        self.flow_anim_toggle = QtWidgets.QCheckBox("Dolum + Katılaşma")
+        self.flow_anim_toggle.setToolTip("İki fazlı animasyon: önce dolum, sonra katılaşma")
         self.flow_anim_toggle.setChecked(False)
         self.flow_anim_toggle.toggled.connect(self.on_toggle_flow_animation)
         anim_layout.addWidget(self.flow_anim_toggle)
@@ -557,7 +557,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         count_label = QtWidgets.QLabel("Kare:")
         self.flow_particle_label = QtWidgets.QLabel("—")
-        self.flow_particle_label.setToolTip("Katılaşma cephesi kare sayısı")
+        self.flow_particle_label.setToolTip("Dolum + katılaşma kare sayısı")
         speed_layout.addWidget(count_label)
         speed_layout.addWidget(self.flow_particle_label)
 
