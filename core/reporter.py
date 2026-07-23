@@ -148,6 +148,14 @@ def _format_gate_table(result: AnalysisResult) -> str:
             return f"hedef {sf.target_area_min_cm2:.2f}-{sf.target_area_max_cm2:.2f} cm²"
         return "hedef -"
 
+    # Map selected section to the real CAD measured area.
+    actual_area_for_selection = {
+        "INGATE": gr.total_ingate_contact_area_cm2,
+        "RUNNER": gr.runner_min_area_cm2,
+        "SPRUE_BASE": gr.sprue_base_area_cm2,
+        "SPRUE_THROAT": gr.sprue_throat_area_cm2,
+    }.get(selected_section, 0.0)
+
     target_ratio = 0.0
     if system_targets and "gate" in system_targets and "runner" in system_targets:
         v_gate_mid = (system_targets["gate"][0] + system_targets["gate"][1]) / 2.0
@@ -172,7 +180,7 @@ def _format_gate_table(result: AnalysisResult) -> str:
         {_section_flow_rows(gr)}
         <tr><td>Toplam debi Q</td><td>{gr.ingate_flow_rate_m3_s*1e3:.2f} L/s</td><td>doldurma süresi {gr.ingate_fill_time_s:.2f} s</td></tr>
         <tr><td>Akışkanlık uzunluğu Lf</td><td>{gr.fluidity_length_mm:.1f} mm</td><td>parça boyutu ≤ Lf</td></tr>
-        <tr><td>Hız için gerekli seçili kesit alanı</td><td>{gr.required_ingate_area_for_velocity_cm2:.2f} cm²</td><td>mevcut {selected_area:.2f} cm²</td></tr>
+        <tr><td>Hız için gerekli seçili kesit alanı</td><td>{gr.required_ingate_area_for_velocity_cm2:.2f} cm²</td><td>mevcut {actual_area_for_selection:.2f} cm²</td></tr>
         <tr><td>Campbell (Ag/Ar) kontrolü</td><td>{'Geçer' if gr.campbell_ok else 'Geçersiz'}</td><td>hedef oran {target_ratio:.2f}</td></tr>
         <tr><td>Bernoulli döküm ağzı kontrolü</td><td>{'Geçer' if gr.bernoulli_ok else 'Geçersiz'}</td><td>As ≥ gerekli</td></tr>
         <tr><td>Dirsek kaybı (K·v²/2g)</td><td>{gr.elbow_count} dirsek, {gr.head_loss_mm:.1f} mm kayıp</td><td>efektif H={gr.effective_head_mm:.1f} mm</td></tr>

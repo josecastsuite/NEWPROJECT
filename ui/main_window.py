@@ -332,6 +332,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.visc_spin.setValue(0.0060)
         _params_labeled(self.visc_spin, "Viskozite μ (Pa·s):")
 
+        self.gravity_combo = QtWidgets.QComboBox()
+        self.gravity_combo.addItem("Aşağı (-Z)", "0,0,-1")
+        self.gravity_combo.addItem("Yukarı (+Z)", "0,0,1")
+        self.gravity_combo.addItem("-X", "-1,0,0")
+        self.gravity_combo.addItem("+X", "1,0,0")
+        self.gravity_combo.addItem("-Y", "0,-1,0")
+        self.gravity_combo.addItem("+Y", "0,1,0")
+        _params_labeled(self.gravity_combo, "Döküm yönü (yerçekimi):", "Metalin hangi eksende aşağı aktığını seç.")
+
         self.velocity_section_combo = QtWidgets.QComboBox()
         self.velocity_section_combo.addItem("Meme (ingate)", "INGATE")
         self.velocity_section_combo.addItem("Yolluk (runner)", "RUNNER")
@@ -537,6 +546,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.visc_spin.setValue(alloy.viscosity_pa_s)
 
     def _casting_params_from_ui(self) -> CastingParameters:
+        gstr = self.gravity_combo.currentData() or "0,0,-1"
+        gravity_direction = tuple(float(x.strip()) for x in gstr.split(","))
         return CastingParameters(
             t_pour_c=self.t_pour_spin.value(),
             t_liquidus_c=self.t_liq_spin.value(),
@@ -547,6 +558,7 @@ class MainWindow(QtWidgets.QMainWindow):
             viscosity_pa_s=self.visc_spin.value(),
             ingate_velocity_m_s=self.v_ingate_spin.value(),
             velocity_section_key=self.velocity_section_combo.currentData(),
+            gravity_direction=gravity_direction,
         )
 
     def aiLog(self, msg: str, type_: str = "info"):

@@ -22,6 +22,8 @@ class CastingParameters:
     ingate_velocity_m_s: float = 0.0
     # v8.3: which gating section the velocity above refers to
     velocity_section_key: str = "INGATE"
+    # v9.1: gravity / casting direction (default: -Z, i.e. downward in world coords)
+    gravity_direction: Tuple[float, float, float] = (0.0, 0.0, -1.0)
 
     @property
     def superheat_c(self) -> float:

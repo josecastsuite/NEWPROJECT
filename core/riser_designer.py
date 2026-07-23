@@ -172,9 +172,9 @@ def propose_risers(
         # when at least one riser already exists; otherwise a feeder is still needed.
         prefer_chill = (
             existing_riser_count > 0
-            and hs.m_value_mm <= 10.0
-            and hs.t_section_mm <= 20.0
-            and t_attach <= 20.0
+            and hs.m_value_mm <= 12.0
+            and hs.t_section_mm <= 25.0
+            and t_attach <= 22.0
         )
 
         if prefer_chill:
