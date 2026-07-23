@@ -37,8 +37,8 @@ class FlowAnimator(QtCore.QObject):
     N_SIDES = 4
     MARKER_SIZE = 10
     MAX_ANIM_CELLS = 120_000
-    MAX_FRAMES = 400
-    MIN_FILL_FRAMES = 250  # most frames are allocated to the filling phase
+    MAX_FRAMES = 600
+    MIN_FILL_FRAMES = 450  # most frames are allocated to the filling phase
     PHI_SIGMA = 1.2  # voxels; controls how liquid surface is smoothed
     DECIMATE_TARGET = 0.5  # reduce triangle count per frame for GPU/CPU relief
 
