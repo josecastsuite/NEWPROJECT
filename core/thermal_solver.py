@@ -16,6 +16,7 @@ from scipy import ndimage, sparse
 from scipy.sparse import linalg as spla
 
 from core.materials import Alloy, MoldMaterial
+from core.types import BODY_METAL_TYPES
 
 
 def _scheil_fs(
@@ -24,13 +25,18 @@ def _scheil_fs(
     t_solidus: float,
     partition_coeff: float,
 ) -> np.ndarray:
-    """Scheil solid fraction [0..1]."""
+    """Scheil solid fraction [0..1].
+
+    fs = 1 - ((T - T_solidus) / (T_liquidus - T_solidus))^(1 / (1 - k))
+    """
     fs = np.zeros_like(T)
     mask = (T <= t_liquidus) & (T >= t_solidus)
     denom = max(t_liquidus - t_solidus, 1.0)
+    # u is the solidified fraction of the temperature interval, 0 at liquidus, 1 at solidus
     u = np.clip((t_liquidus - T[mask]) / denom, 0.0, 1.0)
-    exponent = 1.0 / (max(partition_coeff, 1e-6) - 1.0)
-    fs[mask] = 1.0 - np.power(u, exponent)
+    v = 1.0 - u
+    exponent = 1.0 / max(1.0 - partition_coeff, 1e-6)
+    fs[mask] = 1.0 - np.power(v, exponent)
     fs[T < t_solidus] = 1.0
     return np.clip(fs, 0.0, 1.0)
 
@@ -49,10 +55,11 @@ def _dscheil_dT(
     denom = max(t_liquidus - t_solidus, 1.0)
     u = (t_liquidus - T[mask]) / denom
     u = np.clip(u, 1e-9, 1.0 - 1e-9)
+    v = 1.0 - u
     k = max(partition_coeff, 1e-6)
-    p = 1.0 / (k - 1.0)
-    d[mask] = p * np.power(u, p - 1.0) / denom
-    return np.clip(d, -1e6, 0.0)
+    p = 1.0 / (1.0 - k)
+    d[mask] = p * np.power(v, p - 1.0) / denom
+    return np.clip(d, 0.0, 1e6)
 
 
 def _cp_eff(
@@ -67,7 +74,7 @@ def _cp_eff(
         dT_mush = max(alloy.t_liquidus_c - alloy.t_solidus_c, 1.0)
         df = _dscheil_dT(T, alloy.t_liquidus_c, alloy.t_solidus_c, alloy.partition_coefficient)
         # Cap the latent contribution so the total latent over the mush equals L
-        cp[is_metal] += alloy.latent_heat_j_kg * np.clip(-df[is_metal], 0.0, 1.0 / dT_mush)
+        cp[is_metal] += alloy.latent_heat_j_kg * np.clip(df[is_metal], 0.0, 1.0 / dT_mush)
     return cp
 
 
@@ -145,9 +152,14 @@ def solve_3d_thermal(
     max_time_s: float = 600.0,
     downsample: int = 2,
     progress_callback: Optional[callable] = None,
+    fill_time_s: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Implicit 3-D enthalpy thermal solver.
+
+    If ``fill_time_s`` is supplied it is interpreted as the per-voxel metal
+    arrival time (s).  Solidification/liquidus times are shifted by this amount,
+    so late-filled regions start cooling later.
 
     Returns fine-grid arrays:
     T_final, fs_final, t_liquidus, t_solidus, G_at_ts, R_at_ts, niyama
@@ -156,17 +168,35 @@ def solve_3d_thermal(
     if downsample > 1:
         grid_c = _downsample_grid(grid, downsample)
         dx_c_mm = dx * downsample
+        if fill_time_s is not None:
+            fill_c = ndimage.zoom(
+                fill_time_s,
+                (
+                    grid_c.shape[0] / fill_time_s.shape[0],
+                    grid_c.shape[1] / fill_time_s.shape[1],
+                    grid_c.shape[2] / fill_time_s.shape[2],
+                ),
+                order=0,
+            )
+        else:
+            fill_c = None
     else:
         grid_c = grid
         dx_c_mm = dx
+        fill_c = fill_time_s
+
+    # Extend the simulation so even the last-filled metal has time to solidify.
+    if fill_c is not None:
+        max_fill = float(np.nanmax(fill_c[np.isfinite(fill_c)])) if np.isfinite(fill_c).any() else 0.0
+        max_time_s = max(max_time_s, max_fill + max_time_s)
 
     dx_m = dx_c_mm / 1000.0  # SI metres
     nx, ny, nz = grid_c.shape
     n = nx * ny * nz
 
-    # Casting metal: part + riser + ingate + runner + sprue + pouring basin.
-    # Chill (cooling sprue) and filter are NOT liquid metal and are handled below.
-    casting_metal_ids = [1, 3, 5, 6, 7, 15]
+    # Casting metal: all liquid-metal body types (PART, RISER, INGATE, RUNNER,
+    # SPRUE, SPRUE_THROAT, POURING_BASIN). Chill/filter are excluded.
+    casting_metal_ids = [int(t) for t in BODY_METAL_TYPES]
     is_metal_c = np.isin(grid_c, casting_metal_ids)
     chill_mask_3d = grid_c == 11  # COOLING_SPRUE
 
@@ -291,7 +321,24 @@ def solve_3d_thermal(
     R_fine = _upsample(R_at_ts, fine_shape)
     niyama_fine = _upsample(niyama_c, fine_shape)
 
-    is_metal_fine = np.isin(grid, [1, 3, 5, 6, 7])
+    is_metal_fine = np.isin(grid, casting_metal_ids)
+
+    # Shift liquidus/solidus times by the local metal arrival time.
+    if fill_c is not None:
+        fill_time_fine = _upsample(fill_c, fine_shape)
+        fill_time_fine = np.where(is_metal_fine, fill_time_fine, 0.0)
+        with np.errstate(invalid="ignore"):
+            t_liq_fine = np.where(
+                is_metal_fine & np.isfinite(t_liq_fine) & np.isfinite(fill_time_fine),
+                t_liq_fine + fill_time_fine,
+                t_liq_fine,
+            )
+            t_sol_fine = np.where(
+                is_metal_fine & np.isfinite(t_sol_fine) & np.isfinite(fill_time_fine),
+                t_sol_fine + fill_time_fine,
+                t_sol_fine,
+            )
+
     for arr in (niyama_fine, G_fine, R_fine, t_liq_fine, t_sol_fine, fs_fine):
         arr[:] = np.where(is_metal_fine, arr, 0.0)
 

@@ -1,14 +1,21 @@
 """PyVistaQt 3D viewer wrapper for JoseCast Analyzer v8.x."""
 
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import pyvista as pv
 from pyvistaqt import QtInteractor
 
+from core.gating import (
+    _characteristic_cross_section_area,
+    _flow_axis,
+    _section_2d_area_and_perim,
+    _sprue_circular_base_and_throat,
+)
 from core.materials import get_alloy
 from core.sdf_analyzer import _trace_path_to_riser
 from core.types import AnalysisResult, Body, BodyType, RefinementRegion
+from ui.flow_animator import FlowAnimator
 
 
 BODY_COLORS = {
@@ -21,6 +28,9 @@ BODY_COLORS = {
     BodyType.COOLING_SPRUE: "#00BCD4",
     BodyType.FILTER: "#607D8B",
     BodyType.POURING_BASIN: "#3F51B5",
+    BodyType.SPRUE_THROAT: "#673AB7",
+    BodyType.DISTRIBUTOR: "#FFC107",
+    BodyType.CURUFLUK: "#795548",
 }
 
 BODY_OPACITY = {
@@ -33,6 +43,26 @@ BODY_OPACITY = {
     BodyType.COOLING_SPRUE: 1.0,
     BodyType.FILTER: 1.0,
     BodyType.POURING_BASIN: 1.0,
+    BodyType.SPRUE_THROAT: 1.0,
+    BodyType.DISTRIBUTOR: 1.0,
+    BodyType.CURUFLUK: 1.0,
+}
+
+# Post-analysis transparency: all bodies become translucent so internal
+# hotspots, Niyama surfaces and flow fields are visible through the geometry.
+BODY_OPACITY_POST = {
+    BodyType.PART: 0.60,
+    BodyType.RISER: 0.35,
+    BodyType.INGATE: 0.35,
+    BodyType.RUNNER: 0.35,
+    BodyType.SPRUE: 0.35,
+    BodyType.CORE: 0.35,
+    BodyType.COOLING_SPRUE: 0.35,
+    BodyType.FILTER: 0.35,
+    BodyType.POURING_BASIN: 0.35,
+    BodyType.SPRUE_THROAT: 0.35,
+    BodyType.DISTRIBUTOR: 0.35,
+    BodyType.CURUFLUK: 0.35,
 }
 
 
@@ -79,8 +109,14 @@ class Analyzer3DViewer(QtInteractor):
         self._path_actors: List = []
         self._slice_actors: List = []
         self._local_actors: List = []
+        self._section_actors: List = []
+        self._section_picker = None
+        self._flow_actor = None
+        self._flow_node_actor = None
+        self.flow_animator = FlowAnimator(self)
 
     def clear_scene(self):
+        self.flow_animator.stop()
         self.clear_actors()
         self.add_axes(line_width=2, color="#00ffff")
         self._body_actors.clear()
@@ -92,20 +128,24 @@ class Analyzer3DViewer(QtInteractor):
         self._path_actors.clear()
         self._slice_actors.clear()
         self._local_actors.clear()
+        self._flow_actor = None
+        self._flow_node_actor = None
+        self._clear_section_actors()
 
-    def show_bodies(self, bodies: List[Body], reset_camera: bool = True):
-        """Display original body meshes colored by type; part is semi-transparent."""
+    def show_bodies(self, bodies: List[Body], reset_camera: bool = True, analysis_mode: bool = False):
+        """Display original body meshes colored by type."""
         for actor in self._body_actors:
             self.remove_actor(actor)
         self._body_actors.clear()
 
+        opacity_map = BODY_OPACITY_POST if analysis_mode else BODY_OPACITY
         for body in bodies:
             if len(body.faces) == 0:
                 continue
             faces = np.c_[np.full(len(body.faces), 3, dtype=np.int64), body.faces].ravel()
             mesh = pv.PolyData(body.vertices, faces)
             color = BODY_COLORS.get(body.body_type, "#E0E0E0")
-            opacity = BODY_OPACITY.get(body.body_type, 1.0)
+            opacity = opacity_map.get(body.body_type, 1.0)
             actor = self.add_mesh(
                 mesh,
                 color=color,
@@ -169,7 +209,8 @@ class Analyzer3DViewer(QtInteractor):
         bbox_min = np.min(result.bbox_size_mm) if result.bbox_size_mm.any() else 100.0
         centers = []
         labels = []
-        for hs in result.hotspots:
+        visible_hotspots = [hs for hs in result.hotspots if not hs.solved]
+        for hs in visible_hotspots:
             # Radius proportional to local wall thickness, clamped to a sensible fraction of the part size.
             radius = max(1.2, min(hs.t_section_mm * 0.15, bbox_min * 0.02, 6.0))
             sphere = pv.Sphere(
@@ -248,19 +289,22 @@ class Analyzer3DViewer(QtInteractor):
     def show_porosity_cloud(
         self,
         result: Optional[AnalysisResult],
-        percentile: float = 95.0,
-        max_points: int = 1500,
+        noise_percent: float = 3.0,
+        max_points: int = 5000,
+        pore_size_filter: Optional[str] = None,
     ):
-        """High-risk porosity as bright point markers inside the part.
+        """Porosity point cloud colored by estimated pore size.
 
-        Uses the slowest-solidifying regions (solidification time) so the cloud
-        is visible even when the normalized risk score is low.  If no
-        solidification time field is present, falls back to the top percentile of
-        the risk field.
+        Only the top ``noise_percent``% of the displayed scalar is rendered so
+        that numerical / physical noise is suppressed.  ``pore_size_filter``
+        restricts the cloud to ``macro``, ``micro`` or ``fine`` classes.
+        Falls back to the slowest-solidifying regions only when pore-size data
+        are not available or the user has not requested a specific class.
         """
         if self._porosity_actor is not None:
             self.remove_actor(self._porosity_actor)
             self._porosity_actor = None
+        self._remove_scalar_bar("Pore size (µm)")
         if result is None:
             return
 
@@ -268,35 +312,86 @@ class Analyzer3DViewer(QtInteractor):
         if not part_mask.any():
             return
 
-        # Prefer solidification time: last-to-solidify regions are the real
-        # porosity-prone volumes.  Risk is used as a fallback / for coloring.
-        solid_time = np.asarray(result.solidification_time) if result.solidification_time is not None else np.array([])
-        risk = np.asarray(result.risk) if result.risk is not None else np.array([])
-        if solid_time.size and np.isfinite(solid_time[part_mask]).any():
-            field = solid_time
-            scalar_name = "t_solid"
-        elif risk.size:
-            field = risk
-            scalar_name = "risk"
+        pore_size_filter = (pore_size_filter or "").lower()
+        # v9.2: visualize the shrinkage-only pore-size field; the gas/oxide
+        # baseline would otherwise make every voxel positive and dominate the cloud.
+        shrinkage_um = getattr(result, "pore_size_shrinkage_um", None)
+        if shrinkage_um is not None and shrinkage_um.size == part_mask.size:
+            pore_size_um = np.asarray(shrinkage_um)
         else:
-            return
+            pore_size_um = np.asarray(result.pore_size_um) if result.pore_size_um is not None else np.array([])
+        has_pore_size = pore_size_um.size and pore_size_um.shape == part_mask.shape
 
-        part_values = np.asarray(field[part_mask], dtype=np.float64)
-        finite = np.isfinite(part_values)
+        class_mask = np.zeros_like(part_mask, dtype=bool)
+        use_pore_size = False
+        if has_pore_size and pore_size_filter in ("macro", "micro", "fine"):
+            class_mask = np.asarray(getattr(result, f"pore_size_{pore_size_filter}_mask", class_mask))
+            if class_mask is None or class_mask.size == 0:
+                class_mask = np.zeros_like(part_mask, dtype=bool)
+            use_pore_size = class_mask.any()
+            # v9.1: if the user explicitly selected a class, do not fall back to
+            # solidification-time/risk clouds; show nothing for that class.
+            if not use_pore_size:
+                return
+        elif has_pore_size and pore_size_filter in ("", "all"):
+            class_mask = part_mask & (pore_size_um > 0.0)
+            use_pore_size = class_mask.any()
+
+        if use_pore_size:
+            field = pore_size_um
+            scalar_name = "pore_size_um"
+        else:
+            # Fallback to the old behaviour if no pore-size field or no filter.
+            solid_time = np.asarray(result.solidification_time) if result.solidification_time is not None else np.array([])
+            risk = np.asarray(result.risk) if result.risk is not None else np.array([])
+            if solid_time.size and np.isfinite(solid_time[part_mask]).any():
+                field = solid_time
+                scalar_name = "t_solid"
+            elif risk.size:
+                field = risk
+                scalar_name = "risk"
+            else:
+                return
+            class_mask = part_mask
+
+        # v9.3: use the risk field to suppress low-probability shrinkage noise.
+        # The slider selects the top noise_percent% of risk within the chosen class;
+        # the displayed scalar remains the shrinkage pore size.
+        risk = np.asarray(result.risk) if result.risk is not None else np.array([])
+        has_risk = risk.size and risk.shape == part_mask.shape
+        if use_pore_size and has_risk:
+            if pore_size_filter in ("macro", "micro", "fine"):
+                target_percent = float(
+                    getattr(result, f"pore_size_{pore_size_filter}_percent", 0.0)
+                )
+                if target_percent <= 0.0:
+                    target_percent = {"macro": 60.0, "micro": 40.0, "fine": 20.0}[pore_size_filter]
+                effective_percent = min(100.0, target_percent * (noise_percent / 3.0))
+            else:
+                effective_percent = noise_percent
+            risk_values = risk[class_mask & (risk > 0.0)]
+            if risk_values.size == 0:
+                return
+            p = max(0.0, 100.0 - effective_percent)
+            risk_threshold = float(np.percentile(risk_values, p))
+            class_mask = class_mask & (risk >= risk_threshold)
+
+        field = np.asarray(field, dtype=np.float64)
+        values = field[class_mask]
+        finite = np.isfinite(values) & (values > 0.0)
         if not finite.any():
             return
-        finite_max = float(np.max(part_values[finite]))
-        lo = float(np.percentile(part_values[finite], percentile))
-        # Cells that never solidified (inf) are the most porosity-prone; assign a
-        # value above the finite maximum so they fall inside the threshold.
-        if finite_max > 0.0:
-            inf_replace = finite_max * 1.5
-        else:
-            inf_replace = 1.0
-        clean_field = np.where(np.isfinite(field), field, inf_replace)
-        hi = float(np.max(clean_field[part_mask]))
+        finite_max = float(np.max(values[finite]))
+
+        # Keep all shrinkage selected by the risk filter; color by size.
+        lo = 0.0
+        hi = finite_max
         if hi <= lo:
             return
+
+        # Mask the field to the selected class so threshold only picks from there.
+        display_field = np.where(class_mask, field, 0.0)
+        clean_field = np.where(np.isfinite(display_field), display_field, hi * 1.5)
 
         grid = self._make_grid(result, clean_field, scalar_name)
         part = self._part_only(grid)
@@ -306,20 +401,39 @@ class Analyzer3DViewer(QtInteractor):
         if high.n_cells == 0:
             return
 
-        cloud = high.cell_centers()
+        # cell_centers() drops arrays; convert point->cell data first and attach it.
+        try:
+            high_cells = high.point_data_to_cell_data(pass_point_data=False)
+            cloud = high_cells.cell_centers()
+            if scalar_name in high_cells.cell_data:
+                cloud.point_data[scalar_name] = high_cells.cell_data[scalar_name]
+        except Exception:
+            cloud = high.cell_centers()
+
         if cloud.n_points > max_points:
             idx = np.random.choice(cloud.n_points, max_points, replace=False)
-            cloud = pv.PolyData(cloud.points[idx])
+            points = cloud.points[idx]
+            if scalar_name in cloud.point_data:
+                vals = np.asarray(cloud.point_data[scalar_name])[idx]
+                cloud = pv.PolyData(points)
+                cloud.point_data[scalar_name] = vals
+            else:
+                cloud = pv.PolyData(points)
 
+        title = "Pore size (µm)" if scalar_name == "pore_size_um" else ("Solidification time" if scalar_name == "t_solid" else scalar_name)
         self._porosity_actor = self.add_mesh(
             cloud,
-            color="#ff0000",
+            scalars=scalar_name if scalar_name in cloud.array_names else None,
+            color="#ff0000" if scalar_name not in cloud.array_names else None,
+            cmap="plasma",
+            clim=[0.0, max(hi, 1.0)],
             style="points",
             point_size=8,
             render_points_as_spheres=True,
             opacity=1.0,
             lighting=False,
-            show_scalar_bar=False,
+            show_scalar_bar=True,
+            scalar_bar_args=_scalar_bar_args(title, (0.82, 0.02)),
         )
 
     def show_niyama_isosurfaces(self, result: Optional[AnalysisResult]):
@@ -356,6 +470,70 @@ class Analyzer3DViewer(QtInteractor):
         )
         self._niyama_actors.append(actor)
 
+    def show_flow_velocity(self, result: Optional[AnalysisResult]):
+        """Overlay the 3-D Darcy flow-velocity magnitude on the metal surfaces."""
+        if self._flow_actor is not None:
+            self.remove_actor(self._flow_actor)
+            self._flow_actor = None
+        self._remove_scalar_bar("Akış hızı (m/s)")
+        if result is None or result.flow_result is None:
+            return
+        fr = result.flow_result
+        vmag = fr.velocity_magnitude
+        if vmag is None or vmag.size == 0:
+            return
+        grid = self._make_grid(result, vmag, "velocity_magnitude")
+        metal = self._metal_only(grid)
+        if metal.n_cells == 0:
+            return
+        surf = self._smooth_surface(metal)
+        if surf.n_points == 0:
+            return
+        vmax = float(np.nanmax(vmag)) if np.isfinite(vmag).any() else 1.0
+        self._flow_actor = self.add_mesh(
+            surf,
+            scalars="velocity_magnitude",
+            cmap="turbo",
+            opacity=1.0,
+            clim=[0.0, max(vmax, 1e-3)],
+            show_scalar_bar=True,
+            scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.64, 0.02)),
+            smooth_shading=True,
+        )
+
+    def show_flow_node_labels(self, result: Optional[AnalysisResult]):
+        """Add a 3-D point + label at each gating contact (node) velocity."""
+        if self._flow_node_actor is not None:
+            self.remove_actor(self._flow_node_actor)
+            self._flow_node_actor = None
+        if result is None or result.flow_result is None:
+            return
+        nodes = result.flow_result.gating_nodes
+        if not nodes:
+            return
+        points = []
+        labels = []
+        for node in nodes:
+            if node.velocity_m_s <= 1e-12:
+                continue
+            points.append(node.centroid_mm)
+            labels.append(f"{node.name}\n{node.velocity_m_s:.2f} m/s")
+        if not points:
+            return
+        points = np.asarray(points, dtype=np.float64)
+        self._flow_node_actor = self.add_point_labels(
+            points,
+            labels,
+            font_size=10,
+            text_color="white",
+            point_color="red",
+            point_size=12,
+            shape=None,
+            always_visible=True,
+            shadow=False,
+            name="flow_node_labels",
+        )
+
     def show_feeding_paths(self, result: Optional[AnalysisResult]):
         for actor in self._path_actors:
             self.remove_actor(actor)
@@ -365,6 +543,8 @@ class Analyzer3DViewer(QtInteractor):
 
         part_mask = result.grid == BodyType.PART
         for hs in result.hotspots:
+            if hs.solved:
+                continue
             vox = np.round((hs.position_mm - result.origin_mm) / result.dx_mm).astype(int)
             if not (
                 0 <= vox[0] < part_mask.shape[0]
@@ -495,13 +675,14 @@ class Analyzer3DViewer(QtInteractor):
                 self.remove_actor(self._hotspot_label_actor)
                 self._hotspot_label_actor = None
 
-    def toggle_porosity(self, result: AnalysisResult, checked: bool, percentile: float = 95.0, max_points: int = 1500):
+    def toggle_porosity(self, result: AnalysisResult, checked: bool, noise_percent: float = 3.0, max_points: int = 5000, pore_size_filter: Optional[str] = None):
         if checked:
-            self.show_porosity_cloud(result, percentile=percentile, max_points=max_points)
+            self.show_porosity_cloud(result, noise_percent=noise_percent, max_points=max_points, pore_size_filter=pore_size_filter)
         else:
             if self._porosity_actor is not None:
                 self.remove_actor(self._porosity_actor)
                 self._porosity_actor = None
+            self._remove_scalar_bar("Pore size (µm)")
 
     def toggle_niyama(self, result: AnalysisResult, checked: bool):
         if checked:
@@ -511,6 +692,29 @@ class Analyzer3DViewer(QtInteractor):
                 self.remove_actor(actor)
             self._niyama_actors.clear()
             self._remove_scalar_bar("Niyama")
+
+    def toggle_flow_velocity(self, result: AnalysisResult, checked: bool):
+        if checked:
+            self.show_flow_velocity(result)
+        else:
+            if self._flow_actor is not None:
+                self.remove_actor(self._flow_actor)
+                self._flow_actor = None
+            self._remove_scalar_bar("Akış hızı (m/s)")
+
+    def toggle_flow_node_labels(self, result: AnalysisResult, checked: bool):
+        if checked:
+            self.show_flow_node_labels(result)
+        else:
+            if self._flow_node_actor is not None:
+                self.remove_actor(self._flow_node_actor)
+                self._flow_node_actor = None
+
+    def toggle_flow_animation(self, result: AnalysisResult, checked: bool):
+        if checked:
+            self.flow_animator.set_result(result)
+        else:
+            self.flow_animator.stop()
 
     def toggle_feeding_paths(self, result: AnalysisResult, checked: bool):
         if checked:
@@ -530,6 +734,164 @@ class Analyzer3DViewer(QtInteractor):
             # Remove any slice scalar bar to avoid overlap when switching fields.
             for title in ["SDF (mm)", "Risk", "Niyama", "Mat ID", "T (°C)"]:
                 self._remove_scalar_bar(title)
+
+    # ---------------- gating cross-section picker ----------------
+    def start_section_picker(
+        self,
+        section_key: str,
+        bodies: List[Body],
+        callback: Callable[[str, float, str], None],
+    ):
+        """Let the user click on a gating body to measure its cross-sectional area.
+
+        The cut plane is perpendicular to the principal axis that best aligns
+        with the clicked face normal, so the measured area corresponds to the
+        flow cross-section when the user clicks on an end face.
+        """
+        self._clear_section_actors()
+        self._section_callback = callback
+        self._section_bodies = bodies
+        self._section_key = section_key
+
+        def _on_pick(point):
+            self._handle_section_pick(np.asarray(point, dtype=np.float64))
+
+        # Make sure a previous point-picking session is fully disabled before
+        # starting a new one, otherwise PyVista raises "Picking is already enabled".
+        try:
+            self.disable_picking()
+        except Exception:
+            pass
+        self._section_picker = None
+
+        print(f"[section picker] '{section_key}' kesiti için 3D görünümde ilgili yüzeye tıklayın.")
+        self._section_picker = self.enable_point_picking(
+            _on_pick,
+            left_clicking=True,
+            picker="cell",
+            show_message=False,
+            color="#ff00ff",
+            point_size=12,
+        )
+
+    def _handle_section_pick(self, point: np.ndarray):
+        try:
+            body = self._find_body_at_point(point)
+            if body is None:
+                print("[section picker] Tıklanan nokta herhangi bir body yüzeyine yakın değil.")
+                return
+
+            # Use the body's natural flow axis and the robust cross-section
+            # estimator so a single click on any face gives the characteristic
+            # runner/ingate/sprue area, not a one-off slice.
+            axis = _flow_axis(body.mesh)
+
+            if self._section_key in ("SPRUE_BASE", "SPRUE_THROAT"):
+                base_mm2, throat_mm2 = _sprue_circular_base_and_throat(
+                    body.mesh, axis
+                )
+                area_mm2 = base_mm2 if self._section_key == "SPRUE_BASE" else throat_mm2
+            else:
+                area_mm2 = _characteristic_cross_section_area(body.mesh, axis)
+
+            area_cm2 = area_mm2 / 100.0
+
+            # Visualise a representative section through the body centroid.
+            centroid = np.asarray(body.mesh.centroid, dtype=np.float64)
+            section = body.mesh.section(plane_origin=centroid, plane_normal=axis)
+            if section is not None and len(section.vertices) >= 3:
+                self._show_section_outline(centroid, axis, body, section)
+            print(f"[section picker] {body.name} ({self._section_key}): A = {area_cm2:.3f} cm²")
+
+            if self._section_callback is not None:
+                self._section_callback(self._section_key, area_cm2, body.name)
+        except Exception as e:
+            print(f"[section picker] Kesit ölçüm hatası: {e}")
+        finally:
+            self.disable_picking()
+            self._section_picker = None
+
+    def _find_body_at_point(self, point: np.ndarray) -> Optional[Body]:
+        import trimesh
+
+        best_body = None
+        best_dist = float("inf")
+        for body in self._section_bodies:
+            if len(body.faces) == 0:
+                continue
+            try:
+                closest, dist, _ = trimesh.proximity.closest_point(
+                    body.mesh, np.array([point])
+                )
+                dist = float(dist[0])
+                if dist < best_dist:
+                    best_dist = dist
+                    best_body = body
+            except Exception:
+                continue
+        return best_body
+
+    def _show_section_outline(
+        self,
+        point: np.ndarray,
+        axis: np.ndarray,
+        body: Body,
+        section,
+    ):
+        """Visualise the picked point, cutting plane and section outline."""
+        # Picked point marker
+        marker = pv.PolyData(point)
+        actor = self.add_mesh(
+            marker,
+            color="#ff00ff",
+            style="points",
+            point_size=14,
+            render_points_as_spheres=True,
+            pickable=False,
+        )
+        self._section_actors.append(actor)
+
+        # Section vertices as a point cloud / outline
+        pts = np.asarray(section.vertices, dtype=np.float64)
+        if len(pts) >= 3:
+            poly = pv.PolyData(pts)
+            actor = self.add_mesh(
+                poly,
+                color="#ffff00",
+                style="points",
+                point_size=8,
+                render_points_as_spheres=True,
+                pickable=False,
+            )
+            self._section_actors.append(actor)
+
+        # Transparent cutting plane sized to the body bounds
+        bounds = body.mesh.bounds
+        diag = float(np.linalg.norm(bounds[1] - bounds[0]))
+        if diag <= 0:
+            diag = 50.0
+        plane = pv.Plane(
+            center=point,
+            direction=axis,
+            i_size=diag,
+            j_size=diag,
+        )
+        actor = self.add_mesh(
+            plane,
+            color="#00ffff",
+            opacity=0.15,
+            pickable=False,
+        )
+        self._section_actors.append(actor)
+        self.render()
+
+    def _clear_section_actors(self):
+        for actor in getattr(self, "_section_actors", []):
+            try:
+                self.remove_actor(actor)
+            except Exception:
+                pass
+        self._section_actors = []
 
     def save_screenshot(self, path: str) -> str:
         """Save a PNG screenshot of the current 3D view."""

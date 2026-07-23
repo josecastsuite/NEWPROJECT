@@ -7,6 +7,7 @@ from typing import Optional
 
 import numpy as np
 
+from core.materials import get_alloy
 from core.types import AnalysisResult, SectionFlow
 
 
@@ -20,13 +21,90 @@ def _html_escape(text: str) -> str:
     )
 
 
+def _format_pore_size_summary(result: AnalysisResult) -> str:
+    """Return an HTML table summarising estimated pore size distribution.
+
+    Each porosity class now has its own display filter so macro and micro
+    shrinkage are not forced through the same top-% noise threshold.
+    """
+    ps = result.pore_size_um
+    if ps is None or ps.size == 0:
+        return "<p>Gözenek boyutu hesabı mevcut değil.</p>"
+    ps = np.asarray(ps, dtype=np.float64)
+
+    alloy = get_alloy(result.alloy_key)
+    macro_limit = float(alloy.macro_pore_limit_um)
+    micro_limit = float(alloy.micro_pore_limit_um)
+
+    macro_thr = float(getattr(result, "pore_size_macro_threshold_um", 0.0))
+    micro_thr = float(getattr(result, "pore_size_micro_threshold_um", 0.0))
+    fine_thr = float(getattr(result, "pore_size_fine_threshold_um", 0.0))
+    # If a class has no voxels the stored threshold is 0; use the absolute class
+    # lower bound so the row still reports the correct size range.
+    if macro_thr <= 0.0:
+        macro_thr = macro_limit
+    if micro_thr <= 0.0:
+        micro_thr = micro_limit
+    if fine_thr <= 0.0:
+        fine_thr = 0.0
+
+    pm = result.pore_size_macro_mask & np.isfinite(ps) & (ps >= macro_thr)
+    pmi = result.pore_size_micro_mask & np.isfinite(ps) & (ps >= micro_thr)
+    pf = result.pore_size_fine_mask & np.isfinite(ps) & (ps >= fine_thr)
+    macro_vox = int(pm.sum())
+    micro_vox = int(pmi.sum())
+    fine_vox = int(pf.sum())
+    total = macro_vox + micro_vox + fine_vox
+    if total == 0:
+        return "<p>Tahmini gözenek tespit edilmedi.</p>"
+
+    macro_vals = ps[pm]
+    micro_vals = ps[pmi]
+    fine_vals = ps[pf]
+
+    def _max(a: np.ndarray) -> float:
+        return float(np.max(a)) if len(a) else 0.0
+
+    macro_pct = float(getattr(result, "pore_size_macro_percent", 60.0))
+    micro_pct = float(getattr(result, "pore_size_micro_percent", 40.0))
+    fine_pct = float(getattr(result, "pore_size_fine_percent", 20.0))
+
+    return f"""<p>Filtre oranları farklı: Makro üst %{macro_pct:.0f} (eşik {macro_thr:.2f} µm), Mikro üst %{micro_pct:.0f} (eşik {micro_thr:.2f} µm), İnce üst %{fine_pct:.0f} (eşik {fine_thr:.2f} µm).</p>
+    <table>
+        <tr><th>Sınıf</th><th>Voxel sayısı</th><th>Oran</th><th>Max gözenek (µm)</th></tr>
+        <tr><td>Makro (&gt;{macro_limit:.0f} µm)</td><td>{macro_vox}</td><td>{100.0*macro_vox/total:.1f}%</td><td>{_max(macro_vals):.1f}</td></tr>
+        <tr><td>Mikro ({micro_limit:.0f}–{macro_limit:.0f} µm)</td><td>{micro_vox}</td><td>{100.0*micro_vox/total:.1f}%</td><td>{_max(micro_vals):.1f}</td></tr>
+        <tr><td>İnce (&lt;{micro_limit:.0f} µm)</td><td>{fine_vox}</td><td>{100.0*fine_vox/total:.1f}%</td><td>{_max(fine_vals):.1f}</td></tr>
+    </table>"""
+
+
 def _format_hotspot_table(result: AnalysisResult) -> str:
     rows = []
-    if result.hotspots:
-        for i, hs in enumerate(result.hotspots, 1):
+    alloy = get_alloy(result.alloy_key)
+    macro_limit = float(alloy.macro_pore_limit_um)
+    micro_limit = float(alloy.micro_pore_limit_um)
+    visible = [hs for hs in result.hotspots if not hs.solved]
+    if visible:
+        for i, hs in enumerate(visible, 1):
             pos = ",".join(f"{v:.1f}" for v in hs.position_mm)
-            status = "OK" if hs.feed_ok else "UZAK/DARALMA"
-            niy = ", ".join(f"{k}={v:.2f}" for k, v in hs.niyama_variants.items())
+            if hs.chill_ok:
+                status = "ÇIKICI (chill) ile çözüldü"
+            elif hs.feed_ok:
+                status = "OK"
+            else:
+                status = "UZAK/DARALMA"
+            niy = ", ".join(f"{k}={v:.3f}" for k, v in hs.niyama_variants.items())
+            # Hotspot pore display should use the class absolute lower bound,
+            # not the percentile-based display threshold.
+            class_thr = {
+                "macro": macro_limit,
+                "micro": micro_limit,
+                "fine": 0.0,
+            }.get(hs.pore_size_class, 0.0)
+            if hs.pore_size_class and hs.pore_size_um >= class_thr:
+                pore = f"{hs.pore_size_um:.1f} µm ({hs.pore_size_class})"
+            else:
+                pore = "-"
             rows.append(
                 f"<tr>"
                 f"<td>{i}</td>"
@@ -36,16 +114,17 @@ def _format_hotspot_table(result: AnalysisResult) -> str:
                 f"<td>{hs.dist_to_riser_mm:.1f}</td>"
                 f"<td>{hs.max_feeding_distance_mm:.1f}</td>"
                 f"<td>{hs.feeding_cost:.2f}</td>"
-                f"<td>{hs.niyama_ensemble:.2f}</td>"
+                f"<td>{hs.niyama_ensemble:.4f}</td>"
                 f"<td>{hs.darcy_resistance:.2f}</td>"
                 f"<td>{hs.curvature_mean:.2f}</td>"
                 f"<td>{hs.shape_factor:.4f}</td>"
                 f"<td>{'Evet' if hs.heuvers_ok else 'Hayır'}</td>"
+                f"<td>{pore}</td>"
                 f"<td>{status}</td>"
                 f"</tr>"
             )
     else:
-        rows.append('<tr><td colspan="13">Tespit edilmedi.</td></tr>')
+        rows.append('<tr><td colspan="14">Tespit edilmedi (çözülenler gizli).</td></tr>')
     return "".join(rows)
 
 
@@ -53,13 +132,15 @@ def _format_riser_table(result: AnalysisResult) -> str:
     rows = []
     if result.riser_results:
         for rr in result.riser_results:
+            eff_m = max(rr.effective_m_value_mm, rr.m_value_mm)
+            type_text = f" ({rr.feeder_type})" if rr.feeder_type else ""
             rows.append(
                 f"<tr>"
-                f"<td>{_html_escape(rr.name)}</td>"
+                f"<td>{_html_escape(rr.name)}{type_text}</td>"
                 f"<td>{rr.volume_cm3:.2f}</td>"
                 f"<td>{rr.surface_area_cm2:.2f}</td>"
-                f"<td>{rr.m_value_mm:.2f}</td>"
-                f"<td>{rr.effective_m_required:.2f}</td>"
+                f"<td>{rr.m_value_mm / 10.0:.2f} / etkin {eff_m / 10.0:.2f}</td>"
+                f"<td>{rr.effective_m_required / 10.0:.2f}</td>"
                 f"<td>{rr.required_volume_cm3:.2f}</td>"
                 f"<td>{'Geçer' if rr.large_enough and rr.volume_ratio_ok else 'Geçersiz'}</td>"
                 f"</tr>"
@@ -73,22 +154,30 @@ def _format_riser_proposal_table(result: AnalysisResult) -> str:
     rows = []
     if result.riser_proposals:
         for rp in result.riser_proposals:
-            pos = ",".join(f"{v:.1f}" for v in rp.placement_mm)
-            shape_text = "çıkıcı (chill)" if rp.shape == "chill" else _html_escape(rp.shape)
+            pos = ",".join(f"{v / 10.0:.1f}" for v in rp.placement_mm)
+            if rp.infeasible:
+                shape_text = "uyarı (sığmıyor)"
+                dims = "Mini exotermik besleyici veya çıkıcı (chill) önerilir"
+            elif rp.shape == "chill":
+                shape_text = "çıkıcı (chill)"
+                dims = f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, V={rp.volume_cm3:.2f} cm³"
+            elif rp.exothermic:
+                shape_text = "ekzotermik mini besleyici"
+                dims = f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, V={rp.volume_cm3:.2f} cm³"
+            else:
+                shape_text = _html_escape(rp.shape)
+                dims = f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, V={rp.volume_cm3:.2f} cm³, M={rp.m_required_mm / 10.0:.2f} cm"
             rows.append(
                 f"<tr>"
                 f"<td>{rp.target_hotspot_index + 1}</td>"
                 f"<td>{shape_text}</td>"
                 f"<td>({pos})</td>"
-                f"<td>{rp.diameter_mm:.1f}</td>"
-                f"<td>{rp.height_mm:.1f}</td>"
-                f"<td>{rp.volume_cm3:.2f}</td>"
-                f"<td>{rp.m_required_mm:.2f}</td>"
+                f"<td>{dims}</td>"
                 f"<td>{_html_escape(rp.reason)}</td>"
                 f"</tr>"
             )
     else:
-        rows.append('<tr><td colspan="8">Yeni besleyici/çıkıcı önerisi yok.</td></tr>')
+        rows.append('<tr><td colspan="5">Yeni besleyici/çıkıcı önerisi yok.</td></tr>')
     return "".join(rows)
 
 
@@ -97,6 +186,8 @@ def _section_flow_rows(gr) -> str:
     section_names = {
         "INGATE": "Meme",
         "RUNNER": "Yolluk",
+        "DISTRIBUTOR": "Dağıtıcı",
+        "CURUFLUK": "Curufluk",
         "SPRUE_THROAT": "Döküm ağzı boğazı",
         "SPRUE_BASE": "Döküm ağzı tabanı",
     }
@@ -119,6 +210,107 @@ def _section_flow_rows(gr) -> str:
             f"türbülans={'Evet' if sf.turbulent else 'Hayır'}{target}</td></tr>"
         )
     return "".join(rows)
+
+
+def _format_flow_result(flow) -> str:
+    """Render the 3-D filling-flow node velocities as a table and bar chart."""
+    if flow is None:
+        return ""
+    node_v = getattr(flow, "node_velocities", {}) or {}
+    if not node_v:
+        return ""
+    labels = {
+        "SPRUE_THROAT": "D.ağzı boğazı",
+        "SPRUE_BASE": "D.ağzı tabanı",
+        "RUNNER": "Yolluk",
+        "DISTRIBUTOR": "Dağıtıcı",
+        "CURUFLUK": "Curufluk",
+        "INGATE": "Meme",
+        "FILTER": "Filtre",
+        "RISER": "Besleyici",
+    }
+    order = ["SPRUE_THROAT", "SPRUE_BASE", "RUNNER", "DISTRIBUTOR", "CURUFLUK", "FILTER", "INGATE", "RISER"]
+    items = [(k, float(node_v.get(k, 0.0))) for k in order if node_v.get(k, 0.0) > 1e-9]
+    if not items:
+        return ""
+    max_v = max(v for _, v in items) or 1.0
+
+    rows = ""
+    bars = ""
+    for key, val in items:
+        pct = 100.0 * val / max_v
+        rows += f"<tr><td>{labels.get(key, key)}</td><td>{val:.3f}</td><td>{val*100:.1f} cm/s</td></tr>"
+        bars += (
+            f'<div style="margin:2px 0;"><span style="display:inline-block;width:90px;">{labels.get(key, key)}</span>'
+            f'<span style="display:inline-block;background:#2a9d8f;height:16px;width:{pct:.1f}%;"></span>'
+            f'<span style="margin-left:6px;">{val:.3f} m/s</span></div>'
+        )
+
+    # Matplotlib node-velocity graph as a base64 PNG.
+    graph_html = ""
+    try:
+        import io
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        names = [labels.get(k, k) for k, _ in items]
+        values = [v for _, v in items]
+        colors = ["#2a9d8f" if v <= max_v * 0.8 else "#e76f51" for v in values]
+        fig, ax = plt.subplots(figsize=(max(6, len(items) * 1.2), 4.5))
+        bars2 = ax.bar(range(len(items)), values, color=colors, edgecolor="#264653")
+        ax.set_xticks(range(len(items)))
+        ax.set_xticklabels(names, rotation=30, ha="right")
+        ax.set_ylabel("Hız (m/s)")
+        ax.set_title(f"3-B Darcy Akış - Düğüm Hızları (Q={flow.Q_m3_s*1e3:.2f} L/s)")
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+        for bar, val in zip(bars2, values):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.01 * max_v,
+                f"{val:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+        ax.set_ylim(0, max_v * 1.15)
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png", dpi=120)
+        plt.close(fig)
+        buf.seek(0)
+        b64 = base64.b64encode(buf.read()).decode("ascii")
+        graph_html = f'<img src="data:image/png;base64,{b64}" style="max-width:100%;height:auto;margin-top:10px;" />'
+    except Exception:
+        graph_html = ""
+
+    per_gate = getattr(flow, "per_gate_contact_velocity_m_s", {}) or {}
+    per_area = getattr(flow, "per_gate_contact_area_cm2", {}) or {}
+    per_gate_html = ""
+    if per_gate:
+        gate_rows = "".join(
+            f"<tr><td>{name}</td><td>{v:.3f}</td><td>{per_area.get(name, 0.0):.2f}</td></tr>"
+            for name, v in per_gate.items()
+        )
+        per_gate_html = f"""
+        <h4>Meme başına temas hızı</h4>
+        <table>
+            <tr><th>Gate</th><th>Hız (m/s)</th><th>Alan (cm²)</th></tr>
+            {gate_rows}
+        </table>
+        """
+
+    return f"""
+    <h3>3-B Darcy Akış Simülasyonu (v9.3)</h3>
+    <p>Toplam debi Q = {flow.Q_m3_s*1e3:.3f} L/s | Giriş alanı = {flow.inlet_area_m2*1e4:.2f} cm² | Tahmini doldurma süresi = {flow.fill_time_s:.2f} s | Meme temas hızı = {flow.ingate_contact_velocity_m_s:.3f} m/s</p>
+    {graph_html}
+    <table>
+        <tr><th>Kesit</th><th>Hız (m/s)</th><th>Hız (cm/s)</th></tr>
+        {rows}
+    </table>
+    <div style="margin-top:10px;"><strong>Kesit hızları (m/s):</strong><br/>{bars}</div>
+    {per_gate_html}
+    """
 
 
 def _format_gate_table(result: AnalysisResult) -> str:
@@ -157,8 +349,11 @@ def _format_gate_table(result: AnalysisResult) -> str:
 
     auto_fill = getattr(gr, "auto_fill_time_s", gr.recommended_fill_time_s)
     campbell_fill = getattr(gr, "campbell_fill_time_s", 0.0)
-    return f""""
+    flow = getattr(result, "flow_result", None) or getattr(gr, "flow_result", None)
+    flow_html = _format_flow_result(flow)
+    return f"""
     <p><strong>Ana motor:</strong> parça kütlesi → dolum süresi → metal yüksekliği → sprue hızı → As:Ar:Ag oranıyla hedef alanlar. CAD ölçümleri sadece karşılaştırmadır.</p>
+    {flow_html}
     <table>
         <tr><th>Parametre</th><th>Değer</th><th>Durum / Gerekli</th></tr>
         <tr><td>Seçili giriş kesiti</td><td>{selected_section}</td><td>v = {gr.ingate_velocity_m_s:.2f} m/s</td></tr>
@@ -170,6 +365,8 @@ def _format_gate_table(result: AnalysisResult) -> str:
         <tr><td>Döküm ağzı boğaz alanı (As)</td><td>{gr.sprue_throat_area_cm2:.2f} cm²</td><td>gerekli {gr.required_sprue_area_cm2:.2f} cm²</td></tr>
         <tr><td>Döküm ağzı taban alanı</td><td>{gr.sprue_base_area_cm2:.2f} cm²</td><td>-</td></tr>
         {_section_flow_rows(gr)}
+        <tr><td>Dağıtıcı alanı (Ad)</td><td>{gr.distributor_area_cm2:.2f} cm²</td><td>v = {gr.distributor_velocity_m_s:.2f} m/s</td></tr>
+        <tr><td>Curufluk alanı</td><td>{gr.curufluk_area_cm2:.2f} cm²</td><td>v = {gr.curufluk_velocity_m_s:.2f} m/s</td></tr>
         <tr><td>Toplam debi Q</td><td>{gr.ingate_flow_rate_m3_s*1e3:.2f} L/s</td><td>doldurma süresi {gr.ingate_fill_time_s:.2f} s</td></tr>
         <tr><td>Akışkanlık uzunluğu Lf</td><td>{gr.fluidity_length_mm:.1f} mm</td><td>parça boyutu ≤ Lf</td></tr>
         <tr><td>Hız için gerekli seçili kesit alanı</td><td>{gr.required_ingate_area_for_velocity_cm2:.2f} cm²</td><td>mevcut {selected_area:.2f} cm²</td></tr>
@@ -297,25 +494,30 @@ def _render_html(result: AnalysisResult, screenshot_path: Optional[str] = None) 
         <tr><td>Boyut (mm)</td><td>{result.bbox_size_mm[0]:.1f} x {result.bbox_size_mm[1]:.1f} x {result.bbox_size_mm[2]:.1f}</td></tr>
     </table>
 
+    <h2>Gözenek Boyutu Tahmini (µm)</h2>
+    {_format_pore_size_summary(result)}
+
     <h2>Sıcak Noktalar (Hot Spots)</h2>
+    <p>Yeterli besleyici/çıkıcı ile çözülen hot spot'lar ekranda gösterilmez; aşağıda sadece çözülmemişler listelenir.</p>
     <table>
         <tr>
             <th>#</th><th>Konum (mm)</th><th>M ± hata (mm)</th><th>t (mm)</th>
             <th>Mesafe (mm)</th><th>Limit (mm)</th><th>Maliyet</th>
-            <th>Niyama ens.</th><th>Darcy</th><th>Mean curv</th><th>SF</th><th>Heuver</th><th>Durum</th>
+            <th>Niyama ens.</th><th>Darcy</th><th>Mean curv</th><th>SF</th><th>Heuver</th><th>Gözenek</th><th>Durum</th>
         </tr>
         {_format_hotspot_table(result)}
     </table>
+    <p><em>Genel önleme: kalın kesitlerde yatay yüzey değiştirin, yerel besleyici/çıkıcı ekleyin veya geometriyi inceltin.</em></p>
 
     <h2>Besleyici (Riser) Değerlendirmesi</h2>
     <table>
-        <tr><th>İsim</th><th>Hacim (cm³)</th><th>Yüzey (cm²)</th><th>M (mm)</th><th>Gerekli M (mm)</th><th>Gerekli V (cm³)</th><th>Durum</th></tr>
+        <tr><th>İsim</th><th>Hacim (cm³)</th><th>Yüzey (cm²)</th><th>M (cm)</th><th>Gerekli M (cm)</th><th>Gerekli V (cm³)</th><th>Durum</th></tr>
         {_format_riser_table(result)}
     </table>
 
     <h2>Otomatik Besleyici / Çıkıcı Önerileri</h2>
     <table>
-        <tr><th>Hot Spot</th><th>Şekil</th><th>Konum (mm)</th><th>Çap (mm)</th><th>Yükseklik (mm)</th><th>Hacim (cm³)</th><th>M (mm)</th><th>Neden</th></tr>
+        <tr><th>Hot Spot</th><th>Şekil</th><th>Konum (cm)</th><th>Boyutlar</th><th>Neden</th></tr>
         {_format_riser_proposal_table(result)}
     </table>
 
@@ -412,17 +614,65 @@ def _generate_report_fpdf2(
     pdf.ln(4)
 
     pdf.set_font(font, "", 13)
+    pdf.cell(0, 8, "Gözenek Boyutu Tahmini", ln=True)
+    pdf.set_font(font, "", 10)
+    ps = result.pore_size_um
+    if ps is not None and ps.size:
+        ps_arr = np.asarray(ps, dtype=np.float64)
+        alloy = get_alloy(result.alloy_key)
+        macro_limit = float(alloy.macro_pore_limit_um)
+        micro_limit = float(alloy.micro_pore_limit_um)
+        macro_thr = float(getattr(result, "pore_size_macro_threshold_um", 0.0))
+        micro_thr = float(getattr(result, "pore_size_micro_threshold_um", 0.0))
+        fine_thr = float(getattr(result, "pore_size_fine_threshold_um", 0.0))
+        if macro_thr <= 0.0:
+            macro_thr = macro_limit
+        if micro_thr <= 0.0:
+            micro_thr = micro_limit
+        if fine_thr <= 0.0:
+            fine_thr = 0.0
+        pm = result.pore_size_macro_mask & np.isfinite(ps_arr) & (ps_arr >= macro_thr)
+        pmi = result.pore_size_micro_mask & np.isfinite(ps_arr) & (ps_arr >= micro_thr)
+        pf = result.pore_size_fine_mask & np.isfinite(ps_arr) & (ps_arr >= fine_thr)
+        macro_vox = int(pm.sum())
+        micro_vox = int(pmi.sum())
+        fine_vox = int(pf.sum())
+        macro_max = float(np.max(ps_arr[pm])) if macro_vox else 0.0
+        micro_max = float(np.max(ps_arr[pmi])) if micro_vox else 0.0
+        fine_max = float(np.max(ps_arr[pf])) if fine_vox else 0.0
+        pdf.cell(0, 6, f"Filtre oranlari farkli: Makro ust %60 (esik {macro_thr:.1f} um) | Mikro ust %40 (esik {micro_thr:.1f} um) | Ince ust %20 (esik {fine_thr:.1f} um). Makro (>{macro_limit:.0f} um): {macro_vox} vox (max {macro_max:.1f} um) | Mikro ({micro_limit:.0f}-{macro_limit:.0f} um): {micro_vox} vox (max {micro_max:.1f} um) | Ince (<{micro_limit:.0f} um): {fine_vox} vox (max {fine_max:.1f} um)", ln=True)
+    else:
+        pdf.cell(0, 6, "Gözenek boyutu hesabi mevcut degil.", ln=True)
+    pdf.ln(4)
+
+    pdf.set_font(font, "", 13)
     pdf.cell(0, 8, "Sıcak Noktalar", ln=True)
     pdf.set_font(font, "", 10)
-    if result.hotspots:
-        for i, hs in enumerate(result.hotspots, 1):
+    pdf.cell(0, 6, "Yeterli besleyici/çıkıcı ile çözülen hot spot'lar gizlendi; sadece çözülmemişler listeleniyor.", ln=True)
+    visible_hs = [hs for hs in result.hotspots if not hs.solved]
+    if visible_hs:
+        for i, hs in enumerate(visible_hs, 1):
             pos = ",".join(f"{v:.1f}" for v in hs.position_mm)
-            status = "OK" if hs.feed_ok else "UZAK/DARALMA"
+            if hs.chill_ok:
+                status = "CIKICI (chill) ile cozuldu"
+            elif hs.feed_ok:
+                status = "OK"
+            else:
+                status = "UZAK/DARALMA"
+            pore = ""
+            class_thr = {
+                "macro": macro_limit,
+                "micro": micro_limit,
+                "fine": 0.0,
+            }.get(hs.pore_size_class, 0.0)
+            if hs.pore_size_class and hs.pore_size_um >= class_thr:
+                pore = f" | Gozenek={hs.pore_size_um:.1f} um ({hs.pore_size_class})"
             pdf.cell(0, 6, f"{i}. Konum=({pos}) mm | M={hs.m_value_mm:.2f} ± {hs.m_uncertainty_mm:.2f} mm | "
                            f"t={hs.t_section_mm:.2f} mm | Besleme={hs.dist_to_riser_mm:.1f}/{hs.max_feeding_distance_mm:.1f} mm | "
-                           f"Niyama={hs.niyama_ensemble:.2f} | Darcy={hs.darcy_resistance:.2f} | Heuver={'OK' if hs.heuvers_ok else 'FAIL'} | {status}", ln=True)
+                           f"Niyama={hs.niyama_ensemble:.2f} | Darcy={hs.darcy_resistance:.2f} | Heuver={'OK' if hs.heuvers_ok else 'FAIL'} | {status}{pore}", ln=True)
     else:
         pdf.cell(0, 6, "Tespit edilmedi.", ln=True)
+    pdf.cell(0, 6, "Genel onleme: kalin kesitlerde yatay yuzey degistirin, yerel besleyici/cikici ekleyin veya geometriyi inceltin.", ln=True)
     pdf.ln(4)
 
     pdf.set_font(font, "", 13)
@@ -430,8 +680,10 @@ def _generate_report_fpdf2(
     pdf.set_font(font, "", 10)
     if result.riser_results:
         for rr in result.riser_results:
-            pdf.cell(0, 6, f"{rr.name}: V={rr.volume_cm3:.2f} cm³, A={rr.surface_area_cm2:.2f} cm², "
-                           f"M={rr.m_value_mm:.2f} mm (gerekli {rr.effective_m_required:.2f} mm), "
+            eff_m = max(rr.effective_m_value_mm, rr.m_value_mm)
+            type_text = f" [{rr.feeder_type}]" if rr.feeder_type else ""
+            pdf.cell(0, 6, f"{rr.name}{type_text}: V={rr.volume_cm3:.2f} cm³, A={rr.surface_area_cm2:.2f} cm², "
+                           f"M={rr.m_value_mm / 10.0:.2f} / etkin {eff_m / 10.0:.2f} cm (gerekli {rr.effective_m_required / 10.0:.2f} cm), "
                            f"V gerekli={rr.required_volume_cm3:.2f} cm³", ln=True)
     else:
         pdf.cell(0, 6, "Besleyici body atanmamış.", ln=True)
@@ -442,13 +694,21 @@ def _generate_report_fpdf2(
         pdf.cell(0, 8, "Otomatik Besleyici / Cikici Onerileri", ln=True)
         pdf.set_font(font, "", 10)
         for i, rp in enumerate(result.riser_proposals, 1):
-            pos = ",".join(f"{v:.1f}" for v in rp.placement_mm)
-            if rp.shape == "chill":
-                pdf.cell(0, 6, f"{i}. cikici (chill): cap={rp.diameter_mm:.1f} mm, yukseklik={rp.height_mm:.1f} mm, "
-                               f"V={rp.volume_cm3:.2f} cm3, konum=({pos}) mm", ln=True)
+            pos = ",".join(f"{v / 10.0:.1f}" for v in rp.placement_mm)
+            if rp.infeasible:
+                pdf.cell(0, 6, f"{i}. UYARI: Hotspot #{rp.target_hotspot_index + 1} icin onerilen besleyici/cikici parcaya sigmiyor.", ln=True)
+                pdf.cell(0, 6, f"   Mini exotermik besleyici veya cikici (chill) onerilir; konum=({pos}) cm.", ln=True)
+                warning_text = rp.warning if rp.warning else "Cozum kullanici kararidir."
+                pdf.cell(0, 6, f"   {warning_text}", ln=True)
+            elif rp.shape == "chill":
+                pdf.cell(0, 6, f"{i}. cikici (chill): cap={rp.diameter_mm / 10.0:.1f} cm, yukseklik={rp.height_mm / 10.0:.1f} cm, "
+                               f"V={rp.volume_cm3:.2f} cm3, konum=({pos}) cm", ln=True)
+            elif rp.exothermic:
+                pdf.cell(0, 6, f"{i}. ekzotermik mini besleyici: cap={rp.diameter_mm / 10.0:.1f} cm, yukseklik={rp.height_mm / 10.0:.1f} cm, "
+                               f"V={rp.volume_cm3:.2f} cm3, konum=({pos}) cm", ln=True)
             else:
-                pdf.cell(0, 6, f"{i}. {rp.shape}: cap={rp.diameter_mm:.1f} mm, yukseklik={rp.height_mm:.1f} mm, "
-                               f"V={rp.volume_cm3:.2f} cm3, M={rp.m_required_mm:.2f} mm, konum=({pos}) mm", ln=True)
+                pdf.cell(0, 6, f"{i}. {rp.shape}: cap={rp.diameter_mm / 10.0:.1f} cm, yukseklik={rp.height_mm / 10.0:.1f} cm, "
+                               f"V={rp.volume_cm3:.2f} cm3, M={rp.m_required_mm / 10.0:.2f} cm, konum=({pos}) cm", ln=True)
             pdf.cell(0, 6, f"   Neden: {_html_escape(rp.reason)}", ln=True)
         pdf.ln(4)
 

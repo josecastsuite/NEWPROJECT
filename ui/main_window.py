@@ -5,8 +5,9 @@ import sys
 import time
 import webbrowser
 from dataclasses import replace
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pyvista as pv
 from PyQt6 import QtCore, QtGui, QtWidgets
 
@@ -15,7 +16,6 @@ from core import (
     ALLOYS,
     MOLDS,
     analyze,
-    analyze_gating,
     apply_unit_scale,
     build_voxel_grid,
     detect_unit_suggestion,
@@ -26,6 +26,8 @@ from core import (
 )
 from core.materials import chvorinov_c_from_properties
 from core.types import Body, BodyType, CastingParameters
+from ui.feeder_dialog import FeederDialog, FEEDER_TYPE_NAMES
+from ui.section_dialog import SectionDialog
 from ui.viewer import Analyzer3DViewer
 
 
@@ -39,6 +41,9 @@ BODY_TYPE_NAMES = {
     BodyType.COOLING_SPRUE: "SOĞUTUCU D.AĞZI",
     BodyType.FILTER: "FİLTRE",
     BodyType.POURING_BASIN: "DÖKÜM HAVZASI",
+    BodyType.SPRUE_THROAT: "D.AĞZI BOĞAZI",
+    BodyType.DISTRIBUTOR: "DAĞITICI",
+    BodyType.CURUFLUK: "CURUFLUK",
 }
 
 
@@ -83,6 +88,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._origin = None
         self._dx = None
         self._unit_scale = 1.0
+        # User-selected section area for the velocity inlet (sprue throat/top).
+        self._user_section_area_cm2 = 0.0
+        self._user_section_key = "SPRUE_THROAT"
+        self._user_section_body_name = ""
+        self._body_feeder_buttons: Dict[str, QtWidgets.QPushButton] = {}
+        self._body_feeder_labels: Dict[str, QtWidgets.QLabel] = {}
+        self._body_items: Dict[str, QtWidgets.QListWidgetItem] = {}
+
 
         self._build_ui()
         self._apply_dark_theme()
@@ -183,7 +196,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ---------------- LEFT PANEL (scrollable) ----------------
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidgetResizable(True)
-        left_scroll.setMinimumWidth(380) 
+        left_scroll.setMinimumWidth(560) 
         
         left_panel = QtWidgets.QWidget()
         left_scroll.setWidget(left_panel)
@@ -333,11 +346,21 @@ class MainWindow(QtWidgets.QMainWindow):
         _params_labeled(self.visc_spin, "Viskozite μ (Pa·s):")
 
         self.velocity_section_combo = QtWidgets.QComboBox()
-        self.velocity_section_combo.addItem("Meme (ingate)", "INGATE")
-        self.velocity_section_combo.addItem("Yolluk (runner)", "RUNNER")
         self.velocity_section_combo.addItem("Döküm ağzı boğazı (sprue throat)", "SPRUE_THROAT")
-        self.velocity_section_combo.addItem("Döküm ağzı tabanı (sprue base)", "SPRUE_BASE")
-        _params_labeled(self.velocity_section_combo, "Hız kesiti:", "Giriş hızının uygulanacağı kesit.")
+        self.velocity_section_combo.addItem("Döküm ağzı en üst noktası (sprue top)", "SPRUE_BASE")
+        self.velocity_section_combo.setCurrentIndex(self.velocity_section_combo.findData("SPRUE_THROAT"))
+        _params_labeled(self.velocity_section_combo, "Hız kesiti:", "Seçilen sprue kesitinin hızı girilir; program bu kesit alanından Q hesaplar, düzeltme yapmaz.")
+
+        self.section_pick_button = QtWidgets.QPushButton("Kesit seçiniz")
+        self.section_pick_button.setToolTip("Seçili sprue elemanının gerçek kesit alanını 3D modelden seç. 0 = otomatik CAD ölçümü.")
+        self.section_pick_button.clicked.connect(self.on_pick_section)
+        self.section_pick_label = QtWidgets.QLabel("A=otomatik")
+
+        pick_layout = QtWidgets.QHBoxLayout()
+        pick_layout.addWidget(self.section_pick_button)
+        pick_layout.addWidget(self.section_pick_label)
+        pick_layout.addStretch()
+        params_layout.addLayout(pick_layout)
 
         self.v_ingate_spin = QtWidgets.QDoubleSpinBox()
         self.v_ingate_spin.setRange(0.0, 20.0)
@@ -347,10 +370,35 @@ class MainWindow(QtWidgets.QMainWindow):
         _params_labeled(
             self.v_ingate_spin,
             "Giriş hızı v (m/s):",
-            "0 = otomatik (Q = V_parça / t_fill). >0 kullanıcı girişi; seçili kesitte Re/Fr hesaplanır.",
+            "0 = otomatik (tasarım debisi). >0 kullanıcı girişi; seçili sprue kesitinde geçerlidir. Program düzeltmez.",
         )
 
         left_layout.addWidget(params_group)
+
+        # Gravity direction group
+        gravity_group = QtWidgets.QGroupBox("Yerçekimi Yönü")
+        gravity_layout = QtWidgets.QVBoxLayout(gravity_group)
+        gravity_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        gravity_layout.setSpacing(6)
+        self.gravity_combo = QtWidgets.QComboBox()
+        for label, value in [
+            ("Aşağı (-Z)", "0,0,-1"),
+            ("Yukarı (+Z)", "0,0,1"),
+            ("Ön (-Y)", "0,-1,0"),
+            ("Arka (+Y)", "0,1,0"),
+            ("Sol (-X)", "-1,0,0"),
+            ("Sağ (+X)", "1,0,0"),
+            ("Özel", "custom"),
+        ]:
+            self.gravity_combo.addItem(label, value)
+        self.gravity_combo.setCurrentIndex(0)
+        self.gravity_custom = QtWidgets.QLineEdit()
+        self.gravity_custom.setPlaceholderText("x,y,z (örn: 0.0,-1.0,0.0)")
+        self.gravity_custom.setEnabled(False)
+        self.gravity_combo.currentIndexChanged.connect(self._on_gravity_preset_changed)
+        gravity_layout.addWidget(self.gravity_combo)
+        gravity_layout.addWidget(self.gravity_custom)
+        left_layout.addWidget(gravity_group)
 
         # Sync casting parameter defaults now that all parameter spin boxes exist.
         self._sync_casting_params_from_materials()
@@ -430,19 +478,104 @@ class MainWindow(QtWidgets.QMainWindow):
         self.porosity_toggle.toggled.connect(self.on_toggle_porosity)
         vis_layout.addWidget(self.porosity_toggle)
 
-        self.porosity_detail_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.porosity_detail_slider.setMinimum(0)
-        self.porosity_detail_slider.setMaximum(100)
-        self.porosity_detail_slider.setValue(50)
-        self.porosity_detail_slider.setToolTip("Porozite bulutu detayı: 0 = az/sadece uç değerler, 100 = yoğun")
-        self.porosity_detail_slider.valueChanged.connect(self.on_porosity_detail_changed)
-        vis_layout.addWidget(self.porosity_detail_slider)
+        self.porosity_noise_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.porosity_noise_slider.setMinimum(1)    # 0.01%
+        self.porosity_noise_slider.setMaximum(300)  # 3.00%
+        self.porosity_noise_slider.setValue(300)    # default 3.00%
+        self.porosity_noise_slider.setToolTip("Porozite gürültü filtresi: tek slider, ama Makro/Mikro daha geniş, İnce daha dar gösterir")
+        self.porosity_noise_slider.valueChanged.connect(self.on_porosity_noise_changed)
+        self.porosity_noise_label = QtWidgets.QLabel("Filtre: %3.00")
+        vis_layout.addWidget(self.porosity_noise_label)
+        vis_layout.addWidget(self.porosity_noise_slider)
+
+        self.porosity_size_filter = QtWidgets.QComboBox()
+        self.porosity_size_filter.addItem("Tüm poroziteler", "all")
+        self.porosity_size_filter.addItem("Makro (>1000 µm)", "macro")
+        self.porosity_size_filter.addItem("Mikro (100–1000 µm)", "micro")
+        self.porosity_size_filter.addItem("İnce (<100 µm)", "fine")
+        self.porosity_size_filter.setToolTip("Gösterilecek gözenek boyutu sınıfı")
+        self.porosity_size_filter.currentIndexChanged.connect(self.on_porosity_size_filter_changed)
+        vis_layout.addWidget(self.porosity_size_filter)
 
         self.niyama_toggle = QtWidgets.QCheckBox("Niyama İzosurface")
         self.niyama_toggle.setToolTip("Niyama 0.775 / 1.5 izoyüzeyleri")
         self.niyama_toggle.setChecked(False)
         self.niyama_toggle.toggled.connect(self.on_toggle_niyama)
         vis_layout.addWidget(self.niyama_toggle)
+
+        self.flow_toggle = QtWidgets.QCheckBox("Akış Hızı")
+        self.flow_toggle.setToolTip("3-B Darcy akış hızını metal yüzeylerinde göster")
+        self.flow_toggle.setChecked(False)
+        self.flow_toggle.toggled.connect(self.on_toggle_flow_velocity)
+        vis_layout.addWidget(self.flow_toggle)
+
+        self.flow_node_toggle = QtWidgets.QCheckBox("Düğüm Hızları")
+        self.flow_node_toggle.setToolTip("Her gating elemanında nokta + hız değeri göster")
+        self.flow_node_toggle.setChecked(True)
+        self.flow_node_toggle.toggled.connect(self.on_toggle_flow_node_labels)
+        vis_layout.addWidget(self.flow_node_toggle)
+
+        anim_group = QtWidgets.QGroupBox("Akış & Katılaşma")
+        anim_layout = QtWidgets.QVBoxLayout(anim_group)
+
+        self.flow_anim_toggle = QtWidgets.QCheckBox("Katılaşma Cephesi")
+        self.flow_anim_toggle.setToolTip("Dolum + katılaşma cephesini zaman kaydırıcıyla oynatır")
+        self.flow_anim_toggle.setChecked(False)
+        self.flow_anim_toggle.toggled.connect(self.on_toggle_flow_animation)
+        anim_layout.addWidget(self.flow_anim_toggle)
+
+        play_layout = QtWidgets.QHBoxLayout()
+        self.flow_play_btn = QtWidgets.QPushButton("▶ Oynat")
+        self.flow_play_btn.setEnabled(False)
+        self.flow_play_btn.clicked.connect(self.on_flow_play_clicked)
+        play_layout.addWidget(self.flow_play_btn)
+
+        self.flow_time_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.flow_time_slider.setMinimum(0)
+        self.flow_time_slider.setMaximum(1000)
+        self.flow_time_slider.setValue(0)
+        self.flow_time_slider.setEnabled(False)
+        self.flow_time_slider.valueChanged.connect(self.on_flow_time_changed)
+        play_layout.addWidget(self.flow_time_slider)
+        anim_layout.addLayout(play_layout)
+
+        self.flow_time_label = QtWidgets.QLabel("t: 0.000 s / 0.000 s")
+        self.flow_time_label.setEnabled(False)
+        anim_layout.addWidget(self.flow_time_label)
+
+        speed_layout = QtWidgets.QHBoxLayout()
+        speed_label = QtWidgets.QLabel("Hız:")
+        self.flow_speed_spin = QtWidgets.QDoubleSpinBox()
+        self.flow_speed_spin.setRange(0.01, 20.0)
+        self.flow_speed_spin.setValue(1.0)
+        self.flow_speed_spin.setSingleStep(0.1)
+        self.flow_speed_spin.setDecimals(2)
+        self.flow_speed_spin.setSuffix("x")
+        self.flow_speed_spin.valueChanged.connect(self.on_flow_speed_changed)
+        speed_layout.addWidget(speed_label)
+        speed_layout.addWidget(self.flow_speed_spin)
+
+        count_label = QtWidgets.QLabel("Kare:")
+        self.flow_particle_label = QtWidgets.QLabel("—")
+        self.flow_particle_label.setToolTip("Katılaşma cephesi kare sayısı")
+        speed_layout.addWidget(count_label)
+        speed_layout.addWidget(self.flow_particle_label)
+
+        self.flow_graph_btn = QtWidgets.QPushButton("Hız Grafiği")
+        self.flow_graph_btn.setToolTip("Darcy ön cephe hızı - dolum zamanı grafiğini aç")
+        self.flow_graph_btn.setEnabled(False)
+        self.flow_graph_btn.clicked.connect(self.on_flow_graph_clicked)
+        speed_layout.addWidget(self.flow_graph_btn)
+        anim_layout.addLayout(speed_layout)
+
+        self.flow_surface_check = QtWidgets.QCheckBox("Akış Yolları")
+        self.flow_surface_check.setToolTip("Akış yollarını ve ilerleyen marker'ları göster/gizle")
+        self.flow_surface_check.setChecked(True)
+        self.flow_surface_check.setEnabled(False)
+        self.flow_surface_check.toggled.connect(self.on_flow_surface_toggled)
+        anim_layout.addWidget(self.flow_surface_check)
+
+        vis_layout.addWidget(anim_group)
 
         self.path_toggle = QtWidgets.QCheckBox("Besleme Yolları")
         self.path_toggle.setToolTip("Hot spot'tan besleyiciye/gating'e giden yol")
@@ -497,7 +630,7 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([450, 700, 450]) 
+        splitter.setSizes([560, 680, 560]) 
         
         # Add splitter to main VBox
         main_vbox.addWidget(splitter, stretch=1)
@@ -547,7 +680,31 @@ class MainWindow(QtWidgets.QMainWindow):
             viscosity_pa_s=self.visc_spin.value(),
             ingate_velocity_m_s=self.v_ingate_spin.value(),
             velocity_section_key=self.velocity_section_combo.currentData(),
+            gravity_vector=self._gravity_vector_from_ui(),
         )
+
+    def _gravity_vector_from_ui(self) -> Tuple[float, float, float]:
+        data = self.gravity_combo.currentData()
+        if data == "custom":
+            text = self.gravity_custom.text().strip()
+            if text:
+                try:
+                    parts = [float(x.strip()) for x in text.split(",")]
+                    if len(parts) == 3:
+                        v = np.array(parts, dtype=np.float64)
+                        norm = float(np.linalg.norm(v))
+                        if norm > 0:
+                            return tuple((v / norm).tolist())
+                except Exception:
+                    pass
+            return (0.0, 0.0, -1.0)
+        return tuple(float(x) for x in data.split(","))
+
+    def _on_gravity_preset_changed(self):
+        is_custom = self.gravity_combo.currentData() == "custom"
+        self.gravity_custom.setEnabled(is_custom)
+        if not is_custom:
+            self.gravity_custom.clear()
 
     def aiLog(self, msg: str, type_: str = "info"):
         """Print a line to the black AI terminal."""
@@ -573,19 +730,46 @@ class MainWindow(QtWidgets.QMainWindow):
         item = QtWidgets.QListWidgetItem()
         widget = QtWidgets.QWidget()
         row = QtWidgets.QHBoxLayout(widget)
-        row.setContentsMargins(4, 2, 4, 2)
+        row.setContentsMargins(2, 1, 2, 1)
+        row.setSpacing(2)
 
-        label = QtWidgets.QLabel(f"{body.name} ({body.volume_cm3:.2f} cm³)")
-        label.setToolTip(f"Merkez: {body.center}")
-        row.addWidget(label, stretch=1)
+        # Compact body label; full volume/centroid info in tooltip.
+        label = QtWidgets.QLabel(body.name)
+        label.setToolTip(
+            f"Hacim: {body.volume_cm3:.2f} cm³\nMerkez: {body.center}"
+        )
+        label.setStyleSheet("font-size: 11px;")
+        label.setMaximumWidth(80)
+        label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
+        )
+        row.addWidget(label)
+
+        # Feeder type controls (always visible; dialog warns if not a RISER).
+        feeder_btn = QtWidgets.QPushButton("Besleyici tipi")
+        feeder_btn.setToolTip("Bu besleyicinin tipini ve opsiyonel modülünü ayarla")
+        feeder_btn.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
+        )
+        feeder_btn.clicked.connect(lambda _, b=body: self.on_body_feeder(b))
+        row.addWidget(feeder_btn)
+        self._body_feeder_buttons[body.name] = feeder_btn
 
         combo = QtWidgets.QComboBox()
+        combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
+        )
+        combo.setMaximumWidth(120)
         for bt in (
             BodyType.PART,
             BodyType.RISER,
             BodyType.INGATE,
             BodyType.RUNNER,
             BodyType.SPRUE,
+            BodyType.SPRUE_THROAT,
+            BodyType.DISTRIBUTOR,
+            BodyType.CURUFLUK,
             BodyType.COOLING_SPRUE,
             BodyType.FILTER,
             BodyType.POURING_BASIN,
@@ -598,9 +782,13 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         row.addWidget(combo)
 
-        item.setSizeHint(widget.sizeHint())
+        self._body_items[body.name] = item
+
         self.body_list.addItem(item)
         self.body_list.setItemWidget(item, widget)
+        self._update_body_row_state(body)
+        self._update_body_feeder_label(body.name)
+        item.setSizeHint(widget.sizeHint())
 
     def on_load_step(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -629,6 +817,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.voxelize_btn.setEnabled(True)
             self.analyze_btn.setEnabled(False)
             self._analysis = None
+            self._body_feeder_buttons.clear()
+            self._body_feeder_labels.clear()
+            self._body_items.clear()
+
             self._clear_checklist()
             self.rec_text.clear()
             self._grid = None
@@ -650,8 +842,128 @@ class MainWindow(QtWidgets.QMainWindow):
         self.viewer.show_bodies(self._bodies)
 
     def on_body_type_changed(self, body: Body, combo: QtWidgets.QComboBox):
-        body.body_type = combo.currentData()
+        data = combo.currentData()
+        try:
+            new_type = BodyType(data) if isinstance(data, int) else data
+        except Exception:
+            new_type = BodyType.PART
+
+        old_type = body.body_type
+        body.body_type = new_type
+
+        # If the body is no longer a riser, clear feeder overrides.
+        if old_type != new_type and new_type != BodyType.RISER:
+            body.feeder_type = ""
+            body.feeder_m_mm = 0.0
+            body.feeder_note = ""
+            self._update_body_feeder_label(body.name)
+
+        self._update_body_row_state(body)
         self.viewer.show_bodies(self._bodies)
+
+    def _update_body_row_state(self, body: Body):
+        # Keeping this hook for any future row-specific updates.
+        pass
+
+    def _update_body_feeder_label(self, body_name: str):
+        label = self._body_feeder_labels.get(body_name)
+        if label is None:
+            return
+        body = next((b for b in self._bodies if b.name == body_name), None)
+        if body is None or not body.feeder_type:
+            label.setText("")
+            return
+        short_names = {
+            "conventional": "konv",
+            "exothermic": "ekzo",
+            "insulated": "izol",
+            "sleeve": "göm",
+            "chilled": "chill",
+        }
+        type_text = short_names.get(body.feeder_type, body.feeder_type[:4])
+        m_text = f" M={body.feeder_m_mm:.1f}" if body.feeder_m_mm > 0 else " auto"
+        label.setText(f"{type_text}{m_text}")
+
+    def on_body_feeder(self, body: Body):
+        """Open the per-riser feeder type / optional modulus dialog."""
+        if body is None:
+            return
+        try:
+            bt = BodyType(body.body_type) if isinstance(body.body_type, int) else body.body_type
+        except Exception:
+            bt = body.body_type
+        if bt != BodyType.RISER:
+            QtWidgets.QMessageBox.information(
+                self, "Tip Uyarısı",
+                "Besleyici tipi seçimi sadece BESLEYİCİ (RISER) tipindeki body'ler için geçerlidir.\n"
+                "Lütfen önce body tipini değiştirin."
+            )
+            return
+
+        try:
+            dialog = FeederDialog(body, parent=self)
+        except Exception as e:
+            self.aiLog(f"Besleyici dialogu açılamadı: {e}", "crit")
+            QtWidgets.QMessageBox.critical(self, "Hata", f"Besleyici dialogu açılamadı:\n{e}")
+            return
+
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            body.feeder_type = dialog.feeder_type or "conventional"
+            body.feeder_m_mm = float(dialog.feeder_m_mm)
+            body.feeder_note = dialog.feeder_note
+            self._update_body_feeder_label(body.name)
+            self.aiLog(
+                f"{body.name} - besleyici tipi: {FEEDER_TYPE_NAMES.get(body.feeder_type, body.feeder_type)}"
+                f"{', M=' + f'{body.feeder_m_mm:.2f} mm' if body.feeder_m_mm > 0 else ''}",
+                "ok",
+            )
+
+    def on_pick_section(self):
+        """Open SectionDialog for the selected velocity-section body."""
+        if not self._bodies:
+            QtWidgets.QMessageBox.warning(self, "UYARI", "Önce STEP dosyası yükleyin.")
+            return
+        section_key = self.velocity_section_combo.currentData()
+        if section_key == "SPRUE_THROAT":
+            target_types = {BodyType.SPRUE_THROAT, BodyType.SPRUE}
+        elif section_key == "SPRUE_BASE":
+            target_types = {BodyType.SPRUE, BodyType.POURING_BASIN}
+        else:
+            target_types = {BodyType.SPRUE, BodyType.SPRUE_THROAT, BodyType.POURING_BASIN}
+        candidates = [b for b in self._bodies if b.body_type in target_types]
+        if not candidates:
+            QtWidgets.QMessageBox.warning(
+                self, "UYARI",
+                f"{section_key} tipinde body bulunamadı. Lütfen body tipini doğru atayın."
+            )
+            return
+        if len(candidates) == 1:
+            body = candidates[0]
+        else:
+            names = [b.name for b in candidates]
+            name, ok = QtWidgets.QInputDialog.getItem(
+                self, "Body Seçimi", f"{section_key} için body seçin:", names, 0, False
+            )
+            if not ok or not name:
+                return
+            body = next((b for b in candidates if b.name == name), None)
+            if body is None:
+                return
+        try:
+            dialog = SectionDialog(body, section_key=section_key, parent=self)
+        except Exception as e:
+            self.aiLog(f"Kesit dialogu açılamadı: {e}", "crit")
+            QtWidgets.QMessageBox.critical(self, "Hata", f"Kesit dialogu açılamadı:\n{e}")
+            return
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            if dialog.area_cm2 and dialog.area_cm2 > 0.0:
+                self._user_section_area_cm2 = float(dialog.area_cm2)
+                self._user_section_key = str(dialog.section_key)
+                self._user_section_body_name = body.name
+                self.section_pick_label.setText(f"A={self._user_section_area_cm2:.2f} cm² ({body.name})")
+                self.aiLog(
+                    f"{body.name} - {dialog.section_key}: A = {self._user_section_area_cm2:.4f} cm²", "ok"
+                )
 
     def on_voxelize(self):
         if not self._bodies:
@@ -666,6 +978,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._bodies,
                 target_dim=target_dim,
                 progress_callback=self._set_progress,
+                gravity_vector=self._gravity_vector_from_ui(),
             )
             self._grid = grid
             self._origin = origin
@@ -729,40 +1042,54 @@ class MainWindow(QtWidgets.QMainWindow):
                 thermal_downsample=3,
                 casting_params=casting_params,
                 progress_callback=self._set_progress,
+                user_section_areas_cm2=(
+                    {self._user_section_key: self._user_section_area_cm2}
+                    if self._user_section_area_cm2 > 0.0
+                    else None
+                ),
             )
             self._analysis.casting_params = casting_params
 
-            self.aiLog("AŞAMA 5/6: Meme / yolluk / döküm ağzı kontrolleri yapılıyor...", "info")
-            gate_result = analyze_gating(self._analysis, casting_params=casting_params, bodies=self._bodies)
-            self._analysis.gate_result = gate_result
-            self._analysis.recommendations.extend(self._gating_recommendations(gate_result))
+            gate_result = self._analysis.gate_result
+            if gate_result:
+                self._analysis.recommendations.extend(
+                    self._gating_recommendations(gate_result)
+                )
 
             elapsed = time.time() - t0
             self.aiLog(f"AŞAMA 6/6: Analiz tamamlandı ({elapsed:.1f} sn)", "ok")
 
             self.progress.setValue(100)
+            n_visible = sum(1 for hs in self._analysis.hotspots if not hs.solved)
             self.status_label.setText(
-                f"Analiz tamamlandı ({elapsed:.1f} sn). {len(self._analysis.hotspots)} hot spot."
+                f"Analiz tamamlandı ({elapsed:.1f} sn). {n_visible}/{len(self._analysis.hotspots)} hot spot görünür."
             )
             self.export_btn.setEnabled(True)
             self.html_btn.setEnabled(True)
             self._update_checklist()
             self._update_recommendations()
-            # Opaque/translucent bodies first; markers are drawn afterwards so
-            # porosity, paths and hot-spots are visible inside the transparent part.
-            self.viewer.show_bodies(self._bodies, reset_camera=True)
+            # Post-analysis: all bodies are translucent so internal markers,
+            # porosity, paths, hot-spots and flow/Niyama overlays are visible.
+            self.viewer.show_bodies(self._bodies, reset_camera=True, analysis_mode=True)
             if self.risk_toggle.isChecked():
                 self.viewer.show_risk(self._analysis)
             if self.porosity_toggle.isChecked():
-                pct, mp = self._porosity_cloud_params()
-                self.viewer.show_porosity_cloud(self._analysis, percentile=pct, max_points=mp)
+                noise, mp, size_filter = self._porosity_cloud_params()
+                self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
             if self.niyama_toggle.isChecked():
                 self.viewer.show_niyama_isosurfaces(self._analysis)
+            if self.flow_toggle.isChecked():
+                self.viewer.show_flow_velocity(self._analysis)
+            if self.flow_node_toggle.isChecked():
+                self.viewer.show_flow_node_labels(self._analysis)
             if self.path_toggle.isChecked():
                 self.viewer.show_feeding_paths(self._analysis)
             if self.local_toggle.isChecked():
                 self.viewer.show_local_regions(self._analysis, self.slice_field.currentData())
             self.viewer.show_hotspots(self._analysis)
+            self._update_flow_controls()
+            if self.flow_anim_toggle.isChecked() and self._analysis.flow_result is not None:
+                self.viewer.toggle_flow_animation(self._analysis, True)
         except Exception as e:
             import traceback
             self.aiLog(f"Analiz hatası: {e}", "crit")
@@ -809,6 +1136,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"A={sf.area_cm2:.2f} cm²{turb_note}.{target}"
             )
 
+        # Per-gate velocities when multiple INGATE bodies are detected.
+        if gr.flow_result is not None:
+            per_gate = getattr(gr.flow_result, "per_gate_contact_velocity_m_s", {})
+            per_area = getattr(gr.flow_result, "per_gate_contact_area_cm2", {})
+            if per_gate:
+                gate_lines = []
+                for name, v in per_gate.items():
+                    a = per_area.get(name, 0.0)
+                    gate_lines.append(f"{name}: v={v:.2f} m/s, A={a:.2f} cm²")
+                if gate_lines:
+                    recs.append("Meme başına temas hızı/alan: " + " | ".join(gate_lines))
+
         if gr.ingate_velocity_m_s > 0:
             recs.append(
                 f"Toplam debi Q={gr.ingate_flow_rate_m3_s*1e3:.2f} L/s, doldurma süresi={gr.ingate_fill_time_s:.2f}s, "
@@ -835,7 +1174,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._analysis is None:
             return
 
-        for hs in self._analysis.hotspots:
+        visible_hotspots = [hs for hs in self._analysis.hotspots if not hs.solved]
+        for hs in visible_hotspots:
             status = "OK" if hs.feed_ok else "DARALMA/UZAK"
             text = (
                 f"Hot spot M={hs.m_value_mm:.1f} mm, t={hs.t_section_mm:.1f} mm, "
@@ -843,13 +1183,55 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Niyama={hs.niyama_ensemble:.2f}"
             )
             self.checklist_layout.addWidget(CheckListItem(text, hs.feed_ok))
+        if any(hs.solved for hs in self._analysis.hotspots):
+            n_total = len(self._analysis.hotspots)
+            n_hidden = n_total - len(visible_hotspots)
+            note = QtWidgets.QLabel(
+                f"{n_hidden} adet hot spot yeterli besleyici/çıkıcı ile çözüldü; "
+                "sadece çözülmemişler listeleniyor."
+            )
+            note.setStyleSheet("color: green;")
+            self.checklist_layout.addWidget(note)
 
         for rr in self._analysis.riser_results:
+            eff_m = max(rr.effective_m_value_mm, rr.m_value_mm)
+            type_text = f" [{rr.feeder_type}]" if rr.feeder_type else ""
             text = (
-                f"{rr.name}: M={rr.m_value_mm:.1f} mm, "
+                f"{rr.name}{type_text}: M={rr.m_value_mm / 10.0:.1f} / etkin {eff_m / 10.0:.1f} cm, "
                 f"V={rr.volume_cm3:.2f} cm³ (gerekli {rr.required_volume_cm3:.2f} cm³)"
             )
             self.checklist_layout.addWidget(CheckListItem(text, rr.large_enough and rr.volume_ratio_ok))
+
+        for rp in self._analysis.riser_proposals:
+            pos = f"({rp.placement_mm[0] / 10.0:.1f}, {rp.placement_mm[1] / 10.0:.1f}, {rp.placement_mm[2] / 10.0:.1f})"
+            if rp.infeasible:
+                text = (
+                    f"UYARI Hotspot #{rp.target_hotspot_index + 1}: besleyici/çıkıcı parçaya sığmıyor. "
+                    f"Mini exotermik besleyici veya çıkıcı (chill) önerilir, konum={pos} cm."
+                )
+                ok = False
+            elif rp.shape == "chill":
+                text = (
+                    f"ÖNERİ Hotspot #{rp.target_hotspot_index + 1}: çıkıcı (chill) ekle -> "
+                    f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, "
+                    f"V={rp.volume_cm3:.2f} cm³, konum={pos} cm"
+                )
+                ok = True
+            elif rp.exothermic:
+                text = (
+                    f"ÖNERİ Hotspot #{rp.target_hotspot_index + 1}: ekzotermik mini besleyici ekle -> "
+                    f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, "
+                    f"V={rp.volume_cm3:.2f} cm³, konum={pos} cm"
+                )
+                ok = True
+            else:
+                text = (
+                    f"ÖNERİ Hotspot #{rp.target_hotspot_index + 1}: {rp.shape} besleyici ekle -> "
+                    f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, "
+                    f"V={rp.volume_cm3:.2f} cm³, M={rp.m_required_mm / 10.0:.2f} cm, konum={pos} cm"
+                )
+                ok = True
+            self.checklist_layout.addWidget(CheckListItem(text, ok))
 
         if self._analysis.gate_result:
             gr = self._analysis.gate_result
@@ -951,6 +1333,35 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                 )
 
+        if self._analysis and self._analysis.flow_result:
+            fr = self._analysis.flow_result
+            self.checklist_layout.addWidget(
+                CheckListItem(
+                    f"3-B Akış: Q={fr.Q_m3_s*1e3:.2f} L/s, doldurma={fr.fill_time_s:.2f} s, meme temas v={fr.ingate_contact_velocity_m_s:.2f} m/s",
+                    True,
+                )
+            )
+            section_names = {
+                "SPRUE_THROAT": "D.ağzı boğazı",
+                "SPRUE_BASE": "D.ağzı tabanı",
+                "RUNNER": "Yolluk",
+                "DISTRIBUTOR": "Dağıtıcı",
+                "CURUFLUK": "Curufluk",
+                "INGATE": "Meme",
+                "FILTER": "Filtre",
+                "RISER": "Besleyici",
+            }
+            for key, val in fr.node_velocities.items():
+                if val <= 1e-9:
+                    continue
+                name = section_names.get(key, key)
+                self.checklist_layout.addWidget(
+                    CheckListItem(
+                        f"  {name}: v={val:.3f} m/s ({val*100:.1f} cm/s)",
+                        True,
+                    )
+                )
+
     def _update_recommendations(self):
         if self._analysis and self._analysis.recommendations:
             html = "<ul style='margin:0;padding-left:16px;color:#00ffff;'>"
@@ -971,23 +1382,101 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_toggle_porosity(self, checked: bool):
         if self._analysis:
-            pct, mp = self._porosity_cloud_params()
-            self.viewer.toggle_porosity(self._analysis, checked, percentile=pct, max_points=mp)
+            noise, mp, size_filter = self._porosity_cloud_params()
+            self.viewer.toggle_porosity(self._analysis, checked, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
 
-    def on_porosity_detail_changed(self, value: int):
+    def on_porosity_noise_changed(self, value: int):
+        noise_percent = value / 100.0
+        self.porosity_noise_label.setText(f"Filtre: %{noise_percent:.2f}")
         if self._analysis and self.porosity_toggle.isChecked():
-            pct, mp = self._porosity_cloud_params()
-            self.viewer.show_porosity_cloud(self._analysis, percentile=pct, max_points=mp)
+            noise, mp, size_filter = self._porosity_cloud_params()
+            self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
 
-    def _porosity_cloud_params(self) -> Tuple[float, int]:
-        detail = self.porosity_detail_slider.value() / 100.0
-        percentile = 99.5 - detail * 19.5  # 99.5 (az) .. 80.0 (yoğun)
-        max_points = int(500 + detail * 4500)  # 500 .. 5000 nokta
-        return float(percentile), int(max_points)
+    def on_porosity_size_filter_changed(self, index: int):
+        if self._analysis and self.porosity_toggle.isChecked():
+            noise, mp, size_filter = self._porosity_cloud_params()
+            self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
+
+    def _porosity_cloud_params(self) -> Tuple[float, int, str]:
+        noise_percent = self.porosity_noise_slider.value() / 100.0  # 0.01 .. 3.00
+        max_points = 5000
+        size_filter = str(self.porosity_size_filter.currentData() or "all")
+        return float(noise_percent), int(max_points), size_filter
 
     def on_toggle_niyama(self, checked: bool):
         if self._analysis:
             self.viewer.toggle_niyama(self._analysis, checked)
+
+    def on_toggle_flow_velocity(self, checked: bool):
+        if self._analysis:
+            self.viewer.toggle_flow_velocity(self._analysis, checked)
+
+    def on_toggle_flow_node_labels(self, checked: bool):
+        if self._analysis:
+            self.viewer.toggle_flow_node_labels(self._analysis, checked)
+
+    def _update_flow_controls(self):
+        has_flow = bool(self._analysis and self._analysis.flow_result)
+        self.flow_anim_toggle.setEnabled(has_flow)
+        self.flow_graph_btn.setEnabled(has_flow)
+        if not self.flow_anim_toggle.isChecked():
+            self.flow_play_btn.setEnabled(False)
+            self.flow_time_slider.setEnabled(False)
+            self.flow_surface_check.setEnabled(False)
+            self.flow_time_label.setEnabled(False)
+        animator = self.viewer.flow_animator
+        if animator and animator._max_time > 0:
+            t = animator._current_time
+            ratio = t / animator._max_time
+            self.flow_time_slider.blockSignals(True)
+            self.flow_time_slider.setValue(int(round(ratio * 1000)))
+            self.flow_time_slider.blockSignals(False)
+            self.flow_time_label.setText(f"t: {t:.3f} s / {animator._max_time:.3f} s")
+            if animator:
+                self.flow_particle_label.setText(
+                    f"{animator.current_frame_index() + 1}/{animator.frame_count()} kare"
+                )
+
+    def on_toggle_flow_animation(self, checked: bool):
+        if self._analysis:
+            self.viewer.toggle_flow_animation(self._analysis, checked)
+        self.flow_play_btn.setEnabled(checked and bool(self._analysis and self._analysis.flow_result))
+        self.flow_time_slider.setEnabled(checked)
+        self.flow_surface_check.setEnabled(checked)
+        self.flow_time_label.setEnabled(checked)
+        if checked:
+            self._update_flow_controls()
+            # Do not auto-play; user presses the play button.
+        else:
+            self.flow_play_btn.setText("▶ Oynat")
+
+    def on_flow_play_clicked(self):
+        if self.viewer.flow_animator is None:
+            return
+        self.viewer.flow_animator.play()
+        self.flow_play_btn.setText(
+            "⏸ Duraklat" if self.viewer.flow_animator._is_running else "▶ Oynat"
+        )
+
+    def on_flow_time_changed(self, value: int):
+        if self.viewer.flow_animator is None or not self.flow_anim_toggle.isChecked():
+            return
+        ratio = value / 1000.0
+        t = ratio * self.viewer.flow_animator._max_time
+        self.viewer.flow_animator.set_current_time(t)
+        self._update_flow_controls()
+
+    def on_flow_speed_changed(self, value: float):
+        if self.viewer.flow_animator is not None:
+            self.viewer.flow_animator.set_speed_multiplier(value)
+
+    def on_flow_graph_clicked(self):
+        if self.viewer.flow_animator is not None:
+            self.viewer.flow_animator.show_velocity_graph(self)
+
+    def on_flow_surface_toggled(self, checked: bool):
+        if self.viewer.flow_animator is not None:
+            self.viewer.flow_animator.set_show_streamlines(checked)
 
     def on_toggle_feeding_paths(self, checked: bool):
         if self._analysis:

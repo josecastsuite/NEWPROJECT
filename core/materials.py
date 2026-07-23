@@ -57,6 +57,12 @@ class Alloy:
     # Riser sizing
     riser_m_factor: float = 1.2
     riser_volume_factor: float = 0.3
+    # Exothermic mini-riser correction: the delivered metal is kept liquid longer,
+    # so the required volume can be reduced while still supplying the same modulus.
+    # A 0.45 yield means ~45% of a normal riser volume is needed; the equivalent
+    # modulus boost (exothermic_head_factor) accounts for the extra liquid metal time.
+    exothermic_volume_yield: float = 0.45
+    exothermic_modulus_factor: float = 1.5
     # Niyama thresholds (dimensionless as used by engine)
     niyama_macro: float = 0.775
     niyama_shrinkage: float = 1.5
@@ -68,10 +74,80 @@ class Alloy:
     shrinkage_factor: float = 0.03
     # Secondary dendrite arm spacing [mm] for interdendritic permeability
     dendrite_spacing_mm: float = 0.12
+    # Practical porosity acceptance limits [µm] and unavoidable gas/oxide baseline
+    micro_pore_limit_um: float = 50.0
+    macro_pore_limit_um: float = 500.0
+    gas_pore_baseline_um: float = 0.5
+    # Porosity-shape exponent: (1 - N/N_thr)^n.  n>1 makes marginally-low-Niyama
+    # regions much less porous, reflecting real-life feeding reservoirs/pressure.
+    pore_niyama_exponent: float = 1.5
+    feed_risk_exponent: float = 1.2
+    # Unavoidable gas/oxide micro-porosity is modulated by local solidification
+    # time (thicker section -> larger gas pores) and local Niyama risk.
+    gas_pore_time_factor: float = 2.0
+    gas_pore_niyama_factor: float = 0.5
+    # Carlson-Beckermann dimensionless-Niyama calibration.
+    # curve_key selects the published fit ("WCB", "A356", "AZ91D").
+    # niyama_star_scale converts the engine's Niyama [sqrt(K s)/mm] to the
+    # dimensionless Ny* used by the Carlson curve.  If <= 0 it is solved from
+    # niyama_macro and macro_pore_limit_um so N=niyama_macro gives a pore-size
+    # proxy equal to the macro limit.  pore_size_um_per_porosity_pct turns the
+    # predicted porosity volume percentage into a size proxy for visualization.
+    carlson_curve_key: str = "WCB"
+    niyama_star_scale: float = 0.0
+    pore_size_um_per_porosity_pct: float = 1000.0
 
     def __post_init__(self):
         if self.density_g_cm3 == 0.0:
             self.density_g_cm3 = self.rho_g_cm3
+        if self.niyama_star_scale <= 0.0:
+            self.niyama_star_scale = self._niyama_star_scale()
+
+    def _niyama_star_scale(self) -> float:
+        """Solve the Carlson curve so N=niyama_macro gives the macro size proxy."""
+        import math
+
+        target_gp = self.macro_pore_limit_um / max(self.pore_size_um_per_porosity_pct, 1e-9)
+
+        def gp_for_scale(s: float) -> float:
+            ny = self.niyama_macro * s
+            if ny <= 0:
+                return float("inf")
+            b0 = max(self.shrinkage_factor * 100.0, 1e-9)
+            key = self.carlson_curve_key
+            if key == "A356":
+                if ny <= 1.43:
+                    val = -2.068 * math.log10(ny) + 3.160
+                elif ny <= 18.0:
+                    val = 4.024 * (ny ** -0.9786)
+                else:
+                    val = 7.771 * (ny ** -1.206)
+            elif key == "AZ91D":
+                if ny <= 41.0:
+                    val = -1.671 * math.log10(ny) + 3.483
+                elif ny <= 45.2:
+                    val = -10.81 * math.log10(ny) + 18.23
+                else:
+                    val = 73.01 * (ny ** -1.415)
+            else:  # WCB default
+                if ny <= 28.2:
+                    val = -1.654 * math.log10(ny) + 3.052
+                else:
+                    val = 43.05 * (ny ** -1.254)
+            return max(0.0, min(b0, val))
+
+        lo, hi = 1e-3, 1e6
+        if gp_for_scale(lo) <= target_gp:
+            return lo
+        if gp_for_scale(hi) >= target_gp:
+            return hi
+        for _ in range(60):
+            mid = (lo + hi) / 2.0
+            if gp_for_scale(mid) > target_gp:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2.0
 
     @property
     def diffusivity_mm2_s(self) -> float:
@@ -137,6 +213,7 @@ ALLOYS: Dict[str, Alloy] = {
         feed_k2=0.0,
         niyama_macro=0.775,
         niyama_shrinkage=1.5,
+        carlson_curve_key="A356",
     ),
     "GGG40": Alloy(
         key="GGG40",
