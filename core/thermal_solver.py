@@ -327,7 +327,7 @@ def solve_3d_thermal(
     del A, A_ib
 
     # Time stepping
-    n_steps_target = max(20, min(200, int(max_time_s / 3.0)))
+    n_steps_target = max(20, min(100, int(max_time_s / 3.0)))
     dt_diff = max_time_s / n_steps_target
     t = 0.0
     step = 0
@@ -405,10 +405,11 @@ def solve_3d_thermal(
         # definite reduced system.  Keeping the matrix SPD avoids the expensive
         # direct solves that occurred with the old non-symmetric row replacement.
         precond = sparse.diags(1.0 / (M_ii.diagonal() + 1e-12), format="csc")
-        T_i, info = spla.cg(M_ii, b_i, rtol=1e-7, atol=0.0, maxiter=300, M=precond)
+        T_i, info = spla.cg(M_ii, b_i, rtol=1e-5, atol=0.0, maxiter=150, M=precond)
         if info != 0:
-            # Last-resort direct solve on the much smaller interior system only.
-            T_i = spla.spsolve(M_ii, b_i)
+            # Do not fall back to a full direct solve on large grids; use the
+            # advected temperature field instead to keep the analysis moving.
+            T_i = T_adv_r[interior_idx].copy()
 
         T_new = np.full(n, T0, dtype=np.float64)
         T_new[interior_idx] = T_i

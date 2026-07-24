@@ -71,8 +71,8 @@ def _downsample_grid(
 def _flow_refined_grid(
     bodies: List[Body],
     casting_params,
-    desired_dx_mm: float = 1.0,
-    max_cells: int = 12_000_000,
+    desired_dx_mm: float = 1.75,
+    max_cells: int = 6_000_000,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float]]:
     """Re-voxelise the casting bodies for the Darcy flow solve.
 
@@ -546,7 +546,7 @@ def _solve_pressure(
             inv_diag = 1.0 / safe_diag
             M = spla.LinearOperator((n_red, n_red), matvec=lambda x: inv_diag * x)
             x, info = spla.cg(
-                A_spd, b_spd, M=M, atol=0.0, rtol=1e-7, maxiter=min(10000, n_red + 1000)
+                A_spd, b_spd, M=M, atol=0.0, rtol=1e-5, maxiter=min(2000, n_red + 500)
             )
             if info == 0:
                 return x
@@ -555,7 +555,7 @@ def _solve_pressure(
             print(f"[Darcy solver] PCG+Jacobi exception: {exc}")
 
         # 2) ILU(0) preconditioned CG for moderate systems.
-        if n_red <= 500_000:
+        if n_red <= 200_000:
             try:
                 A_csc = A_spd.tocsc()
                 ilu = spla.spilu(
@@ -901,14 +901,14 @@ def _compute_fill_time(
     heapq.heapify(heap)
     visited = np.zeros(shape, dtype=bool)
 
-    # 26-neighbour front propagation: metal can flow through faces, edges and
-    # corners so thin/diagonal gating connections are not lost.
+    # 6-neighbour front propagation on the resolved flow grid.  Face-only
+    # connections keep the fast-marching heap small; the Darcy pressure solve
+    # already resolved the 3-D velocity field, so this is just an arrival-time
+    # estimate.
     neighbours = [
-        (di, dj, dk)
-        for di in (-1, 0, 1)
-        for dj in (-1, 0, 1)
-        for dk in (-1, 0, 1)
-        if not (di == 0 and dj == 0 and dk == 0)
+        (1, 0, 0), (-1, 0, 0),
+        (0, 1, 0), (0, -1, 0),
+        (0, 0, 1), (0, 0, -1),
     ]
 
     while heap:
@@ -1908,7 +1908,7 @@ def solve_filling_flow(
     casting_params,
     alloy,
     bodies=None,
-    max_solver_cells: int = 12_000_000,
+    max_solver_cells: int = 6_000_000,
     progress_callback=None,
     design_velocity_m_s: float = 0.0,
     design_section_key: str = "SPRUE_THROAT",
@@ -1966,7 +1966,7 @@ def solve_filling_flow(
     # capture gate cross-sections (≤ ~1.8 mm) while staying within the solver
     # cavity budget.  Otherwise fall back to the supplied analysis grid.
     ref_grid, ref_origin, ref_dx = _flow_refined_grid(
-        bodies, casting_params, desired_dx_mm=1.0, max_cells=max_solver_cells
+        bodies, casting_params, desired_dx_mm=1.75, max_cells=max_solver_cells
     )
     if ref_grid is not None and ref_dx < dx * 0.95:
         grid, origin, dx = ref_grid, ref_origin, ref_dx
