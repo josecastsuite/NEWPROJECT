@@ -361,8 +361,11 @@ def _voxelize_at_dim(
 
         mesh = body.mesh.copy()
         if fix_mesh:
+            # Robust preprocessing: remove degenerate/duplicate faces, merge vertices
+            # even with different normals/UVs (common in STEP triangulations), and
+            # fix face winding/normals so shared edges are recognised.
+            mesh.process(validate=True, merge_tex=True, merge_norm=True)
             mesh.fill_holes()
-            mesh.merge_vertices()
             mesh.remove_unreferenced_vertices()
             # Keep the repaired mesh on the Body so the rest of the pipeline
             # (viewer, section dialog, flow solver) uses the same topology.
@@ -374,10 +377,21 @@ def _voxelize_at_dim(
                 body.volume_cm3 = float(mesh.volume) / 1000.0
             body.surface_area_cm2 = float(mesh.area) / 100.0
             if not mesh.is_watertight:
-                body.watertight_warning = (
-                    f"UYARI: {body.name} CAD modeli su geçirmez değil. "
-                    "Vokselleştirmede iç boşluk hataları oluşabilir."
-                )
+                # Only raise the UI warning for a *substantial* breach. Small
+                # triangulation artefacts can make is_watertight False even on
+                # otherwise valid CAD; suppress the noise unless broken_faces
+                # exceeds a tiny tolerance.
+                try:
+                    broken = trimesh.repair.broken_faces(mesh)
+                    broken_count = len(broken) if broken is not None else 0
+                except Exception:
+                    broken_count = 1
+                threshold = max(10, int(0.001 * len(mesh.faces)))
+                if broken_count > threshold:
+                    body.watertight_warning = (
+                        f"UYARI: {body.name} CAD modeli su geçirmez değil. "
+                        "Vokselleştirmede iç boşluk hataları oluşabilir."
+                    )
 
         if len(mesh.faces) == 0:
             continue
