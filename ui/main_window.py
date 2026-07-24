@@ -1000,6 +1000,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._origin = origin
             self._dx = dx
             self._bodies = bodies
+
+            # Surface watertight warnings from the voxelizer's repair step.
+            watertight_warnings = [
+                b.watertight_warning for b in bodies if b.watertight_warning
+            ]
+            if watertight_warnings:
+                msg = "\n".join(watertight_warnings)
+                self.aiLog(msg, "crit")
+                QtWidgets.QMessageBox.warning(self, "UYARI", msg)
+
             self.viewer.show_bodies(self._bodies)
             self.progress.setValue(100)
             self.status_label.setText(

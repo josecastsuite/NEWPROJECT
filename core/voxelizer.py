@@ -363,6 +363,20 @@ def _voxelize_at_dim(
             mesh.fill_holes()
             mesh.merge_vertices()
             mesh.remove_unreferenced_vertices()
+            # Keep the repaired mesh on the Body so the rest of the pipeline
+            # (viewer, section dialog, flow solver) uses the same topology.
+            body.mesh = mesh
+            body.vertices = mesh.vertices.copy()
+            body.faces = mesh.faces.copy()
+            body.center = mesh.center_mass if mesh.is_watertight else mesh.centroid
+            if mesh.is_watertight:
+                body.volume_cm3 = float(mesh.volume) / 1000.0
+            body.surface_area_cm2 = float(mesh.area) / 100.0
+            if not mesh.is_watertight:
+                body.watertight_warning = (
+                    f"UYARI: {body.name} CAD modeli su geçirmez değil. "
+                    "Vokselleştirmede iç boşluk hataları oluşabilir."
+                )
 
         if len(mesh.faces) == 0:
             continue
@@ -422,6 +436,58 @@ def _voxelize_at_dim(
     return grid, origin, dx, repaired_bodies
 
 
+def _fill_enclosed_voids(grid: np.ndarray) -> np.ndarray:
+    """Fill isolated background voxels that are fully enclosed by metal.
+
+    After ``ndimage.label`` on the background (grid == 0), any component that
+    does not touch the grid boundary is a closed internal void caused by
+    voxelisation rounding.  Each such component is filled with the most common
+    non-zero body type in its 26-neighbourhood, so the voxel matrix becomes a
+    watertight solid without altering the outer shell.
+    """
+    bg = grid == 0
+    if not bg.any():
+        return grid
+
+    # 26-connectivity for the background so diagonal leakage is recognised.
+    labeled, n = ndimage.label(bg, structure=np.ones((3, 3, 3), dtype=int))
+    if n == 0:
+        return grid
+
+    # Labels that touch the padded grid boundary are part of the outside.
+    boundary_mask = np.zeros_like(labeled, dtype=bool)
+    boundary_mask[0, :, :] = True
+    boundary_mask[-1, :, :] = True
+    boundary_mask[:, 0, :] = True
+    boundary_mask[:, -1, :] = True
+    boundary_mask[:, :, 0] = True
+    boundary_mask[:, :, -1] = True
+    boundary_labels = np.unique(labeled[boundary_mask])
+
+    max_label = int(labeled.max())
+    if max_label == 0:
+        return grid
+
+    is_boundary = np.zeros(max_label + 1, dtype=bool)
+    is_boundary[boundary_labels] = True
+
+    footprint = np.ones((3, 3, 3), dtype=bool)
+    # Fill every enclosed background component with its surrounding metal label.
+    for label_id in range(1, max_label + 1):
+        if is_boundary[label_id]:
+            continue
+        comp = labeled == label_id
+        # One-voxel dilation touches the body that encloses this void.
+        dilated = ndimage.binary_dilation(comp, structure=footprint)
+        neighbors = grid[dilated & (grid != 0)]
+        if len(neighbors) == 0:
+            continue
+        fill_label = int(np.bincount(neighbors).argmax())
+        grid[comp] = fill_label
+
+    return grid
+
+
 def build_voxel_grid(
     bodies: List[Body],
     target_dim: int = BASE_RES,
@@ -465,6 +531,10 @@ def build_voxel_grid(
     grid, origin, dx, repaired_bodies = _voxelize_at_dim(
         bodies, target_dim, margin, progress_callback, fix_mesh, conservative=conservative
     )
+
+    # Close any isolated internal voids created by voxelisation rounding so the
+    # metal volume is a watertight solid while the outer shell stays open.
+    grid = _fill_enclosed_voids(grid)
 
     # Resolution sanity check based on the thinnest metal region captured by
     # the voxel grid.  Conservative dilation + 26-neighbour connectivity is the

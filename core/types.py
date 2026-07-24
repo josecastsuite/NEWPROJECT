@@ -122,6 +122,8 @@ class Body:
     volume_cm3: float = 0.0
     surface_area_cm2: float = 0.0
     center: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    # v10.1: Aşama 5 mesh repair warnings to surface in the UI.
+    watertight_warning: str = ""
     # v9.3: per-body user overrides from the GUI
     section_key: str = ""  # INGATE / RUNNER / SPRUE_BASE / SPRUE_THROAT
     section_area_cm2: float = 0.0
