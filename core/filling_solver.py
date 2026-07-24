@@ -1639,10 +1639,11 @@ def _gating_node_velocities(
     def _component_cad_area_m2(mesh, btype) -> float:
         """Return the analytical minimum cross-sectional area of a gating body.
 
-        The flow axis is the component's dominant direction:
-        - Choke / thin disk (SPRUE_THROAT, POURING_BASIN, or aspect ratio < 0.35):
-          flow along the shortest OBB extent; area is the perpendicular face.
-        - Runner / ingate: flow along the longest OBB extent; area is the
+        The flow axis is chosen by component type:
+        - Choke / thin disk (SPRUE_THROAT, POURING_BASIN, RISER): flow along the
+          shortest OBB extent; area is the perpendicular face.
+        - Runner / ingate / sprue (SPRUE, INGATE, RUNNER, DISTRIBUTOR,
+          CURUFLUK, FILTER): flow along the longest OBB extent; area is the
           perpendicular cross-section.
         The section is taken at the body centroid and a small sweep around it,
         returning the minimum finite area so the true choke is captured.
@@ -1654,14 +1655,21 @@ def _gating_node_velocities(
             R = obb.primitive.transform[:3, :3]
             extents = np.asarray(obb.primitive.extents, dtype=np.float64)
             order = np.argsort(extents)
-            is_choke = (
-                btype in {BodyType.SPRUE_THROAT, BodyType.POURING_BASIN}
-                or float(extents[order[0]] / (extents[order[2]] + 1e-18)) < 0.35
-            )
-            if is_choke:
+            choke_types = {BodyType.SPRUE_THROAT, BodyType.POURING_BASIN, BodyType.RISER}
+            runner_types = {
+                BodyType.SPRUE, BodyType.INGATE, BodyType.RUNNER,
+                BodyType.DISTRIBUTOR, BodyType.CURUFLUK, BodyType.FILTER,
+            }
+            if btype in choke_types:
                 axis = R[:, order[0]]  # shortest dimension = through-flow axis
-            else:
+            elif btype in runner_types:
                 axis = R[:, order[2]]  # longest dimension = runner axis
+            else:
+                # Fallback: treat thin disks as chokes, everything else as runners.
+                if float(extents[order[0]] / (extents[order[2]] + 1e-18)) < 0.35:
+                    axis = R[:, order[0]]
+                else:
+                    axis = R[:, order[2]]
             axis = np.asarray(axis, dtype=np.float64)
             axis = axis / (np.linalg.norm(axis) + 1e-18)
             origin = mesh.vertices.mean(axis=0)
