@@ -314,6 +314,18 @@ def solve_3d_thermal(
     A = _build_laplacian(k, dx_m)
     k = k.ravel()
 
+    # Dirichlet T=T0 on the outer shell: solve the reduced SPD system for the
+    # interior cells only.  Boundary columns move to the RHS, so the interior
+    # matrix stays symmetric and CG converges; the old row-replacement trick
+    # made the matrix non-symmetric and caused very expensive spsolve fallbacks.
+    A = A.tocsr()
+    interior_mask = ~boundary
+    interior_idx = np.flatnonzero(interior_mask.ravel())
+    A_ii = A[interior_idx][:, interior_idx]
+    A_ib = A[interior_idx][:, boundary_idx]
+    A_ib_sum = np.asarray(A_ib.sum(axis=1)).ravel().astype(np.float64)
+    del A, A_ib
+
     # Time stepping
     n_steps_target = max(20, min(200, int(max_time_s / 3.0)))
     dt_diff = max_time_s / n_steps_target
@@ -383,29 +395,24 @@ def solve_3d_thermal(
             # Clip to physical bounds after explicit advection.
             T_adv = np.clip(T_adv, T0, alloy.t_pour_c)
 
-        b = C * T_adv.ravel()
+        T_adv_r = T_adv.ravel()
+        C_i = C[interior_idx]
+        b_i = C_i * T_adv_r[interior_idx] + dt * T0 * A_ib_sum
 
-        M = -dt * A + sparse.diags([C], offsets=[0], format="csc")
+        M_ii = -dt * A_ii + sparse.diags(C_i, format="csc")
 
-        # Enforce Dirichlet T=T0 on the outer shell exactly by replacing the
-        # boundary rows of the linear system.  This avoids the 1e12 penalty that
-        # badly conditioned the matrix.
-        if len(boundary_idx):
-            M = M.tolil()
-            for bi in boundary_idx:
-                M.rows[bi] = [bi]
-                M.data[bi] = [1.0]
-            M = M.tocsc()
-            b[boundary_idx] = T0
+        # CG with a diagonal (Jacobi) preconditioner for the symmetric positive
+        # definite reduced system.  Keeping the matrix SPD avoids the expensive
+        # direct solves that occurred with the old non-symmetric row replacement.
+        precond = sparse.diags(1.0 / (M_ii.diagonal() + 1e-12), format="csc")
+        T_i, info = spla.cg(M_ii, b_i, rtol=1e-7, atol=0.0, maxiter=300, M=precond)
+        if info != 0:
+            # Last-resort direct solve on the much smaller interior system only.
+            T_i = spla.spsolve(M_ii, b_i)
 
-        # Use CG with a diagonal (Jacobi) preconditioner for speed on large grids
-        precond = sparse.diags(1.0 / (M.diagonal() + 1e-12), format="csc")
-        T_new, info = spla.cg(M, b, rtol=1e-7, atol=0.0, maxiter=300, M=precond)
-        if info == 0:
-            T_new = T_new.reshape((nx, ny, nz))
-        else:
-            # Fallback to a direct sparse solve if CG fails to converge
-            T_new = spla.spsolve(M, b).reshape((nx, ny, nz))
+        T_new = np.full(n, T0, dtype=np.float64)
+        T_new[interior_idx] = T_i
+        T_new = T_new.reshape((nx, ny, nz))
         # Guard against NaN/Inf from the linear solver before clipping/gradient.
         T_new = np.nan_to_num(T_new, nan=T0, posinf=alloy.t_pour_c, neginf=T0)
         T_new = np.clip(T_new, T0, alloy.t_pour_c)
