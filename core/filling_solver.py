@@ -71,8 +71,8 @@ def _downsample_grid(
 def _flow_refined_grid(
     bodies: List[Body],
     casting_params,
-    desired_dx_mm: float = 1.75,
-    max_cells: int = 6_000_000,
+    desired_dx_mm: float = 1.0,
+    max_cells: int = 12_000_000,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float]]:
     """Re-voxelise the casting bodies for the Darcy flow solve.
 
@@ -1908,7 +1908,7 @@ def solve_filling_flow(
     casting_params,
     alloy,
     bodies=None,
-    max_solver_cells: int = 6_000_000,
+    max_solver_cells: int = 12_000_000,
     progress_callback=None,
     design_velocity_m_s: float = 0.0,
     design_section_key: str = "SPRUE_THROAT",
@@ -1966,7 +1966,7 @@ def solve_filling_flow(
     # capture gate cross-sections (≤ ~1.8 mm) while staying within the solver
     # cavity budget.  Otherwise fall back to the supplied analysis grid.
     ref_grid, ref_origin, ref_dx = _flow_refined_grid(
-        bodies, casting_params, desired_dx_mm=1.75, max_cells=max_solver_cells
+        bodies, casting_params, desired_dx_mm=1.0, max_cells=max_solver_cells
     )
     if ref_grid is not None and ref_dx < dx * 0.95:
         grid, origin, dx = ref_grid, ref_origin, ref_dx
