@@ -21,7 +21,7 @@ velocity and an optional per-voxel fill-time estimate.
 """
 import heapq
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import trimesh
@@ -1442,11 +1442,35 @@ def _gating_node_velocities(
             "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
         )
 
-    # Source selection: prefer the component selected by the user.
+    # Source selection: use the BodyType selected by the user's velocity_section_key.
+    # Gravity is used only as a tie-breaker when multiple components of the
+    # selected type exist.
+    source_section = (source_section_key or "SPRUE_THROAT").upper()
+    section_to_types = {
+        "SPRUE": {BodyType.SPRUE},
+        "SPRUE_BASE": {BodyType.SPRUE},
+        "SPRUE_THROAT": {BodyType.SPRUE_THROAT, BodyType.SPRUE},
+        "POURING_BASIN": {BodyType.POURING_BASIN},
+        "RUNNER": {BodyType.RUNNER},
+        "DISTRIBUTOR": {BodyType.DISTRIBUTOR},
+        "CURUFLUK": {BodyType.CURUFLUK},
+        "FILTER": {BodyType.FILTER},
+        "INGATE": {BodyType.INGATE},
+    }
+    allowed_source_types = section_to_types.get(
+        source_section,
+        {BodyType.POURING_BASIN, BodyType.SPRUE_THROAT, BodyType.SPRUE},
+    )
     source_candidates = [
         cid for cid, (bt, _) in comp_meta.items()
-        if bt in {BodyType.POURING_BASIN, BodyType.SPRUE_THROAT, BodyType.SPRUE} and cid != part_id
+        if bt in allowed_source_types and cid != part_id
     ]
+    if not source_candidates:
+        source_candidates = [
+            cid for cid, (bt, _) in comp_meta.items()
+            if bt in {BodyType.POURING_BASIN, BodyType.SPRUE_THROAT, BodyType.SPRUE}
+            and cid != part_id
+        ]
 
     gating_ids = [cid for cid in comp_meta if cid != part_id]
     if not gating_ids:
@@ -1521,72 +1545,25 @@ def _gating_node_velocities(
         )
 
     # ------------------------------------------------------------------
-    # Real 3B Darcy flux / projected-area integration (FAVOR).
-    #
-    # Each orthogonal face separating two components contributes its exact
-    # volumetric flux v_n * A_real, signed by the upstream/downstream
-    # orientation found by the BFS.  The projected cross-sectional area is the
-    # area of that face projected onto a plane perpendicular to the component
-    # flow axis, so the reported velocity satisfies Q = v * A with the true
-    # CAD section.
     # ------------------------------------------------------------------
-    def _component_flow_axis(mesh, btype) -> np.ndarray:
-        if mesh is None or len(mesh.faces) == 0:
-            return -g_u.copy()
-        try:
-            obb = mesh.bounding_box_oriented
-            R = obb.primitive.transform[:3, :3]
-            extents = np.asarray(obb.primitive.extents, dtype=np.float64)
-            order = np.argsort(extents)
-            choke_types = {BodyType.SPRUE_THROAT, BodyType.POURING_BASIN, BodyType.RISER, BodyType.FILTER}
-            runner_types = {BodyType.SPRUE, BodyType.RUNNER, BodyType.DISTRIBUTOR, BodyType.CURUFLUK}
-            if btype == BodyType.INGATE:
-                # Ingate flow is through the *middle* extent (width x thickness
-                # passage); the shortest is the wall thickness and the longest is
-                # the width, neither of which is the primary flow direction.
-                axis = R[:, order[1]]
-            elif btype in choke_types:
-                axis = R[:, order[0]]  # shortest = flow axis
-            elif btype in runner_types:
-                axis = R[:, order[2]]  # longest = flow axis
-            else:
-                if float(extents[order[0]] / (extents[order[2]] + 1e-18)) < 0.35:
-                    axis = R[:, order[0]]
-                else:
-                    axis = R[:, order[2]]
-            axis = np.asarray(axis, dtype=np.float64)
-            n = float(np.linalg.norm(axis))
-            if n > 1e-18:
-                axis = axis / n
-            return axis
-        except Exception:
-            return -g_u.copy()
-
-    comp_flow_axis: Dict[int, np.ndarray] = {}
-    for cid, (btype, _) in comp_meta.items():
-        if cid == part_id:
-            continue
-        body = comp_body.get(cid)
-        if body is None:
-            comp_flow_axis[cid] = -g_u.copy()
-        else:
-            comp_flow_axis[cid] = _component_flow_axis(body.mesh, btype)
-
+    # Real 3B Darcy flux / projected-contact-area model.
+    #
+    # 1) First pass: the local flow direction for each unordered contact is
+    #    the Darcy velocity vector at the shared faces, weighted by the
+    #    normal flux magnitude (|v_n| * A_real).  This direction comes from
+    #    the solved velocity field, not from OBB/gravity guesses.
+    # 2) Second pass: each face area is projected onto the plane perpendicular
+    #    to that local flow direction.  The projected area is the throat area
+    #    that satisfies Q = v * A.  The flux is the signed Darcy volumetric
+    #    flow from the upstream component to the downstream component.
+    # ------------------------------------------------------------------
     flux_pair = np.zeros(n_keys, dtype=np.float64)
     area_pair = np.zeros(n_keys, dtype=np.float64)
-    V_flow_array = np.zeros((3, n_keys), dtype=np.float64)
+    vel_sum_pair = np.zeros((3, n_keys), dtype=np.float64)
+    weight_pair = np.zeros(n_keys, dtype=np.float64)
     up_by_key = np.zeros(n_keys, dtype=np.int32)
     down_by_key = np.zeros(n_keys, dtype=np.int32)
     contact_keys = np.zeros(n_keys, dtype=bool)
-
-    def _contact_flow_axis(up: int, down: int) -> np.ndarray:
-        # Use the axis of the gating element that actually defines the throat.
-        # For throat->sprue this is the throat axis; for sprue->ingate the ingate
-        # axis; for ingate->part the ingate axis.
-        down_btype = comp_meta[down][0]
-        if down == part_id or down_btype == BodyType.SPRUE:
-            return comp_flow_axis.get(up, -g_u.copy())
-        return comp_flow_axis.get(down, -g_u.copy())
 
     for c in contacts:
         up = c.get("up_id")
@@ -1597,7 +1574,6 @@ def _gating_node_velocities(
         contact_keys[k] = True
         up_by_key[k] = int(up)
         down_by_key[k] = int(down)
-        V_flow_array[:, k] = _contact_flow_axis(up, down)
 
     use_face = (
         u_m_s is not None
@@ -1623,95 +1599,119 @@ def _gating_node_velocities(
                 return slice(-d, None), slice(0, d)
             return slice(None), slice(None)
 
-        for di, dj, dk in unique_dirs:
-            if abs(di) + abs(dj) + abs(dk) != 1:
-                continue
-            sa0, sb0 = _slice(0, di)
-            sa1, sb1 = _slice(1, dj)
-            sa2, sb2 = _slice(2, dk)
+        def _iter_contact_faces():
+            for di, dj, dk in unique_dirs:
+                if abs(di) + abs(dj) + abs(dk) != 1:
+                    continue
+                sa0, sb0 = _slice(0, di)
+                sa1, sb1 = _slice(1, dj)
+                sa2, sb2 = _slice(2, dk)
 
-            id_a = comp_id[sa0, sa1, sa2]
-            id_b = comp_id[sb0, sb1, sb2]
-            valid = (id_a != 0) & (id_b != 0) & (id_a != id_b)
-            if not valid.any():
-                continue
+                id_a = comp_id[sa0, sa1, sa2]
+                id_b = comp_id[sb0, sb1, sb2]
+                valid = (id_a != 0) & (id_b != 0) & (id_a != id_b)
+                if not valid.any():
+                    continue
 
-            start_i = sa0.start if sa0.start is not None else 0
-            start_j = sa1.start if sa1.start is not None else 0
-            start_k = sa2.start if sa2.start is not None else 0
+                start_i = sa0.start if sa0.start is not None else 0
+                start_j = sa1.start if sa1.start is not None else 0
+                start_k = sa2.start if sa2.start is not None else 0
 
-            i, j, k = np.where(valid)
-            gi_i = (start_i + i).astype(np.int64)
-            gj_j = (start_j + j).astype(np.int64)
-            gk_k = (start_k + k).astype(np.int64)
-            ni_idx = gi_i + di
-            nj_idx = gj_j + dj
-            nk_idx = gk_k + dk
+                i, j, k = np.where(valid)
+                gi_i = (start_i + i).astype(np.int64)
+                gj_j = (start_j + j).astype(np.int64)
+                gk_k = (start_k + k).astype(np.int64)
+                ni_idx = gi_i + di
+                nj_idx = gj_j + dj
+                nk_idx = gk_k + dk
 
-            id_a_v = id_a[valid]
-            id_b_v = id_b[valid]
-            k_arr = np.minimum(id_a_v, id_b_v) * mult + np.maximum(id_a_v, id_b_v)
-            in_contact = contact_keys[k_arr]
-            if not in_contact.any():
-                continue
+                id_a_v = id_a[valid]
+                id_b_v = id_b[valid]
+                k_arr = np.minimum(id_a_v, id_b_v) * mult + np.maximum(id_a_v, id_b_v)
+                in_contact = contact_keys[k_arr]
+                if not in_contact.any():
+                    continue
 
-            k_arr = k_arr[in_contact]
-            gi_i = gi_i[in_contact]
-            gj_j = gj_j[in_contact]
-            gk_k = gk_k[in_contact]
-            ni_idx = ni_idx[in_contact]
-            nj_idx = nj_idx[in_contact]
-            nk_idx = nk_idx[in_contact]
+                k_arr = k_arr[in_contact]
+                gi_i = gi_i[in_contact]
+                gj_j = gj_j[in_contact]
+                gk_k = gk_k[in_contact]
+                ni_idx = ni_idx[in_contact]
+                nj_idx = nj_idx[in_contact]
+                nk_idx = nk_idx[in_contact]
+                id_a_v = id_a_v[in_contact]
 
-            if use_face:
-                if di == 1:
-                    v0 = u_m_s[ni_idx, gj_j, gk_k]
-                    v1 = v_m_s[ni_idx, gj_j, gk_k]
-                    v2 = w_m_s[ni_idx, gj_j, gk_k]
-                    f_A_face = f_A_z[ni_idx, gj_j, gk_k]
-                elif dj == 1:
-                    v0 = u_m_s[gi_i, nj_idx, gk_k]
-                    v1 = v_m_s[gi_i, nj_idx, gk_k]
-                    v2 = w_m_s[gi_i, nj_idx, gk_k]
-                    f_A_face = f_A_y[gi_i, nj_idx, gk_k]
-                else:  # dk == 1
-                    v0 = u_m_s[gi_i, gj_j, nk_idx]
-                    v1 = v_m_s[gi_i, gj_j, nk_idx]
-                    v2 = w_m_s[gi_i, gj_j, nk_idx]
-                    f_A_face = f_A_x[gi_i, gj_j, nk_idx]
-                v = np.stack([v0, v1, v2], axis=0)
-            else:
-                v_ref = velocity_m_s[:, gi_i, gj_j, gk_k]
-                v_nb = velocity_m_s[:, ni_idx, nj_idx, nk_idx]
-                v = 0.5 * (v_ref + v_nb)
-                f_A_face = np.ones_like(v_ref[0])
+                if use_face:
+                    if di == 1:
+                        v0 = u_m_s[ni_idx, gj_j, gk_k]
+                        v1 = v_m_s[ni_idx, gj_j, gk_k]
+                        v2 = w_m_s[ni_idx, gj_j, gk_k]
+                        f_A_face = f_A_z[ni_idx, gj_j, gk_k]
+                    elif dj == 1:
+                        v0 = u_m_s[gi_i, nj_idx, gk_k]
+                        v1 = v_m_s[gi_i, nj_idx, gk_k]
+                        v2 = w_m_s[gi_i, nj_idx, gk_k]
+                        f_A_face = f_A_y[gi_i, nj_idx, gk_k]
+                    else:  # dk == 1
+                        v0 = u_m_s[gi_i, gj_j, nk_idx]
+                        v1 = v_m_s[gi_i, gj_j, nk_idx]
+                        v2 = w_m_s[gi_i, gj_j, nk_idx]
+                        f_A_face = f_A_x[gi_i, gj_j, nk_idx]
+                    v = np.stack([v0, v1, v2], axis=0).astype(np.float64, copy=False)
+                else:
+                    v_ref = velocity_m_s[:, gi_i, gj_j, gk_k]
+                    v_nb = velocity_m_s[:, ni_idx, nj_idx, nk_idx]
+                    v = (0.5 * (v_ref + v_nb)).astype(np.float64, copy=False)
+                    f_A_face = np.ones_like(v[0])
 
-            up_k = up_by_key[k_arr]
-            down_k = down_by_key[k_arr]
-            # sign = +1 when the lower-index cell id_a is upstream; then the
-            # face normal (di,dj,dk) already points from up to down.
-            sign = np.where(id_a_v[in_contact] == up_k, 1.0, -1.0).astype(np.float64)
-            V_flow = V_flow_array[:, k_arr]
+                yield di, dj, dk, k_arr, id_a_v, v, f_A_face
+
+        # First pass: find the local Darcy flow direction for each contact.
+        for di, dj, dk, k_arr, id_a_v, v, f_A_face in _iter_contact_faces():
             n_vec = np.array([float(di), float(dj), float(dk)], dtype=np.float64)
             v_normal = np.einsum("i,ij->j", n_vec, v)
-            # n_vec and V_flow are both [X, Y, Z]; cos is the true cosine between
-            # the face normal and the contact-specific component flow axis.
-            cos = np.abs(np.einsum("i,ij->j", n_vec, V_flow))
-            active = cos > 0.1
-            A_proj = np.where(
-                active,
-                area_face * f_A_face * cos,
-                0.0,
-            )
-            # Exact volumetric flux from the up component to the down component.
-            Q_face = np.where(
-                active,
-                sign * v_normal * area_face * f_A_face,
-                0.0,
-            )
+            A_face = area_face * f_A_face
+            active = np.abs(v_normal) > 1e-6
+            weight = np.where(active, np.abs(v_normal) * A_face, 0.0)
+            vel_contribution = v * weight
+            for idx in range(3):
+                vel_sum_pair[idx] += np.bincount(
+                    k_arr, weights=vel_contribution[idx], minlength=n_keys
+                )
+            weight_pair += np.bincount(k_arr, weights=weight, minlength=n_keys)
+
+        # Per-contact mean flow direction from the Darcy field.
+        V_flow_pair = np.zeros((3, n_keys), dtype=np.float64)
+        nonzero = weight_pair > 1e-18
+        if nonzero.any():
+            V_flow_pair[:, nonzero] = vel_sum_pair[:, nonzero] / weight_pair[nonzero]
+            norms = np.linalg.norm(V_flow_pair[:, nonzero], axis=0)
+            norms[norms < 1e-18] = 1.0
+            V_flow_pair[:, nonzero] /= norms
+
+        # Second pass: projected throat area and signed flux.
+        for di, dj, dk, k_arr, id_a_v, v, f_A_face in _iter_contact_faces():
+            n_vec = np.array([float(di), float(dj), float(dk)], dtype=np.float64)
+            v_normal = np.einsum("i,ij->j", n_vec, v)
+
+            V = V_flow_pair[:, k_arr]
+            V_norm = np.linalg.norm(V, axis=0)
+            V_safe = V_norm.copy()
+            V_safe[V_safe < 1e-18] = 1.0
+            V_unit = V / V_safe
+            cos = np.abs(np.einsum("i,ij->j", n_vec, V_unit))
+            # If no Darcy direction was found for this contact, use the raw face area.
+            cos = np.where(V_norm > 1e-18, cos, 1.0)
+
+            active = np.abs(v_normal) > 1e-6
+            A_proj_face = np.where(active, area_face * f_A_face * cos, 0.0)
+
+            up_k = up_by_key[k_arr]
+            sign = np.where(id_a_v == up_k, 1.0, -1.0).astype(np.float64)
+            Q_face = np.where(active, sign * v_normal * area_face * f_A_face, 0.0)
 
             flux_pair += np.bincount(k_arr, weights=Q_face, minlength=n_keys)
-            area_pair += np.bincount(k_arr, weights=A_proj, minlength=n_keys)
+            area_pair += np.bincount(k_arr, weights=A_proj_face, minlength=n_keys)
 
     # Assign the integrated Darcy flux and projected contact area to each contact.
     for c in contacts:
@@ -1722,114 +1722,41 @@ def _gating_node_velocities(
         k = int(min(up, down)) * mult + int(max(up, down))
         c["flux_m3_s"] = float(flux_pair[k])
         c["area_real_m2"] = float(area_pair[k])
-        # The physical throat area for Q = v × A is the real voxel contact area,
-        # not the analytical CAD minimum.  Fall back to the CAD estimate only
-        # when no faces carry flux (disconnected or degenerate contact).
-        if c["area_real_m2"] > 1e-12:
-            c["area_m2"] = c["area_real_m2"]
+        # The node velocity uses the projected Darcy contact area.  If the flux
+        # integration did not produce a measurable projected area (e.g. the
+        # velocity field is zero), fall back to the raw voxel contact area so the
+        # Q = v * A relation remains defined.
+        a = float(area_pair[k])
+        if a <= 1e-12:
+            a = float(c.get("voxel_area_m2", 0.0))
+        c["area_m2"] = a
+        c["area_raw_m2"] = a
 
-    def _component_cad_area_m2(mesh, btype) -> float:
-        """Return the analytical minimum cross-sectional area of a gating body.
-
-        The flow axis is taken from the same OBB-based rule used for the Darcy
-        flux integration, so the analytical section is perpendicular to the
-        actual flow direction.  First we try mesh slicing; if that fails, we
-        fall back to the bounding-box cross-section (the product of the two
-        extents perpendicular to the chosen flow axis).  This guarantees a
-        non-zero design area even for thin or non-watertight triangulations.
-        """
-        if mesh is None or len(mesh.faces) == 0:
-            return 0.0
-        try:
-            axis = _component_flow_axis(mesh, btype)
-            origin = mesh.vertices.mean(axis=0)
-            obb = mesh.bounding_box_oriented
-            extents = np.asarray(obb.primitive.extents, dtype=np.float64)
-            R = obb.primitive.transform[:3, :3]
-            # Determine which OBB extent axis `axis` corresponds to.
-            cosines = np.abs(np.dot(R.T, axis))
-            flow_idx = int(np.argmax(cosines))
-            other = [i for i in range(3) if i != flow_idx]
-            obb_area_mm2 = float(extents[other[0]] * extents[other[1]])
-
-            L = float(np.max(extents)) * 0.25
-            best = float("inf")
-            steps = np.linspace(-L, L, 11)
-            for s in steps:
-                section = mesh.section(plane_origin=origin + s * axis, plane_normal=axis)
-                if section is None:
-                    continue
-                path2d = section.to_2D()
-                if isinstance(path2d, tuple):
-                    path2d = path2d[0]
-                area_mm2 = float(path2d.area)
-                if area_mm2 > 1e-12 and area_mm2 < best:
-                    best = area_mm2
-            if np.isfinite(best) and best > 0.0:
-                return min(best, obb_area_mm2) * 1e-6
-            return obb_area_mm2 * 1e-6
-        except Exception:
-            return 0.0
-
-    # ------------------------------------------------------------------
-    # Analytical, component-level cross-sectional areas from the CAD mesh.
-    # Symmetric components of the same BodyType share the same area so that
-    # identical gates get identical velocities and flow rates.
-    # ------------------------------------------------------------------
-    comp_design_m2: Dict[int, float] = {part_id: float("inf")}
-    for cid, (btype, _) in comp_meta.items():
-        if cid == part_id:
+    # Symmetrize identical body-type pairs: all contacts between the same two
+    # body types (e.g. SPRUE->INGATE or INGATE->PART) get the same flux and
+    # throat area.  This removes voxel-discretization noise so that identical
+    # symmetric gates report exactly the same velocity and Q.
+    pair_groups: Dict[Tuple[str, str], List[Dict]] = {}
+    for c in contacts:
+        key = tuple(sorted((c["type1"].name, c["type2"].name)))
+        pair_groups.setdefault(key, []).append(c)
+    for group in pair_groups.values():
+        if len(group) < 2:
             continue
-        if cid == source_id:
-            comp_design_m2[cid] = float(source_area_m2)
-            continue
-        body = comp_body.get(cid)
-        if body is None:
-            comp_design_m2[cid] = 0.0
-            continue
-        a = _component_cad_area_m2(body.mesh, btype)
-        # A SPRUE_THROAT can never be larger than the user-specified choke.
-        if btype == BodyType.SPRUE_THROAT and source_area_m2 > 1e-18:
-            a = min(a, float(source_area_m2))
-        comp_design_m2[cid] = float(a)
-
-    # Enforce symmetry within each BodyType: identical components share the
-    # same cross-sectional area (e.g. the four identical ingates of Deneme_Ring).
-    type_areas: Dict[BodyType, List[float]] = {}
-    for cid, (btype, _) in comp_meta.items():
-        if cid == part_id:
-            continue
-        type_areas.setdefault(btype, []).append(comp_design_m2[cid])
-    for btype, areas in type_areas.items():
-        if not areas:
+        areas = np.array([float(c.get("area_m2", 0.0)) for c in group], dtype=np.float64)
+        fluxes = np.array([float(c.get("flux_m3_s", 0.0)) for c in group], dtype=np.float64)
+        if areas.size == 0:
             continue
         mean_area = float(np.mean(areas))
-        if mean_area > 1e-18:
-            for cid, (bt, _) in comp_meta.items():
-                if bt == btype and cid != part_id:
-                    comp_design_m2[cid] = mean_area
-
-    # Contact area: the physically real throat is the Darcy-integrated voxel
-    # contact area (area_real_m2).  Only if the flux integration produced no
-    # measurable contact (degenerate/disconnected) do we fall back to the
-    # analytical CAD throat estimate.
-    for c in contacts:
-        a_real = float(c.get("area_real_m2", 0.0))
-        if a_real > 1e-12:
-            c["area_m2"] = a_real
-            c["area_raw_m2"] = a_real
-            continue
-        id1, id2 = c["id1"], c["id2"]
-        a1 = comp_design_m2.get(id1, 0.0)
-        a2 = comp_design_m2.get(id2, 0.0)
-        if a1 > 1e-18 and a2 > 1e-18:
-            a_contact = float(min(a1, a2))
-        elif a1 > 1e-18 or a2 > 1e-18:
-            a_contact = float(max(a1, a2))
-        else:
-            a_contact = float(c.get("voxel_area_m2", 0.0))
-        c["area_m2"] = float(a_contact)
-        c["area_raw_m2"] = float(a_contact)
+        # Preserve the sign of the first flux; all contacts in a group should
+        # already share the same downstream direction from the BFS.
+        sign = float(np.sign(fluxes[0])) if fluxes.size else 1.0
+        mean_flux = float(np.mean(np.abs(fluxes)))
+        if mean_area > 1e-12:
+            for c in group:
+                c["area_m2"] = mean_area
+                c["area_raw_m2"] = mean_area
+                c["flux_m3_s"] = sign * mean_flux
 
     # Propagate Q and compute velocities.
     Q_in: Dict[int, float] = {cid: 0.0 for cid in comp_meta if cid != part_id}
@@ -1857,7 +1784,7 @@ def _gating_node_velocities(
     # Source inlet node (user velocity at the source throat).
     if source_area_m2 > 1e-18:
         src_type, src_name = comp_meta[source_id]
-        source_centroid = comp_centroids[source_id] - 5.0 * g_u
+        source_centroid = comp_centroids[source_id]
         nodes.append(
             GatingNode(
                 name=f"Kaynak → {src_name}",
@@ -1945,11 +1872,9 @@ def _gating_node_velocities(
             down_id = c["down_id"]
             if down_id != part_id:
                 Q_in[down_id] += Q_branch
-            design_a = float(comp_design_m2[cid] * 1e4) if cid in comp_design_m2 else 0.0
             print(
                 f"[GATING_NODE] {comp_meta[cid][1]} -> {comp_meta[down_id][1]}  "
-                f"design_area_cm2={design_a:.4f}  real_area_cm2={A*1e4:.4f}  "
-                f"Q_L_s={Q_branch*1e3:.4f}  v_m_s={v_branch:.4f}",
+                f"area_cm2={A*1e4:.4f}  Q_L_s={Q_branch*1e3:.4f}  v_m_s={v_branch:.4f}",
                 flush=True,
             )
             node = _make_node(cid, down_id, A, Q_branch, c["centroid_mm"], flow_rate_m3_s=Q_branch)
@@ -1961,9 +1886,18 @@ def _gating_node_velocities(
             "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
         )
 
-    # Sort so the report follows the fill path (source first).
-    rank_by_name = {comp_meta[cid][1]: _upstream_rank(cid) for cid in comp_meta if cid != part_id}
-    nodes.sort(key=lambda n: (-rank_by_name.get(n.name.split(" → ")[0], 0.0), n.body_type))
+    # Sort so the report follows the BFS fill path (source first).
+    up_name_to_cid = {name: cid for cid, (_, name) in comp_meta.items()}
+    order_index = {cid: i for i, cid in enumerate(order)}
+
+    def _node_order(node: GatingNode) -> int:
+        if node.body_type.startswith("SOURCE"):
+            return -1
+        up_name = node.name.split(" → ")[0]
+        cid = up_name_to_cid.get(up_name, -1)
+        return order_index.get(cid, 9999)
+
+    nodes.sort(key=_node_order)
     return nodes
 
 
