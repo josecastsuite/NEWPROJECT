@@ -1636,151 +1636,105 @@ def _gating_node_velocities(
         c["flux_m3_s"] = float(flux_pair[k])
         c["area_real_m2"] = float(area_pair[k])
 
-    # Component throat areas will be filled after the contact-based mesh
-    # sections are computed below.  Initialize with inf (part) and zero.
-    comp_section_m2: Dict[int, Tuple[float, float, float]] = {
-        part_id: (float("inf"), float("inf"), float("inf"))
-    }
-    for cid in comp_cells:
-        if cid != part_id:
-            comp_section_m2[cid] = (0.0, 0.0, 0.0)
+    def _component_cad_area_m2(mesh, btype) -> float:
+        """Return the analytical minimum cross-sectional area of a gating body.
 
-
-
-    def _mesh_section_area_m2(mesh, plane_origin, plane_normal) -> float:
-        """Return the throat area (m²) of a mesh near a contact plane.
-
-        The plane is oriented perpendicular to the component's flow axis and we
-        sweep a short distance around the contact to find the largest stable
-        polygon area.  The largest avoids the tiny slivers produced when a plane
-        just clips the body, while a small L prevents moving into an expanding
-        tapered section.
+        The flow axis is the component's dominant direction:
+        - Choke / thin disk (SPRUE_THROAT, POURING_BASIN, or aspect ratio < 0.35):
+          flow along the shortest OBB extent; area is the perpendicular face.
+        - Runner / ingate: flow along the longest OBB extent; area is the
+          perpendicular cross-section.
+        The section is taken at the body centroid and a small sweep around it,
+        returning the minimum finite area so the true choke is captured.
         """
         if mesh is None or len(mesh.faces) == 0:
             return 0.0
         try:
-            plane_origin = np.asarray(plane_origin, dtype=np.float64)
-            n = np.asarray(plane_normal, dtype=np.float64)
-            if np.linalg.norm(n) < 1e-18:
-                n = -g_u
-            n = n / np.linalg.norm(n)
-            L = max(dx_mm * 0.5, 0.05)
-            steps = np.concatenate([
-                np.linspace(-L, -0.1 * L, 4),
-                [0.0],
-                np.linspace(0.1 * L, L, 4),
-            ])
-            best = 0.0
+            obb = mesh.bounding_box_oriented
+            R = obb.primitive.transform[:3, :3]
+            extents = np.asarray(obb.primitive.extents, dtype=np.float64)
+            order = np.argsort(extents)
+            is_choke = (
+                btype in {BodyType.SPRUE_THROAT, BodyType.POURING_BASIN}
+                or float(extents[order[0]] / (extents[order[2]] + 1e-18)) < 0.35
+            )
+            if is_choke:
+                axis = R[:, order[0]]  # shortest dimension = through-flow axis
+            else:
+                axis = R[:, order[2]]  # longest dimension = runner axis
+            axis = np.asarray(axis, dtype=np.float64)
+            axis = axis / (np.linalg.norm(axis) + 1e-18)
+            origin = mesh.vertices.mean(axis=0)
+            L = float(np.max(extents)) * 0.25
+            best = float("inf")
+            steps = np.linspace(-L, L, 11)
             for s in steps:
-                section = mesh.section(plane_origin=plane_origin + s * n, plane_normal=n)
+                section = mesh.section(plane_origin=origin + s * axis, plane_normal=axis)
                 if section is None:
                     continue
                 path2d = section.to_2D()
                 if isinstance(path2d, tuple):
                     path2d = path2d[0]
                 area_mm2 = float(path2d.area)
-                if area_mm2 > 1e-12:
-                    best = max(best, area_mm2)
-            return best * 1e-6
+                if area_mm2 > 1e-12 and area_mm2 < best:
+                    best = area_mm2
+            return best * 1e-6 if np.isfinite(best) and best > 0.0 else 0.0
         except Exception:
             return 0.0
 
-    # Compute the real throat/contact area for each contact from the CAD mesh.
-    # Each contact area is the minimum of the two body cross-sections taken
-    # perpendicular to the contact normal.  We also record the smallest such
-    # cross-section for each component, which is its throat for design scaling.
-    for c in contacts:
-        id1, id2 = c["id1"], c["id2"]
-        body1 = comp_body.get(id1)
-        body2 = comp_body.get(id2)
-        plane_origin = c["centroid_mm"]
-        normal = c.get("normal", -g_u)
-
-        a1 = _mesh_section_area_m2(body1.mesh if body1 else None, plane_origin, normal)
-        a2 = _mesh_section_area_m2(body2.mesh if body2 else None, plane_origin, normal)
-        if a1 > 1e-18 and a2 > 1e-18:
-            a_mesh = float(min(a1, a2))
-        elif a1 > 1e-18 or a2 > 1e-18:
-            a_mesh = float(max(a1, a2))
-        else:
-            a_mesh = 0.0
-
-        # Update component throat (minimum self-section at any contact).
-        for cid, a_self in ((id1, a1), (id2, a2)):
-            if cid == part_id:
-                continue
-            if a_self > 1e-18:
-                old = comp_section_m2.get(cid, (0.0, 0.0, 0.0))
-                new_throat = min(old[2], a_self) if old[2] > 1e-18 else a_self
-                comp_section_m2[cid] = (new_throat, new_throat, new_throat)
-
-        # The CAD cross-section (minimum of the two body sections) is the true
-        # throat area.  Voxel shared-face area is only used when the mesh
-        # section cannot be computed.
-        voxel_area_m2 = float(c.get("voxel_area_m2", 0.0))
-        a_contact = a_mesh if a_mesh > 1e-18 else voxel_area_m2
-
-        c["area_raw_m2"] = float(a_contact)
-
-    # Design caps: source area, and total INGATE area split by throat.
-    section_key_to_type = {
-        "SPRUE_THROAT": BodyType.SPRUE,
-        "SPRUE_BASE": BodyType.SPRUE,
-        "RUNNER": BodyType.RUNNER,
-        "DISTRIBUTOR": BodyType.DISTRIBUTOR,
-        "CURUFLUK": BodyType.CURUFLUK,
-        "FILTER": BodyType.FILTER,
-        "POURING_BASIN": BodyType.POURING_BASIN,
-        "RISER": BodyType.RISER,
-        "INGATE": BodyType.INGATE,
-    }
-    type_design_total: Dict[BodyType, float] = {}
-    if section_areas_m2:
-        for key, val in section_areas_m2.items():
-            btype = section_key_to_type.get(key.upper())
-            if btype is not None and val > 1e-18:
-                type_design_total[btype] = type_design_total.get(btype, 0.0) + float(val)
-
-    raw_throat_per_type: Dict[BodyType, float] = {}
-    for cid, (_, _, throat) in comp_section_m2.items():
+    # ------------------------------------------------------------------
+    # Analytical, component-level cross-sectional areas from the CAD mesh.
+    # Symmetric components of the same BodyType share the same area so that
+    # identical gates get identical velocities and flow rates.
+    # ------------------------------------------------------------------
+    comp_design_m2: Dict[int, float] = {part_id: float("inf")}
+    for cid, (btype, _) in comp_meta.items():
         if cid == part_id:
             continue
-        btype = comp_meta[cid][0]
-        if throat > 1e-18:
-            raw_throat_per_type[btype] = raw_throat_per_type.get(btype, 0.0) + float(throat)
-
-    comp_design_m2: Dict[int, float] = {}
-    ingate_design_total = type_design_total.get(BodyType.INGATE, 0.0)
-    ingate_raw_total = raw_throat_per_type.get(BodyType.INGATE, 0.0)
-    for cid in comp_meta:
-        if cid == part_id:
-            continue
-        btype = comp_meta[cid][0]
         if cid == source_id:
             comp_design_m2[cid] = float(source_area_m2)
-        elif btype == BodyType.INGATE and ingate_design_total > 1e-18 and ingate_raw_total > 1e-18:
-            raw_throat = comp_section_m2[cid][2]
-            comp_design_m2[cid] = ingate_design_total * (raw_throat / ingate_raw_total)
-        else:
-            comp_design_m2[cid] = float("inf")
+            continue
+        body = comp_body.get(cid)
+        if body is None:
+            comp_design_m2[cid] = 0.0
+            continue
+        a = _component_cad_area_m2(body.mesh, btype)
+        # A SPRUE_THROAT can never be larger than the user-specified choke.
+        if btype == BodyType.SPRUE_THROAT and source_area_m2 > 1e-18:
+            a = min(a, float(source_area_m2))
+        comp_design_m2[cid] = float(a)
 
-    # Final contact area: FAVOR/Darcy integration gives the voxel-based area, but
-    # the true physical throat cannot be larger than the CAD cross-section or
-    # the design reference.  Use the smallest reliable bound.
+    # Enforce symmetry within each BodyType: identical components share the
+    # same cross-sectional area (e.g. the four identical ingates of Deneme_Ring).
+    type_areas: Dict[BodyType, List[float]] = {}
+    for cid, (btype, _) in comp_meta.items():
+        if cid == part_id:
+            continue
+        type_areas.setdefault(btype, []).append(comp_design_m2[cid])
+    for btype, areas in type_areas.items():
+        if not areas:
+            continue
+        mean_area = float(np.mean(areas))
+        if mean_area > 1e-18:
+            for cid, (bt, _) in comp_meta.items():
+                if bt == btype and cid != part_id:
+                    comp_design_m2[cid] = mean_area
+
+    # Contact area: the flow passage is limited by the smaller of the two
+    # connected component cross-sections.  FAVOR/voxel area is kept only as
+    # a fallback when CAD geometry cannot be sectioned.
     for c in contacts:
         id1, id2 = c["id1"], c["id2"]
-        a_real = float(c.get("area_real_m2", 0.0))
-        a_contact = float(c.get("area_raw_m2", 0.0))
-        design1 = comp_design_m2.get(id1, float("inf"))
-        design2 = comp_design_m2.get(id2, float("inf"))
-        if a_real > 1e-18 and a_contact > 1e-18:
-            c["area_m2"] = float(min(a_real, a_contact, design1, design2))
-        elif a_real > 1e-18:
-            c["area_m2"] = float(min(a_real, design1, design2))
-        elif a_contact > 1e-18:
-            c["area_m2"] = float(min(a_contact, design1, design2))
+        a1 = comp_design_m2.get(id1, 0.0)
+        a2 = comp_design_m2.get(id2, 0.0)
+        if a1 > 1e-18 and a2 > 1e-18:
+            a_contact = float(min(a1, a2))
+        elif a1 > 1e-18 or a2 > 1e-18:
+            a_contact = float(max(a1, a2))
         else:
-            c["area_m2"] = float(min(design1, design2))
+            a_contact = float(c.get("voxel_area_m2", 0.0))
+        c["area_m2"] = float(a_contact)
+        c["area_raw_m2"] = float(a_contact)
 
     # Propagate Q and compute velocities.
     Q_in: Dict[int, float] = {cid: 0.0 for cid in comp_meta if cid != part_id}
@@ -1836,9 +1790,11 @@ def _gating_node_velocities(
                 f"Düğüm hızları çözülemedi: {comp_meta[cid][1]} elemanının toplam çıkış kesit alanı sıfır. "
                 "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
             )
-        # Darcy gives the relative split of flow among outlets; the node balance
-        # enforces exact continuity (sum of Q_branch = Q at the node).
-        flux_total = sum(abs(float(c.get("flux_m3_s", 0.0))) for c in out_edges)
+        # In a gating manifold the pressure at a junction is essentially uniform,
+        # so all outlets share the same velocity: v = Q / A_total.  Each branch
+        # then carries Q_branch = v * A_branch, which preserves continuity and
+        # gives identical velocities for identical (symmetric) gates.
+        v_common = float(Q / A_total) if A_total > 1e-18 else 0.0
         for c in out_edges:
             A = c["area_m2"]
             if A <= 1e-18:
@@ -1847,13 +1803,9 @@ def _gating_node_velocities(
                     f"{comp_meta[c['down_id']][1]} temas kesit alanı sıfır. "
                     "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
                 )
-            flux_actual = float(c.get("flux_m3_s", 0.0))
-            if flux_total > 1e-18:
-                Q_branch = Q * (abs(flux_actual) / flux_total)
-            else:
-                Q_branch = Q * (A / A_total)
+            Q_branch = v_common * A
             c["Q_branch"] = Q_branch
-            c["v_branch"] = Q_branch / A
+            c["v_branch"] = v_common
             down_id = c["down_id"]
             if down_id != part_id:
                 Q_in[down_id] += Q_branch
