@@ -108,7 +108,7 @@ def _flow_refined_grid(
             bodies,
             target_dim=target_dim,
             gravity_vector=gvec,
-            conservative=True,
+            conservative=False,
             progress_callback=None,
         )
         return grid, origin, dx
@@ -1538,15 +1538,14 @@ def _gating_node_velocities(
             R = obb.primitive.transform[:3, :3]
             extents = np.asarray(obb.primitive.extents, dtype=np.float64)
             order = np.argsort(extents)
-            choke_types = {
-                BodyType.SPRUE_THROAT, BodyType.POURING_BASIN, BodyType.RISER,
-                BodyType.INGATE, BodyType.FILTER,
-            }
-            runner_types = {
-                BodyType.SPRUE, BodyType.RUNNER,
-                BodyType.DISTRIBUTOR, BodyType.CURUFLUK,
-            }
-            if btype in choke_types:
+            choke_types = {BodyType.SPRUE_THROAT, BodyType.POURING_BASIN, BodyType.RISER, BodyType.FILTER}
+            runner_types = {BodyType.SPRUE, BodyType.RUNNER, BodyType.DISTRIBUTOR, BodyType.CURUFLUK}
+            if btype == BodyType.INGATE:
+                # Ingate flow is through the *middle* extent (width x thickness
+                # passage); the shortest is the wall thickness and the longest is
+                # the width, neither of which is the primary flow direction.
+                axis = R[:, order[1]]
+            elif btype in choke_types:
                 axis = R[:, order[0]]  # shortest = flow axis
             elif btype in runner_types:
                 axis = R[:, order[2]]  # longest = flow axis
@@ -1695,12 +1694,9 @@ def _gating_node_velocities(
             V_flow = V_flow_array[:, k_arr]
             n_vec = np.array([float(di), float(dj), float(dk)], dtype=np.float64)
             v_normal = np.einsum("i,ij->j", n_vec, v)
-            # n_vec is [axis0, axis1, axis2] = [Z, Y, X] (grid storage order).
-            # V_flow from the OBB is [X, Y, Z]; align it to [Z, Y, X] before
-            # the dot product so cos is the true cosine between face normal and
-            # the component flow axis.
-            V_flow_zyx = V_flow[[2, 1, 0], :]
-            cos = np.abs(np.einsum("i,ij->j", n_vec, V_flow_zyx))
+            # n_vec and V_flow are both [X, Y, Z]; cos is the true cosine between
+            # the face normal and the contact-specific component flow axis.
+            cos = np.abs(np.einsum("i,ij->j", n_vec, V_flow))
             active = cos > 0.1
             A_proj = np.where(
                 active,
@@ -1938,6 +1934,13 @@ def _gating_node_velocities(
             down_id = c["down_id"]
             if down_id != part_id:
                 Q_in[down_id] += Q_branch
+            design_a = float(comp_design_m2[cid] * 1e4) if cid in comp_design_m2 else 0.0
+            print(
+                f"[GATING_NODE] {comp_meta[cid][1]} -> {comp_meta[down_id][1]}  "
+                f"design_area_cm2={design_a:.4f}  real_area_cm2={A*1e4:.4f}  "
+                f"Q_L_s={Q_branch*1e3:.4f}  v_m_s={v_branch:.4f}",
+                flush=True,
+            )
             node = _make_node(cid, down_id, A, Q_branch, c["centroid_mm"], flow_rate_m3_s=Q_branch)
             nodes.append(node)
 

@@ -93,24 +93,33 @@ def _downsample_grid(grid: np.ndarray, factor: int) -> np.ndarray:
     return ndimage.zoom(grid, (shape_c[0] / nx, shape_c[1] / ny, shape_c[2] / nz), order=0)
 
 
-def _upsample(field_c: np.ndarray, target_shape: Tuple[int, int, int]) -> np.ndarray:
-    """Trilinear upsample a scalar field to the original grid shape."""
+def _upsample(field_c: np.ndarray, target_shape: Tuple[int, int, int], order: int = 1) -> np.ndarray:
+    """Upsample a scalar field to the original grid shape.
+
+    Fields that may contain ``inf`` sentinel values (e.g. t_liq, t_sol,
+    fill_time) are upsampled with ``order=0`` (nearest neighbour) so the
+    sentinel does not leak into neighbouring cells.
+    """
     if field_c.shape == target_shape:
         return field_c
     return ndimage.zoom(
         field_c,
         (target_shape[0] / field_c.shape[0], target_shape[1] / field_c.shape[1], target_shape[2] / field_c.shape[2]),
-        order=1,
+        order=order,
     )
 
 
 def _build_laplacian(k: np.ndarray, dx: float) -> sparse.csc_matrix:
-    """Build the symmetric finite-volume matrix A for ∇·(k∇T) with harmonic k at faces."""
+    """Build the symmetric finite-volume matrix A for ∇·(k∇T) with harmonic k at faces.
+
+    Grid shape is (nx, ny, nz).  Raveled index = x*(ny*nz) + y*nz + z, so the
+    stride in x is ny*nz, in y is nz, and in z is 1.
+    """
     nx, ny, nz = k.shape
     n = nx * ny * nz
     inv_dx2 = 1.0 / (dx * dx)
 
-    # Harmonic mean face conductivities
+    # Harmonic mean face conductivities: kx along x, ky along y, kz along z.
     kx = 2.0 * k[1:, :, :] * k[:-1, :, :] / (k[1:, :, :] + k[:-1, :, :] + 1e-12)
     ky = 2.0 * k[:, 1:, :] * k[:, :-1, :] / (k[:, 1:, :] + k[:, :-1, :] + 1e-12)
     kz = 2.0 * k[:, :, 1:] * k[:, :, :-1] / (k[:, :, 1:] + k[:, :, :-1] + 1e-12)
@@ -135,7 +144,8 @@ def _build_laplacian(k: np.ndarray, dx: float) -> sparse.csc_matrix:
     deg_z[:, :, :-1] += kz
     deg_z[:, :, 1:] += kz
 
-    off = ny * nz
+    stride_x = ny * nz
+    stride_y = nz
     diag_x = Dx.ravel() * inv_dx2
     diag_y = Dy.ravel() * inv_dx2
     diag_z = Dz.ravel() * inv_dx2
@@ -143,11 +153,61 @@ def _build_laplacian(k: np.ndarray, dx: float) -> sparse.csc_matrix:
 
     A = sparse.diags(
         [diag_x, diag_x, diag_y, diag_y, diag_z, diag_z, main],
-        offsets=[-off, off, -nz, nz, -1, 1, 0],
+        offsets=[-stride_x, stride_x, -stride_y, stride_y, -1, 1, 0],
         shape=(n, n),
         format="csc",
     )
     return A
+
+
+def _upwind_advection(
+    T: np.ndarray,
+    velocity: np.ndarray,
+    dx: float,
+    fill_c: Optional[np.ndarray],
+    sub_t: float,
+    is_metal: np.ndarray,
+) -> np.ndarray:
+    """First-order upwind explicit advection of temperature.
+
+    ``velocity`` is (3, nx, ny, nz) with [x, y, z] components.  For each axis the
+    derivative is taken from the upwind side, which is stable for CFL <= 1.  The
+    result is masked to metal cells that have already been filled at time
+    ``sub_t``.
+    """
+    if fill_c is not None:
+        active = (sub_t >= fill_c) & is_metal
+    else:
+        active = is_metal
+    if not np.any(active):
+        return np.zeros_like(T)
+
+    # Pad with edge values so outflow boundaries use a one-sided difference.
+    Tz = np.pad(T, ((1, 1), (0, 0), (0, 0)), mode="edge")
+    Ty = np.pad(T, ((0, 0), (1, 1), (0, 0)), mode="edge")
+    Tx = np.pad(T, ((0, 0), (0, 0), (1, 1)), mode="edge")
+
+    # z-direction
+    dTdz = np.where(
+        velocity[0] >= 0,
+        (Tz[1:-1, :, :] - Tz[:-2, :, :]) / dx,
+        (Tz[2:, :, :] - Tz[1:-1, :, :]) / dx,
+    )
+    # y-direction
+    dTdy = np.where(
+        velocity[1] >= 0,
+        (Ty[:, 1:-1, :] - Ty[:, :-2, :]) / dx,
+        (Ty[:, 2:, :] - Ty[:, 1:-1, :]) / dx,
+    )
+    # x-direction
+    dTdx = np.where(
+        velocity[2] >= 0,
+        (Tx[:, :, 1:-1] - Tx[:, :, :-2]) / dx,
+        (Tx[:, :, 2:] - Tx[:, :, 1:-1]) / dx,
+    )
+
+    adv = velocity[0] * dTdz + velocity[1] * dTdy + velocity[2] * dTdx
+    return np.where(active, adv, 0.0)
 
 
 def solve_3d_thermal(
@@ -168,9 +228,10 @@ def solve_3d_thermal(
     arrival time (s).  Solidification/liquidus times are shifted by this amount,
     so late-filled regions start cooling later.
 
-    If ``velocity_m_s`` is supplied as a (3, nz, ny, nx) array, an explicit
-    convective term ``-ρ·cp·(v·∇T)`` is added to the enthalpy balance.  The
-    term is masked to metal cells whose fill time has already elapsed.
+    If ``velocity_m_s`` is supplied as a (3, nx, ny, nz) array with [x, y, z]
+    components, an explicit convective term ``-ρ·cp·(v·∇T)`` is added to the
+    enthalpy balance.  The term is masked to metal cells whose fill time has
+    already elapsed.
 
     Returns fine-grid arrays:
     T_final, fs_final, t_liquidus, t_solidus, G_at_ts, R_at_ts, niyama
@@ -248,16 +309,28 @@ def solve_3d_thermal(
     boundary[:, :, 0] = True
     boundary[:, :, -1] = True
     boundary_idx = np.flatnonzero(boundary.ravel())
-    boundary_penalty = 1e12
 
     # Build constant-in-time diffusion operator on the raveled grid
     A = _build_laplacian(k, dx_m)
     k = k.ravel()
 
     # Time stepping
-    n_steps = max(20, min(200, int(max_time_s / 3.0)))
-    dt = max_time_s / n_steps
+    n_steps_target = max(20, min(200, int(max_time_s / 3.0)))
+    dt_diff = max_time_s / n_steps_target
     t = 0.0
+    step = 0
+
+    # Advective CFL limit; only used while metal is still being filled and a
+    # velocity field is supplied.  After filling the diffusion time-step is
+    # restored because the explicit advection term is no longer physically
+    # relevant for a stationary solidifying metal.
+    if velocity_c is not None:
+        vmax = float(np.max(np.linalg.norm(velocity_c, axis=0))) if np.any(velocity_c) else 0.0
+        dt_adv = 0.3 * dx_m / max(vmax, 1e-6)
+    else:
+        vmax = 0.0
+        dt_adv = np.inf
+    fill_end = max_fill if fill_c is not None and np.isfinite(max_fill) else 0.0
 
     t_liq = np.full((nx, ny, nz), np.inf, dtype=np.float64)
     t_sol = np.full((nx, ny, nz), np.inf, dtype=np.float64)
@@ -266,9 +339,28 @@ def solve_3d_thermal(
 
     Tl = alloy.t_liquidus_c
     Ts = alloy.t_solidus_c
-    report_interval = max(1, n_steps // 10)
+    report_interval = max(1, n_steps_target // 10)
 
-    for step in range(n_steps):
+    # Operator-split advection: up to this many explicit advection sub-cycles
+    # are performed inside each implicit diffusion step so the matrix solve is
+    # not repeated for the tiny advective CFL time step.
+    max_adv_subcycles = 200
+
+    while t < max_time_s:
+        # Pick a stable time step.  While filling, the explicit upwind
+        # advection sub-cycles must satisfy CFL <= 0.3; the diffusion step is
+        # limited to at most ``max_adv_subcycles`` of those sub-cycles.  After
+        # filling the normal diffusion time step is used.  The final step lands
+        # exactly on max_time_s.
+        if velocity_c is not None and t < fill_end:
+            dt = min(dt_diff, max_adv_subcycles * dt_adv)
+        else:
+            dt = dt_diff
+        if t + dt > max_time_s:
+            dt = max_time_s - t
+        if dt <= 0:
+            break
+
         T_old = T.copy()
         cp_eff = _cp_eff(T_old, is_metal_c, alloy, mold)
         # Cooling sprue cp stays as a solid metal (no latent heat).
@@ -276,34 +368,35 @@ def solve_3d_thermal(
             cp_eff[chill_mask_3d] = cp_chill
         C = rho * cp_eff.ravel()
 
-        # (C I - dt A) T_new = C T_old - dt * C * (v · ∇T_old)
-        # Dirichlet on the outer shell is enforced by a large diagonal penalty
-        if len(boundary_idx):
-            C[boundary_idx] = boundary_penalty
-            b = C * T_old.ravel()
-            b[boundary_idx] = boundary_penalty * T0
-        else:
-            b = C * T_old.ravel()
-
-        # Explicit Darcy-velocity advection.  Only active in metal cells that
-        # have already been filled by the current time.
+        # Explicit Darcy-velocity advection via first-order operator splitting.
+        # The temperature is advected with small CFL-limited sub-steps first,
+        # then that pre-advected field becomes the initial condition for the
+        # implicit diffusion solve over the same interval.
+        T_adv = T_old.copy()
         if velocity_c is not None:
-            grad_z, grad_y, grad_x = np.gradient(T_old, dx_m)
-            adv = (
-                velocity_c[0] * grad_z
-                + velocity_c[1] * grad_y
-                + velocity_c[2] * grad_x
-            )
-            if fill_c is not None:
-                active = (t + 0.5 * dt) >= fill_c
-            else:
-                active = np.ones_like(T_old, dtype=bool)
-            adv = np.where(is_metal_c & active, adv, 0.0)
-            b -= dt * C * adv.ravel()
-            if len(boundary_idx):
-                b[boundary_idx] = boundary_penalty * T0
+            n_sub = max(1, int(np.ceil(dt / dt_adv))) if np.isfinite(dt_adv) else 1
+            sub_dt = dt / n_sub
+            for k in range(n_sub):
+                sub_t = t + (k + 0.5) * sub_dt
+                adv = _upwind_advection(T_adv, velocity_c, dx_m, fill_c, sub_t, is_metal_c)
+                T_adv = T_adv - sub_dt * adv
+            # Clip to physical bounds after explicit advection.
+            T_adv = np.clip(T_adv, T0, alloy.t_pour_c)
+
+        b = C * T_adv.ravel()
 
         M = -dt * A + sparse.diags([C], offsets=[0], format="csc")
+
+        # Enforce Dirichlet T=T0 on the outer shell exactly by replacing the
+        # boundary rows of the linear system.  This avoids the 1e12 penalty that
+        # badly conditioned the matrix.
+        if len(boundary_idx):
+            M = M.tolil()
+            for bi in boundary_idx:
+                M.rows[bi] = [bi]
+                M.data[bi] = [1.0]
+            M = M.tocsc()
+            b[boundary_idx] = T0
 
         # Use CG with a diagonal (Jacobi) preconditioner for speed on large grids
         precond = sparse.diags(1.0 / (M.diagonal() + 1e-12), format="csc")
@@ -342,9 +435,10 @@ def solve_3d_thermal(
 
         T = T_new
         t += dt
+        step += 1
 
-        if progress_callback and (step + 1) % report_interval == 0:
-            progress_callback(int(20 + 40 * ((step + 1) / n_steps)))
+        if progress_callback and step % report_interval == 0:
+            progress_callback(int(20 + 40 * min(t / max_time_s, 1.0)))
 
         # Early stop once all metal has solidified
         if is_metal_c.any() and not np.isinf(t_sol[is_metal_c]).any():
@@ -361,19 +455,22 @@ def solve_3d_thermal(
     fs_c = _scheil_fs(T_c, Tl, Ts, alloy.partition_coefficient)
 
     # Upsample to fine grid
-    T_fine = _upsample(T_c, fine_shape)
-    fs_fine = _upsample(fs_c, fine_shape)
-    t_liq_fine = _upsample(t_liq, fine_shape)
-    t_sol_fine = _upsample(t_sol, fine_shape)
-    G_fine = _upsample(G_at_ts, fine_shape)
-    R_fine = _upsample(R_at_ts, fine_shape)
-    niyama_fine = _upsample(niyama_c, fine_shape)
+    T_fine = _upsample(T_c, fine_shape, order=1)
+    fs_fine = _upsample(fs_c, fine_shape, order=1)
+    # t_liq/t_sol may contain inf for cells that never crossed the relevant
+    # temperature; use order=0 (nearest-neighbour) upsampling so inf does not
+    # leak into neighbouring cells.
+    t_liq_fine = _upsample(t_liq, fine_shape, order=0)
+    t_sol_fine = _upsample(t_sol, fine_shape, order=0)
+    G_fine = _upsample(G_at_ts, fine_shape, order=1)
+    R_fine = _upsample(R_at_ts, fine_shape, order=1)
+    niyama_fine = _upsample(niyama_c, fine_shape, order=1)
 
     is_metal_fine = np.isin(grid, casting_metal_ids)
 
     # Shift liquidus/solidus times by the local metal arrival time.
     if fill_c is not None:
-        fill_time_fine = _upsample(fill_c, fine_shape)
+        fill_time_fine = _upsample(fill_c, fine_shape, order=0)
         fill_time_fine = np.where(is_metal_fine, fill_time_fine, 0.0)
         with np.errstate(invalid="ignore"):
             t_liq_fine = np.where(
