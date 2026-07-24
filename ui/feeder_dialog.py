@@ -12,6 +12,8 @@ FEEDER_TYPE_NAMES = {
     "insulated": "İzole gömleklı besleyici",
     "sleeve": "Seramik / manyetik gömlek besleyici",
     "chilled": "Soğutucu çelik / chill besleyici",
+    "side": "Yan besleyici (side riser)",
+    "blind": "Kör besleyici (blind riser)",
 }
 
 

@@ -26,6 +26,9 @@ class CastingParameters:
     velocity_section_key: str = "SPRUE_THROAT"
     # v8.7: gravity direction for feeding and gating calculations (default -Z)
     gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0)
+    # v10.0: hot-spot detection thresholds exposed to the user
+    hotspot_min_size_mm: float = 0.0
+    hotspot_cluster_eps_mm: float = 0.0
 
     @property
     def superheat_c(self) -> float:
@@ -122,7 +125,7 @@ class Body:
     # v9.3: per-body user overrides from the GUI
     section_key: str = ""  # INGATE / RUNNER / SPRUE_BASE / SPRUE_THROAT
     section_area_cm2: float = 0.0
-    feeder_type: str = ""  # conventional / exothermic / insulated / chilled / sleeve
+    feeder_type: str = ""  # conventional / exothermic / insulated / chilled / sleeve / side / blind
     feeder_m_mm: float = 0.0
     feeder_note: str = ""
 
@@ -156,6 +159,7 @@ class HotSpot:
     heuvers_ok: bool = True
     feeding_cost: float = 0.0
     darcy_ok: bool = True
+    feedable_fraction: float = 1.0
     # v8.8: estimated pore size from Niyama + SDAS + feeding risk
     pore_size_um: float = 0.0
     pore_size_mm: float = 0.0
@@ -241,6 +245,7 @@ class GatingNode:
     velocity_m_s: float
     section_area_cm2: float
     centroid_mm: Tuple[float, float, float]
+    flow_rate_m3_s: float = 0.0
 
 
 @dataclass
@@ -259,9 +264,11 @@ class FillingResult:
     solver_dx_mm: float = 0.0
     pressure: Optional[np.ndarray] = None
     reason: str = ""
-    # Per-gate contact velocity / area when multiple INGATE bodies exist.
+    # Per-gate contact velocity / area / flow rate when multiple INGATE bodies exist.
     per_gate_contact_velocity_m_s: Dict[str, float] = field(default_factory=dict)
     per_gate_contact_area_cm2: Dict[str, float] = field(default_factory=dict)
+    per_gate_flow_rate_m3_s: Dict[str, float] = field(default_factory=dict)
+    total_ingate_flow_m3_s: float = 0.0
     # Discrete gating nodes (sprue, runner, distributor, each INGATE, etc.)
     # with their throat velocity, area and 3-D position for labelling/marker display.
     gating_nodes: List[GatingNode] = field(default_factory=list)
@@ -426,11 +433,11 @@ class AnalysisResult:
     # v8.9: per-class display filters (top % of computed porosity to display)
     pore_size_noise_percent: float = 3.0
     pore_size_threshold_um: float = 0.0
-    pore_size_macro_percent: float = 60.0
+    pore_size_macro_percent: float = 0.0
     pore_size_macro_threshold_um: float = 0.0
-    pore_size_micro_percent: float = 40.0
+    pore_size_micro_percent: float = 0.0
     pore_size_micro_threshold_um: float = 0.0
-    pore_size_fine_percent: float = 20.0
+    pore_size_fine_percent: float = 0.0
     pore_size_fine_threshold_um: float = 0.0
     # v9.4: hot spots detected inside risers/feeders (shown separately, not part defects)
     feeder_hotspots: List[HotSpot] = field(default_factory=list)

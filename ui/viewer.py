@@ -14,7 +14,7 @@ from core.gating import (
 )
 from core.materials import get_alloy
 from core.sdf_analyzer import _trace_path_to_riser
-from core.types import AnalysisResult, Body, BodyType, RefinementRegion
+from core.types import AnalysisResult, Body, BodyType, HotSpot, RefinementRegion
 from ui.flow_animator import FlowAnimator
 
 
@@ -202,15 +202,23 @@ class Analyzer3DViewer(QtInteractor):
         if self._hotspot_label_actor is not None:
             self.remove_actor(self._hotspot_label_actor)
             self._hotspot_label_actor = None
-        if result is None or not result.hotspots:
+        if result is None:
             return
 
-        alloy = get_alloy(result.alloy_key)
+        # Part hotspots + riser/feeder hotspots (the latter are thermal reservoirs,
+        # not part defects, and must be shown as solved).
+        all_hotspots: List[Tuple[HotSpot, bool]] = []
+        for hs in result.hotspots:
+            all_hotspots.append((hs, False))
+        for fhs in result.feeder_hotspots:
+            all_hotspots.append((fhs, True))
+        if not all_hotspots:
+            return
+
         bbox_min = np.min(result.bbox_size_mm) if result.bbox_size_mm.any() else 100.0
         centers = []
         labels = []
-        visible_hotspots = [hs for hs in result.hotspots if not hs.solved]
-        for hs in visible_hotspots:
+        for hs, is_feeder in all_hotspots:
             # Radius proportional to local wall thickness, clamped to a sensible fraction of the part size.
             radius = max(1.2, min(hs.t_section_mm * 0.15, bbox_min * 0.02, 6.0))
             sphere = pv.Sphere(
@@ -219,12 +227,14 @@ class Analyzer3DViewer(QtInteractor):
                 theta_resolution=24,
                 phi_resolution=24,
             )
-            if not hs.feed_ok or hs.niyama_ensemble < alloy.niyama_macro:
-                color = "#ff3333"
-            elif hs.niyama_ensemble < alloy.niyama_shrinkage:
-                color = "#ffaa00"
+            if is_feeder or hs.solved:
+                # Solved / feeder-backed hot spot: blue/green sphere.
+                color = "#00aaff" if is_feeder else "#00ff88"
+                status = "Besleyici Tarafından Çözüldü (Safe)" if is_feeder else "Çözüldü (Safe)"
             else:
-                color = "#00ff88"
+                # Unfed or hydraulic/thermal feeding failed -> dangerous.
+                color = "#ff0000"
+                status = "TEHLİKE: ÇÖZÜLMEDİ!"
             actor = self.add_mesh(
                 sphere,
                 color=color,
@@ -238,8 +248,9 @@ class Analyzer3DViewer(QtInteractor):
 
             label_pos = hs.position_mm + np.array([0.0, 0.0, radius * 1.4])
             centers.append(label_pos)
+            d_str = f"{hs.dist_to_riser_mm:.0f}mm" if np.isfinite(hs.dist_to_riser_mm) else "inf"
             labels.append(
-                f"M={hs.m_value_mm:.1f}mm | D={hs.dist_to_riser_mm:.0f}mm | N={hs.niyama_ensemble:.2f}"
+                f"{status}\nM={hs.m_value_mm:.1f}mm | D={d_str} | N={hs.niyama_ensemble:.2f}"
             )
 
         if centers:
@@ -247,7 +258,7 @@ class Analyzer3DViewer(QtInteractor):
                 self._hotspot_label_actor = self.add_point_labels(
                     np.array(centers),
                     labels,
-                    text_color="#00ffff",
+                    text_color="#ffffff",
                     font_size=11,
                     shape="rounded_rect",
                     background_color="black",
@@ -356,23 +367,15 @@ class Analyzer3DViewer(QtInteractor):
 
         # v9.3: use the risk field to suppress low-probability shrinkage noise.
         # The slider selects the top noise_percent% of risk within the chosen class;
-        # the displayed scalar remains the shrinkage pore size.
+        # the displayed scalar remains the shrinkage pore size.  No empirical
+        # top-percent class filters are used; class limits come from the alloy.
         risk = np.asarray(result.risk) if result.risk is not None else np.array([])
         has_risk = risk.size and risk.shape == part_mask.shape
-        if use_pore_size and has_risk:
-            if pore_size_filter in ("macro", "micro", "fine"):
-                target_percent = float(
-                    getattr(result, f"pore_size_{pore_size_filter}_percent", 0.0)
-                )
-                if target_percent <= 0.0:
-                    target_percent = {"macro": 60.0, "micro": 40.0, "fine": 20.0}[pore_size_filter]
-                effective_percent = min(100.0, target_percent * (noise_percent / 3.0))
-            else:
-                effective_percent = noise_percent
+        if use_pore_size and has_risk and 0.0 < noise_percent < 100.0:
             risk_values = risk[class_mask & (risk > 0.0)]
             if risk_values.size == 0:
                 return
-            p = max(0.0, 100.0 - effective_percent)
+            p = max(0.0, 100.0 - noise_percent)
             risk_threshold = float(np.percentile(risk_values, p))
             class_mask = class_mask & (risk >= risk_threshold)
 

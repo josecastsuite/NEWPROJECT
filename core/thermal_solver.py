@@ -246,11 +246,11 @@ def solve_3d_thermal(
 
     for step in range(n_steps):
         T_old = T.copy()
-        cp_eff = _cp_eff(T_old, is_metal_c, alloy, mold).ravel()
+        cp_eff = _cp_eff(T_old, is_metal_c, alloy, mold)
         # Cooling sprue cp stays as a solid metal (no latent heat).
         if np.any(chill_mask_3d):
-            cp_eff[chill_mask_3d.ravel()] = cp_chill
-        C = rho * cp_eff
+            cp_eff[chill_mask_3d] = cp_chill
+        C = rho * cp_eff.ravel()
 
         # (C I - dt A) T_new = C T_old
         # Dirichlet on the outer shell is enforced by a large diagonal penalty
@@ -287,10 +287,15 @@ def solve_3d_thermal(
             if np.any(mask_sol):
                 gz, gy, gx = np.gradient(T_new, dx_m)
                 G_cross = np.sqrt(gx * gx + gy * gy + gz * gz) / 1000.0  # K/mm
-                R_cross = np.abs((T_new - T_old) / dt)
+                # Enthalpy-based cooling rate: dH = cp*dT + L*dfs; R = |dH/dt| / cp_eff
+                # so latent heat release during solid-fraction change is explicit.
+                fs_old = _scheil_fs(T_old, Tl, Ts, alloy.partition_coefficient)
+                fs_new = _scheil_fs(T_new, Tl, Ts, alloy.partition_coefficient)
+                dH = alloy.cp_j_kgk * (T_new - T_old) + alloy.latent_heat_j_kg * (fs_new - fs_old)
+                R_cross = np.abs(dH[mask_sol]) / (dt * np.maximum(cp_eff[mask_sol], 1e-9))
                 t_sol[mask_sol] = t + dt * (Ts - T_old[mask_sol]) / (T_new[mask_sol] - T_old[mask_sol] + 1e-12)
                 G_at_ts[mask_sol] = G_cross[mask_sol]
-                R_at_ts[mask_sol] = R_cross[mask_sol]
+                R_at_ts[mask_sol] = R_cross
 
         T = T_new
         t += dt

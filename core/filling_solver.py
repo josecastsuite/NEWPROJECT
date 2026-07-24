@@ -30,6 +30,7 @@ from scipy.sparse import csr_matrix
 from scipy.sparse import linalg as spla
 
 from core.types import Body, BodyType, FillingResult, GatingNode, GatingVelocityError
+from core.voxelizer import compute_face_fractions
 
 
 def _downsample_grid(
@@ -87,7 +88,14 @@ def _ensure_dirichlet_per_component(
     Laplacian matrix singular.  We set the highest (most upstream) cell of each
     unassigned component to atmospheric pressure p=0.
     """
-    labeled, n = ndimage.label(cavity, structure=np.ones((3, 3, 3), dtype=int))
+    # Use the same 6-face connectivity as the Darcy matrix to avoid declaring
+    # diagonally-touching cells as one component when the matrix has no edge.
+    structure = np.zeros((3, 3, 3), dtype=int)
+    structure[1, 1, 1] = 1
+    structure[0, 1, 1] = structure[2, 1, 1] = 1
+    structure[1, 0, 1] = structure[1, 2, 1] = 1
+    structure[1, 1, 0] = structure[1, 1, 2] = 1
+    labeled, n = ndimage.label(cavity, structure=structure)
     if n <= 1:
         return dirichlet, dirichlet_value
     proj = _projection_along(cavity.shape, origin, dx, g)
@@ -141,40 +149,82 @@ def _find_boundary_cells_along(
     g: np.ndarray,
     side: str,
 ) -> np.ndarray:
-    """Return a boolean mask of cells on the upstream or downstream boundary.
+    """Return the exact upstream (side='up') or downstream (side='down')
+    face cells of a boolean mask for an arbitrary normalised gravity vector.
 
-    side='up'  -> cells whose neighbour in the -g direction is not in the mask.
-    side='down'-> cells whose neighbour in the +g direction is not in the mask.
+    A cell is a face cell only if it has at least one 26-neighbour in the
+    requested half-space (against gravity for 'up', with gravity for 'down')
+    that lies outside the mask or outside the grid.  The connected component
+    containing the extreme projection onto that direction is kept, so the
+    selected area is not artificially inflated by a tolerance band.
     """
-    boundary = np.zeros_like(mask, dtype=bool)
-    axis = _roll_axis_from_g(g)
-    if axis is None:
-        # Gravity not aligned to a cardinal axis: fall back to projection max.
-        return boundary
+    out = np.zeros_like(mask, dtype=bool)
+    if not mask.any():
+        return out
 
-    sign = int(np.sign(g[axis]))
-    # For axis=0: up-stream neighbour index = i - sign, down-stream = i + sign.
-    # Use zero-padding to avoid periodic wrap-around errors.
-    pad_width = [(1, 1) if a == axis else (0, 0) for a in range(3)]
-    padded = np.pad(mask, pad_width, mode="constant", constant_values=False)
+    shape = mask.shape
+    # 26-neighbour offsets.
+    offsets = [
+        (di, dj, dk)
+        for di in (-1, 0, 1)
+        for dj in (-1, 0, 1)
+        for dk in (-1, 0, 1)
+        if not (di == 0 and dj == 0 and dk == 0)
+    ]
 
-    # Slice padded so the result has the same shape as mask.
+    # Projection of each voxel centre onto -g in voxel units.  Only the
+    # ordering matters; the upstream direction maximises this projection.
+    ii, jj, kk = np.indices(shape, dtype=np.float64)
+    proj = -(ii * g[0] + jj * g[1] + kk * g[2])
+
+    # A face cell has a neighbour in the requested flow half-space that is
+    # not part of the mask.  side='up'  -> flow comes from -g, so we look
+    # at offsets with d·g < 0.  side='down' -> flow goes with g, d·g > 0.
+    directional = np.zeros_like(mask, dtype=bool)
+    for di, dj, dk in offsets:
+        dot = float(di * g[0] + dj * g[1] + dk * g[2])
+        if side == "up" and dot >= 0:
+            continue
+        if side == "down" and dot <= 0:
+            continue
+
+        # We need rolled[c] = mask[c + d], which is np.roll(mask, -d).
+        rolled = np.roll(mask, (-di, -dj, -dk), axis=(0, 1, 2))
+        # Zero the slices that wrapped around from the opposite border.
+        if di > 0:
+            rolled[-di:, :, :] = False
+        elif di < 0:
+            rolled[: abs(di), :, :] = False
+        if dj > 0:
+            rolled[:, -dj:, :] = False
+        elif dj < 0:
+            rolled[:, : abs(dj), :] = False
+        if dk > 0:
+            rolled[:, :, -dk:] = False
+        elif dk < 0:
+            rolled[:, :, : abs(dk)] = False
+
+        directional |= (mask & (~rolled))
+
+    if not directional.any():
+        return out
+
     if side == "up":
-        # neighbour in -g direction: for original cell i, value is mask[i - sign]
-        if sign == 1:
-            neigh_slice = [slice(0, -2) if a == axis else slice(None) for a in range(3)]
-        else:
-            neigh_slice = [slice(2, None) if a == axis else slice(None) for a in range(3)]
+        limit = float(proj[directional].max())
+        seed = directional & (proj >= limit - 1e-12)
     else:
-        # neighbour in +g direction: for original cell i, value is mask[i + sign]
-        if sign == 1:
-            neigh_slice = [slice(2, None) if a == axis else slice(None) for a in range(3)]
-        else:
-            neigh_slice = [slice(0, -2) if a == axis else slice(None) for a in range(3)]
+        limit = float(proj[directional].min())
+        seed = directional & (proj <= limit + 1e-12)
 
-    neighbor = padded[tuple(neigh_slice)]
-    boundary = mask & ~neighbor
-    return boundary
+    labeled, num = ndimage.label(directional, structure=np.ones((3, 3, 3), dtype=int))
+    if num == 0:
+        return out
+    seed_labels = np.unique(labeled[seed])
+    seed_labels = seed_labels[seed_labels != 0]
+    if seed_labels.size == 0:
+        return out
+    out = np.isin(labeled, seed_labels)
+    return out
 
 
 def _select_inlet_cells(
@@ -252,62 +302,120 @@ def _build_laplace_matrix(
     cavity: np.ndarray,
     dirichlet: np.ndarray,
     dirichlet_value: np.ndarray,
+    permeability: Optional[np.ndarray] = None,
+    dx: float = 1.0,
+    face_fractions: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
 ) -> Tuple[csr_matrix, np.ndarray, np.ndarray]:
-    """Build a 7-point Laplacian matrix on the cavity with Dirichlet cells.
+    """Build a 7-point Darcy matrix on the cavity with Dirichlet cells.
 
-    Solid neighbours are treated as zero-flux (Neumann) boundaries.
+    Solid neighbours are treated as zero-flux (Neumann) boundaries.  Face
+    conductance is ``K_face * f_A / dx**2`` where ``K_face`` is the harmonic mean
+    of the two adjacent cell permeabilities and ``f_A`` is the FAVOR fractional
+    face area.  This makes narrow gates locally more resistive and removes the
+    staircase area bloat on curved geometry.
     """
     flat_idx = np.full(cavity.shape, -1, dtype=np.int32)
     flat_idx[cavity] = np.arange(int(cavity.sum()))
     n_unknowns = int(cavity.sum())
-    coords = np.argwhere(cavity)
 
     rows: List[int] = []
     cols: List[int] = []
     data: List[float] = []
     rhs = np.zeros(n_unknowns, dtype=np.float64)
+    diag = np.zeros(n_unknowns, dtype=np.float64)
 
-    neighbours = [
-        (-1, 0, 0),
-        (1, 0, 0),
-        (0, -1, 0),
-        (0, 1, 0),
-        (0, 0, -1),
-        (0, 0, 1),
-    ]
+    if permeability is None:
+        permeability = np.ones(cavity.shape, dtype=np.float64)
+    K = np.maximum(permeability, 1e-18)
+    dx2 = float(dx) * float(dx)
 
-    for idx in range(n_unknowns):
-        i, j, k = coords[idx]
+    if face_fractions is None:
+        nz, ny, nx = cavity.shape
+        f_A_z = np.ones((nz + 1, ny, nx), dtype=np.float64)
+        f_A_y = np.ones((nz, ny + 1, nx), dtype=np.float64)
+        f_A_x = np.ones((nz, ny, nx + 1), dtype=np.float64)
+    else:
+        f_A_z, f_A_y, f_A_x = face_fractions
 
-        if dirichlet[i, j, k]:
-            rows.append(idx)
-            cols.append(idx)
-            data.append(1.0)
-            rhs[idx] = float(dirichlet_value[i, j, k])
-            continue
+    def _add_faces(cur_flat, nb_flat, cur_dir, nb_dir, cur_val, nb_val, K_face):
+        valid = (cur_flat >= 0) & (nb_flat >= 0)
+        if not valid.any():
+            return
+        cur_idx = cur_flat[valid]
+        nb_idx = nb_flat[valid]
+        cdir = cur_dir[valid]
+        ndir = nb_dir[valid]
+        cv = cur_val[valid]
+        nv = nb_val[valid]
+        w = K_face[valid] / dx2
 
-        diag = 0
-        for di, dj, dk in neighbours:
-            ni, nj, nk = i + di, j + dj, k + dk
-            if 0 <= ni < cavity.shape[0] and 0 <= nj < cavity.shape[1] and 0 <= nk < cavity.shape[2] and cavity[ni, nj, nk]:
-                nidx = int(flat_idx[ni, nj, nk])
-                diag += 1
-                if dirichlet[ni, nj, nk]:
-                    rhs[idx] -= float(dirichlet_value[ni, nj, nk])
-                else:
-                    rows.append(idx)
-                    cols.append(nidx)
-                    data.append(1.0)
-            # else solid/outside: zero-flux (Neumann)
+        # both non-Dirichlet: symmetric off-diagonals, both diagonals accumulate
+        both = (~cdir) & (~ndir)
+        if both.any():
+            c = cur_idx[both]
+            n = nb_idx[both]
+            wb = w[both]
+            rows.extend(c.tolist())
+            cols.extend(n.tolist())
+            data.extend(wb.tolist())
+            rows.extend(n.tolist())
+            cols.extend(c.tolist())
+            data.extend(wb.tolist())
+            diag[c] += wb
+            diag[n] += wb
 
-        if diag == 0:
-            rows.append(idx)
-            cols.append(idx)
-            data.append(1.0)
-        else:
-            rows.append(idx)
-            cols.append(idx)
-            data.append(-float(diag))
+        # cur non-Dirichlet, nb Dirichlet
+        c_nd_nb_d = (~cdir) & ndir
+        if c_nd_nb_d.any():
+            c = cur_idx[c_nd_nb_d]
+            wb = w[c_nd_nb_d]
+            diag[c] += wb
+            rhs[c] -= wb * nv[c_nd_nb_d]
+
+        # cur Dirichlet, nb non-Dirichlet (the symmetric contribution from
+        # the other side of the same face).
+        c_d_nb_nd = cdir & (~ndir)
+        if c_d_nb_nd.any():
+            n = nb_idx[c_d_nb_nd]
+            wb = w[c_d_nb_nd]
+            diag[n] += wb
+            rhs[n] -= wb * cv[c_d_nb_nd]
+
+    # z-faces (axis 0) -- interior face indices 1..nz-1 of f_A_z
+    Kz = 2.0 * K[:-1] * K[1:] / (K[:-1] + K[1:]) * f_A_z[1:-1]
+    _add_faces(
+        flat_idx[:-1], flat_idx[1:],
+        dirichlet[:-1], dirichlet[1:],
+        dirichlet_value[:-1], dirichlet_value[1:], Kz,
+    )
+    # y-faces (axis 1)
+    Ky = 2.0 * K[:, :-1] * K[:, 1:] / (K[:, :-1] + K[:, 1:]) * f_A_y[:, 1:-1, :]
+    _add_faces(
+        flat_idx[:, :-1], flat_idx[:, 1:],
+        dirichlet[:, :-1], dirichlet[:, 1:],
+        dirichlet_value[:, :-1], dirichlet_value[:, 1:], Ky,
+    )
+    # x-faces (axis 2)
+    Kx = 2.0 * K[:, :, :-1] * K[:, :, 1:] / (K[:, :, :-1] + K[:, :, 1:]) * f_A_x[:, :, 1:-1]
+    _add_faces(
+        flat_idx[:, :, :-1], flat_idx[:, :, 1:],
+        dirichlet[:, :, :-1], dirichlet[:, :, 1:],
+        dirichlet_value[:, :, :-1], dirichlet_value[:, :, 1:], Kx,
+    )
+
+    unknown = np.arange(n_unknowns, dtype=np.int32)
+    dirichlet_unknowns = dirichlet[cavity]
+    if dirichlet_unknowns.any():
+        rows.extend(unknown[dirichlet_unknowns].tolist())
+        cols.extend(unknown[dirichlet_unknowns].tolist())
+        data.extend(np.ones(dirichlet_unknowns.sum(), dtype=np.float64).tolist())
+        rhs[dirichlet_unknowns] = dirichlet_value[cavity][dirichlet_unknowns]
+
+    non_dirichlet = ~dirichlet_unknowns
+    if non_dirichlet.any():
+        rows.extend(unknown[non_dirichlet].tolist())
+        cols.extend(unknown[non_dirichlet].tolist())
+        data.extend((-diag[non_dirichlet]).tolist())
 
     A = csr_matrix((data, (rows, cols)), shape=(n_unknowns, n_unknowns))
     return A, rhs, flat_idx
@@ -322,34 +430,49 @@ def _solve_pressure(
         p, info = spla.cg(A, rhs, atol=0.0, rtol=1e-9, maxiter=500)
         if info == 0:
             return p
-    except Exception:
-        pass
+        print(f"[Darcy solver] CG failed info={info}")
+    except Exception as exc:
+        print(f"[Darcy solver] CG exception: {exc}")
 
     try:
         p = spla.spsolve(A, rhs)
-    except Exception:
+        if not np.isfinite(p).all():
+            print("[Darcy solver] spsolve produced non-finite values")
+            p = np.zeros_like(rhs)
+        return p
+    except Exception as exc:
+        print(f"[Darcy solver] spsolve failed: {exc}")
         # Extremely ill-conditioned; use least-squares fallback.
-        p = np.zeros_like(rhs)
-    return p
+        return np.zeros_like(rhs)
 
 
 def _face_velocities(
     p: np.ndarray,
     cavity: np.ndarray,
     dx: float,
+    permeability: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute staggered face velocities u = -dp/dx, v = -dp/dy, w = -dp/dz.
+    """Compute staggered Darcy face velocities u = -K_face * dp/dx, etc.
 
-    Velocities are zero on faces adjacent to a solid cell.
+    Velocities are zero on faces adjacent to a solid cell.  ``permeability`` is
+    cell-centred; face values are the harmonic mean of the two adjacent cells.
     """
+    if permeability is None:
+        Kz = Ky = Kx = 1.0
+    else:
+        K = np.maximum(permeability, 1e-18)
+        Kz = 2.0 * K[:-1] * K[1:] / (K[:-1] + K[1:])
+        Ky = 2.0 * K[:, :-1] * K[:, 1:] / (K[:, :-1] + K[:, 1:])
+        Kx = 2.0 * K[:, :, :-1] * K[:, :, 1:] / (K[:, :, :-1] + K[:, :, 1:])
+
     u = np.zeros((p.shape[0] + 1, p.shape[1], p.shape[2]), dtype=np.float64)
     v = np.zeros((p.shape[0], p.shape[1] + 1, p.shape[2]), dtype=np.float64)
     w = np.zeros((p.shape[0], p.shape[1], p.shape[2] + 1), dtype=np.float64)
 
     # interior faces
-    u[1:-1, :, :] = -(p[1:] - p[:-1]) / dx
-    v[:, 1:-1, :] = -(p[:, 1:] - p[:, :-1]) / dx
-    w[:, :, 1:-1] = -(p[:, :, 1:] - p[:, :, :-1]) / dx
+    u[1:-1, :, :] = -Kz * (p[1:] - p[:-1]) / dx
+    v[:, 1:-1, :] = -Ky * (p[:, 1:] - p[:, :-1]) / dx
+    w[:, :, 1:-1] = -Kx * (p[:, :, 1:] - p[:, :, :-1]) / dx
 
     u_valid = np.zeros(u.shape, dtype=bool)
     u_valid[1:-1, :, :] = cavity[:-1] & cavity[1:]
@@ -377,6 +500,44 @@ def _cell_velocity_magnitude(
     return np.sqrt(ux * ux + vy * vy + wz * wz)
 
 
+def _inlet_face_area_m2(
+    source: np.ndarray,
+    cavity: np.ndarray,
+    dx: float,
+    face_fractions: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+) -> float:
+    """Real open area (m²) of the faces separating the source mask from the rest of the cavity."""
+    if face_fractions is None:
+        nz, ny, nx = cavity.shape
+        f_A_z = np.ones((nz + 1, ny, nx), dtype=np.float64)
+        f_A_y = np.ones((nz, ny + 1, nx), dtype=np.float64)
+        f_A_x = np.ones((nz, ny, nx + 1), dtype=np.float64)
+    else:
+        f_A_z, f_A_y, f_A_x = face_fractions
+    area = dx * dx
+    A = 0.0
+
+    # z-faces (axis 0)
+    left = source[:-1] & ~source[1:] & cavity[1:]
+    right = source[1:] & ~source[:-1] & cavity[:-1]
+    a_z = f_A_z[1:-1] * area
+    A += float(a_z[left | right].sum())
+
+    # y-faces (axis 1)
+    down = source[:, :-1] & ~source[:, 1:] & cavity[:, 1:]
+    up = source[:, 1:] & ~source[:, :-1] & cavity[:, :-1]
+    a_y = f_A_y[:, 1:-1, :] * area
+    A += float(a_y[down | up].sum())
+
+    # x-faces (axis 2)
+    back = source[:, :, :-1] & ~source[:, :, 1:] & cavity[:, :, 1:]
+    front = source[:, :, 1:] & ~source[:, :, :-1] & cavity[:, :, :-1]
+    a_x = f_A_x[:, :, 1:-1] * area
+    A += float(a_x[back | front].sum())
+
+    return A
+
+
 def _inlet_flux_m3_s(
     u: np.ndarray,
     v: np.ndarray,
@@ -384,31 +545,46 @@ def _inlet_flux_m3_s(
     source: np.ndarray,
     cavity: np.ndarray,
     dx: float,
+    face_fractions: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
 ) -> float:
-    """Total flux (m³/s) leaving the source mask into the rest of the cavity."""
+    """Total flux (m³/s) leaving the source mask into the rest of the cavity.
+
+    The face area is ``dx*dx * f_A`` so only the real open fraction contributes
+    to the volumetric flow rate on curved/staircase geometry.
+    """
+    if face_fractions is None:
+        nz, ny, nx = cavity.shape
+        f_A_z = np.ones((nz + 1, ny, nx), dtype=np.float64)
+        f_A_y = np.ones((nz, ny + 1, nx), dtype=np.float64)
+        f_A_x = np.ones((nz, ny, nx + 1), dtype=np.float64)
+    else:
+        f_A_z, f_A_y, f_A_x = face_fractions
     area = dx * dx
     flux = 0.0
 
-    # x-faces: u[1:-1] shape (nx-1, ny, nz) between cells (i-1) and (i)
+    # z-faces (axis 0) -- face k is between cells k-1 and k
     left_source = source[:-1] & ~source[1:] & cavity[1:]
     right_source = source[1:] & ~source[:-1] & cavity[:-1]
-    ux = u[1:-1]
-    flux += float(ux[left_source].sum()) * area
-    flux -= float(ux[right_source].sum()) * area
+    uz = u[1:-1]
+    a_z = f_A_z[1:-1] * area
+    flux += float((uz * a_z)[left_source].sum())
+    flux -= float((uz * a_z)[right_source].sum())
 
-    # y-faces
+    # y-faces (axis 1)
     down_source = source[:, :-1] & ~source[:, 1:] & cavity[:, 1:]
     up_source = source[:, 1:] & ~source[:, :-1] & cavity[:, :-1]
     vy = v[:, 1:-1]
-    flux += float(vy[down_source].sum()) * area
-    flux -= float(vy[up_source].sum()) * area
+    a_y = f_A_y[:, 1:-1, :] * area
+    flux += float((vy * a_y)[down_source].sum())
+    flux -= float((vy * a_y)[up_source].sum())
 
-    # z-faces
+    # x-faces (axis 2)
     back_source = source[:, :, :-1] & ~source[:, :, 1:] & cavity[:, :, 1:]
     front_source = source[:, :, 1:] & ~source[:, :, :-1] & cavity[:, :, :-1]
-    wz = w[:, :, 1:-1]
-    flux += float(wz[back_source].sum()) * area
-    flux -= float(wz[front_source].sum()) * area
+    wx = w[:, :, 1:-1]
+    a_x = f_A_x[:, :, 1:-1] * area
+    flux += float((wx * a_x)[back_source].sum())
+    flux -= float((wx * a_x)[front_source].sum())
 
     return flux
 
@@ -570,6 +746,16 @@ def _compute_fill_time(
     heapq.heapify(heap)
     visited = np.zeros(shape, dtype=bool)
 
+    # 26-neighbour front propagation: metal can flow through faces, edges and
+    # corners so thin/diagonal gating connections are not lost.
+    neighbours = [
+        (di, dj, dk)
+        for di in (-1, 0, 1)
+        for dj in (-1, 0, 1)
+        for dk in (-1, 0, 1)
+        if not (di == 0 and dj == 0 and dk == 0)
+    ]
+
     while heap:
         t, i, j, k = heapq.heappop(heap)
         if visited[i, j, k]:
@@ -577,30 +763,21 @@ def _compute_fill_time(
         visited[i, j, k] = True
         if t > fill[i, j, k] + 1e-12:
             continue
-        for di, dj, dk in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)):
+        for di, dj, dk in neighbours:
             ni, nj, nk = i + di, j + dj, k + dk
             if not (0 <= ni < shape[0] and 0 <= nj < shape[1] and 0 <= nk < shape[2]):
                 continue
             if visited[ni, nj, nk] or not cavity[ni, nj, nk]:
                 continue
             v_avg = 0.5 * (max(vmag[i, j, k], 1e-6) + max(vmag[ni, nj, nk], 1e-6))
-            dt = dx_m / v_avg
+            dist = float(np.sqrt(di * di + dj * dj + dk * dk))
+            dt = (dx_m * dist) / v_avg
             t_new = t + dt
             if t_new < fill[ni, nj, nk]:
                 fill[ni, nj, nk] = t_new
                 heapq.heappush(heap, (t_new, ni, nj, nk))
 
     fill[~cavity] = 0.0
-
-    # Any metal cavity still unreachable (e.g. isolated/discretised gate pockets)
-    # should still appear at the end of the fill so the animation does not leave
-    # gates visibly empty when solidification begins.
-    unreached = cavity & np.isinf(fill)
-    if unreached.any():
-        finite = fill[cavity & np.isfinite(fill)]
-        max_fill = float(finite.max()) if finite.size else 0.0
-        fill[unreached] = max_fill
-
     return fill
 
 
@@ -837,10 +1014,24 @@ def _gating_node_velocities(
     g: np.ndarray,
     bodies: Optional[List[Body]],
     section_areas_m2: Optional[Dict[str, float]] = None,
+    velocity_m_s: Optional[np.ndarray] = None,
+    dx_m: float = 0.0,
+    u_m_s: Optional[np.ndarray] = None,
+    v_m_s: Optional[np.ndarray] = None,
+    w_m_s: Optional[np.ndarray] = None,
+    face_fractions: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
 ) -> List[GatingNode]:
-    """Compute contact-node velocities from a pure hydraulic Q = vA network.
+    """Compute contact-node velocities from the Darcy velocity field if available.
 
-    The algorithm is completely independent of the Darcy solver.
+    When staggered face velocities ``u_m_s``, ``v_m_s``, ``w_m_s`` (z, y, x
+    components on the MAC grid) are supplied, the flux through each contact is
+    integrated directly from the Darcy field using a projected main-flow-axis
+    method.  This eliminates the staircasing area inflation and direction noise
+    of raw voxel normals on curved/amorphous geometry, and gives the *actual* Q
+    per branch so continuity Q = vA is satisfied.
+
+    If no Darcy velocity is supplied, the network falls back to a hydraulic
+    Q = vA split proportional to throat area.
     - Q_user is computed once at the source (sprue/pouring-basin) from the user
       velocity and the selected source area.
     - Voxels are used ONLY to discover which gating element touches which.
@@ -870,6 +1061,14 @@ def _gating_node_velocities(
 
     dx_m = float(dx_mm) / 1000.0
     area_face = dx_m * dx_m
+
+    if face_fractions is None:
+        nz, ny, nx = grid.shape
+        f_A_z = np.ones((nz + 1, ny, nx), dtype=np.float64)
+        f_A_y = np.ones((nz, ny + 1, nx), dtype=np.float64)
+        f_A_x = np.ones((nz, ny, nx + 1), dtype=np.float64)
+    else:
+        f_A_z, f_A_y, f_A_x = face_fractions
 
     g_u = np.asarray(g, dtype=np.float64)
     if np.linalg.norm(g_u) > 1e-12:
@@ -935,6 +1134,11 @@ def _gating_node_velocities(
             comp_body[next_id] = matched.get(label_id)
             next_id += 1
 
+    # Correct part centroid (it is used for the main flow direction of gate→part contacts).
+    part_idx = np.argwhere(grid == BodyType.PART)
+    if part_idx.size:
+        comp_centroids[part_id] = part_idx.mean(axis=0) * dx_mm + origin_mm
+
     # Discover shared faces between gating components and the part.
     max_id = int(comp_id.max())
     mult = max_id + 1
@@ -947,6 +1151,8 @@ def _gating_node_velocities(
     nx_b = np.zeros(n_keys, dtype=np.float64)
     ny_b = np.zeros(n_keys, dtype=np.float64)
     nz_b = np.zeros(n_keys, dtype=np.float64)
+    # Projected Darcy flux per unordered component pair is computed after BFS,
+    # once the true upstream/downstream direction of each contact is known.
 
     def _accumulate_contact_1d(
         id_a_1d: np.ndarray,
@@ -957,6 +1163,7 @@ def _gating_node_velocities(
         s_x: float,
         s_y: float,
         s_z: float,
+        f_A_1d: np.ndarray,
     ) -> None:
         nonlocal area_b, cx_b, cy_b, cz_b, nx_b, ny_b, nz_b
         if id_a_1d.size == 0:
@@ -964,60 +1171,76 @@ def _gating_node_velocities(
         up = np.minimum(id_a_1d, id_b_1d)
         down = np.maximum(id_a_1d, id_b_1d)
         key = up * mult + down
-        area_b += np.bincount(key, minlength=n_keys) * area_face
-        cx_b += np.bincount(key, weights=x_1d * area_face, minlength=n_keys)
-        cy_b += np.bincount(key, weights=y_1d * area_face, minlength=n_keys)
-        cz_b += np.bincount(key, weights=z_1d * area_face, minlength=n_keys)
-        # The geometric face normal does not depend on id ordering; the sign is
-        # irrelevant because the section plane is the same for +/-n.
-        w_norm = np.ones(id_a_1d.shape[0], dtype=np.float64) * area_face
-        nx_b += np.bincount(key, weights=s_x * w_norm, minlength=n_keys)
-        ny_b += np.bincount(key, weights=s_y * w_norm, minlength=n_keys)
-        nz_b += np.bincount(key, weights=s_z * w_norm, minlength=n_keys)
+        w = area_face * f_A_1d
+        area_b += np.bincount(key, weights=w, minlength=n_keys)
+        cx_b += np.bincount(key, weights=x_1d * w, minlength=n_keys)
+        cy_b += np.bincount(key, weights=y_1d * w, minlength=n_keys)
+        cz_b += np.bincount(key, weights=z_1d * w, minlength=n_keys)
+        # Signed normal weighted by the real fractional area.  The sign is fixed
+        # by the +axis orientation and is oriented downstream later.
+        nx_b += np.bincount(key, weights=s_x * w, minlength=n_keys)
+        ny_b += np.bincount(key, weights=s_y * w, minlength=n_keys)
+        nz_b += np.bincount(key, weights=s_z * w, minlength=n_keys)
 
-    # x-faces
-    id_a = comp_id[:-1, :, :]
-    id_b = comp_id[1:, :, :]
-    valid = (id_a != 0) & (id_b != 0) & (id_a != id_b)
-    if valid.any():
+    # Only orthogonal face neighbours carry hydraulic flow; diagonal/edge touches
+    # do not create a real flow path and are ignored.
+    directions = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]
+    unique_dirs = directions
+
+    for di, dj, dk in unique_dirs:
+        # Slices for id_a (lower-index cell) and id_b (higher-index cell).
+        sa0, sb0 = slice(0, -1), slice(1, None)
+        sa1, sb1 = slice(0, -1), slice(1, None)
+        sa2, sb2 = slice(0, -1), slice(1, None)
+        if di == 1:
+            pass
+        elif dj == 1:
+            sa0, sb0 = slice(None), slice(None)
+            sa1, sb1 = slice(0, -1), slice(1, None)
+            sa2, sb2 = slice(None), slice(None)
+        else:  # dk == 1
+            sa0, sb0 = slice(None), slice(None)
+            sa1, sb1 = slice(None), slice(None)
+            sa2, sb2 = slice(0, -1), slice(1, None)
+
+        id_a = comp_id[sa0, sa1, sa2]
+        id_b = comp_id[sb0, sb1, sb2]
+        valid = (id_a != 0) & (id_b != 0) & (id_a != id_b)
+        if not valid.any():
+            continue
+
+        s_x, s_y, s_z = float(di), float(dj), float(dk)
+
         i, j, k = np.where(valid)
+        start_i = sa0.start if sa0.start is not None else 0
+        start_j = sa1.start if sa1.start is not None else 0
+        start_k = sa2.start if sa2.start is not None else 0
+        gi_i = (start_i + i).astype(np.int64)
+        gj_j = (start_j + j).astype(np.int64)
+        gk_k = (start_k + k).astype(np.int64)
+
+        # Face centre coordinates and the matching FAVOR face index.
+        gi = gi_i.astype(np.float64) + 0.5 + di * 0.5
+        gj = gj_j.astype(np.float64) + 0.5 + dj * 0.5
+        gk = gk_k.astype(np.float64) + 0.5 + dk * 0.5
+
+        if di == 1:
+            f_A_face = f_A_z[gi_i + 1, gj_j, gk_k]
+        elif dj == 1:
+            f_A_face = f_A_y[gi_i, gj_j + 1, gk_k]
+        else:
+            f_A_face = f_A_x[gi_i, gj_j, gk_k + 1]
+
         _accumulate_contact_1d(
             id_a[valid],
             id_b[valid],
-            origin_mm[0] + (i + 1) * dx_mm,
-            origin_mm[1] + (j + 0.5) * dx_mm,
-            origin_mm[2] + (k + 0.5) * dx_mm,
-            1.0, 0.0, 0.0,
-        )
-
-    # y-faces
-    id_a = comp_id[:, :-1, :]
-    id_b = comp_id[:, 1:, :]
-    valid = (id_a != 0) & (id_b != 0) & (id_a != id_b)
-    if valid.any():
-        i, j, k = np.where(valid)
-        _accumulate_contact_1d(
-            id_a[valid],
-            id_b[valid],
-            origin_mm[0] + (i + 0.5) * dx_mm,
-            origin_mm[1] + (j + 1) * dx_mm,
-            origin_mm[2] + (k + 0.5) * dx_mm,
-            0.0, 1.0, 0.0,
-        )
-
-    # z-faces
-    id_a = comp_id[:, :, :-1]
-    id_b = comp_id[:, :, 1:]
-    valid = (id_a != 0) & (id_b != 0) & (id_a != id_b)
-    if valid.any():
-        i, j, k = np.where(valid)
-        _accumulate_contact_1d(
-            id_a[valid],
-            id_b[valid],
-            origin_mm[0] + (i + 0.5) * dx_mm,
-            origin_mm[1] + (j + 0.5) * dx_mm,
-            origin_mm[2] + (k + 1) * dx_mm,
-            0.0, 0.0, 1.0,
+            origin_mm[0] + gi * dx_mm,
+            origin_mm[1] + gj * dx_mm,
+            origin_mm[2] + gk * dx_mm,
+            s_x,
+            s_y,
+            s_z,
+            f_A_face,
         )
 
     contacts: List[Dict] = []
@@ -1035,12 +1258,14 @@ def _gating_node_velocities(
             [cx_b[key] / area_b[key], cy_b[key] / area_b[key], cz_b[key] / area_b[key]],
             dtype=np.float64,
         )
-        nvec = np.array([abs(nx_b[key]), abs(ny_b[key]), abs(nz_b[key])], dtype=np.float64)
+        nvec = np.array([nx_b[key], ny_b[key], nz_b[key]], dtype=np.float64)
         n_norm = float(np.linalg.norm(nvec))
         if n_norm > 1e-18:
             contact_normal = nvec / n_norm
         else:
             contact_normal = -g_u
+        # Darcy flux and flow-axis orientation are recomputed below after BFS.
+        flux_12 = 0.0
         contacts.append(
             {
                 "id1": id1,
@@ -1052,6 +1277,7 @@ def _gating_node_velocities(
                 "voxel_area_m2": area_m2,
                 "centroid_mm": centroid,
                 "normal": contact_normal,
+                "flux_m3_s": flux_12,
             }
         )
 
@@ -1124,14 +1350,166 @@ def _gating_node_velocities(
             queue.append(other)
             order.append(other)
 
-    # Ignore gating components that are not reachable from the source (they will
-    # simply appear filled at the end of the animation via the fill_time fallback).
     unvisited = [
         cid for cid in gating_ids
         if cid not in visited and comp_meta[cid][0] != BodyType.RISER
     ]
-    for cid in unvisited:
-        gating_ids.remove(cid)
+    if unvisited:
+        names = ", ".join(comp_meta[cid][1] for cid in unvisited)
+        raise GatingVelocityError(
+            f"Düğüm hızları çözülemedi: şu elemanlar kaynaktan parçaya ulaşan zincire "
+            f"bağlı değil: {names}. Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
+        )
+
+    # ------------------------------------------------------------------
+    # Projected Darcy flux integration (FAVOR).
+    # The main flow axis V_flow for a contact is the mean interface normal,
+    # oriented downstream (from the upstream component to the downstream one).
+    # Each shared voxel face contributes its true normal flux v_normal * A_real
+    # projected onto V_flow, giving the real cross-sectional area A_proj and the
+    # physically consistent Q = v_axis * A_proj.
+    # ------------------------------------------------------------------
+    flux_pair = np.zeros(n_keys, dtype=np.float64)
+    area_pair = np.zeros(n_keys, dtype=np.float64)
+    V_flow_array = np.zeros((3, n_keys), dtype=np.float64)
+    contact_keys = np.zeros(n_keys, dtype=bool)
+    for c in contacts:
+        up = c.get("up_id")
+        down = c.get("down_id")
+        if up is None or down is None:
+            continue
+        k = int(min(up, down)) * mult + int(max(up, down))
+        contact_keys[k] = True
+        n_mean = np.asarray(c.get("normal", -g_u), dtype=np.float64)
+        downstream = comp_centroids[down] - comp_centroids[up]
+        if np.dot(n_mean, downstream) < 0:
+            n_mean = -n_mean
+        n_norm = float(np.linalg.norm(n_mean))
+        if n_norm > 1e-12:
+            V_flow_array[:, k] = n_mean / n_norm
+        else:
+            V_flow_array[:, k] = -g_u
+
+    use_face = (
+        u_m_s is not None
+        and v_m_s is not None
+        and w_m_s is not None
+        and u_m_s.ndim == 3
+        and v_m_s.ndim == 3
+        and w_m_s.ndim == 3
+    )
+    use_cell = (
+        velocity_m_s is not None
+        and dx_m > 0.0
+        and velocity_m_s.ndim == 4
+    )
+
+    if use_face or use_cell:
+        area_face = dx_m * dx_m
+
+        def _slice(axis: int, d: int) -> Tuple[slice, slice]:
+            if d > 0:
+                return slice(0, -d), slice(d, None)
+            if d < 0:
+                return slice(-d, None), slice(0, d)
+            return slice(None), slice(None)
+
+        for di, dj, dk in unique_dirs:
+            if abs(di) + abs(dj) + abs(dk) != 1:
+                continue
+            sa0, sb0 = _slice(0, di)
+            sa1, sb1 = _slice(1, dj)
+            sa2, sb2 = _slice(2, dk)
+
+            id_a = comp_id[sa0, sa1, sa2]
+            id_b = comp_id[sb0, sb1, sb2]
+            valid = (id_a != 0) & (id_b != 0) & (id_a != id_b)
+            if not valid.any():
+                continue
+
+            start_i = sa0.start if sa0.start is not None else 0
+            start_j = sa1.start if sa1.start is not None else 0
+            start_k = sa2.start if sa2.start is not None else 0
+
+            i, j, k = np.where(valid)
+            gi_i = (start_i + i).astype(np.int64)
+            gj_j = (start_j + j).astype(np.int64)
+            gk_k = (start_k + k).astype(np.int64)
+            ni_idx = gi_i + di
+            nj_idx = gj_j + dj
+            nk_idx = gk_k + dk
+
+            id_a_v = id_a[valid]
+            id_b_v = id_b[valid]
+            k_arr = np.minimum(id_a_v, id_b_v) * mult + np.maximum(id_a_v, id_b_v)
+            in_contact = contact_keys[k_arr]
+            if not in_contact.any():
+                continue
+
+            k_arr = k_arr[in_contact]
+            gi_i = gi_i[in_contact]
+            gj_j = gj_j[in_contact]
+            gk_k = gk_k[in_contact]
+            ni_idx = ni_idx[in_contact]
+            nj_idx = nj_idx[in_contact]
+            nk_idx = nk_idx[in_contact]
+
+            if use_face:
+                # Staggered face velocities in (z, y, x) component order.
+                if di == 1:
+                    v0 = u_m_s[ni_idx, gj_j, gk_k]
+                    v1 = v_m_s[ni_idx, gj_j, gk_k]
+                    v2 = w_m_s[ni_idx, gj_j, gk_k]
+                    f_A_face = f_A_z[ni_idx, gj_j, gk_k]
+                elif dj == 1:
+                    v0 = u_m_s[gi_i, nj_idx, gk_k]
+                    v1 = v_m_s[gi_i, nj_idx, gk_k]
+                    v2 = w_m_s[gi_i, nj_idx, gk_k]
+                    f_A_face = f_A_y[gi_i, nj_idx, gk_k]
+                else:  # dk == 1
+                    v0 = u_m_s[gi_i, gj_j, nk_idx]
+                    v1 = v_m_s[gi_i, gj_j, nk_idx]
+                    v2 = w_m_s[gi_i, gj_j, nk_idx]
+                    f_A_face = f_A_x[gi_i, gj_j, nk_idx]
+                v = np.stack([v0, v1, v2], axis=0)
+            else:
+                v_ref = velocity_m_s[:, gi_i, gj_j, gk_k]
+                v_nb = velocity_m_s[:, ni_idx, nj_idx, nk_idx]
+                v = 0.5 * (v_ref + v_nb)
+                f_A_face = np.ones_like(v_ref[0])
+
+            V_flow = V_flow_array[:, k_arr]
+            n_vec = np.array([float(di), float(dj), float(dk)], dtype=np.float64)
+            # Use the face-normal Darcy velocity.  Faces whose normal is nearly
+            # parallel to the flow do not form part of the cross-section and are
+            # excluded from both A_proj and Q.
+            v_normal = np.einsum("i,ij->j", n_vec, v)
+            n_dot = np.einsum("i,ij->j", n_vec, V_flow)
+            cos_active = np.abs(n_dot)
+            active = cos_active > 0.1
+            A_proj = np.where(
+                active,
+                area_face * f_A_face * cos_active,
+                0.0,
+            )
+            Q_face = np.where(
+                active,
+                v_normal * area_face * f_A_face * np.sign(n_dot),
+                0.0,
+            )
+
+            flux_pair += np.bincount(k_arr, weights=Q_face, minlength=n_keys)
+            area_pair += np.bincount(k_arr, weights=A_proj, minlength=n_keys)
+
+    # Assign the projected Darcy flux and real contact area to each contact.
+    for c in contacts:
+        up = c.get("up_id")
+        down = c.get("down_id")
+        if up is None or down is None:
+            continue
+        k = int(min(up, down)) * mult + int(max(up, down))
+        c["flux_m3_s"] = float(flux_pair[k])
+        c["area_real_m2"] = float(area_pair[k])
 
     # Component throat areas will be filled after the contact-based mesh
     # sections are computed below.  Initialize with inf (part) and zero.
@@ -1261,9 +1639,15 @@ def _gating_node_velocities(
         else:
             comp_design_m2[cid] = float("inf")
 
-    # Apply design caps to the raw contact areas.
+    # Prefer the real FAVOR contact area from the Darcy flux integration; if that
+    # is unavailable (no velocity field) fall back to the CAD mesh/voxel area
+    # capped by the gating design areas.
     for c in contacts:
         id1, id2 = c["id1"], c["id2"]
+        a_real = float(c.get("area_real_m2", 0.0))
+        if a_real > 1e-18:
+            c["area_m2"] = a_real
+            continue
         a_contact = c["area_raw_m2"]
         design1 = comp_design_m2.get(id1, float("inf"))
         design2 = comp_design_m2.get(id2, float("inf"))
@@ -1282,7 +1666,7 @@ def _gating_node_velocities(
     def _node_body_type(up_id: int, down_id: int) -> str:
         return f"{comp_meta[up_id][0].name}→{comp_meta[down_id][0].name}"
 
-    def _make_node(up_id: int, down_id: int, area_m2: float, Q: float, centroid: np.ndarray) -> GatingNode:
+    def _make_node(up_id: int, down_id: int, area_m2: float, Q: float, centroid: np.ndarray, flow_rate_m3_s: float = 0.0) -> GatingNode:
         v = float(Q / area_m2) if area_m2 > 1e-18 else 0.0
         return GatingNode(
             name=_node_name(up_id, down_id),
@@ -1290,6 +1674,7 @@ def _gating_node_velocities(
             velocity_m_s=v,
             section_area_cm2=float(area_m2 * 1e4),
             centroid_mm=tuple(float(x) for x in centroid),
+            flow_rate_m3_s=float(flow_rate_m3_s),
         )
 
     nodes: List[GatingNode] = []
@@ -1305,6 +1690,7 @@ def _gating_node_velocities(
                 velocity_m_s=float(Q_user / source_area_m2),
                 section_area_cm2=float(source_area_m2 * 1e4),
                 centroid_mm=tuple(float(x) for x in source_centroid),
+                flow_rate_m3_s=float(Q_user),
             )
         )
 
@@ -1314,23 +1700,38 @@ def _gating_node_velocities(
         if comp_meta[cid][0] in {BodyType.RISER, BodyType.CURUFLUK}:
             continue
         if not out_edges:
-            # Dead-end gating pocket (e.g. an isolated ingate); it will still be
-            # filled at the end of the animation, so skip velocity node creation.
-            continue
+            raise GatingVelocityError(
+                f"Düğüm hızları çözülemedi: {comp_meta[cid][1]} elemanının çıkış bağlantısı yok. "
+                "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
+            )
         A_total = sum(c["area_m2"] for c in out_edges)
         if A_total <= 1e-18:
-            continue
+            raise GatingVelocityError(
+                f"Düğüm hızları çözülemedi: {comp_meta[cid][1]} elemanının toplam çıkış kesit alanı sıfır. "
+                "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
+            )
+        # Darcy gives the relative split of flow among outlets; the node balance
+        # enforces exact continuity (sum of Q_branch = Q at the node).
+        flux_total = sum(abs(float(c.get("flux_m3_s", 0.0))) for c in out_edges)
         for c in out_edges:
             A = c["area_m2"]
             if A <= 1e-18:
-                continue
-            Q_branch = Q * (A / A_total)
+                raise GatingVelocityError(
+                    f"Düğüm hızları çözülemedi: {comp_meta[cid][1]} → "
+                    f"{comp_meta[c['down_id']][1]} temas kesit alanı sıfır. "
+                    "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
+                )
+            flux_actual = float(c.get("flux_m3_s", 0.0))
+            if flux_total > 1e-18:
+                Q_branch = Q * (abs(flux_actual) / flux_total)
+            else:
+                Q_branch = Q * (A / A_total)
             c["Q_branch"] = Q_branch
             c["v_branch"] = Q_branch / A
             down_id = c["down_id"]
             if down_id != part_id:
                 Q_in[down_id] += Q_branch
-            nodes.append(_make_node(cid, down_id, A, Q_branch, c["centroid_mm"]))
+            nodes.append(_make_node(cid, down_id, A, Q_branch, c["centroid_mm"], flow_rate_m3_s=Q_branch))
 
     if not nodes:
         raise GatingVelocityError(
@@ -1351,7 +1752,7 @@ def solve_filling_flow(
     casting_params,
     alloy,
     bodies=None,
-    max_solver_cells: int = 1_000_000,
+    max_solver_cells: int = 500_000,
     progress_callback=None,
     design_velocity_m_s: float = 0.0,
     design_section_key: str = "SPRUE_THROAT",
@@ -1438,8 +1839,29 @@ def solve_filling_flow(
     if progress_callback:
         progress_callback(20)
 
+    # FAVOR fractional face areas from the CAD geometry.  These replace the raw
+    # dx*dx area on curved/staircase surfaces so Q = v * A uses the real area.
+    is_metal_c = grid_c != BodyType.EMPTY
+    face_fractions = compute_face_fractions(is_metal_c, sub=4)
+    f_A_z, f_A_y, f_A_x = face_fractions
+
+    # Real source throat area (for reporting / validation only).
+    source_real_area_m2 = _inlet_face_area_m2(inlet_cells, cavity, dx_m, face_fractions)
+
+    # Local isotropic permeability from the distance to the nearest solid wall.
+    # Narrow channels (small hydraulic radius) get small K, wide cavities large K,
+    # so the Darcy pressure field resolves local hydraulic resistance.
+    distance_voxels = ndimage.distance_transform_edt(cavity)
+    permeability_m2 = (distance_voxels * dx_m) ** 2
+    permeability_m2 = np.maximum(permeability_m2, (dx_m * 0.01) ** 2)
+
+    if progress_callback:
+        progress_callback(25)
+
     # Pressure solve.
-    A, rhs, flat_idx = _build_laplace_matrix(cavity, dirichlet, dirichlet_value)
+    A, rhs, flat_idx = _build_laplace_matrix(
+        cavity, dirichlet, dirichlet_value, permeability_m2, dx_m, face_fractions
+    )
     if progress_callback:
         progress_callback(35)
 
@@ -1450,11 +1872,11 @@ def solve_filling_flow(
     if progress_callback:
         progress_callback(55)
 
-    # Face velocities (Darcy: u = -K/μ * dp/dx).  K/μ is irrelevant because we
-    # scale to the user-specified flow rate, so we set it to 1 here.
-    u, v, w = _face_velocities(p, cavity, dx_m)
+    # Face velocities (Darcy: v = -K/μ * dp/dx).  K is now spatially variable,
+    # so narrow gates and wide runners feel their own hydraulic resistance.
+    u, v, w = _face_velocities(p, cavity, dx_m, permeability_m2)
 
-    # Determine user flow rate.
+    # Determine user flow rate, preferring the FAVOR source area if it is available.
     fine_part_mask = (fine_grid == BodyType.PART) & fine_cavity
     part_volume_m3 = float(fine_part_mask.sum()) * (fine_dx_m ** 3)
     fill_time_input = float(getattr(casting_params, "t_fill_s", 0.0) or 0.0)
@@ -1478,7 +1900,7 @@ def solve_filling_flow(
     )
 
     # Total flux leaving the inlet region in the raw pressure field.
-    Q_raw = _inlet_flux_m3_s(u, v, w, inlet_cells, cavity, dx_m)
+    Q_raw = _inlet_flux_m3_s(u, v, w, inlet_cells, cavity, dx_m, face_fractions)
     if abs(Q_raw) < 1e-18:
         # Degenerate geometry (e.g. disconnected inlet).  Fall back to area average.
         Q_raw = float(np.maximum(np.abs(u).sum(), 1e-18)) * (dx_m * dx_m)
@@ -1552,22 +1974,28 @@ def solve_filling_flow(
     vmag_fine = np.linalg.norm(velocity, axis=0)
 
     # Contact-node velocities / areas for every gating-gating and gating-part interface.
-    # Uses a pure hydraulic Q = vA network on the CAD mesh cross-sections; Darcy is
-    # bypassed for node velocities (it is still computed for fill_time/velocity overlay).
+    # Use the solver (coarse) grid, the staggered face velocities and the FAVOR
+    # fractional face areas so the real contact area is used in Q = v * A.
     gating_nodes = _gating_node_velocities(
-        grid,
-        origin,
-        dx,
+        grid_c,
+        origin_c,
+        dx_c,
         Q_user,
         area_m2,
         used_section,
         g,
         bodies,
         section_areas_m2=section_areas_m2,
+        u_m_s=u,
+        v_m_s=v,
+        w_m_s=w,
+        dx_m=dx_c / 1000.0,
+        face_fractions=face_fractions,
     )
     # Collect every node that feeds the part directly as a "gate" (meme).
     per_gate_v = {}
     per_gate_area = {}
+    per_gate_q = {}
     for n in gating_nodes:
         parts = n.body_type.split("→")
         if len(parts) != 2:
@@ -1577,6 +2005,8 @@ def solve_filling_flow(
             gate_name = n.name.split(" → ")[0]
             per_gate_v[gate_name] = n.velocity_m_s
             per_gate_area[gate_name] = n.section_area_cm2
+            per_gate_q[gate_name] = n.flow_rate_m3_s
+    total_ingate_flow_m3_s = float(sum(per_gate_q.values())) if per_gate_q else 0.0
 
     # Aggregate section velocities and ingate contact velocity directly from
     # the computed contact nodes so the report/viewer match the 3-D labels.
@@ -1608,5 +2038,7 @@ def solve_filling_flow(
         reason=reason,
         per_gate_contact_velocity_m_s=per_gate_v,
         per_gate_contact_area_cm2=per_gate_area,
+        per_gate_flow_rate_m3_s=per_gate_q,
+        total_ingate_flow_m3_s=total_ingate_flow_m3_s,
         gating_nodes=gating_nodes,
     )

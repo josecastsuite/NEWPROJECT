@@ -36,17 +36,10 @@ def _format_pore_size_summary(result: AnalysisResult) -> str:
     macro_limit = float(alloy.macro_pore_limit_um)
     micro_limit = float(alloy.micro_pore_limit_um)
 
-    macro_thr = float(getattr(result, "pore_size_macro_threshold_um", 0.0))
-    micro_thr = float(getattr(result, "pore_size_micro_threshold_um", 0.0))
-    fine_thr = float(getattr(result, "pore_size_fine_threshold_um", 0.0))
-    # If a class has no voxels the stored threshold is 0; use the absolute class
-    # lower bound so the row still reports the correct size range.
-    if macro_thr <= 0.0:
-        macro_thr = macro_limit
-    if micro_thr <= 0.0:
-        micro_thr = micro_limit
-    if fine_thr <= 0.0:
-        fine_thr = 0.0
+    # Class thresholds come directly from the alloy's physical micron limits.
+    macro_thr = macro_limit
+    micro_thr = micro_limit
+    fine_thr = 0.0
 
     pm = result.pore_size_macro_mask & np.isfinite(ps) & (ps >= macro_thr)
     pmi = result.pore_size_micro_mask & np.isfinite(ps) & (ps >= micro_thr)
@@ -65,11 +58,7 @@ def _format_pore_size_summary(result: AnalysisResult) -> str:
     def _max(a: np.ndarray) -> float:
         return float(np.max(a)) if len(a) else 0.0
 
-    macro_pct = float(getattr(result, "pore_size_macro_percent", 60.0))
-    micro_pct = float(getattr(result, "pore_size_micro_percent", 40.0))
-    fine_pct = float(getattr(result, "pore_size_fine_percent", 20.0))
-
-    return f"""<p>Filtre oranları farklı: Makro üst %{macro_pct:.0f} (eşik {macro_thr:.2f} µm), Mikro üst %{micro_pct:.0f} (eşik {micro_thr:.2f} µm), İnce üst %{fine_pct:.0f} (eşik {fine_thr:.2f} µm).</p>
+    return f"""<p>Gözenek sınıfları alaşımın fiziksel mikron limitlerine göre belirlenir: Makro &gt;{macro_limit:.0f} µm, Mikro {micro_limit:.0f}–{macro_limit:.0f} µm, İnce &lt;{micro_limit:.0f} µm.</p>
     <table>
         <tr><th>Sınıf</th><th>Voxel sayısı</th><th>Oran</th><th>Max gözenek (µm)</th></tr>
         <tr><td>Makro (&gt;{macro_limit:.0f} µm)</td><td>{macro_vox}</td><td>{100.0*macro_vox/total:.1f}%</td><td>{_max(macro_vals):.1f}</td></tr>
@@ -622,15 +611,9 @@ def _generate_report_fpdf2(
         alloy = get_alloy(result.alloy_key)
         macro_limit = float(alloy.macro_pore_limit_um)
         micro_limit = float(alloy.micro_pore_limit_um)
-        macro_thr = float(getattr(result, "pore_size_macro_threshold_um", 0.0))
-        micro_thr = float(getattr(result, "pore_size_micro_threshold_um", 0.0))
-        fine_thr = float(getattr(result, "pore_size_fine_threshold_um", 0.0))
-        if macro_thr <= 0.0:
-            macro_thr = macro_limit
-        if micro_thr <= 0.0:
-            micro_thr = micro_limit
-        if fine_thr <= 0.0:
-            fine_thr = 0.0
+        macro_thr = macro_limit
+        micro_thr = micro_limit
+        fine_thr = 0.0
         pm = result.pore_size_macro_mask & np.isfinite(ps_arr) & (ps_arr >= macro_thr)
         pmi = result.pore_size_micro_mask & np.isfinite(ps_arr) & (ps_arr >= micro_thr)
         pf = result.pore_size_fine_mask & np.isfinite(ps_arr) & (ps_arr >= fine_thr)
@@ -640,7 +623,7 @@ def _generate_report_fpdf2(
         macro_max = float(np.max(ps_arr[pm])) if macro_vox else 0.0
         micro_max = float(np.max(ps_arr[pmi])) if micro_vox else 0.0
         fine_max = float(np.max(ps_arr[pf])) if fine_vox else 0.0
-        pdf.cell(0, 6, f"Filtre oranlari farkli: Makro ust %60 (esik {macro_thr:.1f} um) | Mikro ust %40 (esik {micro_thr:.1f} um) | Ince ust %20 (esik {fine_thr:.1f} um). Makro (>{macro_limit:.0f} um): {macro_vox} vox (max {macro_max:.1f} um) | Mikro ({micro_limit:.0f}-{macro_limit:.0f} um): {micro_vox} vox (max {micro_max:.1f} um) | Ince (<{micro_limit:.0f} um): {fine_vox} vox (max {fine_max:.1f} um)", ln=True)
+        pdf.cell(0, 6, f"Gozenek siniflari alasim limitleriyle: Makro >{macro_limit:.0f} um | Mikro {micro_limit:.0f}-{macro_limit:.0f} um | Ince <{micro_limit:.0f} um. Makro: {macro_vox} vox (max {macro_max:.1f} um) | Mikro: {micro_vox} vox (max {micro_max:.1f} um) | Ince: {fine_vox} vox (max {fine_max:.1f} um)", ln=True)
     else:
         pdf.cell(0, 6, "Gözenek boyutu hesabi mevcut degil.", ln=True)
     pdf.ln(4)

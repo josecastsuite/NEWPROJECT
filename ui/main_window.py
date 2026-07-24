@@ -373,6 +373,30 @@ class MainWindow(QtWidgets.QMainWindow):
             "0 = otomatik (tasarım debisi). >0 kullanıcı girişi; seçili sprue kesitinde geçerlidir. Program düzeltmez.",
         )
 
+        self.hs_min_size_spin = QtWidgets.QDoubleSpinBox()
+        self.hs_min_size_spin.setRange(0.0, 20.0)
+        self.hs_min_size_spin.setDecimals(1)
+        self.hs_min_size_spin.setValue(0.0)
+        self.hs_min_size_spin.setSingleStep(0.5)
+        self.hs_min_size_spin.setSpecialValueText("Otomatik")
+        _params_labeled(
+            self.hs_min_size_spin,
+            "Hot-spot min. boyut (mm):",
+            "0 = otomatik. Küçük hot-spot ceplerinin atılması için kullanılan eşik.",
+        )
+
+        self.hs_cluster_eps_spin = QtWidgets.QDoubleSpinBox()
+        self.hs_cluster_eps_spin.setRange(0.0, 100.0)
+        self.hs_cluster_eps_spin.setDecimals(1)
+        self.hs_cluster_eps_spin.setValue(0.0)
+        self.hs_cluster_eps_spin.setSingleStep(1.0)
+        self.hs_cluster_eps_spin.setSpecialValueText("Otomatik")
+        _params_labeled(
+            self.hs_cluster_eps_spin,
+            "Hot-spot küme mesafesi (mm):",
+            "0 = otomatik. DBSCAN ile yakın hot-spot'ların birleştirilme mesafesi.",
+        )
+
         left_layout.addWidget(params_group)
 
         # Gravity direction group
@@ -669,6 +693,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ingate_velocity_m_s=self.v_ingate_spin.value(),
             velocity_section_key=self.velocity_section_combo.currentData(),
             gravity_vector=self._gravity_vector_from_ui(),
+            hotspot_min_size_mm=self.hs_min_size_spin.value(),
+            hotspot_cluster_eps_mm=self.hs_cluster_eps_spin.value(),
         )
 
     def _gravity_vector_from_ui(self) -> Tuple[float, float, float]:
@@ -867,6 +893,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "insulated": "izol",
             "sleeve": "göm",
             "chilled": "chill",
+            "side": "yan",
+            "blind": "kör",
         }
         type_text = short_names.get(body.feeder_type, body.feeder_type[:4])
         m_text = f" M={body.feeder_m_mm:.1f}" if body.feeder_m_mm > 0 else " auto"
@@ -1037,6 +1065,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ),
             )
             self._analysis.casting_params = casting_params
+            self._update_porosity_filter_labels(get_alloy(alloy_key))
 
             gate_result = self._analysis.gate_result
             if gate_result:
@@ -1388,6 +1417,15 @@ class MainWindow(QtWidgets.QMainWindow):
         max_points = 5000
         size_filter = str(self.porosity_size_filter.currentData() or "all")
         return float(noise_percent), int(max_points), size_filter
+
+    def _update_porosity_filter_labels(self, alloy) -> None:
+        """Set class combo labels from the alloy's physical micron limits."""
+        macro = int(round(alloy.macro_pore_limit_um))
+        micro = int(round(alloy.micro_pore_limit_um))
+        self.porosity_size_filter.setItemText(0, "Tüm poroziteler")
+        self.porosity_size_filter.setItemText(1, f"Makro (>{macro} µm)")
+        self.porosity_size_filter.setItemText(2, f"Mikro ({micro}–{macro} µm)")
+        self.porosity_size_filter.setItemText(3, f"İnce (<{micro} µm)")
 
     def on_toggle_niyama(self, checked: bool):
         if self._analysis:

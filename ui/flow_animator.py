@@ -65,6 +65,7 @@ class FlowAnimator(QtCore.QObject):
         self._edt: Optional[np.ndarray] = None
         self._streamline_actor = None
         self._marker_actor = None
+        self._pore_actor = None
 
         # Two-phase pre-computed scalar matrices (NO full 3-D mesh geometry).
         # Phase 1: one phi scalar volume per fill frame.
@@ -95,6 +96,12 @@ class FlowAnimator(QtCore.QObject):
         self._outside_mask: Optional[np.ndarray] = None
         self._outside_idx: Optional[np.ndarray] = None
         self._sentinel: float = 1e9
+
+        # Macro porosity data: full-res mask, downsampled mask, and the smooth
+        # metal indicator used to carve live holes during solidification.
+        self._pore_mask_full: Optional[np.ndarray] = None
+        self._pore_mask_d: Optional[np.ndarray] = None
+        self._phi_base_d: Optional[np.ndarray] = None
 
     def set_result(self, result: Optional[AnalysisResult]) -> None:
         """Attach a completed analysis result and build the animation frames."""
@@ -134,6 +141,22 @@ class FlowAnimator(QtCore.QObject):
         solid_time = result.solidification_time
         if solid_time is not None and solid_time.size == fill_time.size:
             self._solid_time = np.asarray(solid_time, dtype=np.float64)
+            # Extrapolate cells that did not reach solidus within the thermal
+            # solver horizon using Chvorinov t_s = C * M^2 so the animation can
+            # cover their actual solidification and pores can appear in time.
+            metal_inf = metal & ~np.isfinite(self._solid_time)
+            if (
+                metal_inf.any()
+                and getattr(result, "sdf", None) is not None
+                and result.sdf.size == fill_time.size
+                and getattr(result, "chvorinov_c", 0.0) > 0.0
+            ):
+                sdf = np.maximum(np.asarray(result.sdf, dtype=np.float64), 0.1)
+                t_est = result.chvorinov_c * sdf * sdf
+                # Never shorten an already-known solidification time.
+                known = np.where(np.isfinite(self._solid_time) & metal, self._solid_time, 0.0)
+                t_est = np.maximum(t_est, known + 1.0)
+                self._solid_time = np.where(metal_inf, t_est, self._solid_time)
             max_solid = self._finite_max(self._solid_time, metal)
         else:
             self._solid_time = np.full_like(self._fill_time, np.inf)
@@ -146,6 +169,9 @@ class FlowAnimator(QtCore.QObject):
 
         # ---- temperature bounds ----
         self._load_temperature_bounds(result)
+
+        # ---- macro-pore mask from backend (full resolution; cropped/downsampled below) ----
+        self._load_pore_mask(result)
 
         # ---- build downsampled animation grid and precompute frames ----
         if not self._build_animation_grid(metal):
@@ -188,10 +214,14 @@ class FlowAnimator(QtCore.QObject):
         self._metal_d = None
         self._outside_mask = None
         self._outside_idx = None
+        self._pore_mask_full = None
+        self._pore_mask_d = None
+        self._filled_d = None
         self._frame_actor = None
         self._frame_actor_scalar = ""
         self._streamline_actor = None
         self._marker_actor = None
+        self._pore_actor = None
 
     def _finite_max(self, arr: np.ndarray, mask: np.ndarray) -> float:
         finite = mask & np.isfinite(arr)
@@ -214,6 +244,40 @@ class FlowAnimator(QtCore.QObject):
             self._t_mold = float(mold.t0_c)
             self._t_liq = float(alloy.t_liquidus_c)
             self._t_sol = float(alloy.t_solidus_c)
+
+    def _load_pore_mask(self, result: AnalysisResult) -> None:
+        """Load or derive the full-resolution macro-pore mask from the result.
+
+        Priority:
+          1. result.pore_size_macro_mask (backend classification)
+          2. result.pore_size_um >= alloy macro limit
+          3. result.pore_size_shrinkage_um >= alloy macro limit
+          4. empty mask if no pore data are present.
+        """
+        grid_shape = tuple(int(s) for s in result.grid.shape)
+        mask = np.zeros(grid_shape, dtype=bool)
+
+        macro_thr = 1000.0
+        try:
+            alloy = get_alloy(getattr(result, "alloy_key", "42CrMo4"))
+            macro_thr = float(getattr(alloy, "macro_pore_limit_um", 1000.0))
+        except Exception:
+            pass
+
+        candidate = getattr(result, "pore_size_macro_mask", None)
+        if candidate is not None and candidate.shape == grid_shape:
+            mask = np.asarray(candidate, dtype=bool)
+        else:
+            pore_um = getattr(result, "pore_size_um", None)
+            if pore_um is not None and pore_um.shape == grid_shape:
+                mask = np.asarray(pore_um, dtype=np.float64) >= macro_thr
+            else:
+                pore_shrink = getattr(result, "pore_size_shrinkage_um", None)
+                if pore_shrink is not None and pore_shrink.shape == grid_shape:
+                    mask = np.asarray(pore_shrink, dtype=np.float64) >= macro_thr
+
+        # Restrict to actual metal voxels; EMPTY/void cells cannot host porosity.
+        self._pore_mask_full = mask & (result.grid > 0)
 
     def _build_animation_grid(self, metal: np.ndarray) -> bool:
         """Crop, downsample, and precompute the frame meshes."""
@@ -241,6 +305,9 @@ class FlowAnimator(QtCore.QObject):
         metal_c = metal[
             bbox[0] : bbox[1], bbox[2] : bbox[3], bbox[4] : bbox[5]
         ]
+        pore_c = self._pore_mask_full[
+            bbox[0] : bbox[1], bbox[2] : bbox[3], bbox[4] : bbox[5]
+        ]
 
         self._sentinel = max(10.0 * self._max_time, 1e6) + 1.0
         fill_c = np.where(np.isfinite(fill_c) & metal_c, fill_c, self._sentinel)
@@ -260,17 +327,26 @@ class FlowAnimator(QtCore.QObject):
             ratios = tuple(
                 target_shape[i] / crop_shape[i] for i in range(3)
             )
-            fill_d = ndimage.zoom(fill_c, ratios, order=1)
-            solid_d = ndimage.zoom(solid_c, ratios, order=1)
+            # Nearest-neighbour for fill/solid times: a cell is either filled
+            # at a known time or not (sentinel); linear interpolation would
+            # invent bogus mid-times next to the sentinel.
+            fill_d = ndimage.zoom(fill_c, ratios, order=0)
+            solid_d = ndimage.zoom(solid_c, ratios, order=0)
             metal_d = ndimage.zoom(metal_c.astype(np.float32), ratios, order=0) > 0.5
+            # Trilinear interpolation for the pore mask keeps the purple cavity
+            # surfaces smooth; threshold at 0.5 preserves the binary decision.
+            pore_d = ndimage.zoom(pore_c.astype(np.float32), ratios, order=1) > 0.5
             fill_d = np.where(metal_d, fill_d, self._sentinel)
             solid_d = np.where(metal_d, solid_d, self._sentinel)
             spacing = tuple(self._dx * crop_shape[i] / target_shape[i] for i in range(3))
             shape = target_shape
         else:
-            fill_d, solid_d, metal_d = fill_c, solid_c, metal_c
+            fill_d, solid_d, metal_d, pore_d = fill_c, solid_c, metal_c, pore_c
             spacing = (self._dx, self._dx, self._dx)
             shape = crop_shape
+
+        # Restrict pores to metal cells; zoom may have bled into void voxels.
+        pore_d = pore_d & metal_d
 
         origin_c = self._origin + np.array(
             [bbox[0], bbox[2], bbox[4]], dtype=np.float64
@@ -279,6 +355,7 @@ class FlowAnimator(QtCore.QObject):
         self._fill_time_d = fill_d
         self._solid_time_d = solid_d
         self._metal_d = metal_d
+        self._pore_mask_d = pore_d
 
         img = pv.ImageData(
             dimensions=shape, spacing=spacing, origin=origin_c
@@ -364,7 +441,14 @@ class FlowAnimator(QtCore.QObject):
         return phi.astype(np.float32).ravel(order="F")
 
     def _build_solid_base(self) -> None:
-        """Build the decimated fixed geometry for the solidification phase."""
+        """Precompute the smooth metal indicator used for live phase-2 frames.
+
+        The solidification mesh is rebuilt every frame so that macro-pores can
+        appear as true holes in the metal surface and a separate purple pore
+        surface can grow with time.  This method stores the base metal level-set
+        (without pores) and an empty pore-phi placeholder; per-frame updates
+        subtract the active pore mask and contour both surfaces live.
+        """
         if self._base_image is None:
             return
 
@@ -372,30 +456,28 @@ class FlowAnimator(QtCore.QObject):
         metal = ft < self._sentinel
         filled = (ft <= self._max_fill_time) & metal
         if not filled.any():
+            self._filled_d = None
             self._phase2_mesh = None
             return
 
-        phi = ndimage.gaussian_filter(
-            filled.astype(np.float64), sigma=self.PHI_SIGMA, mode="constant", cval=0.0
+        # Boolean metal indicator for the fully-filled part.  Pore cells are
+        # carved out per-frame in _update_scene by smoothing (filled & ~pore).
+        self._filled_d = filled
+
+        # Placeholders; overwritten every phase-2 frame.
+        self._base_image.point_data["phi"] = np.zeros(
+            self._base_image.n_points, dtype=np.float32
         )
-        self._base_image.point_data["phi"] = phi.ravel(order="F")
-        # Placeholder so contour copies a "temperature" array; overwritten below.
+        self._base_image.point_data["pore_phi"] = np.zeros(
+            self._base_image.n_points, dtype=np.float32
+        )
+        # Temperature array is also overwritten per frame.
         self._base_image.point_data["temperature"] = np.full(
             self._base_image.n_points, self._t_pour, dtype=np.float32
         )
 
-        surface = self._base_image.contour(isosurfaces=[0.5], scalars="phi")
-        if surface.n_points == 0:
-            self._phase2_mesh = None
-            return
-
-        surface = self._finalize_surface(surface, active_scalars="temperature")
-        self._phase2_mesh = surface
-        surf_t, surf_sf = self._solid_scalars_for_time(self._max_fill_time)
-        self._phase2_mesh.point_data["temperature"] = surf_t
-        self._phase2_mesh.point_data["solid_fraction"] = surf_sf
-        self._phase2_mesh.set_active_scalars("temperature")
-        self._phase2_times.append(float(self._max_fill_time))
+        # The fixed phase-2 mesh is no longer used; surfaces are contoured live.
+        self._phase2_mesh = None
 
     def _finalize_surface(
         self, surface: pv.PolyData, active_scalars: str = "velocity_magnitude"
@@ -921,6 +1003,12 @@ class FlowAnimator(QtCore.QObject):
             except Exception:
                 pass
             self._frame_actor = None
+        if self._pore_actor is not None:
+            try:
+                self._viewer.remove_actor(self._pore_actor)
+            except Exception:
+                pass
+            self._pore_actor = None
 
     def _on_timer(self) -> None:
         if not self._is_running or self._frame_times is None or len(self._frame_times) == 0:
@@ -993,33 +1081,107 @@ class FlowAnimator(QtCore.QObject):
                         self._frame_actor_scalar = "temperature"
                     else:
                         self._frame_actor.mapper.dataset = surface
+
+            # Macro porosity is not shown during filling; remove any stale actor.
+            if self._pore_actor is not None:
+                try:
+                    self._viewer.remove_actor(self._pore_actor)
+                except Exception:
+                    pass
+                self._pore_actor = None
         else:
-            # Phase 2: fixed geometry, colour by temperature / solid fraction.
+            # Phase 2: live reconstruction of the metal surface with macro-pore
+            # holes carved out, plus a separate purple pore_actor that grows as
+            # solid_time <= t advances.
             s_idx = frame - self._n_fill
-            if self._phase2_mesh is None or s_idx >= len(self._phase2_temps):
+            if (
+                self._filled_d is None
+                or self._pore_mask_d is None
+                or s_idx >= self._n_solid
+                or self._base_image is None
+            ):
                 return
-            self._phase2_mesh.point_data["temperature"] = self._phase2_temps[s_idx]
-            self._phase2_mesh.point_data["solid_fraction"] = self._phase2_solids[s_idx]
-            self._phase2_mesh.set_active_scalars("temperature")
-            if self._frame_actor is None or self._frame_actor_scalar != "temperature":
+            t = self._frame_times[frame]
+
+            # Temperature field for this instant (cools from pour down to mold).
+            T = self._compute_temperature(t)
+            T = self._extrapolate_metal_scalar(T).astype(np.float32).ravel(order="F")
+            self._base_image.point_data["temperature"] = T
+
+            # Active pores: cells that are in the macro-pore mask and have already
+            # solidified (solid_time <= current time).  This makes pores appear
+            # one by one as the liquid path closes.
+            active_pore = self._pore_mask_d & (self._solid_time_d <= t)
+            pore_smooth = ndimage.gaussian_filter(
+                active_pore.astype(np.float64), sigma=self.PHI_SIGMA, mode="constant", cval=0.0
+            ).astype(np.float32)
+
+            # Metal level-set: smooth the (filled metal minus active pore) volume.
+            # Cells inside active pores become phi = 0, producing true holes.
+            phi_t = ndimage.gaussian_filter(
+                (self._filled_d & ~active_pore).astype(np.float64),
+                sigma=self.PHI_SIGMA,
+                mode="constant",
+                cval=0.0,
+            ).astype(np.float32)
+            self._base_image.point_data["phi"] = phi_t.ravel(order="F")
+
+            surface = self._base_image.contour(isosurfaces=[0.5], scalars="phi")
+            if surface.n_points == 0:
                 if self._frame_actor is not None:
                     try:
                         self._viewer.remove_actor(self._frame_actor)
                     except Exception:
                         pass
-                self._frame_actor = self._viewer.add_mesh(
-                    self._phase2_mesh,
-                    cmap=self._metal_cmap(),
-                    clim=(self._t_mold, self._t_pour),
-                    opacity=1.0,
-                    scalars="temperature",
-                    show_scalar_bar=True,
-                    scalar_bar_args={"title": "Sıcaklık (°C)"},
-                    name="flow_frame",
-                )
-                self._frame_actor_scalar = "temperature"
+                    self._frame_actor = None
+                    self._frame_actor_scalar = ""
             else:
-                self._frame_actor.mapper.dataset = self._phase2_mesh
+                surface = self._finalize_surface(surface, active_scalars="temperature")
+                if self._frame_actor is None or self._frame_actor_scalar != "temperature":
+                    if self._frame_actor is not None:
+                        try:
+                            self._viewer.remove_actor(self._frame_actor)
+                        except Exception:
+                            pass
+                    self._frame_actor = self._viewer.add_mesh(
+                        surface,
+                        cmap=self._metal_cmap(),
+                        clim=(self._t_mold, self._t_pour),
+                        opacity=1.0,
+                        scalars="temperature",
+                        show_scalar_bar=True,
+                        scalar_bar_args={"title": "Sıcaklık (°C)"},
+                        name="flow_frame",
+                    )
+                    self._frame_actor_scalar = "temperature"
+                else:
+                    self._frame_actor.mapper.dataset = surface
+
+            # Pore surface: contour the smoothed active-pore indicator at 0.5.
+            # Rendered in bright purple (#800080) with 0.9 opacity so deep cavities
+            # remain visible even behind the metal surface.
+            self._base_image.point_data["pore_phi"] = pore_smooth.ravel(order="F")
+            pore_surface = self._base_image.contour(isosurfaces=[0.5], scalars="pore_phi")
+            if pore_surface.n_points == 0:
+                if self._pore_actor is not None:
+                    try:
+                        self._viewer.remove_actor(self._pore_actor)
+                    except Exception:
+                        pass
+                    self._pore_actor = None
+            else:
+                pore_surface = self._finalize_surface(pore_surface, active_scalars="pore_phi")
+                pore_surface.set_active_scalars(None)
+                if self._pore_actor is None:
+                    self._pore_actor = self._viewer.add_mesh(
+                        pore_surface,
+                        color="#800080",
+                        opacity=0.9,
+                        show_scalar_bar=False,
+                        name="pore_actor",
+                    )
+                else:
+                    self._pore_actor.mapper.dataset = pore_surface
 
         # Optional red streamlines overlay.
         if self._show_streamlines and self._tube_mesh is not None:

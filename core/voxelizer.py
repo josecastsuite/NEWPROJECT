@@ -257,42 +257,44 @@ def _classify_casting_bodies(
     ingate_threshold = score_min + 0.40 * score_range
 
     if len(gating) == 1:
-        bodies[sorted_by_score[0]].body_type = BodyType.INGATE
+        # A single gating body is the metal entry by definition.
+        bodies[sorted_by_score[0]].body_type = BodyType.SPRUE
         return
 
-    # The farthest upstream body is the sprue only if it is large enough to be
-    # the metal entry.  A tiny body at the far end is more likely a remote gate
-    # (or there is no distinct sprue in the model).
+    # The farthest upstream gating body is the metal entry.  Respect any
+    # name-based source label, otherwise default to the highest-score body even
+    # if it is small; a tiny remote cup/gate can still be the only source.
     sprue_idx = None
-    if bodies[sorted_by_score[-1]].volume_cm3 >= sprue_min_vol:
+    for v in reversed(sorted_by_score):
+        if v in name_assigned and bodies[v].body_type in {
+            BodyType.SPRUE,
+            BodyType.SPRUE_THROAT,
+            BodyType.POURING_BASIN,
+        }:
+            sprue_idx = v
+            break
+    if sprue_idx is None:
         sprue_idx = sorted_by_score[-1]
-        bodies[sprue_idx].body_type = BodyType.SPRUE
+        if bodies[sprue_idx].body_type == BodyType.PART:
+            bodies[sprue_idx].body_type = BodyType.SPRUE
 
     # Gate candidates are the small bodies within the downstream score band.
     ingate_candidates = [
         v
         for v in sorted_by_score
-        if score[v] <= ingate_threshold and bodies[v].volume_cm3 <= gate_max_vol
+        if v != sprue_idx
+        and score[v] <= ingate_threshold
+        and bodies[v].volume_cm3 <= gate_max_vol
     ]
 
     if ingate_candidates:
         ingate_indices = ingate_candidates[:]
-    elif sprue_idx is not None:
-        # No small downstream body found; the closest candidate becomes the gate.
-        ingate_indices = [sorted_by_score[0]]
     else:
-        # No distinct sprue: the far-end small body is treated as the gate
-        # (runner -> remote gate layout).
-        ingate_indices = [
-            max(
-                sorted_by_score,
-                key=lambda v: score[v] if bodies[v].volume_cm3 <= gate_max_vol else -1e9,
-            )
-        ]
-        # If every body is larger than the median gate size, fall back to the
-        # smallest body overall.
-        if bodies[ingate_indices[0]].volume_cm3 > gate_max_vol:
-            ingate_indices = [min(sorted_by_score, key=lambda v: bodies[v].volume_cm3)]
+        # No small downstream body found; the closest candidate to the part
+        # becomes the ingate (sprue -> runner -> gate layout).
+        ingate_indices = [sorted_by_score[0] if sorted_by_score[0] != sprue_idx else sorted_by_score[1]]
+        if len(gating) >= 2 and sorted_by_score[0] == sprue_idx and len(sorted_by_score) > 1:
+            ingate_indices = [sorted_by_score[1]]
 
     for v in ingate_indices:
         if bodies[v].body_type == BodyType.PART:
@@ -338,6 +340,7 @@ def _voxelize_at_dim(
     margin: int,
     progress_callback: Optional[callable],
     fix_mesh: bool,
+    conservative: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, float, List[Body]]:
     """Single-shot voxelization used by build_voxel_grid."""
     bbox_min, bbox_max = _global_bbox(bodies)
@@ -402,6 +405,11 @@ def _voxelize_at_dim(
 
         region = matrix[li0:li1, lj0:lj1, lk0:lk1]
         mask = region.astype(bool)
+        if mask.any() and conservative:
+            # Conservative voxelization: any cell touched by the geometry is metal.
+            # A 26-neighbour binary dilation of one voxel guarantees thin walls and
+            # corner/edge contacts are preserved in the flow grid.
+            mask = ndimage.binary_dilation(mask, structure=np.ones((3, 3, 3), dtype=bool))
 
         # Later body wins on overlap
         grid[i0:i1, j0:j1, k0:k1][mask] = int(body.body_type)
@@ -420,6 +428,7 @@ def build_voxel_grid(
     progress_callback: Optional[callable] = None,
     fix_mesh: bool = True,
     gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
+    conservative: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, float, List[Body]]:
     """
     Build a global voxel grid.
@@ -454,31 +463,35 @@ def build_voxel_grid(
     margin = 4
 
     grid, origin, dx, repaired_bodies = _voxelize_at_dim(
-        bodies, target_dim, margin, progress_callback, fix_mesh
+        bodies, target_dim, margin, progress_callback, fix_mesh, conservative=conservative
     )
 
-    # Resolution sanity check: dx must be <= t_min / 3 to capture thin walls.
+    # Resolution sanity check based on the thinnest metal region captured by
+    # the voxel grid.  Conservative dilation + 26-neighbour connectivity is the
+    # primary fix for thin walls, so we only warn here and do not automatically
+    # blow up the grid (which can be enormous for spread-out assemblies).
     is_metal = grid != 0
     if is_metal.any():
-        sdf_grid = ndimage.distance_transform_edt(is_metal) * dx
-        min_sdf = float(sdf_grid[is_metal].min())
-        t_min = 2.0 * min_sdf
-        if t_min > 0.0 and dx > t_min / 3.0:
+        dt = ndimage.distance_transform_edt(is_metal)
+        footprint = np.ones((3, 3, 3), dtype=bool)
+        footprint[1, 1, 1] = False
+        max_neigh = ndimage.maximum_filter(dt, footprint=footprint, mode="constant", cval=0)
+        ridge = is_metal & (dt >= max_neigh - 1e-9)
+        if ridge.any():
+            min_ridge = float(dt[ridge].min())
+        else:
+            min_ridge = float(dt[is_metal].max())
+        # 2 * ridge_distance * dx is a safe (slightly over-)estimate of the
+        # thinnest wall thickness; the Nyquist condition wants >= 3 voxels.
+        t_min = 2.0 * dx * max(1.0, min_ridge)
+        if dx > t_min / 3.0:
             required_dim = int(np.ceil(np.max(bbox_size) / (t_min / 3.0)))
-            if required_dim > target_dim and required_dim <= MAX_RES:
-                warnings.warn(
-                    f"Voxel pitch {dx:.3f} mm > t_min/3 ({t_min/3.0:.3f} mm). "
-                    f"Re-voxelizing at dimension {required_dim} to satisfy Nyquist criterion."
-                )
-                target_dim = required_dim
-                grid, origin, dx, repaired_bodies = _voxelize_at_dim(
-                    bodies, target_dim, margin, progress_callback, fix_mesh
-                )
-            elif required_dim > MAX_RES:
-                warnings.warn(
-                    f"Tavsiye edilen çözünürlük ({required_dim}) MAX_RES ({MAX_RES}) aşıyor. "
-                    f"İnce cidarlar (t_min ≈ {t_min:.2f} mm) voxel ağında kopabilir."
-                )
+            warnings.warn(
+                f"Voxel pitch {dx:.3f} mm > t_min/3 ({t_min/3.0:.3f} mm). "
+                f"İnce cidarlar için önerilen çözünürlük {required_dim}, "
+                f"mevcut hedef {target_dim}. 26-komşuluk ve muhafazakar "
+                f"vokselleştirme bağlantıyı korumaya yardımcı olur."
+            )
 
     return grid, origin, dx, repaired_bodies
 
@@ -499,7 +512,7 @@ def build_part_grid(
     """
     part_bodies = [b for b in bodies if b.body_type == BodyType.PART]
     if not part_bodies:
-        return build_voxel_grid(bodies, target_dim=BASE_RES)
+        return build_voxel_grid(bodies, target_dim=BASE_RES, conservative=False)
 
     # Use the part bbox to anchor the resolution, then include nearby casting
     # metal bodies so that sprue/runner/riser thermal mass and connectivity
@@ -508,7 +521,7 @@ def build_part_grid(
     part_size = part_bbox_max - part_bbox_min
     part_max_size = float(part_size.max())
     if part_max_size <= 0.0:
-        return build_voxel_grid(bodies, target_dim=BASE_RES)
+        return build_voxel_grid(bodies, target_dim=BASE_RES, conservative=False)
 
     # Keep casting-metal bodies within one part-size of the part bbox.  This
     # preserves the fine part resolution while still capturing connected gating.
@@ -529,7 +542,7 @@ def build_part_grid(
     size = bbox_max - bbox_min
     max_size = float(size.max())
     if max_size <= 0.0:
-        return build_voxel_grid(bodies, target_dim=BASE_RES)
+        return build_voxel_grid(bodies, target_dim=BASE_RES, conservative=False)
 
     volume = float(np.prod(size))
     if volume > 0.0:
@@ -546,4 +559,71 @@ def build_part_grid(
         part_dim = int(round(max_size / 0.05))
         part_dim = max(60, min(part_dim, max_dim))
 
-    return build_voxel_grid(all_bodies, target_dim=part_dim, progress_callback=None)
+    return build_voxel_grid(all_bodies, target_dim=part_dim, progress_callback=None, conservative=False)
+
+
+def compute_face_fractions(is_metal: np.ndarray, sub: int = 4) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return FAVOR-style fractional face areas for the three grid axes.
+
+    Each returned array has one more element along its corresponding axis
+    than ``is_metal``; its values are in ``[0, 1]``.  The fraction is the
+    area of a voxel face that is actually open to flow, measured by
+    upsampling the binary occupancy and taking the minimum coverage of the
+    two cells that share the face.  This removes the staircase area bloat
+    that makes plain dx*dx face areas wrong on curved/amorphous geometry.
+    """
+    if sub <= 1:
+        nz, ny, nx = is_metal.shape
+        return np.ones((nz + 1, ny, nx)), np.ones((nz, ny + 1, nx)), np.ones((nz, ny, nx + 1))
+
+    zoom = float(sub)
+    fine = ndimage.zoom(is_metal.astype(np.float64), zoom, order=1, mode="nearest")
+    fine = np.clip(fine, 0.0, 1.0)
+
+    Nz, Ny, Nx = fine.shape
+    nz, ny, nx = Nz // sub, Ny // sub, Nx // sub
+    fine = fine[: nz * sub, : ny * sub, : nx * sub]
+
+    # z-faces (axis 0) -- the face between coarse cell (k-1) and (k) is index k.
+    left = np.zeros((nz + 1, ny * sub, nx * sub), dtype=np.float64)
+    right = np.zeros((nz + 1, ny * sub, nx * sub), dtype=np.float64)
+    left[0] = 0.0
+    left[1:-1] = fine[sub - 1 : -1 : sub]
+    left[-1] = fine[-1]
+    right[0] = fine[0]
+    right[1:-1] = fine[sub::sub]
+    right[-1] = 0.0
+    face = np.minimum(left, right)
+    f_z = face.reshape(nz + 1, ny, sub, nx, sub).mean(axis=(2, 4))
+
+    # y-faces (axis 1)
+    left = np.zeros((nz * sub, ny + 1, nx * sub), dtype=np.float64)
+    right = np.zeros((nz * sub, ny + 1, nx * sub), dtype=np.float64)
+    left[:, 0, :] = 0.0
+    left[:, 1:-1, :] = fine[:, sub - 1 : -1 : sub, :]
+    left[:, -1, :] = fine[:, -1, :]
+    right[:, 0, :] = fine[:, 0, :]
+    right[:, 1:-1, :] = fine[:, sub::sub, :]
+    right[:, -1, :] = 0.0
+    face = np.minimum(left, right)
+    f_y = face.reshape(nz, sub, ny + 1, nx, sub).mean(axis=(1, 4))
+
+    # x-faces (axis 2)
+    left = np.zeros((nz * sub, ny * sub, nx + 1), dtype=np.float64)
+    right = np.zeros((nz * sub, ny * sub, nx + 1), dtype=np.float64)
+    left[:, :, 0] = 0.0
+    left[:, :, 1:-1] = fine[:, :, sub - 1 : -1 : sub]
+    left[:, :, -1] = fine[:, :, -1]
+    right[:, :, 0] = fine[:, :, 0]
+    right[:, :, 1:-1] = fine[:, :, sub::sub]
+    right[:, :, -1] = 0.0
+    face = np.minimum(left, right)
+    f_x = face.reshape(nz, sub, ny, sub, nx + 1).mean(axis=(1, 3))
+
+    # Avoid zero fractions on interior faces between two metal cells due to
+    # clipping/sampling; the minimum of two nearly-1 values should stay 1.
+    eps = 1e-3
+    f_z[1:-1] = np.where(f_z[1:-1] < eps, 0.0, f_z[1:-1])
+    f_y[:, 1:-1, :] = np.where(f_y[:, 1:-1, :] < eps, 0.0, f_y[:, 1:-1, :])
+    f_x[:, :, 1:-1] = np.where(f_x[:, :, 1:-1] < eps, 0.0, f_x[:, :, 1:-1])
+    return f_z, f_y, f_x

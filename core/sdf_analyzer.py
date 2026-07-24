@@ -25,7 +25,7 @@ from core.materials import (
     get_mold,
 )
 from core.riser_designer import propose_risers
-from core.thermal_solver import solve_3d_thermal
+from core.thermal_solver import _dscheil_dT, solve_3d_thermal
 from core.voxelizer import build_part_grid
 from core.types import (
     BODY_FEEDER_TYPES,
@@ -242,6 +242,15 @@ def compute_thermal_field(
     solid_fraction = _scheil_fs(
         T, alloy.t_liquidus_c, alloy.t_solidus_c, alloy.partition_coefficient
     )
+    # Latent-heat correction: conduction-only dT/dt is reduced by cp/cp_eff
+    # in the mushy zone where the apparent heat capacity is boosted by L*dfs/dT.
+    if alloy.latent_heat_j_kg > 0:
+        cp0 = alloy.cp_j_kgk
+        dT_mush = max(alloy.t_liquidus_c - alloy.t_solidus_c, 1.0)
+        df_dT = _dscheil_dT(T, alloy.t_liquidus_c, alloy.t_solidus_c, alloy.partition_coefficient)
+        cp_eff = cp0 + alloy.latent_heat_j_kg * np.clip(df_dT, 0.0, 1.0 / dT_mush)
+        cp_eff = np.where(cp_eff > cp0, cp_eff, cp0)
+        cooling_rate = np.where(is_metal, cooling_rate * (cp0 / cp_eff), cooling_rate)
     thermal_divergence = ndimage.laplace(T) / (dx * dx)
     return T, cooling_rate, solid_fraction, thermal_divergence
 
@@ -268,9 +277,12 @@ def compute_niyama(
     Physically-based Niyama criterion N = G / sqrt(R)  [K s^0.5 / mm].
     G is the metal-side temperature gradient required to remove latent +
     superheat, estimated from the Stefan velocity v = M_mod / t_s.  R is the
-    Chvorinov cooling rate ΔT_solid / t_s.  The result is weighted by
-    f = M_mod / sdf so that bulky, sphere-like regions (f < 1) report lower
-    Niyama (higher shrinkage risk) than plates (f ≈ 1).
+    local solidification cooling rate.  If a latent-heat-aware cooling_rate
+    field is supplied, it is used directly; otherwise the Chvorinov-based
+    effective cooling rate explicitly includes the latent-heat temperature
+    equivalent.  The result is weighted by f = M_mod / sdf so that bulky,
+    sphere-like regions (f < 1) report lower Niyama (higher shrinkage risk)
+    than plates (f ≈ 1).
     """
     C = chvorinov_c_from_properties(alloy, mold)
     t_s = np.maximum(compute_chvorinov_t(M_mod, C), 1e-9)
@@ -285,12 +297,22 @@ def compute_niyama(
         alloy.rho_kg_m3 * l_eff * v_solid / (alloy.k_w_mk * 1e6),
         0.0,
     )
-    # Cooling rate from Chvorinov [K/s]
-    R = np.where(
-        sdf > 0,
-        (alloy.t_liquidus_c - alloy.t_solidus_c) / t_s,
-        0.0,
+    # Use supplied latent-heat-aware cooling rate where available.
+    if cooling_rate is not None and cooling_rate.size:
+        R = np.where(
+            np.isfinite(cooling_rate) & (cooling_rate > 1e-12),
+            np.abs(cooling_rate),
+            np.nan,
+        )
+    else:
+        R = np.full_like(t_s, np.nan)
+    # Fallback: effective temperature drop = sensible + latent-heat equivalent.
+    nan_mask = ~np.isfinite(R)
+    dT_eff = (alloy.t_liquidus_c - alloy.t_solidus_c) + alloy.latent_heat_j_kg / max(
+        alloy.cp_j_kgk, 1e-9
     )
+    R = np.where(nan_mask & (sdf > 0), dT_eff / t_s, R)
+    R = np.nan_to_num(R, nan=0.0, posinf=0.0, neginf=0.0)
     with np.errstate(divide="ignore", invalid="ignore"):
         niyama = G / np.sqrt(np.maximum(R, 1e-12))
     # Shape correction: sphere-like regions (f < 1) get lower Niyama
@@ -382,6 +404,9 @@ def compute_pore_size(
     t_s: Optional[np.ndarray] = None,
     feeder_mask: Optional[np.ndarray] = None,
     dx: float = 1.0,
+    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
+    fill_time: Optional[np.ndarray] = None,
+    darcy_factor: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Estimate pore size from the Carlson-Beckermann dimensionless Niyama model.
 
@@ -392,15 +417,23 @@ def compute_pore_size(
     pore_size_um_per_porosity_pct so the macro/micro/fine class thresholds
     (500/50 µm) correspond to physically meaningful volume-fraction levels.
 
+    ``fill_time`` supplies per-voxel metal arrival time (s) so that a feeder reached
+    late is penalised.  ``darcy_factor`` (>1 where pressure head cannot overcome the
+    mushy-zone resistance) directly scales the predicted pore volume in regions
+    where liquid metal cannot be supplied fast enough.
+
     Returns pore_size_um, pore_size_mm, macro_mask, micro_mask, fine_mask,
     shrinkage_pore_size_um, pore_volume_pct.
     """
     valid = part_mask & np.isfinite(niyama) & (niyama > 0.0)
 
-    # Directional feeding: a feeder aligned with the solidification front is
+    # Directional feeding: a feeder aligned with the solidification front and
+    # located above the voxel (opposite to the user-defined gravity vector) is
     # much more effective, but never removes all risk.
     _feeder = feeder_mask if feeder_mask is not None else np.zeros_like(part_mask)
-    feed_eff = directional_feed_efficiency(t_s, _feeder, part_mask, dx)
+    feed_eff = directional_feed_efficiency(
+        t_s, _feeder, part_mask, dx, gravity_vector=gravity_vector, fill_time=fill_time
+    )
     feed_factor = np.power(np.clip(feed_risk, 0.0, 1.0), alloy.feed_risk_exponent) * feed_eff
 
     # Carlson-Beckermann dimensionless Niyama -> shrinkage pore volume %.
@@ -408,7 +441,12 @@ def compute_pore_size(
     b0 = alloy.shrinkage_factor * 100.0  # total solidification shrinkage [%]
     gp_pct = _carlson_gp_pct(ny_star, b0, key=alloy.carlson_curve_key)
     # Apply feeding efficiency; keep zero for invalid (surface/boundary) voxels.
-    gp_pct = np.where(valid, gp_pct * feed_factor, 0.0)
+    # Where hydrostatic/Darcy balance says the pressure head cannot supply enough
+    # liquid, the pore volume is amplified by the supplied darcy_factor.
+    if darcy_factor is not None and darcy_factor.shape == gp_pct.shape:
+        gp_pct = np.where(valid, gp_pct * feed_factor * darcy_factor, 0.0)
+    else:
+        gp_pct = np.where(valid, gp_pct * feed_factor, 0.0)
 
     # Convert predicted volume percentage to a size proxy for visualization/class.
     size_scale = alloy.pore_size_um_per_porosity_pct
@@ -469,19 +507,32 @@ def directional_feed_efficiency(
     dx: float,
     min_eff: float = 0.05,
     max_reduction: float = 0.85,
+    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
+    fill_time: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Return a per-voxel feeding-efficiency factor in [min_eff, 1.0].
 
     The local solidification time gradient points toward the last-freezing
     region.  A riser that lies in that direction can feed the voxel well, so
-    shrinkage risk is reduced.  Where no gradient exists (uniform) the factor
-    is neutral (0.5).  Far from any feeder the factor remains ~1.0.
+    shrinkage risk is reduced.  The user-defined gravity vector is also used:
+    a feeder located above the voxel (opposite to gravity) feeds more
+    effectively because shrinkage voids migrate upward.  Where no gradient
+    exists (uniform) the factor is neutral (0.5).  Far from any feeder the
+    factor remains ~1.0.
+
+    If ``fill_time`` (per-voxel metal arrival time, s) is provided, the metal
+    travel time from the nearest feeder is subtracted from the feeder's available
+    solidification time.  A riser that is reached late, or after the voxel has
+    already started to solidify, cannot feed effectively.
     """
     if t_s is None or not feeder_mask.any():
         return np.ones_like(part_mask, dtype=np.float64)
 
-    # Replace NaN/Inf in t_s so gradients are finite.
-    t_safe = np.nan_to_num(t_s, nan=np.nanmax(t_s) if np.isfinite(t_s).any() else 0.0, posinf=0.0, neginf=0.0)
+    # Replace NaN/Inf in t_s so gradients are finite.  Use the largest finite
+    # solidification time for NaN cells; infinities are explicitly clamped to 0.
+    finite_vals = t_s[np.isfinite(t_s)]
+    t_fill = float(finite_vals.max()) if finite_vals.size > 0 else 0.0
+    t_safe = np.nan_to_num(t_s, nan=t_fill, posinf=0.0, neginf=0.0)
 
     gz, gy, gx = np.gradient(t_safe, dx)
     grad = np.stack([gz, gy, gx], axis=-1)
@@ -499,25 +550,39 @@ def directional_feed_efficiency(
     # grad_dir has channel last; bring diff_dir to same shape.
     diff_dir = np.moveaxis(diff_dir, 0, -1)
 
-    # If the riser is in the direction of the solidification front (+grad t_s),
-    # alignment is positive and feeding is more effective.
-    alignment = np.einsum("...i,...i->...", diff_dir, grad_dir)
-    alignment = np.where(grad_mag > 1e-12, alignment, 0.0)
+    # Thermal alignment: if the riser is in the direction of the solidification
+    # front (+grad t_s), alignment is positive and feeding is more effective.
+    thermal_alignment = np.einsum("...i,...i->...", diff_dir, grad_dir)
+    thermal_alignment = np.where(grad_mag > 1e-12, thermal_alignment, 0.0)
+
+    # Gravity alignment: the riser should be above the voxel (opposite to gravity)
+    # so shrinkage voids migrate upward and the feeder can supply liquid metal.
+    g = np.asarray(gravity_vector, dtype=np.float64)
+    g_norm = float(np.linalg.norm(g)) + 1e-12
+    g = g / g_norm
+    gravity_alignment = np.einsum("...i,i->...", diff_dir, -g)
+
+    # Combine thermal and gravity effects.  Thermal gradient dominates feeding
+    # direction in casting; gravity is a secondary but real modifier (Niyama-based
+    # feeding-distance literature typically gives thermal gradient ~70% weight).
+    alignment = 0.7 * thermal_alignment + 0.3 * gravity_alignment
     alignment = np.clip(alignment, 0.0, 1.0)
 
     # Strong alignment -> strong shrinkage reduction, but never zero (real life baseline).
     # Additionally, if the feeder solidifies before the part voxel it cannot feed it,
-    # so the risk reduction is weakened.
+    # so the risk reduction is weakened.  Use the *nearest* feeder voxel (not the
+    # best feeder everywhere), and subtract the metal travel time from that feeder.
     reduction = max_reduction * alignment
-    t_feeder_max = 0.0
-    if feeder_mask.any():
-        feeder_times = t_safe[feeder_mask]
-        finite_feeder_times = feeder_times[np.isfinite(feeder_times) & (feeder_times > 0.0)]
-        if finite_feeder_times.size > 0:
-            t_feeder_max = float(np.max(finite_feeder_times))
-    if t_feeder_max > 0.0:
-        time_factor = np.clip(t_feeder_max / np.maximum(t_safe, 1e-9), 0.0, 1.0)
-        reduction = reduction * time_factor
+    nearest_t_feeder = np.nan_to_num(t_safe[tuple(nearest)], nan=0.0, posinf=0.0, neginf=0.0)
+    t_feeder = nearest_t_feeder
+    if fill_time is not None and fill_time.size == t_safe.size:
+        fill_feeder = np.nan_to_num(fill_time[tuple(nearest)], nan=0.0, posinf=0.0, neginf=0.0)
+        # Metal reaching the voxel later has had more time to cool in the feeder.
+        travel_time = np.maximum(np.nan_to_num(fill_time, nan=0.0, posinf=0.0, neginf=0.0) - fill_feeder, 0.0)
+        t_feeder = np.maximum(t_feeder - travel_time, 0.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        time_factor = np.clip(t_feeder / np.maximum(t_safe, 1e-9), 0.0, 1.0)
+    reduction = reduction * time_factor
 
     efficiency = 1.0 - reduction
     efficiency = np.clip(efficiency, min_eff, 1.0)
@@ -536,37 +601,6 @@ def _pore_size_class(
     if pore_size_um > 0.0:
         return "fine"
     return ""
-
-
-def pore_size_threshold_um(
-    pore_size_um: np.ndarray,
-    noise_percent: float = 3.0,
-    micro_pore_limit_um: float = 100.0,
-    baseline_um: Optional[float] = None,
-) -> float:
-    """Return the display threshold for porosity.
-
-    It is the larger of (a) the ``noise_percent`` percentile of positive pore
-    sizes and (b) a material baseline floor.  The baseline floor is the material
-    ``gas_pore_baseline_um`` (or the SDAS-derived 0.02*SDAS minimum) halved, so
-    tiny gas pores are still represented without turning the whole part into a
-    cloud.  If ``baseline_um`` is not provided, ``micro_pore_limit_um`` is used
-    as a legacy fallback.
-    """
-    positive = np.asarray(pore_size_um[pore_size_um > 0.0], dtype=np.float64)
-    if len(positive) == 0:
-        return 0.0
-    if noise_percent <= 0.0:
-        return 0.0
-    if noise_percent >= 100.0:
-        return float(np.max(positive)) + 1.0
-    p = 100.0 - noise_percent
-    perc = float(np.percentile(positive, p))
-    if baseline_um is not None and baseline_um > 0.0:
-        floor = baseline_um * 0.5
-    else:
-        floor = micro_pore_limit_um * noise_percent / 100.0
-    return max(perc, floor)
 
 
 def _sdf_histogram(sdf: np.ndarray, mask: np.ndarray, bins: int = 50):
@@ -687,6 +721,7 @@ def find_hotspots(
     chvorinov_c: Optional[float] = None,
     n_time_steps: int = 40,
     niyama: Optional[np.ndarray] = None,
+    feeder_time_factor: float = 1.0,
 ) -> List[HotSpot]:
     """Detect hot spots by pseudo-thermal solidification + CCL (Method 2).
 
@@ -719,6 +754,22 @@ def find_hotspots(
     # Solidification time from shape-corrected modulus (Chvorinov)
     t_solid = chvorinov_c * M_mod * M_mod
     t_solid = np.nan_to_num(t_solid, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Riser thermal attraction: a feeder is a heat reservoir, so it solidifies
+    # later and pulls the last-freezing region toward itself.  The feeder's own
+    # solidification time is boosted by the sleeve/insulation factor and a
+    # Gaussian potential is added to neighbouring metal so the hot spot physically
+    # migrates toward the riser.
+    if feeder_mask is not None and feeder_mask.any() and is_metal is not None:
+        feeder_cells = feeder_mask & is_metal
+        if feeder_cells.any():
+            t_solid[feeder_cells] *= max(1.0, float(feeder_time_factor))
+            dist_to_feeder = ndimage.distance_transform_edt(is_metal & ~feeder_cells) * dx
+            r_feeder = max(float(np.mean(M_mod[feeder_cells])), 2.0 * dx)
+            feeder_late = float(np.percentile(t_solid[feeder_cells], 99.0))
+            with np.errstate(over="ignore", under="ignore"):
+                attraction = feeder_late * np.exp(-(dist_to_feeder / max(r_feeder, 1e-6)) ** 2)
+            t_solid = t_solid + attraction
 
     # Time horizon: use the part, fall back to all metal
     if part_mask.any():
@@ -1081,7 +1132,7 @@ def _trace_path_to_riser(
             break
         best = None
         best_d = dist_to_riser[i, j, k]
-        for di, dj, dk in NEIGH_6:
+        for di, dj, dk in NEIGH_26:
             ni, nj, nk = i + di, j + dj, k + dk
             if not (0 <= ni < shape[0] and 0 <= nj < shape[1] and 0 <= nk < shape[2]):
                 continue
@@ -1159,7 +1210,8 @@ def _path_darcy_and_directional(
     feeder_voxels: Optional[np.ndarray] = None,
     t_liq: Optional[np.ndarray] = None,
     t_sol: Optional[np.ndarray] = None,
-) -> Tuple[float, float, float, bool, bool, float, bool]:
+    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
+) -> Tuple[float, float, float, bool, bool, float, bool, float]:
     """
     Walk the lowest-resistance feeding path from start_vox to a riser and compute:
       * Darcy pressure drop through the mushy zone (Kozeny-Carman)
@@ -1169,10 +1221,11 @@ def _path_darcy_and_directional(
       * Heuver's circle flag
       * total feeding cost
       * darcy_ok flag
+      * feedable_fraction of the shrinkage demand that the hydrostatic head can drive
     """
     path = _trace_cost_path(start_vox, cost_pred, sdf.shape)
     if not path:
-        return 0.0, 0.0, 0.0, True, True, 0.0, True
+        return 0.0, 0.0, 0.0, True, True, 0.0, True, 1.0
 
     m_hot = float(M_mod[start_vox[0], start_vox[1], start_vox[2]])
     # Use the actual 3-D transient solidification time if available
@@ -1182,14 +1235,22 @@ def _path_darcy_and_directional(
         C = chvorinov_c_from_properties(alloy, mold)
         t_s_hot = C * m_hot * m_hot
 
-    # Hydrostatic head from feeders above the hot spot (if any)
+    # Hydrostatic head from feeders above the hot spot (opposite to gravity).
+    # Use the feeder voxel centroid instead of the highest voxel so a long/thin
+    # riser does not artificially inflate the available metal head.
     P_head = 0.0
     if feeder_voxels is not None and len(feeder_voxels) > 0:
-        feeder_z = feeder_voxels[:, 2] * dx  # mm
-        hot_z = start_vox[2] * dx
-        dz_mm = np.max(feeder_z - hot_z)
-        if dz_mm > 0:
-            P_head = alloy.rho_kg_m3 * 9.81 * (dz_mm / 1000.0)
+        g = np.asarray(gravity_vector, dtype=np.float64)
+        g_norm = float(np.linalg.norm(g)) + 1e-12
+        g = g / g_norm
+        feeder_centroid_mm = np.mean(feeder_voxels, axis=0) * dx
+        hot_pos_mm = np.asarray(start_vox, dtype=np.float64) * dx
+        diff = feeder_centroid_mm - hot_pos_mm
+        # Positive projection means the feeder centroid is in the -g direction
+        # (above) relative to the hot spot.
+        head_mm = float(np.dot(diff, -g))
+        if head_mm > 0.0:
+            P_head = alloy.rho_kg_m3 * 9.81 * (head_mm / 1000.0)
 
     # Feeding shrinkage demand: shrinkage of the last-liquid pocket at the hot spot
     hot_M = M_mod[start_vox[0], start_vox[1], start_vox[2]]
@@ -1232,6 +1293,13 @@ def _path_darcy_and_directional(
 
     # Minimum driving head: 1000 Pa ≈ 0.01 atm / ~13 mm metal head
     darcy_ok = (not feed_stopped) and (darcy < max(P_head, 1000.0))
+    # Fraction of the required shrinkage flow that the available hydrostatic head
+    # can actually drive through the mushy-zone resistance.  <1 means the rest becomes
+    # a macro shrinkage cavity.
+    if feed_stopped or P_head <= 0.0:
+        feedable_fraction = 0.0
+    else:
+        feedable_fraction = float(min(1.0, P_head / max(darcy, 1e-9)))
 
     # Heuver / directional checks on the PART portion of the path
     part_path = [v for v in path if part_mask[v[0], v[1], v[2]]]
@@ -1268,15 +1336,18 @@ def _path_darcy_and_directional(
 
     # Directional solidification: solidification time must increase (or stay)
     # toward the feeder.  A drop means a cold pocket blocking feeding.
+    # Non-finite values (not reached in the thermal horizon) are treated as
+    # very late so they do not produce artificial drops.
     directional_ok = True
     if has_thermal and len(part_path) > 4:
         t_path = np.array([float(t_sol[v[0], v[1], v[2]]) for v in part_path])
+        t_path = np.nan_to_num(t_path, nan=1e6, posinf=1e6, neginf=0.0)
         tol = max(0.05 * t_s_hot, 1.0)
         if np.any(np.diff(t_path[1:]) < -tol):
             directional_ok = False
 
     feeding_cost = float(cost_grid[start_vox[0], start_vox[1], start_vox[2]])
-    return darcy, min_neck_m, t_s_hot, directional_ok, heuvers_ok, feeding_cost, darcy_ok
+    return darcy, min_neck_m, t_s_hot, directional_ok, heuvers_ok, feeding_cost, darcy_ok, feedable_fraction
 
 
 def _sphere_mask(
@@ -1293,26 +1364,18 @@ def _sphere_mask(
 def _ingate_contact_m(
     grid: np.ndarray, sdf: np.ndarray, part_mask: np.ndarray, dx: float
 ) -> float:
-    """Average SDF (modulus) of part voxels touching an ingate."""
+    """Average SDF (modulus) of part voxels 26-neighbouring an ingate."""
     ingate = grid == BodyType.INGATE
     if not ingate.any():
         return 0.0
-    touch = np.zeros_like(part_mask)
-    for di, dj, dk in NEIGH_6:
-        rolled = np.roll(ingate, (di, dj, dk), axis=(0, 1, 2))
-        if di > 0:
-            rolled[-1, :, :] = False
-        elif di < 0:
-            rolled[0, :, :] = False
-        if dj > 0:
-            rolled[:, -1, :] = False
-        elif dj < 0:
-            rolled[:, 0, :] = False
-        if dk > 0:
-            rolled[:, :, -1] = False
-        elif dk < 0:
-            rolled[:, :, 0] = False
-        touch |= rolled & part_mask
+    # 26-neighbour dilation marks every cavity cell that touches an ingate voxel
+    # through a face, edge or corner.  border_value=0 prevents wrap-around.
+    dilated = ndimage.binary_dilation(
+        ingate,
+        structure=np.ones((3, 3, 3), dtype=bool),
+        border_value=False,
+    )
+    touch = dilated & part_mask
     vals = sdf[touch]
     if len(vals) == 0:
         return 0.0
@@ -1387,6 +1450,7 @@ def _refine_region(
         cropped_bodies,
         target_dim=target_dim,
         progress_callback=progress_callback,
+        conservative=False,
     )
     is_metal = np.isin(grid, BODY_METAL_TYPES)
     sdf = compute_sdf(is_metal, dx)
@@ -1438,6 +1502,7 @@ def _high_res_part_hotspots(
     alloy: Alloy,
     mold: MoldMaterial,
     cluster_eps_mm: Optional[float] = None,
+    min_size_mm: Optional[float] = None,
     progress_callback: Optional[callable] = None,
 ) -> Optional[List[HotSpot]]:
     """Build a high-resolution grid containing the PART and connected casting-metal
@@ -1505,10 +1570,16 @@ def _high_res_part_hotspots(
     # Guard against a completely missing feeder: in that case the CCL cannot mark
     # anything as fed and every liquid pocket becomes isolated, which is fine.
     max_part_sdf = float(part_sdf[part_mask].max()) if part_mask.any() else 0.0
-    hotspot_min_size_mm = min(2.0, max(0.5, 0.5 * max_part_sdf))
+    hotspot_min_size_mm = (
+        min_size_mm
+        if min_size_mm is not None and min_size_mm > 0.0
+        else min(2.0, max(0.5, 0.5 * max_part_sdf))
+    )
     # Use the scale-aware caller-supplied cluster distance if available.
     if cluster_eps_mm is None:
         cluster_eps_mm = max(12.0, 2.0 * part_dx)
+
+    feeder_time_factor = _weighted_feeder_time_factor(bodies)
 
     if progress_callback:
         progress_callback(83)
@@ -1531,6 +1602,7 @@ def _high_res_part_hotspots(
         feeder_mask=part_feeder_mask,
         chvorinov_c=chvorinov_c,
         niyama=part_niyama,
+        feeder_time_factor=feeder_time_factor,
     )
     return part_hotspots
 
@@ -1549,6 +1621,8 @@ def _feeder_time_factor(body: Body) -> float:
         "insulated": 1.2,
         "sleeve": 1.1,
         "chilled": 0.8,
+        "side": 1.0,
+        "blind": 1.0,
     }.get(ftype, 1.0)
 
 
@@ -1576,6 +1650,20 @@ def _apply_feeder_sleeve_time_factor(
     finite_sol = riser_mask & np.isfinite(t_sol)
     t_liq[finite_liq] = t_liq[finite_liq] * factor
     t_sol[finite_sol] = t_sol[finite_sol] * factor
+
+
+def _weighted_feeder_time_factor(bodies: List[Body]) -> float:
+    """Volume-weighted solidification-time multiplier for all riser bodies."""
+    riser_bodies = [b for b in bodies if b.body_type == BodyType.RISER]
+    if not riser_bodies:
+        return 1.0
+    total_volume = sum(max(b.volume_cm3, 1e-9) for b in riser_bodies)
+    if total_volume <= 0.0:
+        return 1.0
+    return sum(
+        _feeder_time_factor(b) * max(b.volume_cm3, 1e-9) / total_volume
+        for b in riser_bodies
+    )
 
 
 def _run_filling_flow(
@@ -1712,6 +1800,12 @@ def analyze(
         if casting_params is not None
         else (0.0, 0.0, -1.0)
     )
+    g_unit = np.asarray(gravity_vector, dtype=np.float64)
+    g_norm = float(np.linalg.norm(g_unit))
+    if g_norm > 1e-12:
+        g_unit = g_unit / g_norm
+    else:
+        g_unit = np.array([0.0, 0.0, -1.0])
     bbox_size = np.array(grid.shape) * dx
 
     is_metal = np.isin(grid, BODY_METAL_TYPES)
@@ -1829,6 +1923,9 @@ def analyze(
         except Exception as exc:
             if isinstance(exc, GatingVelocityError):
                 raise
+            import traceback
+            print("[Darcy exception]", exc)
+            traceback.print_exc()
             pass
 
     # AŞAMA 3: Full 3-D transient enthalpy thermal solver (downsampled for speed)
@@ -1880,8 +1977,27 @@ def analyze(
 
     # AŞAMA 5: Hot spot detection (medial axis + DBSCAN + curvature)
     max_part_sdf = float(sdf[part_mask].max()) if part_mask.any() else 0.0
-    hotspot_min_size_mm = min(2.0, max(0.5, 0.5 * max_part_sdf))
-    hotspot_cluster_mm = _hotspot_cluster_threshold(dominant_m, bbox_size, dx)
+    user_min_size = (
+        casting_params.hotspot_min_size_mm
+        if casting_params is not None and casting_params.hotspot_min_size_mm > 0.0
+        else 0.0
+    )
+    user_cluster = (
+        casting_params.hotspot_cluster_eps_mm
+        if casting_params is not None and casting_params.hotspot_cluster_eps_mm > 0.0
+        else 0.0
+    )
+    hotspot_min_size_mm = (
+        user_min_size
+        if user_min_size > 0.0
+        else min(2.0, max(0.5, 0.5 * max_part_sdf))
+    )
+    hotspot_cluster_mm = (
+        user_cluster
+        if user_cluster > 0.0
+        else _hotspot_cluster_threshold(dominant_m, bbox_size, dx)
+    )
+    feeder_time_factor = _weighted_feeder_time_factor(bodies)
     hotspots = find_hotspots(
         sdf, part_mask, dx, origin_mm, curvature=mean_curv, use_skeleton=True,
         min_size_mm=hotspot_min_size_mm,
@@ -1890,6 +2006,7 @@ def analyze(
         feeder_mask=feeder_mask,
         chvorinov_c=chvorinov_c,
         niyama=niyama,
+        feeder_time_factor=feeder_time_factor,
     )
     if progress_callback:
         progress_callback(75)
@@ -1923,6 +2040,7 @@ def analyze(
             alloy,
             mold,
             cluster_eps_mm=hotspot_cluster_mm,
+            min_size_mm=hotspot_min_size_mm,
             progress_callback=progress_callback,
         )
         if part_hotspots is not None and part_hotspots:
@@ -1953,6 +2071,7 @@ def analyze(
             fhs.directional_ok = True
             fhs.heuvers_ok = True
             fhs.darcy_ok = True
+            fhs.dist_to_riser_mm = 0.0
 
     if progress_callback:
         progress_callback(84)
@@ -1970,6 +2089,9 @@ def analyze(
 
     # AŞAMA 7: Hot-spot physics
     feeder_voxels = np.argwhere(feeder_mask)
+    # Hydraulic feeding factor: 1.0 everywhere, locally amplified where the
+    # hydrostatic head cannot overcome the Darcy resistance along the feeding path.
+    darcy_factor = np.ones(grid.shape, dtype=np.float64)
 
     for hs in hotspots:
         vox_raw = np.round((hs.position_mm - origin_mm) / dx).astype(int)
@@ -2001,7 +2123,7 @@ def analyze(
                 hs.position_mm, cost_feed, origin_mm, dx, order=1, default=0.0
             )
 
-            darcy, min_neck_m, t_hs, directional_ok, heuvers_ok, feeding_cost, darcy_ok = _path_darcy_and_directional(
+            darcy, min_neck_m, t_hs, directional_ok, heuvers_ok, feeding_cost, darcy_ok, feedable_fraction = _path_darcy_and_directional(
                 sdf,
                 M_mod,
                 cost_feed,
@@ -2014,12 +2136,27 @@ def analyze(
                 feeder_voxels=feeder_voxels,
                 t_liq=t_liq,
                 t_sol=t_s,
+                gravity_vector=gravity_vector,
             )
             hs.darcy_resistance = darcy
+            hs.feedable_fraction = feedable_fraction
             hs.min_neck_m_mm = min_neck_m
             hs.directional_ok = directional_ok
             hs.heuvers_ok = heuvers_ok
             hs.darcy_ok = darcy_ok
+
+            # Where the pressure head cannot drive the shrinkage demand through the
+            # mushy-zone resistance, the pore volume grows.  Amplify darcy_factor
+            # around this hot spot (1/f, clamped so the factor stays finite).
+            if feedable_fraction < 1.0:
+                local_factor = 1.0 / max(float(feedable_fraction), 0.1)
+                sphere = _sphere_mask(
+                    grid.shape,
+                    np.array(vox, dtype=np.float64),
+                    max(3.0 * hs.m_value_mm / dx, 3.0),
+                )
+                darcy_factor[sphere] = np.maximum(darcy_factor[sphere], local_factor)
+
             hs.curvature_mean = _sample_field_at_position(
                 hs.position_mm, mean_curv, origin_mm, dx, order=1, default=0.0
             )
@@ -2037,16 +2174,20 @@ def analyze(
 
             if len(feeder_voxels) > 0:
                 feeder_positions_mm = feeder_voxels * dx + origin_mm
-                dz = feeder_positions_mm[:, 2] - hs.position_mm[2]
+                diff_to_feeder = feeder_positions_mm - hs.position_mm
+                # Project the feeder-to-hot-spot vector onto the gravity-opposite
+                # direction.  A feeder above the hot spot increases effective
+                # feeding distance; a feeder at the same level or below gives no
+                # bonus (max(0, ...)).
+                gravity_proj = np.dot(diff_to_feeder, -g_unit)
                 closest_feeder_idx = int(
-                    np.argmin(np.linalg.norm(feeder_positions_mm - hs.position_mm, axis=1))
+                    np.argmin(np.linalg.norm(diff_to_feeder, axis=1))
                 )
-                dz_closest = dz[closest_feeder_idx]
+                proj_closest = gravity_proj[closest_feeder_idx]
                 hs.gravity_factor = 1.0 + 0.3 * max(
-                    0.0, dz_closest / max(hs.dist_to_riser_mm, 1.0)
+                    0.0, proj_closest / max(hs.dist_to_riser_mm, 1.0)
                 )
             else:
-                dz_closest = 0.0
                 hs.gravity_factor = 1.0
 
             # FD = feed_k1 * t_section (t_section = 2 * M_mod)
@@ -2083,12 +2224,6 @@ def analyze(
     # ID 0 means "no riser" and keeps the default factor 1.0.
     riser_factor_map = np.zeros(grid.shape, dtype=np.int32)
     factor_by_id = [1.0]
-    g_unit = np.asarray(gravity_vector, dtype=np.float64)
-    g_norm = float(np.linalg.norm(g_unit))
-    if g_norm > 1e-12:
-        g_unit = g_unit / g_norm
-    else:
-        g_unit = np.array([0.0, 0.0, -1.0])
     for body in bodies:
         if body.body_type != BodyType.RISER:
             continue
@@ -2145,6 +2280,8 @@ def analyze(
             "insulated": 1.2,
             "sleeve": 1.1,
             "chilled": 0.8,
+            "side": 1.0,
+            "blind": 1.0,
         }.get(feeder_type, 1.0)
         # Volume yield: exothermic mini-risers supply the same modulus with less metal.
         feeder_volume_yield = {
@@ -2153,6 +2290,8 @@ def analyze(
             "insulated": 0.8,
             "sleeve": 0.9,
             "chilled": 1.2,
+            "side": 1.0,
+            "blind": 1.0,
         }.get(feeder_type, 1.0)
 
         # If the user entered an explicit feeder modulus, use it as the base modulus.
@@ -2168,12 +2307,19 @@ def analyze(
         global_m_required = alloy.riser_m_factor * m_cast_mm
         m_required = max(local_m_required, global_m_required)
         # v9.1: use the actual gravity vector, not only Z.
+        # gravity_proj > 0  -> riser centroid is ABOVE the hotspot (g points down)
+        # gravity_proj < 0  -> riser centroid is BELOW the hotspot.
+        # Above => smaller required modulus (gravity assists feeding);
+        # below => larger required modulus.  Coefficient 0.002 / mm means
+        # ~20% modulus change per 100 mm vertical offset, capped between 0.6 and
+        # 3.0 to keep engineering results sane while still penalising an
+        # upside-down feeder much harder than the old 0.85 floor.
         riser_centroid_mm = riser_centroid_vox * dx + origin_mm
         if nearest_hs is not None:
-            dz = float(np.dot(nearest_pos - riser_centroid_mm, g_unit))
+            gravity_proj = float(np.dot(nearest_pos - riser_centroid_mm, g_unit))
         else:
-            dz = 0.0
-        gravity = max(0.85, 1.0 - 0.005 * max(0, -dz))
+            gravity_proj = 0.0
+        gravity = float(np.clip(1.0 - 0.002 * gravity_proj, 0.6, 3.0))
         # v9.1: convert Darcy pressure drop (Pa) to an equivalent metal head (mm).
         rho_g = max(alloy.rho_kg_m3 * 9.81, 1e-6)
         resistance_correction = (nearest_resistance / rho_g) * 1000.0
@@ -2256,7 +2402,17 @@ def analyze(
 
     # v8.8: estimate pore size from the Carlson-Beckermann dimensionless Niyama model.
     pore_size_um, pore_size_mm, pore_macro_mask, pore_micro_mask, pore_fine_mask, pore_shrinkage_um, pore_volume_pct = compute_pore_size(
-        niyama, M_mod, feed_risk, alloy, part_mask, t_s=t_s, feeder_mask=feeder_mask, dx=dx
+        niyama,
+        M_mod,
+        feed_risk,
+        alloy,
+        part_mask,
+        t_s=t_s,
+        feeder_mask=feeder_mask,
+        dx=dx,
+        gravity_vector=gravity_vector,
+        fill_time=fill_time_s,
+        darcy_factor=darcy_factor,
     )
 
     # AŞAMA 9: Risk map aligned with the Carlson-Beckermann porosity volume.
@@ -2269,37 +2425,15 @@ def analyze(
     risk = np.where(part_mask, risk, 0.0)
     risk = np.nan_to_num(risk, nan=0.0, posinf=0.0, neginf=0.0)
     risk_norm = risk
-    # v8.9: per-class display filters (macro top 60%, micro top 40%, fine top 20%).
-    baseline_min_um = max(alloy.gas_pore_baseline_um, alloy.dendrite_spacing_mm * 1000.0 * 0.02)
-    pore_macro_percent = 60.0
-    pore_micro_percent = 40.0
-    pore_fine_percent = 20.0
-    # v9.2: thresholds are computed on the shrinkage-only field so that the
-    # gas/oxide baseline does not dominate the percentile thresholds.
-    pore_threshold_um = pore_size_threshold_um(
-        pore_shrinkage_um,
-        pore_macro_percent,
-        micro_pore_limit_um=alloy.micro_pore_limit_um,
-        baseline_um=baseline_min_um,
-    )
-    pore_macro_threshold_um = pore_size_threshold_um(
-        np.where(pore_macro_mask, pore_shrinkage_um, 0.0),
-        pore_macro_percent,
-        micro_pore_limit_um=alloy.micro_pore_limit_um,
-        baseline_um=baseline_min_um,
-    )
-    pore_micro_threshold_um = pore_size_threshold_um(
-        np.where(pore_micro_mask, pore_shrinkage_um, 0.0),
-        pore_micro_percent,
-        micro_pore_limit_um=alloy.micro_pore_limit_um,
-        baseline_um=baseline_min_um,
-    )
-    pore_fine_threshold_um = pore_size_threshold_um(
-        np.where(pore_fine_mask, pore_shrinkage_um, 0.0),
-        pore_fine_percent,
-        micro_pore_limit_um=alloy.micro_pore_limit_um,
-        baseline_um=baseline_min_um,
-    )
+    # Class thresholds are taken directly from the alloy's physical micron
+    # limits; no empirical top-percent filters are used.
+    pore_macro_threshold_um = float(alloy.macro_pore_limit_um)
+    pore_micro_threshold_um = float(alloy.micro_pore_limit_um)
+    pore_fine_threshold_um = 0.0
+    pore_threshold_um = pore_macro_threshold_um
+    pore_macro_percent = 0.0
+    pore_micro_percent = 0.0
+    pore_fine_percent = 0.0
 
     # Assign pore-size estimate to each hot spot and re-evaluate feed_ok with
     # the riser-size-modulated feeding distance.

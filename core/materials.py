@@ -235,6 +235,7 @@ ALLOYS: Dict[str, Alloy] = {
         feed_k2=0.0,
         niyama_macro=0.775,
         niyama_shrinkage=1.5,
+        carlson_curve_key="WCB",
     ),
     "42CrMo4": Alloy(
         key="42CrMo4",
@@ -256,6 +257,7 @@ ALLOYS: Dict[str, Alloy] = {
         feed_k2=0.0,
         niyama_macro=0.775,
         niyama_shrinkage=1.5,
+        carlson_curve_key="WCB",
     ),
     "bronze": Alloy(
         key="bronze",
@@ -277,6 +279,7 @@ ALLOYS: Dict[str, Alloy] = {
         feed_k2=0.0,
         niyama_macro=0.775,
         niyama_shrinkage=1.5,
+        carlson_curve_key="WCB",
     ),
 }
 
