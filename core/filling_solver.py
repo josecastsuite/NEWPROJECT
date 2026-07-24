@@ -502,73 +502,98 @@ def _build_laplace_matrix(
         data.extend((-diag[non_dirichlet]).tolist())
 
     A = csr_matrix((data, (rows, cols)), shape=(n_unknowns, n_unknowns))
-    return A, rhs, flat_idx
+    return A, rhs, flat_idx, dirichlet_unknowns, dirichlet_value[cavity]
 
 
 def _solve_pressure(
     A: csr_matrix,
     rhs: np.ndarray,
+    dirichlet_unknowns: np.ndarray,
+    dirichlet_value: np.ndarray,
 ) -> np.ndarray:
     """Solve the sparse SPD pressure system with PCG + a Jacobi or ILU(0) preconditioner.
 
-    The direct ``spsolve`` factorisation is only used as a last-resort safety net
-    for very small systems because it can consume huge amounts of RAM on
-    million-cell grids.
+    The interior discretisation matrix is a weighted graph Laplacian that is
+    symmetric negative-definite once Dirichlet (inlet/vent) cells are fixed.
+    We therefore solve the reduced system for the non-Dirichlet unknowns on
+    ``-A``, which is symmetric positive-definite.  The direct ``spsolve``
+    factorisation is only used as a last-resort safety net for very small
+    systems because it can consume huge amounts of RAM on million-cell grids.
     """
     n = A.shape[0]
+    is_dir = np.asarray(dirichlet_unknowns, dtype=bool)
+    red = ~is_dir
 
-    # 1) Jacobi-preconditioned CG.  Zero extra memory, fast setup, and the
-    # method of choice for large systems where ILU factorisation is too expensive.
-    try:
-        diag = A.diagonal()
-        safe_diag = np.where(np.abs(diag) > 1e-18, diag, 1.0)
-        inv_diag = 1.0 / safe_diag
-        M = spla.LinearOperator((n, n), matvec=lambda x: inv_diag * x)
-        p, info = spla.cg(
-            A, rhs, M=M, atol=0.0, rtol=1e-7, maxiter=min(10000, n + 1000)
-        )
-        if info == 0:
-            return p
-        print(f"[Darcy solver] PCG+Jacobi failed info={info}")
-    except Exception as exc:
-        print(f"[Darcy solver] PCG+Jacobi exception: {exc}")
+    p = np.empty(n, dtype=np.float64)
+    if is_dir.any():
+        p[is_dir] = dirichlet_value[is_dir]
+    else:
+        # No Dirichlet fixed: pressure is defined up to a constant; anchor one
+        # cell to make the reduced system SPD.
+        is_dir = np.zeros(n, dtype=bool)
+        is_dir[0] = True
+        p[is_dir] = 0.0
+        red[0] = False
 
-    # 2) ILU(0) preconditioned CG for moderate systems.  ILU(0) keeps the same
-    # sparsity as A, so it is much cheaper than a complete LU factorisation.
-    if n <= 500_000:
+    def _cg_solve(A_spd, b_spd, n_red):
+        # 1) Jacobi-preconditioned CG.
         try:
-            A_csc = A.tocsc()
-            ilu = spla.spilu(
-                A_csc,
-                drop_tol=1e-6,
-                fill_factor=1.5,
-                diag_pivot_thresh=0.0,
-                options={"ColPerm": "NATURAL"},
-            )
-            M = spla.LinearOperator((n, n), matvec=ilu.solve)
-            p, info = spla.cg(
-                A, rhs, M=M, atol=0.0, rtol=1e-8, maxiter=min(5000, n + 1000)
+            diag = A_spd.diagonal()
+            safe_diag = np.where(np.abs(diag) > 1e-18, diag, 1.0)
+            inv_diag = 1.0 / safe_diag
+            M = spla.LinearOperator((n_red, n_red), matvec=lambda x: inv_diag * x)
+            x, info = spla.cg(
+                A_spd, b_spd, M=M, atol=0.0, rtol=1e-7, maxiter=min(10000, n_red + 1000)
             )
             if info == 0:
-                return p
-            print(f"[Darcy solver] PCG+ILU failed info={info}")
+                return x
+            print(f"[Darcy solver] PCG+Jacobi failed info={info}")
         except Exception as exc:
-            print(f"[Darcy solver] PCG+ILU exception: {exc}")
+            print(f"[Darcy solver] PCG+Jacobi exception: {exc}")
 
-    # 3) Direct solve only as a safety net for small systems.
-    if n < 100_000:
-        try:
-            p = spla.spsolve(A, rhs)
-            if not np.isfinite(p).all():
-                print("[Darcy solver] spsolve produced non-finite values")
-                p = np.zeros_like(rhs)
-            return p
-        except Exception as exc:
-            print(f"[Darcy solver] spsolve failed: {exc}")
+        # 2) ILU(0) preconditioned CG for moderate systems.
+        if n_red <= 500_000:
+            try:
+                A_csc = A_spd.tocsc()
+                ilu = spla.spilu(
+                    A_csc,
+                    drop_tol=1e-6,
+                    fill_factor=1.5,
+                    diag_pivot_thresh=0.0,
+                    options={"ColPerm": "NATURAL"},
+                )
+                M = spla.LinearOperator((n_red, n_red), matvec=ilu.solve)
+                x, info = spla.cg(
+                    A_spd, b_spd, M=M, atol=0.0, rtol=1e-8, maxiter=min(5000, n_red + 1000)
+                )
+                if info == 0:
+                    return x
+                print(f"[Darcy solver] PCG+ILU failed info={info}")
+            except Exception as exc:
+                print(f"[Darcy solver] PCG+ILU exception: {exc}")
 
-    # 4) Last resort: zero pressure.
-    print("[Darcy solver] all pressure solvers failed; returning zero pressure")
-    return np.zeros_like(rhs)
+        # 3) Direct solve only as a safety net for small systems.
+        if n_red < 100_000:
+            try:
+                x = spla.spsolve(A_spd, b_spd)
+                if not np.isfinite(x).all():
+                    print("[Darcy solver] spsolve produced non-finite values")
+                    x = np.zeros_like(b_spd)
+                return x
+            except Exception as exc:
+                print(f"[Darcy solver] spsolve failed: {exc}")
+
+        # 4) Last resort: zero pressure.
+        print("[Darcy solver] all pressure solvers failed; returning zero pressure")
+        return np.zeros_like(b_spd)
+
+    if red.any():
+        A_red = A[red][:, red]
+        A_spd = -A_red
+        b_spd = -rhs[red]
+        p[red] = _cg_solve(A_spd, b_spd, int(red.sum()))
+
+    return p
 
 
 def _face_velocities(
@@ -1487,17 +1512,71 @@ def _gating_node_velocities(
         )
 
     # ------------------------------------------------------------------
-    # Projected Darcy flux integration (FAVOR).
-    # The main flow axis V_flow for a contact is the mean interface normal,
-    # oriented downstream (from the upstream component to the downstream one).
-    # Each shared voxel face contributes its true normal flux v_normal * A_real
-    # projected onto V_flow, giving the real cross-sectional area A_proj and the
-    # physically consistent Q = v_axis * A_proj.
+    # Real 3B Darcy flux / projected-area integration (FAVOR).
+    #
+    # Each orthogonal face separating two components contributes its exact
+    # volumetric flux v_n * A_real, signed by the upstream/downstream
+    # orientation found by the BFS.  The projected cross-sectional area is the
+    # area of that face projected onto a plane perpendicular to the component
+    # flow axis, so the reported velocity satisfies Q = v * A with the true
+    # CAD section.
     # ------------------------------------------------------------------
+    def _component_flow_axis(mesh, btype) -> np.ndarray:
+        if mesh is None or len(mesh.faces) == 0:
+            return -g_u.copy()
+        try:
+            obb = mesh.bounding_box_oriented
+            R = obb.primitive.transform[:3, :3]
+            extents = np.asarray(obb.primitive.extents, dtype=np.float64)
+            order = np.argsort(extents)
+            choke_types = {BodyType.SPRUE_THROAT, BodyType.POURING_BASIN, BodyType.RISER}
+            runner_types = {
+                BodyType.SPRUE, BodyType.INGATE, BodyType.RUNNER,
+                BodyType.DISTRIBUTOR, BodyType.CURUFLUK, BodyType.FILTER,
+            }
+            if btype in choke_types:
+                axis = R[:, order[0]]  # shortest = flow axis
+            elif btype in runner_types:
+                axis = R[:, order[2]]  # longest = flow axis
+            else:
+                if float(extents[order[0]] / (extents[order[2]] + 1e-18)) < 0.35:
+                    axis = R[:, order[0]]
+                else:
+                    axis = R[:, order[2]]
+            axis = np.asarray(axis, dtype=np.float64)
+            n = float(np.linalg.norm(axis))
+            if n > 1e-18:
+                axis = axis / n
+            return axis
+        except Exception:
+            return -g_u.copy()
+
+    comp_flow_axis: Dict[int, np.ndarray] = {}
+    for cid, (btype, _) in comp_meta.items():
+        if cid == part_id:
+            continue
+        body = comp_body.get(cid)
+        if body is None:
+            comp_flow_axis[cid] = -g_u.copy()
+        else:
+            comp_flow_axis[cid] = _component_flow_axis(body.mesh, btype)
+
     flux_pair = np.zeros(n_keys, dtype=np.float64)
     area_pair = np.zeros(n_keys, dtype=np.float64)
     V_flow_array = np.zeros((3, n_keys), dtype=np.float64)
+    up_by_key = np.zeros(n_keys, dtype=np.int32)
+    down_by_key = np.zeros(n_keys, dtype=np.int32)
     contact_keys = np.zeros(n_keys, dtype=bool)
+
+    def _contact_flow_axis(up: int, down: int) -> np.ndarray:
+        # Use the axis of the gating element that actually defines the throat.
+        # For throat->sprue this is the throat axis; for sprue->ingate the ingate
+        # axis; for ingate->part the ingate axis.
+        down_btype = comp_meta[down][0]
+        if down == part_id or down_btype == BodyType.SPRUE:
+            return comp_flow_axis.get(up, -g_u.copy())
+        return comp_flow_axis.get(down, -g_u.copy())
+
     for c in contacts:
         up = c.get("up_id")
         down = c.get("down_id")
@@ -1505,15 +1584,9 @@ def _gating_node_velocities(
             continue
         k = int(min(up, down)) * mult + int(max(up, down))
         contact_keys[k] = True
-        n_mean = np.asarray(c.get("normal", -g_u), dtype=np.float64)
-        downstream = comp_centroids[down] - comp_centroids[up]
-        if np.dot(n_mean, downstream) < 0:
-            n_mean = -n_mean
-        n_norm = float(np.linalg.norm(n_mean))
-        if n_norm > 1e-12:
-            V_flow_array[:, k] = n_mean / n_norm
-        else:
-            V_flow_array[:, k] = -g_u
+        up_by_key[k] = int(up)
+        down_by_key[k] = int(down)
+        V_flow_array[:, k] = _contact_flow_axis(up, down)
 
     use_face = (
         u_m_s is not None
@@ -1580,7 +1653,6 @@ def _gating_node_velocities(
             nk_idx = nk_idx[in_contact]
 
             if use_face:
-                # Staggered face velocities in (z, y, x) component order.
                 if di == 1:
                     v0 = u_m_s[ni_idx, gj_j, gk_k]
                     v1 = v_m_s[ni_idx, gj_j, gk_k]
@@ -1603,30 +1675,35 @@ def _gating_node_velocities(
                 v = 0.5 * (v_ref + v_nb)
                 f_A_face = np.ones_like(v_ref[0])
 
+            up_k = up_by_key[k_arr]
+            down_k = down_by_key[k_arr]
+            # sign = +1 when the lower-index cell id_a is upstream; then the
+            # face normal (di,dj,dk) already points from up to down.
+            sign = np.where(id_a_v[in_contact] == up_k, 1.0, -1.0).astype(np.float64)
             V_flow = V_flow_array[:, k_arr]
             n_vec = np.array([float(di), float(dj), float(dk)], dtype=np.float64)
-            # Use the face-normal Darcy velocity.  Faces whose normal is nearly
-            # parallel to the flow do not form part of the cross-section and are
-            # excluded from both A_proj and Q.
             v_normal = np.einsum("i,ij->j", n_vec, v)
-            n_dot = np.einsum("i,ij->j", n_vec, V_flow)
-            cos_active = np.abs(n_dot)
-            active = cos_active > 0.1
+            # The face normal from up to down may be +/- the coordinate axis;
+            # the sign above accounts for the +/- direction.  cos is the
+            # projection of the face area onto the plane perpendicular to V_flow.
+            cos = np.abs(np.einsum("i,ij->j", n_vec, V_flow))
+            active = cos > 0.1
             A_proj = np.where(
                 active,
-                area_face * f_A_face * cos_active,
+                area_face * f_A_face * cos,
                 0.0,
             )
+            # Exact volumetric flux from the up component to the down component.
             Q_face = np.where(
                 active,
-                v_normal * area_face * f_A_face * np.sign(n_dot),
+                sign * v_normal * area_face * f_A_face,
                 0.0,
             )
 
             flux_pair += np.bincount(k_arr, weights=Q_face, minlength=n_keys)
             area_pair += np.bincount(k_arr, weights=A_proj, minlength=n_keys)
 
-    # Assign the projected Darcy flux and real contact area to each contact.
+    # Assign the integrated Darcy flux and projected contact area to each contact.
     for c in contacts:
         up = c.get("up_id")
         down = c.get("down_id")
@@ -1639,40 +1716,18 @@ def _gating_node_velocities(
     def _component_cad_area_m2(mesh, btype) -> float:
         """Return the analytical minimum cross-sectional area of a gating body.
 
-        The flow axis is chosen by component type:
-        - Choke / thin disk (SPRUE_THROAT, POURING_BASIN, RISER): flow along the
-          shortest OBB extent; area is the perpendicular face.
-        - Runner / ingate / sprue (SPRUE, INGATE, RUNNER, DISTRIBUTOR,
-          CURUFLUK, FILTER): flow along the longest OBB extent; area is the
-          perpendicular cross-section.
-        The section is taken at the body centroid and a small sweep around it,
-        returning the minimum finite area so the true choke is captured.
+        The flow axis is taken from the same OBB-based rule used for the Darcy
+        flux integration, so the analytical section is perpendicular to the
+        actual flow direction.  The section is swept around the body centroid
+        and the minimum finite area is returned, capturing the true choke.
         """
         if mesh is None or len(mesh.faces) == 0:
             return 0.0
         try:
-            obb = mesh.bounding_box_oriented
-            R = obb.primitive.transform[:3, :3]
-            extents = np.asarray(obb.primitive.extents, dtype=np.float64)
-            order = np.argsort(extents)
-            choke_types = {BodyType.SPRUE_THROAT, BodyType.POURING_BASIN, BodyType.RISER}
-            runner_types = {
-                BodyType.SPRUE, BodyType.INGATE, BodyType.RUNNER,
-                BodyType.DISTRIBUTOR, BodyType.CURUFLUK, BodyType.FILTER,
-            }
-            if btype in choke_types:
-                axis = R[:, order[0]]  # shortest dimension = through-flow axis
-            elif btype in runner_types:
-                axis = R[:, order[2]]  # longest dimension = runner axis
-            else:
-                # Fallback: treat thin disks as chokes, everything else as runners.
-                if float(extents[order[0]] / (extents[order[2]] + 1e-18)) < 0.35:
-                    axis = R[:, order[0]]
-                else:
-                    axis = R[:, order[2]]
-            axis = np.asarray(axis, dtype=np.float64)
-            axis = axis / (np.linalg.norm(axis) + 1e-18)
+            axis = _component_flow_axis(mesh, btype)
             origin = mesh.vertices.mean(axis=0)
+            obb = mesh.bounding_box_oriented
+            extents = np.asarray(obb.primitive.extents, dtype=np.float64)
             L = float(np.max(extents)) * 0.25
             best = float("inf")
             steps = np.linspace(-L, L, 11)
@@ -1798,22 +1853,63 @@ def _gating_node_velocities(
                 f"Düğüm hızları çözülemedi: {comp_meta[cid][1]} elemanının toplam çıkış kesit alanı sıfır. "
                 "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
             )
-        # In a gating manifold the pressure at a junction is essentially uniform,
-        # so all outlets share the same velocity: v = Q / A_total.  Each branch
-        # then carries Q_branch = v * A_branch, which preserves continuity and
-        # gives identical velocities for identical (symmetric) gates.
-        v_common = float(Q / A_total) if A_total > 1e-18 else 0.0
-        for c in out_edges:
-            A = c["area_m2"]
+        # Split the incoming flow among the outgoing branches using the real
+        # 3B Darcy flux integrated across each contact (flux_m3_s).  The flux
+        # proportions come directly from the solved velocity field; the total is
+        # then scaled to enforce continuity at the node, and identical
+        # downstream components receive the mean flow so physical symmetry is
+        # preserved while the Q = v * A relation remains exact.
+        raw_fluxes = np.array(
+            [abs(float(c.get("flux_m3_s", 0.0))) for c in out_edges],
+            dtype=np.float64,
+        )
+        raw_total = float(raw_fluxes.sum())
+        areas = np.array([float(c["area_m2"]) for c in out_edges], dtype=np.float64)
+        A_total = float(areas.sum())
+
+        if raw_total > 1e-18:
+            Q_branches = raw_fluxes * (Q / raw_total)
+        elif A_total > 1e-18:
+            v_common = Q / A_total
+            Q_branches = areas * v_common
+        else:
+            raise GatingVelocityError(
+                f"Düğüm hızları çözülemedi: {comp_meta[cid][1]} elemanının "
+                "çıkış akı toplamı ve kesit alanı sıfır. "
+                "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
+            )
+
+        # Average flows for identical downstream outlets (same BodyType and same
+        # analytical area) so symmetric gates are exactly equal.
+        group_map: Dict[Tuple[BodyType, int], List[int]] = {}
+        for idx, c in enumerate(out_edges):
+            down_id = c["down_id"]
+            btype = comp_meta[down_id][0]
+            area_key = int(round(areas[idx] * 1e7))
+            group_map.setdefault((btype, area_key), []).append(idx)
+        for idxs in group_map.values():
+            if len(idxs) > 1:
+                mean_q = float(Q_branches[idxs].mean())
+                for i in idxs:
+                    Q_branches[i] = mean_q
+
+        # Re-normalize so the sum of the branch flows equals the node inflow Q.
+        branch_sum = float(Q_branches.sum())
+        if branch_sum > 1e-18:
+            Q_branches = Q_branches * (Q / branch_sum)
+
+        for i, c in enumerate(out_edges):
+            A = float(c["area_m2"])
             if A <= 1e-18:
                 raise GatingVelocityError(
                     f"Düğüm hızları çözülemedi: {comp_meta[cid][1]} → "
                     f"{comp_meta[c['down_id']][1]} temas kesit alanı sıfır. "
                     "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
                 )
-            Q_branch = v_common * A
+            Q_branch = float(Q_branches[i])
+            v_branch = float(Q_branch / A)
             c["Q_branch"] = Q_branch
-            c["v_branch"] = v_common
+            c["v_branch"] = v_branch
             down_id = c["down_id"]
             if down_id != part_id:
                 Q_in[down_id] += Q_branch
@@ -1960,13 +2056,13 @@ def solve_filling_flow(
         progress_callback(25)
 
     # Pressure solve.
-    A, rhs, flat_idx = _build_laplace_matrix(
+    A, rhs, flat_idx, dirichlet_unknowns, dirichlet_value_flat = _build_laplace_matrix(
         cavity, dirichlet, dirichlet_value, permeability_m2, dx_m, face_fractions
     )
     if progress_callback:
         progress_callback(35)
 
-    p_flat = _solve_pressure(A, rhs)
+    p_flat = _solve_pressure(A, rhs, dirichlet_unknowns, dirichlet_value_flat)
     p = np.zeros(cavity.shape, dtype=np.float64)
     p[cavity] = p_flat
 
