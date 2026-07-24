@@ -1733,8 +1733,10 @@ def _gating_node_velocities(
 
         The flow axis is taken from the same OBB-based rule used for the Darcy
         flux integration, so the analytical section is perpendicular to the
-        actual flow direction.  The section is swept around the body centroid
-        and the minimum finite area is returned, capturing the true choke.
+        actual flow direction.  First we try mesh slicing; if that fails, we
+        fall back to the bounding-box cross-section (the product of the two
+        extents perpendicular to the chosen flow axis).  This guarantees a
+        non-zero design area even for thin or non-watertight triangulations.
         """
         if mesh is None or len(mesh.faces) == 0:
             return 0.0
@@ -1743,6 +1745,13 @@ def _gating_node_velocities(
             origin = mesh.vertices.mean(axis=0)
             obb = mesh.bounding_box_oriented
             extents = np.asarray(obb.primitive.extents, dtype=np.float64)
+            R = obb.primitive.transform[:3, :3]
+            # Determine which OBB extent axis `axis` corresponds to.
+            cosines = np.abs(np.dot(R.T, axis))
+            flow_idx = int(np.argmax(cosines))
+            other = [i for i in range(3) if i != flow_idx]
+            obb_area_mm2 = float(extents[other[0]] * extents[other[1]])
+
             L = float(np.max(extents)) * 0.25
             best = float("inf")
             steps = np.linspace(-L, L, 11)
@@ -1756,7 +1765,9 @@ def _gating_node_velocities(
                 area_mm2 = float(path2d.area)
                 if area_mm2 > 1e-12 and area_mm2 < best:
                     best = area_mm2
-            return best * 1e-6 if np.isfinite(best) and best > 0.0 else 0.0
+            if np.isfinite(best) and best > 0.0:
+                return min(best, obb_area_mm2) * 1e-6
+            return obb_area_mm2 * 1e-6
         except Exception:
             return 0.0
 
