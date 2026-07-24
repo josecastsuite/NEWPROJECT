@@ -840,12 +840,12 @@ def _compute_user_flow_rate(
     design_section = (design_section_key or used_section).upper()
 
     if velocity_m_s > 0.0:
-        # When the user supplies a velocity, honour the paired reference area
-        # (from the gating engine or from a manual SectionDialog pick) instead
-        # of the raw voxel face area, so Q = v × A_reference.
-        if design_area_m2 > 1e-18 and used_section == design_section:
+        # Absolute UI input: if a reference area is provided it wins over any
+        # automatic voxel/face area measurement.  used_section follows the
+        # user's selected section key so the source node label is correct.
+        if design_area_m2 > 1e-18:
             area_m2 = float(design_area_m2)
-            face, _ = _section_face_cells(a_grid, a_cavity, section_key, g)
+            used_section = design_section
         else:
             face, used_section = _section_face_cells(a_grid, a_cavity, section_key, g)
             area_m2 = float(face.sum()) * (a_dx * a_dx)
@@ -1511,9 +1511,13 @@ def _gating_node_velocities(
     ]
     if unvisited:
         names = ", ".join(comp_meta[cid][1] for cid in unvisited)
-        raise GatingVelocityError(
-            f"Düğüm hızları çözülemedi: şu elemanlar kaynaktan parçaya ulaşan zincire "
-            f"bağlı değil: {names}. Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
+        # Warn but continue: return partial gating nodes for the reachable
+        # portion instead of crashing the whole analysis.
+        import warnings
+        warnings.warn(
+            f"Düğüm hızları: şu elemanlar kaynaktan parçaya ulaşan zincire bağlı değil: {names}. "
+            f"Yalnızca ulaşılabilir düğümler hesaplanacak.",
+            RuntimeWarning,
         )
 
     # ------------------------------------------------------------------
@@ -1717,6 +1721,11 @@ def _gating_node_velocities(
         k = int(min(up, down)) * mult + int(max(up, down))
         c["flux_m3_s"] = float(flux_pair[k])
         c["area_real_m2"] = float(area_pair[k])
+        # The physical throat area for Q = v × A is the real voxel contact area,
+        # not the analytical CAD minimum.  Fall back to the CAD estimate only
+        # when no faces carry flux (disconnected or degenerate contact).
+        if c["area_real_m2"] > 1e-12:
+            c["area_m2"] = c["area_real_m2"]
 
     def _component_cad_area_m2(mesh, btype) -> float:
         """Return the analytical minimum cross-sectional area of a gating body.
@@ -1788,10 +1797,16 @@ def _gating_node_velocities(
                 if bt == btype and cid != part_id:
                     comp_design_m2[cid] = mean_area
 
-    # Contact area: the flow passage is limited by the smaller of the two
-    # connected component cross-sections.  FAVOR/voxel area is kept only as
-    # a fallback when CAD geometry cannot be sectioned.
+    # Contact area: the physically real throat is the Darcy-integrated voxel
+    # contact area (area_real_m2).  Only if the flux integration produced no
+    # measurable contact (degenerate/disconnected) do we fall back to the
+    # analytical CAD throat estimate.
     for c in contacts:
+        a_real = float(c.get("area_real_m2", 0.0))
+        if a_real > 1e-12:
+            c["area_m2"] = a_real
+            c["area_raw_m2"] = a_real
+            continue
         id1, id2 = c["id1"], c["id2"]
         a1 = comp_design_m2.get(id1, 0.0)
         a2 = comp_design_m2.get(id2, 0.0)
@@ -1918,7 +1933,8 @@ def _gating_node_velocities(
             down_id = c["down_id"]
             if down_id != part_id:
                 Q_in[down_id] += Q_branch
-            nodes.append(_make_node(cid, down_id, A, Q_branch, c["centroid_mm"], flow_rate_m3_s=Q_branch))
+            node = _make_node(cid, down_id, A, Q_branch, c["centroid_mm"], flow_rate_m3_s=Q_branch)
+            nodes.append(node)
 
     if not nodes:
         raise GatingVelocityError(
