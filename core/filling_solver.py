@@ -1538,10 +1538,13 @@ def _gating_node_velocities(
             R = obb.primitive.transform[:3, :3]
             extents = np.asarray(obb.primitive.extents, dtype=np.float64)
             order = np.argsort(extents)
-            choke_types = {BodyType.SPRUE_THROAT, BodyType.POURING_BASIN, BodyType.RISER}
+            choke_types = {
+                BodyType.SPRUE_THROAT, BodyType.POURING_BASIN, BodyType.RISER,
+                BodyType.INGATE, BodyType.FILTER,
+            }
             runner_types = {
-                BodyType.SPRUE, BodyType.INGATE, BodyType.RUNNER,
-                BodyType.DISTRIBUTOR, BodyType.CURUFLUK, BodyType.FILTER,
+                BodyType.SPRUE, BodyType.RUNNER,
+                BodyType.DISTRIBUTOR, BodyType.CURUFLUK,
             }
             if btype in choke_types:
                 axis = R[:, order[0]]  # shortest = flow axis
@@ -1692,10 +1695,12 @@ def _gating_node_velocities(
             V_flow = V_flow_array[:, k_arr]
             n_vec = np.array([float(di), float(dj), float(dk)], dtype=np.float64)
             v_normal = np.einsum("i,ij->j", n_vec, v)
-            # The face normal from up to down may be +/- the coordinate axis;
-            # the sign above accounts for the +/- direction.  cos is the
-            # projection of the face area onto the plane perpendicular to V_flow.
-            cos = np.abs(np.einsum("i,ij->j", n_vec, V_flow))
+            # n_vec is [axis0, axis1, axis2] = [Z, Y, X] (grid storage order).
+            # V_flow from the OBB is [X, Y, Z]; align it to [Z, Y, X] before
+            # the dot product so cos is the true cosine between face normal and
+            # the component flow axis.
+            V_flow_zyx = V_flow[[2, 1, 0], :]
+            cos = np.abs(np.einsum("i,ij->j", n_vec, V_flow_zyx))
             active = cos > 0.1
             A_proj = np.where(
                 active,
