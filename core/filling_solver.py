@@ -104,7 +104,7 @@ def _flow_refined_grid(
 
     gvec = getattr(casting_params, "gravity_vector", (0.0, 0.0, -1.0))
     try:
-        grid, origin, dx, _ = build_voxel_grid(
+        grid, _, origin, dx, _ = build_voxel_grid(
             bodies,
             target_dim=target_dim,
             gravity_vector=gvec,
@@ -389,14 +389,16 @@ def _build_laplace_matrix(
     permeability: Optional[np.ndarray] = None,
     dx: float = 1.0,
     face_fractions: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    viscosity_pa_s: float = 1.0,
 ) -> Tuple[csr_matrix, np.ndarray, np.ndarray]:
     """Build a 7-point Darcy matrix on the cavity with Dirichlet cells.
 
     Solid neighbours are treated as zero-flux (Neumann) boundaries.  Face
-    conductance is ``K_face * f_A / dx**2`` where ``K_face`` is the harmonic mean
-    of the two adjacent cell permeabilities and ``f_A`` is the FAVOR fractional
-    face area.  This makes narrow gates locally more resistive and removes the
-    staircase area bloat on curved geometry.
+    conductance is ``K_face * f_A / (mu * dx**2)`` where ``K_face`` is the
+    harmonic mean of the two adjacent cell permeabilities, ``mu`` is the
+    dynamic viscosity, and ``f_A`` is the FAVOR fractional face area.  This
+    makes narrow gates locally more resistive and removes the staircase area
+    bloat on curved geometry.
     """
     flat_idx = np.full(cavity.shape, -1, dtype=np.int32)
     flat_idx[cavity] = np.arange(int(cavity.sum()))
@@ -410,7 +412,8 @@ def _build_laplace_matrix(
 
     if permeability is None:
         permeability = np.ones(cavity.shape, dtype=np.float64)
-    K = np.maximum(permeability, 1e-18)
+    mu = max(float(viscosity_pa_s), 1e-9)
+    K = np.maximum(permeability, 1e-18) / mu
     dx2 = float(dx) * float(dx)
 
     if face_fractions is None:
@@ -601,16 +604,18 @@ def _face_velocities(
     cavity: np.ndarray,
     dx: float,
     permeability: Optional[np.ndarray] = None,
+    viscosity_pa_s: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute staggered Darcy face velocities u = -K_face * dp/dx, etc.
+    """Compute staggered Darcy face velocities u = -(K_face/mu) * dp/dx, etc.
 
     Velocities are zero on faces adjacent to a solid cell.  ``permeability`` is
     cell-centred; face values are the harmonic mean of the two adjacent cells.
     """
+    mu = max(float(viscosity_pa_s), 1e-9)
     if permeability is None:
-        Kz = Ky = Kx = 1.0
+        Kz = Ky = Kx = 1.0 / mu
     else:
-        K = np.maximum(permeability, 1e-18)
+        K = np.maximum(permeability, 1e-18) / mu
         Kz = 2.0 * K[:-1] * K[1:] / (K[:-1] + K[1:])
         Ky = 2.0 * K[:, :-1] * K[:, 1:] / (K[:, :-1] + K[:, 1:])
         Kx = 2.0 * K[:, :, :-1] * K[:, :, 1:] / (K[:, :, :-1] + K[:, :, 1:])
@@ -2002,6 +2007,7 @@ def solve_filling_flow(
     dx_m = dx_c / 1000.0
 
     g = _gravity_unit(getattr(casting_params, "gravity_vector", (0.0, 0.0, -1.0)))
+    mu = max(float(getattr(alloy, "viscosity_pa_s", 0.005) or 0.005), 1e-9)
     cavity, solid = _cavity_and_solid_masks(grid_c)
     if not cavity.any():
         return FillingResult(reason="Mold cavity (non-empty voxels) not found.")
@@ -2055,9 +2061,10 @@ def solve_filling_flow(
     if progress_callback:
         progress_callback(25)
 
-    # Pressure solve.
+    # Pressure solve.  Viscosity enters as hydraulic conductivity K/mu.
     A, rhs, flat_idx, dirichlet_unknowns, dirichlet_value_flat = _build_laplace_matrix(
-        cavity, dirichlet, dirichlet_value, permeability_m2, dx_m, face_fractions
+        cavity, dirichlet, dirichlet_value, permeability_m2, dx_m, face_fractions,
+        viscosity_pa_s=mu,
     )
     if progress_callback:
         progress_callback(35)
@@ -2069,9 +2076,10 @@ def solve_filling_flow(
     if progress_callback:
         progress_callback(55)
 
-    # Face velocities (Darcy: v = -K/μ * dp/dx).  K is now spatially variable,
-    # so narrow gates and wide runners feel their own hydraulic resistance.
-    u, v, w = _face_velocities(p, cavity, dx_m, permeability_m2)
+    # Face velocities (Darcy: v = -(K/μ) * dp/dx).  K is now spatially
+    # variable, so narrow gates and wide runners feel their own hydraulic
+    # resistance.  mu is in the matrix and in this gradient.
+    u, v, w = _face_velocities(p, cavity, dx_m, permeability_m2, viscosity_pa_s=mu)
 
     # Determine user flow rate, preferring the FAVOR source area if it is available.
     fine_part_mask = (fine_grid == BodyType.PART) & fine_cavity
@@ -2102,6 +2110,10 @@ def solve_filling_flow(
         # Degenerate geometry (e.g. disconnected inlet).  Fall back to area average.
         Q_raw = float(np.maximum(np.abs(u).sum(), 1e-18)) * (dx_m * dx_m)
     scale = Q_user / Q_raw
+    # scale carries units of pressure (Pa) because the matrix was built with
+    # K/mu and dimensionless Dirichlet p=1/0; it is the pressure drop needed
+    # to drive Q_user through the Darcy medium.
+    pressure_drop_pa = float(scale) if Q_raw != 0.0 else 0.0
 
     u *= scale
     v *= scale
@@ -2227,7 +2239,8 @@ def solve_filling_flow(
     reason = (
         f"Darcy akış çözümü: giriş '{used_section}', Q={Q_user*6e4:.2f} L/dak, "
         f"girdi hızı/alan={user_velocity:.3f} m/s / {area_m2*1e4:.2f} cm², "
-        f"tahmini doldurma süresi={fill_time_s:.2f} s."
+        f"tahmini doldurma süresi={fill_time_s:.2f} s, "
+        f"basınç düşümü={pressure_drop_pa:.1f} Pa."
     )
 
     return FillingResult(
@@ -2248,4 +2261,5 @@ def solve_filling_flow(
         per_gate_flow_rate_m3_s=per_gate_q,
         total_ingate_flow_m3_s=total_ingate_flow_m3_s,
         gating_nodes=gating_nodes,
+        pressure_drop_pa=pressure_drop_pa,
     )

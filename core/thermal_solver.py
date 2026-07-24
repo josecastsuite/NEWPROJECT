@@ -2,12 +2,18 @@
 
 Uses an implicit finite-volume discretisation of
 
-    dH/dt = ∇ · (k ∇T)
+    dH/dt = ∇ · (k ∇T) - ρ·cp · (v · ∇T)
 
 with H = ρ·cp·T + ρ·L·(1-fs) in the metal and H = ρ·cp·T in the mould.
 The latent-heat contribution is regularised as an apparent heat capacity
 within the mushy zone, giving a stable, second-order-in-space solution.
+
+The optional velocity field ``velocity_m_s`` is the Darcy filling velocity
+(hücre-bazlı 3B hız alanı).  It is treated explicitly as a convective
+(advective) term and is only active in metal voxels whose fill time has
+already elapsed, so the thermal solver is coupled to the flow solution.
 """
+
 
 from typing import Optional, Tuple
 
@@ -153,13 +159,18 @@ def solve_3d_thermal(
     downsample: int = 2,
     progress_callback: Optional[callable] = None,
     fill_time_s: Optional[np.ndarray] = None,
+    velocity_m_s: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Implicit 3-D enthalpy thermal solver.
+    Implicit 3-D enthalpy thermal solver with optional Darcy-velocity advection.
 
     If ``fill_time_s`` is supplied it is interpreted as the per-voxel metal
     arrival time (s).  Solidification/liquidus times are shifted by this amount,
     so late-filled regions start cooling later.
+
+    If ``velocity_m_s`` is supplied as a (3, nz, ny, nx) array, an explicit
+    convective term ``-ρ·cp·(v·∇T)`` is added to the enthalpy balance.  The
+    term is masked to metal cells whose fill time has already elapsed.
 
     Returns fine-grid arrays:
     T_final, fs_final, t_liquidus, t_solidus, G_at_ts, R_at_ts, niyama
@@ -180,10 +191,23 @@ def solve_3d_thermal(
             )
         else:
             fill_c = None
+        if velocity_m_s is not None and velocity_m_s.ndim == 4:
+            ratios = (
+                grid_c.shape[0] / velocity_m_s.shape[1],
+                grid_c.shape[1] / velocity_m_s.shape[2],
+                grid_c.shape[2] / velocity_m_s.shape[3],
+            )
+            velocity_c = np.stack(
+                [ndimage.zoom(velocity_m_s[i], ratios, order=1) for i in range(3)],
+                axis=0,
+            )
+        else:
+            velocity_c = None
     else:
         grid_c = grid
         dx_c_mm = dx
         fill_c = fill_time_s
+        velocity_c = velocity_m_s
 
     # Extend the simulation so even the last-filled metal has time to solidify.
     if fill_c is not None:
@@ -252,7 +276,7 @@ def solve_3d_thermal(
             cp_eff[chill_mask_3d] = cp_chill
         C = rho * cp_eff.ravel()
 
-        # (C I - dt A) T_new = C T_old
+        # (C I - dt A) T_new = C T_old - dt * C * (v · ∇T_old)
         # Dirichlet on the outer shell is enforced by a large diagonal penalty
         if len(boundary_idx):
             C[boundary_idx] = boundary_penalty
@@ -260,6 +284,25 @@ def solve_3d_thermal(
             b[boundary_idx] = boundary_penalty * T0
         else:
             b = C * T_old.ravel()
+
+        # Explicit Darcy-velocity advection.  Only active in metal cells that
+        # have already been filled by the current time.
+        if velocity_c is not None:
+            grad_z, grad_y, grad_x = np.gradient(T_old, dx_m)
+            adv = (
+                velocity_c[0] * grad_z
+                + velocity_c[1] * grad_y
+                + velocity_c[2] * grad_x
+            )
+            if fill_c is not None:
+                active = (t + 0.5 * dt) >= fill_c
+            else:
+                active = np.ones_like(T_old, dtype=bool)
+            adv = np.where(is_metal_c & active, adv, 0.0)
+            b -= dt * C * adv.ravel()
+            if len(boundary_idx):
+                b[boundary_idx] = boundary_penalty * T0
+
         M = -dt * A + sparse.diags([C], offsets=[0], format="csc")
 
         # Use CG with a diagonal (Jacobi) preconditioner for speed on large grids

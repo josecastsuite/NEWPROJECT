@@ -77,7 +77,7 @@ def main():
 
     target_dim = 160
     print(f"Voxelizing at {target_dim} ...")
-    grid, origin, dx, bodies = build_voxel_grid(
+    grid, body_index, origin, dx, bodies = build_voxel_grid(
         bodies, target_dim=target_dim, gravity_vector=gravity
     )
     print(f"  grid shape={grid.shape}, dx={dx:.4f} mm, origin={origin}")
@@ -107,6 +107,7 @@ def main():
     result = analyze(
         bodies,
         grid,
+        body_index,
         origin,
         dx,
         alloy_key=alloy_key,

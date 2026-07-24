@@ -722,6 +722,7 @@ def find_hotspots(
     n_time_steps: int = 40,
     niyama: Optional[np.ndarray] = None,
     feeder_time_factor: float = 1.0,
+    merge_clusters: bool = True,
 ) -> List[HotSpot]:
     """Detect hot spots by pseudo-thermal solidification + CCL (Method 2).
 
@@ -891,29 +892,46 @@ def find_hotspots(
         )
 
     # Final cleanup: merge hot spots that are close enough to be fed by one riser.
-    if len(hotspots) > 1:
-        positions = np.array([hs.position_mm for hs in hotspots], dtype=np.float64)
-        clustering = DBSCAN(eps=cluster_eps_mm, min_samples=1, metric="euclidean").fit(
-            positions
-        )
-        merged: List[HotSpot] = []
-        for lbl in set(clustering.labels_):
-            if lbl == -1:
-                continue
-            group = [hs for i, hs in enumerate(hotspots) if clustering.labels_[i] == lbl]
-            # Choose the most critical representative: high modulus, low Niyama.
-            m_max = max(float(h.m_value_mm) for h in group)
-            n_vals = [h.niyama_ensemble for h in group if h.niyama_ensemble > 0.0]
-            n_max = max(n_vals) if n_vals else 1.0
-            def _priority(h: HotSpot) -> float:
-                m_norm = float(h.m_value_mm) / max(m_max, 1e-9)
-                n_norm = h.niyama_ensemble / max(n_max, 1e-9) if h.niyama_ensemble > 0.0 else 1.0
-                return m_norm - 0.5 * n_norm
-            group.sort(key=_priority, reverse=True)
-            merged.append(group[0])
-        hotspots = merged
+    if merge_clusters and len(hotspots) > 1:
+        hotspots = _merge_hotspots(hotspots, cluster_eps_mm, prefer_unresolved=False)
 
     return hotspots
+
+
+def _merge_hotspots(
+    hotspots: List[HotSpot],
+    cluster_eps_mm: float,
+    prefer_unresolved: bool = True,
+) -> List[HotSpot]:
+    """Merge close hot spots and keep the most critical representative.
+
+    When ``prefer_unresolved`` is True and a cluster contains at least one
+    unsolved hot spot, the representative is chosen from the unsolved subset so
+    that a dangerous (unfed) hot spot is not hidden behind a solved neighbour.
+    The representative is then the one with the largest modulus and the lowest
+    Niyama (highest shrinkage risk).
+    """
+    if len(hotspots) <= 1:
+        return hotspots
+    positions = np.array([hs.position_mm for hs in hotspots], dtype=np.float64)
+    clustering = DBSCAN(eps=cluster_eps_mm, min_samples=1, metric="euclidean").fit(
+        positions
+    )
+    merged: List[HotSpot] = []
+    for lbl in set(clustering.labels_):
+        group = [hs for i, hs in enumerate(hotspots) if clustering.labels_[i] == lbl]
+        has_unresolved = any(not h.solved for h in group)
+
+        def _priority(h: HotSpot) -> Tuple[float, float, float]:
+            # Prefer unresolved when requested; then larger modulus; then lower Niyama.
+            solved_penalty = float(h.solved)
+            if not prefer_unresolved or not has_unresolved:
+                solved_penalty = 0.0
+            return (solved_penalty, -float(h.m_value_mm), float(h.niyama_ensemble))
+
+        group.sort(key=_priority)
+        merged.append(group[0])
+    return merged
 
 
 def feeding_distance_dijkstra(
@@ -1211,6 +1229,8 @@ def _path_darcy_and_directional(
     t_liq: Optional[np.ndarray] = None,
     t_sol: Optional[np.ndarray] = None,
     gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
+    bodies: Optional[List[Body]] = None,
+    body_index: Optional[np.ndarray] = None,
 ) -> Tuple[float, float, float, bool, bool, float, bool, float]:
     """
     Walk the lowest-resistance feeding path from start_vox to a riser and compute:
@@ -1222,6 +1242,10 @@ def _path_darcy_and_directional(
       * total feeding cost
       * darcy_ok flag
       * feedable_fraction of the shrinkage demand that the hydrostatic head can drive
+
+    When ``bodies`` and ``body_index`` are supplied, the nearest riser body is
+    identified and its ``feeder_type`` is used to cap the available hydrostatic
+    head (blind feeders have no open top; side feeders have reduced head).
     """
     path = _trace_cost_path(start_vox, cost_pred, sdf.shape)
     if not path:
@@ -1251,6 +1275,46 @@ def _path_darcy_and_directional(
         head_mm = float(np.dot(diff, -g))
         if head_mm > 0.0:
             P_head = alloy.rho_kg_m3 * 9.81 * (head_mm / 1000.0)
+
+        # v10.1: account for feeder geometry/type. Blind feeders have no open
+        # top, so the available head is capped to the metal height inside the
+        # feeder multiplied by a type-specific efficiency. Side feeders are
+        # horizontal and get a reduced head.
+        head_efficiency = 1.0
+        max_head_m = float("inf")
+        if (
+            body_index is not None
+            and body_index.shape == sdf.shape
+            and bodies is not None
+            and len(feeder_voxels) > 0
+        ):
+            # Identify the riser body nearest to the hot spot.
+            distances = np.linalg.norm(feeder_voxels - start_vox, axis=1)
+            nearest_idx = int(np.argmin(distances))
+            nearest_vox = tuple(int(v) for v in feeder_voxels[nearest_idx])
+            bidx = int(body_index[nearest_vox])
+            if 0 <= bidx < len(bodies):
+                feeder_body = bodies[bidx]
+                ftype = (feeder_body.feeder_type or "conventional").lower().strip()
+                if not ftype:
+                    ftype = "conventional"
+                if ftype == "blind":
+                    head_efficiency = 0.3
+                    # The metal column in a blind riser cannot exceed the
+                    # feeder height projected onto the gravity-opposite axis.
+                    bounds = feeder_body.mesh.bounds  # (2, 3) in mm
+                    extent_mm = bounds[1] - bounds[0]
+                    feeder_height_mm = float(np.dot(extent_mm, -g))
+                    max_head_m = max(feeder_height_mm, 0.0) / 1000.0
+                elif ftype == "side":
+                    head_efficiency = 0.7
+                elif ftype in ("exothermic", "insulated", "sleeve"):
+                    head_efficiency = 1.0
+                else:
+                    head_efficiency = 1.0
+        P_head = P_head * head_efficiency
+        if max_head_m < float("inf"):
+            P_head = min(P_head, max(alloy.rho_kg_m3 * 9.81 * max_head_m, 0.0))
 
     # Feeding shrinkage demand: shrinkage of the last-liquid pocket at the hot spot
     hot_M = M_mod[start_vox[0], start_vox[1], start_vox[2]]
@@ -1446,7 +1510,7 @@ def _refine_region(
         return None
 
     target_dim = max(32, int(max_size / dx_fine))
-    grid, origin, dx, _ = build_voxel_grid(
+    grid, _, origin, dx, _ = build_voxel_grid(
         cropped_bodies,
         target_dim=target_dim,
         progress_callback=progress_callback,
@@ -1513,7 +1577,7 @@ def _high_res_part_hotspots(
     pockets are not reported as isolated hot spots.
     """
     try:
-        part_grid, part_origin, part_dx, _ = build_part_grid(
+        part_grid, _, part_origin, part_dx, _ = build_part_grid(
             bodies,
             target_voxels=part_voxels_target,
             max_dim=part_max_dim,
@@ -1603,6 +1667,7 @@ def _high_res_part_hotspots(
         chvorinov_c=chvorinov_c,
         niyama=part_niyama,
         feeder_time_factor=feeder_time_factor,
+        merge_clusters=False,
     )
     return part_hotspots
 
@@ -1631,25 +1696,51 @@ def _apply_feeder_sleeve_time_factor(
     t_liq: np.ndarray,
     t_sol: np.ndarray,
     bodies: List[Body],
+    body_index: Optional[np.ndarray] = None,
 ) -> None:
-    """Scale solidification times of RISER voxels by the weighted feeder type."""
+    """Scale solidification times of RISER voxels by the per-body feeder type.
+
+    If ``body_index`` is supplied, each RISER voxel is matched to its owning
+    body and multiplied by that body's sleeve factor.  This prevents an
+    exothermic and a blind feeder in the same model from being merged into a
+    single volume-weighted average.
+    """
     riser_bodies = [b for b in bodies if b.body_type == BodyType.RISER]
     if not riser_bodies:
         return
-    total_volume = sum(max(b.volume_cm3, 1e-9) for b in riser_bodies)
-    if total_volume <= 0.0:
-        return
-    factor = sum(
-        _feeder_time_factor(b) * max(b.volume_cm3, 1e-9) / total_volume
-        for b in riser_bodies
-    )
     riser_mask = grid == BodyType.RISER
     if not riser_mask.any():
         return
-    finite_liq = riser_mask & np.isfinite(t_liq)
-    finite_sol = riser_mask & np.isfinite(t_sol)
-    t_liq[finite_liq] = t_liq[finite_liq] * factor
-    t_sol[finite_sol] = t_sol[finite_sol] * factor
+
+    if body_index is None or body_index.shape != grid.shape:
+        # Fallback to the old volume-weighted average.
+        total_volume = sum(max(b.volume_cm3, 1e-9) for b in riser_bodies)
+        if total_volume <= 0.0:
+            return
+        factor = sum(
+            _feeder_time_factor(b) * max(b.volume_cm3, 1e-9) / total_volume
+            for b in riser_bodies
+        )
+        finite_liq = riser_mask & np.isfinite(t_liq)
+        finite_sol = riser_mask & np.isfinite(t_sol)
+        t_liq[finite_liq] = t_liq[finite_liq] * factor
+        t_sol[finite_sol] = t_sol[finite_sol] * factor
+        return
+
+    # Body-index aware: apply the exact factor for each riser body's voxels.
+    for b in riser_bodies:
+        factor = _feeder_time_factor(b)
+        if factor == 1.0:
+            continue
+        bmask = riser_mask & (body_index == b.index)
+        if not bmask.any():
+            continue
+        finite_liq = bmask & np.isfinite(t_liq)
+        finite_sol = bmask & np.isfinite(t_sol)
+        if finite_liq.any():
+            t_liq[finite_liq] = t_liq[finite_liq] * factor
+        if finite_sol.any():
+            t_sol[finite_sol] = t_sol[finite_sol] * factor
 
 
 def _weighted_feeder_time_factor(bodies: List[Body]) -> float:
@@ -1758,6 +1849,7 @@ def _run_filling_flow(
 def analyze(
     bodies: List[Body],
     grid: np.ndarray,
+    body_index: Optional[np.ndarray],
     origin_mm: np.ndarray,
     dx: float,
     alloy_key: str = "42CrMo4",
@@ -1937,18 +2029,24 @@ def analyze(
         if flow_result_for_thermal is not None and flow_result_for_thermal.fill_time is not None
         else None
     )
+    velocity_m_s = (
+        flow_result_for_thermal.velocity
+        if flow_result_for_thermal is not None and flow_result_for_thermal.velocity is not None
+        else None
+    )
     temperature, solid_fraction, t_liq, t_s, G, cooling_rate, niyama = solve_3d_thermal(
         grid, alloy, mold, dx,
         max_time_s=thermal_max_time_s,
         downsample=thermal_downsample,
         progress_callback=progress_callback,
         fill_time_s=fill_time_s,
+        velocity_m_s=velocity_m_s,
     )
     # v9.3: account for feeder sleeves/exothermic/chilled type by scaling the
-    # solidification time of RISER voxels.  A single weighted factor per model is
-    # used because the voxel grid stores body-type IDs; per-body factors require
-    # a body-index grid.  This is a robust first-order correction.
-    _apply_feeder_sleeve_time_factor(grid, t_liq, t_s, bodies)
+    # solidification time of RISER voxels.  With the body-index grid, each
+    # riser body receives its own sleeve/exothermic/chilled factor instead of
+    # a single volume-weighted average.
+    _apply_feeder_sleeve_time_factor(grid, t_liq, t_s, bodies, body_index)
 
     # Fallback for thick regions that did not reach solidus within max_time_s:
     # use the analytical Chvorinov/Stefan Niyama so hot spots are not reported as 0.
@@ -2005,6 +2103,7 @@ def analyze(
         is_metal=is_metal,
         feeder_mask=feeder_mask,
         chvorinov_c=chvorinov_c,
+        merge_clusters=False,
         niyama=niyama,
         feeder_time_factor=feeder_time_factor,
     )
@@ -2137,6 +2236,8 @@ def analyze(
                 t_liq=t_liq,
                 t_sol=t_s,
                 gravity_vector=gravity_vector,
+                bodies=bodies,
+                body_index=body_index,
             )
             hs.darcy_resistance = darcy
             hs.feedable_fraction = feedable_fraction
@@ -2213,6 +2314,11 @@ def analyze(
         else:
             hs.feed_ok = False
             hs.chill_ok = False
+
+    # Re-merge hot spots now that feed_ok / chill_ok are known so an unresolved
+    # (dangerous) hot spot is never hidden behind a solved neighbour in the UI.
+    if hotspots:
+        hotspots = _merge_hotspots(hotspots, hotspot_cluster_mm, prefer_unresolved=True)
 
     if progress_callback:
         progress_callback(88)
@@ -2549,6 +2655,8 @@ def analyze(
 
     result.riser_proposals = propose_risers(result, alloy, existing_riser_count=len(riser_results))
 
+    result.flow_result = flow_result_for_thermal
+
     # AŞAMA 11: Gating result (flow already solved in stage 2.5 for fill_time).
     try:
         from core.gating import analyze_gating
@@ -2564,18 +2672,8 @@ def analyze(
         result.gate_result = gate_result_for_flow
         result.recommendations.append(f"Gating analizi atlandı: {exc}")
 
-    result.flow_result = flow_result_for_thermal
     if result.gate_result and result.flow_result:
         result.gate_result.flow_result = result.flow_result
-        result.gate_result.distributor_velocity_m_s = result.flow_result.node_velocities.get(
-            "DISTRIBUTOR", 0.0
-        )
-        result.gate_result.curufluk_velocity_m_s = result.flow_result.node_velocities.get(
-            "CURUFLUK", 0.0
-        )
-        if result.flow_result.Q_m3_s > 0.0:
-            result.gate_result.ingate_flow_rate_m3_s = result.flow_result.Q_m3_s
-            result.gate_result.ingate_fill_time_s = result.flow_result.fill_time_s
 
     result.recommendations = _build_recommendations(result, alloy, mold)
     if result.gate_result and result.gate_result.gating_system_reason:

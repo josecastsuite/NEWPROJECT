@@ -1,7 +1,7 @@
 """Convert a set of Body meshes into a single labelled voxel grid - JoseCast v7."""
 
 import warnings
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import trimesh
@@ -341,7 +341,7 @@ def _voxelize_at_dim(
     progress_callback: Optional[callable],
     fix_mesh: bool,
     conservative: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, float, List[Body]]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, List[Body]]:
     """Single-shot voxelization used by build_voxel_grid."""
     bbox_min, bbox_max = _global_bbox(bodies)
     bbox_size = bbox_max - bbox_min
@@ -352,6 +352,7 @@ def _voxelize_at_dim(
     grid_shape = np.ceil((bbox_size + 2 * margin * dx) / dx).astype(int)
     origin = bbox_min - margin * dx
     grid = np.zeros(grid_shape, dtype=np.int16)
+    body_index = np.full(grid_shape, -1, dtype=np.int32)
 
     repaired_bodies: List[Body] = []
     for idx, body in enumerate(bodies):
@@ -427,32 +428,36 @@ def _voxelize_at_dim(
 
         # Later body wins on overlap
         grid[i0:i1, j0:j1, k0:k1][mask] = int(body.body_type)
+        body_index[i0:i1, j0:j1, k0:k1][mask] = idx
 
         repaired_bodies.append(body)
 
     if progress_callback:
         progress_callback(50)
 
-    return grid, origin, dx, repaired_bodies
+    return grid, body_index, origin, dx, repaired_bodies
 
 
-def _fill_enclosed_voids(grid: np.ndarray) -> np.ndarray:
+def _fill_enclosed_voids(
+    grid: np.ndarray, body_index: Optional[np.ndarray] = None
+) -> Union[np.ndarray, Tuple[np.ndarray, Optional[np.ndarray]]]:
     """Fill isolated background voxels that are fully enclosed by metal.
 
     After ``ndimage.label`` on the background (grid == 0), any component that
     does not touch the grid boundary is a closed internal void caused by
     voxelisation rounding.  Each such component is filled with the most common
     non-zero body type in its 26-neighbourhood, so the voxel matrix becomes a
-    watertight solid without altering the outer shell.
+    watertight solid without altering the outer shell.  When ``body_index`` is
+    supplied, the same voxels receive the most common surrounding body index.
     """
     bg = grid == 0
     if not bg.any():
-        return grid
+        return (grid, body_index) if body_index is not None else grid
 
     # 26-connectivity for the background so diagonal leakage is recognised.
     labeled, n = ndimage.label(bg, structure=np.ones((3, 3, 3), dtype=int))
     if n == 0:
-        return grid
+        return (grid, body_index) if body_index is not None else grid
 
     # Labels that touch the padded grid boundary are part of the outside.
     boundary_mask = np.zeros_like(labeled, dtype=bool)
@@ -466,7 +471,7 @@ def _fill_enclosed_voids(grid: np.ndarray) -> np.ndarray:
 
     max_label = int(labeled.max())
     if max_label == 0:
-        return grid
+        return (grid, body_index) if body_index is not None else grid
 
     is_boundary = np.zeros(max_label + 1, dtype=bool)
     is_boundary[boundary_labels] = True
@@ -479,13 +484,20 @@ def _fill_enclosed_voids(grid: np.ndarray) -> np.ndarray:
         comp = labeled == label_id
         # One-voxel dilation touches the body that encloses this void.
         dilated = ndimage.binary_dilation(comp, structure=footprint)
-        neighbors = grid[dilated & (grid != 0)]
+        touch = dilated & (grid != 0)
+        neighbors = grid[touch]
         if len(neighbors) == 0:
             continue
         fill_label = int(np.bincount(neighbors).argmax())
         grid[comp] = fill_label
+        if body_index is not None:
+            body_neighbors = body_index[touch]
+            if body_neighbors.size:
+                # Choose the body index of the touching label; otherwise most common.
+                fill_body = int(np.bincount(body_neighbors[body_neighbors >= 0]).argmax())
+                body_index[comp] = fill_body
 
-    return grid
+    return (grid, body_index) if body_index is not None else grid
 
 
 def build_voxel_grid(
@@ -495,7 +507,7 @@ def build_voxel_grid(
     fix_mesh: bool = True,
     gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
     conservative: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, float, List[Body]]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, List[Body]]:
     """
     Build a global voxel grid.
 
@@ -512,6 +524,8 @@ def build_voxel_grid(
     -------
     grid : np.ndarray[int]
         Material id grid (Nx, Ny, Nz).
+    body_index : np.ndarray[int]
+        Per-voxel index into the ``bodies`` list (-1 for empty voxels).
     origin_mm : np.ndarray
         World coordinate of grid[0,0,0].
     dx_mm : float
@@ -528,13 +542,13 @@ def build_voxel_grid(
     bbox_size = bbox_max - bbox_min
     margin = 4
 
-    grid, origin, dx, repaired_bodies = _voxelize_at_dim(
+    grid, body_index, origin, dx, repaired_bodies = _voxelize_at_dim(
         bodies, target_dim, margin, progress_callback, fix_mesh, conservative=conservative
     )
 
     # Close any isolated internal voids created by voxelisation rounding so the
     # metal volume is a watertight solid while the outer shell stays open.
-    grid = _fill_enclosed_voids(grid)
+    grid, body_index = _fill_enclosed_voids(grid, body_index)
 
     # Resolution sanity check based on the thinnest metal region captured by
     # the voxel grid.  Conservative dilation + 26-neighbour connectivity is the
@@ -563,7 +577,7 @@ def build_voxel_grid(
                 f"vokselleştirme bağlantıyı korumaya yardımcı olur."
             )
 
-    return grid, origin, dx, repaired_bodies
+    return grid, body_index, origin, dx, repaired_bodies
 
 
 def build_part_grid(
@@ -571,7 +585,7 @@ def build_part_grid(
     target_voxels: int = 10_000_000,
     max_dim: int = 600,
     margin_vox: int = 4,
-) -> Tuple[np.ndarray, np.ndarray, float, List[Body]]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, List[Body]]:
     """Build a high-resolution voxel grid containing the PART and connected
     casting-metal bodies (risers, runners, gates, sprues, pouring basin).
 
@@ -584,6 +598,7 @@ def build_part_grid(
     if not part_bodies:
         return build_voxel_grid(bodies, target_dim=BASE_RES, conservative=False)
 
+
     # Use the part bbox to anchor the resolution, then include nearby casting
     # metal bodies so that sprue/runner/riser thermal mass and connectivity
     # are visible to the high-resolution hotspot detector.
@@ -592,6 +607,7 @@ def build_part_grid(
     part_max_size = float(part_size.max())
     if part_max_size <= 0.0:
         return build_voxel_grid(bodies, target_dim=BASE_RES, conservative=False)
+
 
     # Keep casting-metal bodies within one part-size of the part bbox.  This
     # preserves the fine part resolution while still capturing connected gating.
@@ -613,6 +629,7 @@ def build_part_grid(
     max_size = float(size.max())
     if max_size <= 0.0:
         return build_voxel_grid(bodies, target_dim=BASE_RES, conservative=False)
+
 
     volume = float(np.prod(size))
     if volume > 0.0:

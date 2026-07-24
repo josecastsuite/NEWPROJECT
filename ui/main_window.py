@@ -990,13 +990,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.aiLog("AŞAMA 1/6: STEP'den çoklu body voxel grid oluşturuluyor...", "info")
             self._set_progress(10)
             target_dim = self.res_spin.value()
-            grid, origin, dx, bodies = build_voxel_grid(
+            grid, body_index, origin, dx, bodies = build_voxel_grid(
                 self._bodies,
                 target_dim=target_dim,
                 progress_callback=self._set_progress,
                 gravity_vector=self._gravity_vector_from_ui(),
             )
             self._grid = grid
+            self._body_index = body_index
             self._origin = origin
             self._dx = dx
             self._bodies = bodies
@@ -1056,6 +1057,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._analysis = analyze(
                 self._bodies,
                 self._grid,
+                self._body_index,
                 self._origin,
                 self._dx,
                 alloy_key=alloy_key,

@@ -274,6 +274,10 @@ class FillingResult:
     # Discrete gating nodes (sprue, runner, distributor, each INGATE, etc.)
     # with their throat velocity, area and 3-D position for labelling/marker display.
     gating_nodes: List[GatingNode] = field(default_factory=list)
+    # P2: pressure drop (Pa) inferred from the Q_user / Q_raw scale.  With
+    # viscosity in the Darcy matrix this is proportional to alloy.viscosity_pa_s
+    # even though the scaled velocity field is independent of a uniform viscosity.
+    pressure_drop_pa: float = 0.0
 
 
 @dataclass

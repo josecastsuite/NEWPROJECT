@@ -21,6 +21,7 @@ try:
 except Exception:  # pragma: no cover - fallback if matplotlib is missing
     LinearSegmentedColormap = None  # type: ignore
 
+from core.config import load_animation_config
 from core.materials import get_alloy, get_mold
 from core.types import AnalysisResult, BodyType
 
@@ -41,10 +42,23 @@ class FlowAnimator(QtCore.QObject):
     MIN_FILL_FRAMES = 1200  # most frames are allocated to the filling phase
     PHI_SIGMA = 1.2  # voxels; controls how liquid surface is smoothed
     DECIMATE_TARGET = 0.5  # reduce triangle count per frame for GPU/CPU relief
+    PORE_RISE_SPEED_M_S = 0.05  # buoyant pore drift against gravity
 
-    def __init__(self, viewer):
+    def __init__(self, viewer, config_path=None):
         super().__init__(parent=None)
         self._viewer = viewer
+        # Load user-configurable animation limits (JSON) and shadow the class
+        # constants so the rest of the module keeps using self.ATTR_NAME.
+        cfg = load_animation_config(config_path)
+        self.MAX_ANIM_CELLS = cfg.max_anim_cells
+        self.MAX_FRAMES = cfg.max_frames
+        self.MIN_FILL_FRAMES = cfg.min_fill_frames
+        self.PHI_SIGMA = cfg.phi_sigma
+        self.DECIMATE_TARGET = cfg.decimate_target
+        self.MAX_STREAMLINES = cfg.max_streamlines
+        self.MAX_STEPS = cfg.max_steps
+        self.CFL_FRACTION = cfg.cfl_fraction
+        self.PORE_RISE_SPEED_M_S = cfg.pore_rise_speed_m_s
         self._timer = QtCore.QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._on_timer)
@@ -102,6 +116,7 @@ class FlowAnimator(QtCore.QObject):
         self._pore_mask_full: Optional[np.ndarray] = None
         self._pore_mask_d: Optional[np.ndarray] = None
         self._phi_base_d: Optional[np.ndarray] = None
+        self._gravity: np.ndarray = np.array([0.0, 0.0, -1.0], dtype=np.float64)
 
     def set_result(self, result: Optional[AnalysisResult]) -> None:
         """Attach a completed analysis result and build the animation frames."""
@@ -217,6 +232,7 @@ class FlowAnimator(QtCore.QObject):
         self._pore_mask_full = None
         self._pore_mask_d = None
         self._filled_d = None
+        self._gravity = np.array([0.0, 0.0, -1.0], dtype=np.float64)
         self._frame_actor = None
         self._frame_actor_scalar = ""
         self._streamline_actor = None
@@ -239,6 +255,9 @@ class FlowAnimator(QtCore.QObject):
             self._t_mold = float(cp.t_mold_c)
             self._t_liq = float(cp.t_liquidus_c)
             self._t_sol = float(cp.t_solidus_c)
+            g = np.asarray(cp.gravity_vector, dtype=np.float64)
+            norm = float(np.linalg.norm(g)) + 1e-9
+            self._gravity = g / norm
         else:
             self._t_pour = float(alloy.t_pour_c)
             self._t_mold = float(mold.t0_c)
@@ -1112,6 +1131,24 @@ class FlowAnimator(QtCore.QObject):
             # solidified (solid_time <= current time).  This makes pores appear
             # one by one as the liquid path closes.
             active_pore = self._pore_mask_d & (self._solid_time_d <= t)
+
+            # P4 prototype: gravity-driven pore rise.  Pores are buoyant in the
+            # still-liquid metal and drift opposite to the gravity vector.
+            # The shift is sub-voxel and grows with time since filling ended.
+            dt_pore = max(0.0, t - self._max_fill_time)
+            rise_m = dt_pore * self.PORE_RISE_SPEED_M_S
+            if rise_m > 1e-6 and self._dx > 0.0:
+                rise_voxels = rise_m * 1000.0 / self._dx
+                shift = tuple(-rise_voxels * self._gravity[i] for i in range(3))
+                shifted = ndimage.shift(
+                    active_pore.astype(np.float64),
+                    shift,
+                    order=1,
+                    mode="constant",
+                    cval=0.0,
+                )
+                active_pore = shifted > 0.5
+
             pore_smooth = ndimage.gaussian_filter(
                 active_pore.astype(np.float64), sigma=self.PHI_SIGMA, mode="constant", cval=0.0
             ).astype(np.float32)

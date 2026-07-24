@@ -33,6 +33,7 @@ from core.types import (
     AnalysisResult,
     Body,
     BodyType,
+    FillingResult,
     GateResult,
     SectionFlow,
 )
@@ -47,6 +48,109 @@ def _neighbor_offsets_6():
         (0, 0, 1),
         (0, 0, -1),
     ]
+
+
+def _map_node_velocity_to_section(key: str) -> Optional[str]:
+    """Map a node-velocity key or gating-node body_type to a canonical section."""
+    up = key.upper()
+    if "INGATE" in up:
+        return "gate"
+    if "DISTRIBUTOR" in up:
+        return "distributor"
+    if "CURUFLUK" in up:
+        return "curufluk"
+    if "RUNNER" in up:
+        return "runner"
+    if "SPRUE" in up:
+        return "sprue"
+    return None
+
+
+def _upstream_section_key(body_type: str) -> str:
+    """Upper-case upstream section key from a 'UP→DOWN' gating node body_type."""
+    up = (body_type or "").split("→")[0].strip().upper()
+    return up
+
+
+def _actual_velocities_from_flow(flow: FillingResult) -> Dict[str, float]:
+    """Return the gating section velocities reported by the Darcy flow solver."""
+    node_v = getattr(flow, "node_velocities", {}) or {}
+    buckets: Dict[str, List[float]] = {}
+    for key, val in node_v.items():
+        section = _map_node_velocity_to_section(key)
+        if not section:
+            continue
+        buckets.setdefault(section, []).append(float(val))
+    return {k: float(np.mean(v)) for k, v in buckets.items() if v}
+
+
+def _section_area_from_flow(flow: FillingResult, section: str) -> float:
+    """Total contact area (cm2) for a gating section from the flow result."""
+    section = section.lower()
+    total = 0.0
+    for node in getattr(flow, "gating_nodes", []) or []:
+        up = _map_node_velocity_to_section(node.body_type or "")
+        if up == section:
+            total += float(node.section_area_cm2 or 0.0)
+    return total
+
+
+def _section_flows_from_flow(
+    flow: FillingResult,
+    rho: float,
+    mu: float,
+    g: float,
+    velocity_targets: Dict[str, Tuple[float, float]],
+) -> Dict[str, SectionFlow]:
+    """Build SectionFlow objects directly from Darcy flow contact nodes.
+
+    Keys match the original gating section names (SPRUE_BASE, SPRUE_THROAT,
+    RUNNER, INGATE, DISTRIBUTOR, CURUFLUK).  Reynolds and Froude numbers use
+    the equivalent hydraulic diameter computed from the summed contact area.
+    """
+    section_data: Dict[str, List[Tuple[float, float, float]]] = {}
+    for node in getattr(flow, "gating_nodes", []) or []:
+        up = _upstream_section_key(node.body_type or "")
+        if not up:
+            continue
+        section_data.setdefault(up, []).append(
+            (node.velocity_m_s, node.section_area_cm2, node.flow_rate_m3_s)
+        )
+    out: Dict[str, SectionFlow] = {}
+    for up_section, rows in section_data.items():
+        areas = [a for _, a, _ in rows]
+        qs = [q for _, _, q in rows]
+        total_area_cm2 = float(np.sum(areas))
+        if total_area_cm2 <= 0.0:
+            continue
+        # Weighted average velocity by flow rate.
+        total_q = float(np.sum(qs))
+        v_m_s = (
+            float(np.average([v for v, _, _ in rows], weights=qs))
+            if total_q > 0.0
+            else float(np.mean([v for v, _, _ in rows]))
+        )
+        d_m = 2.0 * math.sqrt(max(total_area_cm2 * 1e-4, 0.0) / math.pi)
+        re = float(rho * v_m_s * d_m / max(mu, 1e-9))
+        fr = float(v_m_s / math.sqrt(max(g * d_m, 1e-9)))
+        # Map uppercase upstream key to the lower-case target range key.
+        lo_hi_key = _map_node_velocity_to_section(up_section) or up_section.lower()
+        lo, hi = velocity_targets.get(lo_hi_key, (0.0, 1.0))
+        a_min, a_max = 0.0, 1e9
+        out[up_section] = SectionFlow(
+            velocity_m_s=v_m_s,
+            area_cm2=total_area_cm2,
+            thickness_mm=d_m * 1000.0,
+            reynolds=re,
+            froude=fr,
+            turbulent=(re > 2300.0 or fr > 0.8),
+            max_velocity_m_s=hi,
+            target_v_min_m_s=lo,
+            target_v_max_m_s=hi,
+            target_area_min_cm2=a_min,
+            target_area_max_cm2=a_max,
+        )
+    return out
 
 
 def _apply_edge_mask(arr, di, dj, dk):
@@ -1542,6 +1646,14 @@ def analyze_gating(
         a_m2 = a / 1e4
         actual_v[k] = Q_design_m3_s / a_m2 if a_m2 > 0 else 0.0
 
+    # P2: when a 3-D Darcy flow result exists, use it as the single source of
+    # truth for measured section velocities.  Merge flow velocities on top of
+    # the design values so missing sections still have a fallback and KeyError
+    # is avoided later in report strings.
+    flow_result = getattr(result, "flow_result", None)
+    if flow_result is not None and getattr(flow_result, "Q_m3_s", 0.0) > 0.0:
+        actual_v.update(_actual_velocities_from_flow(flow_result))
+
     # Classify the real system from the measured velocities.
     detected_system = _classify_from_velocities(
         actual_v.get("sprue", 0.0),
@@ -1566,6 +1678,16 @@ def analyze_gating(
     sprue_v_range = velocity_targets["sprue"]
     runner_v_range = velocity_targets["runner"]
     gate_v_range = velocity_targets["gate"]
+
+    # P2: overwrite the design SectionFlow objects with the Darcy flow result
+    # once the target ranges are known.
+    if flow_result is not None and getattr(flow_result, "Q_m3_s", 0.0) > 0.0:
+        section_flows = _section_flows_from_flow(
+            flow_result, alloy.rho_kg_m3, mu, 9.81, velocity_targets
+        )
+        ingate_flow = section_flows.get("INGATE", section_flows.get("gate", ingate_flow))
+        runner_flow = section_flows.get("RUNNER", section_flows.get("runner", runner_flow))
+        sprue_flow = section_flows.get("SPRUE_BASE", section_flows.get("sprue", sprue_flow))
 
     # Velocity penalty: a section must be failed if its real velocity exceeds the
     # recommended maximum, even if the area ratio looks acceptable on paper.
@@ -1696,7 +1818,7 @@ def analyze_gating(
     result.recommendations.append(
         f"CAD ölçümü (karşılaştırma): sprue taban={sprue_base_cm2:.2f} cm², runner={runner_min_area_cm2:.2f} cm², "
         f"gate={gate_area_cm2:.2f} cm². Bu alanlarla gerçek hızlar: "
-        f"sprue={actual_v['sprue']:.2f}, runner={actual_v['runner']:.2f}, gate={actual_v['gate']:.2f} m/s."
+        f"sprue={actual_v.get('sprue', 0.0):.2f}, runner={actual_v.get('runner', 0.0):.2f}, gate={actual_v.get('gate', 0.0):.2f} m/s."
     )
 
     # Feeder / part mass and volume ratios
@@ -1736,6 +1858,21 @@ def analyze_gating(
             velocity_ok = False
         return area_ok and velocity_ok
 
+    # P2: final flow-source overrides for the GateResult fields that the UI uses.
+    if flow_result is not None and getattr(flow_result, "Q_m3_s", 0.0) > 0.0:
+        ingate_velocity_m_s = getattr(flow_result, "ingate_contact_velocity_m_s", v_gate_design) or v_gate_design
+        ingate_flow_rate_m3_s = getattr(flow_result, "total_ingate_flow_m3_s", Q_design_m3_s) or Q_design_m3_s
+        ingate_fill_time_s = getattr(flow_result, "fill_time_s", design_fill_time_s) or design_fill_time_s
+        velocity_fill_time_match_ok = (
+            abs(ingate_fill_time_s - design_fill_time_s)
+            <= 0.2 * max(design_fill_time_s, 1e-9)
+        )
+    else:
+        ingate_velocity_m_s = v_gate_design
+        ingate_flow_rate_m3_s = Q_design_m3_s
+        ingate_fill_time_s = design_fill_time_s
+        velocity_fill_time_match_ok = True
+
     # v9.2: gating fills the mould; it does not fix shrinkage hot spots.
     # Remind the user when unfed hot spots remain so that riser/chill/exothermic
     # decisions are not silently delegated to the gating system.
@@ -1774,14 +1911,14 @@ def analyze_gating(
         head_loss_mm=head_loss_m * 1000.0,
         effective_head_mm=H_eff_m * 1000.0,
         required_sprue_area_with_losses_cm2=As_m2 * 1e4,
-        ingate_velocity_m_s=v_gate_design,
+        ingate_velocity_m_s=ingate_velocity_m_s,
         ingate_max_velocity_m_s=gate_v_range[1],
         reynolds=ingate_flow.reynolds,
         froude=ingate_flow.froude,
         turbulent=(ingate_flow.turbulent or actual_v.get('gate', 0.0) > gate_v_range[1]),
-        ingate_flow_rate_m3_s=Q_design_m3_s,
-        ingate_fill_time_s=design_fill_time_s,
-        velocity_fill_time_match_ok=True,
+        ingate_flow_rate_m3_s=ingate_flow_rate_m3_s,
+        ingate_fill_time_s=ingate_fill_time_s,
+        velocity_fill_time_match_ok=velocity_fill_time_match_ok,
         required_ingate_area_for_velocity_cm2=Ag_each_m2 * 1e4,
         velocity_area_ok=(
             _section_ok(actual_sprue_base_cm2, As_m2 * 1e4, actual_v['sprue'], sprue_v_range[1])
