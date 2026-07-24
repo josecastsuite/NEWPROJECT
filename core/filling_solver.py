@@ -30,27 +30,28 @@ from scipy.sparse import csr_matrix
 from scipy.sparse import linalg as spla
 
 from core.types import Body, BodyType, FillingResult, GatingNode, GatingVelocityError
-from core.voxelizer import compute_face_fractions
+from core.voxelizer import build_voxel_grid, compute_face_fractions
 
 
 def _downsample_grid(
     grid: np.ndarray,
     origin: np.ndarray,
     dx: float,
-    max_cells: int = 200_000,
+    max_cells: int = 6_000_000,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """Downsample a body-type grid with nearest-neighbour interpolation.
 
-    The goal is to keep the pressure Poisson solve fast while still capturing
-    the gating geometry.
+    The solver memory/time is driven by the number of cavity (non-empty) cells,
+    so the limit is applied to the cavity count rather than the dense grid size.
     """
     nx, ny, nz = grid.shape
-    cells = nx * ny * nz
-    if cells <= max_cells:
+    cavity = grid != BodyType.EMPTY
+    n_cavity = int(cavity.sum())
+    if n_cavity <= max_cells:
         return grid.copy(), origin.copy(), dx
 
-    # Choose an integer factor that brings the cell count below the limit.
-    factor = int(np.ceil((cells / max_cells) ** (1.0 / 3.0)))
+    # Choose an integer factor that brings the cavity count below the limit.
+    factor = int(np.ceil((n_cavity / max_cells) ** (1.0 / 3.0)))
     factor = max(2, factor)
 
     new_shape = (
@@ -67,11 +68,94 @@ def _downsample_grid(
     return grid_c.astype(grid.dtype), origin_c, dx_c
 
 
+def _flow_refined_grid(
+    bodies: List[Body],
+    casting_params,
+    desired_dx_mm: float = 1.75,
+    max_cells: int = 6_000_000,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float]]:
+    """Re-voxelise the casting bodies for the Darcy flow solve.
+
+    The flow solve needs a grid fine enough to resolve gate cross-sections
+    (desired_dx_mm) while the PCG solver can still handle the cavity cell count
+    (max_cells).  If bodies are unavailable the caller falls back to the
+    supplied grid.
+    """
+    if not bodies:
+        return None, None, None
+    from core.voxelizer import build_voxel_grid
+
+    max_size = 0.0
+    for b in bodies:
+        size = float(np.max(b.mesh.bounds[1] - b.mesh.bounds[0]))
+        if size > max_size:
+            max_size = size
+    if max_size <= 0.0:
+        return None, None, None
+
+    # Target dimension for the desired voxel pitch, capped by the memory budget.
+    target_dim = max(160, int(np.ceil(max_size / desired_dx_mm)))
+    # Total grid cells scale as target_dim^3; leave a 2x safety factor for
+    # margin + empty space, and let _downsample_grid trim the cavity count.
+    max_dim = int(np.floor((max_cells * 2.0) ** (1.0 / 3.0)))
+    target_dim = min(target_dim, max_dim)
+    if target_dim < 160:
+        target_dim = 160
+
+    gvec = getattr(casting_params, "gravity_vector", (0.0, 0.0, -1.0))
+    try:
+        grid, origin, dx, _ = build_voxel_grid(
+            bodies,
+            target_dim=target_dim,
+            gravity_vector=gvec,
+            conservative=True,
+            progress_callback=None,
+        )
+        return grid, origin, dx
+    except Exception as exc:
+        print(f"[Darcy solver] flow re-voxelization failed: {exc}; using supplied grid")
+        return None, None, None
+
+
 def _cavity_and_solid_masks(grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Return cavity (mold cavity incl. gating+part) and solid masks."""
     cavity = grid != BodyType.EMPTY
     solid = ~cavity
     return cavity, solid
+
+
+def _resample_to_grid(
+    src: np.ndarray,
+    src_origin: np.ndarray,
+    src_dx: float,
+    dst_shape: Tuple[int, int, int],
+    dst_origin: np.ndarray,
+    dst_dx: float,
+    fill_value: float = 0.0,
+    order: int = 1,
+) -> np.ndarray:
+    """Tri-linearly resample a cell-centred 3-D scalar from one regular grid to another.
+
+    The two grids may have different origins, voxel pitches and shapes; the
+    physical coordinates of the destination cell centres are mapped back to the
+    source index frame and ``map_coordinates`` is used.
+    """
+    nz, ny, nx = dst_shape
+    zc = dst_origin[0] + (np.arange(nz) + 0.5) * dst_dx
+    yc = dst_origin[1] + (np.arange(ny) + 0.5) * dst_dx
+    xc = dst_origin[2] + (np.arange(nx) + 0.5) * dst_dx
+    zz, yy, xx = np.meshgrid(zc, yc, xc, indexing="ij")
+    coords = np.stack(
+        [
+            (zz - src_origin[0]) / src_dx - 0.5,
+            (yy - src_origin[1]) / src_dx - 0.5,
+            (xx - src_origin[2]) / src_dx - 0.5,
+        ],
+        axis=0,
+    )
+    return ndimage.map_coordinates(
+        src, coords, order=order, mode="nearest", cval=fill_value
+    )
 
 
 def _ensure_dirichlet_per_component(
@@ -425,25 +509,66 @@ def _solve_pressure(
     A: csr_matrix,
     rhs: np.ndarray,
 ) -> np.ndarray:
-    """Solve the sparse linear system; fall back to direct if iterative fails."""
+    """Solve the sparse SPD pressure system with PCG + a Jacobi or ILU(0) preconditioner.
+
+    The direct ``spsolve`` factorisation is only used as a last-resort safety net
+    for very small systems because it can consume huge amounts of RAM on
+    million-cell grids.
+    """
+    n = A.shape[0]
+
+    # 1) Jacobi-preconditioned CG.  Zero extra memory, fast setup, and the
+    # method of choice for large systems where ILU factorisation is too expensive.
     try:
-        p, info = spla.cg(A, rhs, atol=0.0, rtol=1e-9, maxiter=500)
+        diag = A.diagonal()
+        safe_diag = np.where(np.abs(diag) > 1e-18, diag, 1.0)
+        inv_diag = 1.0 / safe_diag
+        M = spla.LinearOperator((n, n), matvec=lambda x: inv_diag * x)
+        p, info = spla.cg(
+            A, rhs, M=M, atol=0.0, rtol=1e-7, maxiter=min(10000, n + 1000)
+        )
         if info == 0:
             return p
-        print(f"[Darcy solver] CG failed info={info}")
+        print(f"[Darcy solver] PCG+Jacobi failed info={info}")
     except Exception as exc:
-        print(f"[Darcy solver] CG exception: {exc}")
+        print(f"[Darcy solver] PCG+Jacobi exception: {exc}")
 
-    try:
-        p = spla.spsolve(A, rhs)
-        if not np.isfinite(p).all():
-            print("[Darcy solver] spsolve produced non-finite values")
-            p = np.zeros_like(rhs)
-        return p
-    except Exception as exc:
-        print(f"[Darcy solver] spsolve failed: {exc}")
-        # Extremely ill-conditioned; use least-squares fallback.
-        return np.zeros_like(rhs)
+    # 2) ILU(0) preconditioned CG for moderate systems.  ILU(0) keeps the same
+    # sparsity as A, so it is much cheaper than a complete LU factorisation.
+    if n <= 500_000:
+        try:
+            A_csc = A.tocsc()
+            ilu = spla.spilu(
+                A_csc,
+                drop_tol=1e-6,
+                fill_factor=1.5,
+                diag_pivot_thresh=0.0,
+                options={"ColPerm": "NATURAL"},
+            )
+            M = spla.LinearOperator((n, n), matvec=ilu.solve)
+            p, info = spla.cg(
+                A, rhs, M=M, atol=0.0, rtol=1e-8, maxiter=min(5000, n + 1000)
+            )
+            if info == 0:
+                return p
+            print(f"[Darcy solver] PCG+ILU failed info={info}")
+        except Exception as exc:
+            print(f"[Darcy solver] PCG+ILU exception: {exc}")
+
+    # 3) Direct solve only as a safety net for small systems.
+    if n < 100_000:
+        try:
+            p = spla.spsolve(A, rhs)
+            if not np.isfinite(p).all():
+                print("[Darcy solver] spsolve produced non-finite values")
+                p = np.zeros_like(rhs)
+            return p
+        except Exception as exc:
+            print(f"[Darcy solver] spsolve failed: {exc}")
+
+    # 4) Last resort: zero pressure.
+    print("[Darcy solver] all pressure solvers failed; returning zero pressure")
+    return np.zeros_like(rhs)
 
 
 def _face_velocities(
@@ -1589,12 +1714,12 @@ def _gating_node_velocities(
                 new_throat = min(old[2], a_self) if old[2] > 1e-18 else a_self
                 comp_section_m2[cid] = (new_throat, new_throat, new_throat)
 
-        # Voxel shared-face area is a robust fallback when the mesh section fails.
+        # The CAD cross-section (minimum of the two body sections) is the true
+        # throat area.  Voxel shared-face area is only used when the mesh
+        # section cannot be computed.
         voxel_area_m2 = float(c.get("voxel_area_m2", 0.0))
-        a_contact = max(a_mesh, voxel_area_m2)
+        a_contact = a_mesh if a_mesh > 1e-18 else voxel_area_m2
 
-        # The design caps are applied after comp_design_m2 is recomputed below,
-        # so we just store the raw physical contact area for now.
         c["area_raw_m2"] = float(a_contact)
 
     # Design caps: source area, and total INGATE area split by throat.
@@ -1639,19 +1764,20 @@ def _gating_node_velocities(
         else:
             comp_design_m2[cid] = float("inf")
 
-    # Prefer the real FAVOR contact area from the Darcy flux integration; if that
-    # is unavailable (no velocity field) fall back to the CAD mesh/voxel area
-    # capped by the gating design areas.
+    # Final contact area: FAVOR/Darcy integration gives the voxel-based area, but
+    # the true physical throat cannot be larger than the CAD cross-section or
+    # the design reference.  Use the smallest reliable bound.
     for c in contacts:
         id1, id2 = c["id1"], c["id2"]
         a_real = float(c.get("area_real_m2", 0.0))
-        if a_real > 1e-18:
-            c["area_m2"] = a_real
-            continue
-        a_contact = c["area_raw_m2"]
+        a_contact = float(c.get("area_raw_m2", 0.0))
         design1 = comp_design_m2.get(id1, float("inf"))
         design2 = comp_design_m2.get(id2, float("inf"))
-        if a_contact > 1e-18:
+        if a_real > 1e-18 and a_contact > 1e-18:
+            c["area_m2"] = float(min(a_real, a_contact, design1, design2))
+        elif a_real > 1e-18:
+            c["area_m2"] = float(min(a_real, design1, design2))
+        elif a_contact > 1e-18:
             c["area_m2"] = float(min(a_contact, design1, design2))
         else:
             c["area_m2"] = float(min(design1, design2))
@@ -1752,7 +1878,7 @@ def solve_filling_flow(
     casting_params,
     alloy,
     bodies=None,
-    max_solver_cells: int = 500_000,
+    max_solver_cells: int = 6_000_000,
     progress_callback=None,
     design_velocity_m_s: float = 0.0,
     design_section_key: str = "SPRUE_THROAT",
@@ -1799,6 +1925,21 @@ def solve_filling_flow(
     """
     if progress_callback:
         progress_callback(2)
+
+    # The input analysis grid is kept as the reference frame for the returned
+    # velocity / fill_time fields (so they match result.grid downstream).
+    orig_grid = grid.copy()
+    orig_origin = origin.copy()
+    orig_dx = float(dx)
+
+    # If body geometry is available, build a flow-dedicated grid fine enough to
+    # capture gate cross-sections (≤ ~1.8 mm) while staying within the solver
+    # cavity budget.  Otherwise fall back to the supplied analysis grid.
+    ref_grid, ref_origin, ref_dx = _flow_refined_grid(
+        bodies, casting_params, desired_dx_mm=1.75, max_cells=max_solver_cells
+    )
+    if ref_grid is not None and ref_dx < dx * 0.95:
+        grid, origin, dx = ref_grid, ref_origin, ref_dx
 
     # Downsample to keep the linear solve tractable.
     grid_c, origin_c, dx_c = _downsample_grid(grid, origin, dx, max_solver_cells)
@@ -1938,31 +2079,41 @@ def solve_filling_flow(
                 fill_time_c * (fill_time_s / raw_max),
                 fill_time_c,
             )
-    if fill_time_c.shape == grid.shape:
+    # Resample the fill-time and velocity fields back onto the original analysis
+    # grid so that downstream modules (e.g. flow animator) see consistent shapes.
+    # Nearest-neighbour is used for fill_time because it carries an inf sentinel
+    # for unreached cells; linear interpolation is used for velocity.
+    if (
+        fill_time_c.shape == orig_grid.shape
+        and abs(dx_c - orig_dx) < 1e-9
+        and np.allclose(origin_c, orig_origin)
+    ):
         fill_time_fine = fill_time_c
     else:
-        fill_time_fine = ndimage.zoom(
+        fill_time_fine = _resample_to_grid(
             fill_time_c,
-            (
-                grid.shape[0] / fill_time_c.shape[0],
-                grid.shape[1] / fill_time_c.shape[1],
-                grid.shape[2] / fill_time_c.shape[2],
-            ),
-            order=1,
+            origin_c,
+            dx_c,
+            orig_grid.shape,
+            orig_origin,
+            orig_dx,
+            fill_value=np.inf,
+            order=0,
         )
-        fill_time_fine = np.where(grid > 0, fill_time_fine, 0.0)
+        fill_time_fine = np.where(orig_grid == BodyType.EMPTY, 0.0, fill_time_fine)
 
-    # Upsample the 3-D velocity vector and magnitude to the (fine) input grid
-    # for surface overlay, node velocity checks and particle animation.
-    if vmag.shape == grid.shape:
+    if (
+        vmag.shape == orig_grid.shape
+        and abs(dx_c - orig_dx) < 1e-9
+        and np.allclose(origin_c, orig_origin)
+    ):
         vx_f, vy_f, vz_f = ux_c, vy_c, wz_c
     else:
-        zoom = tuple(grid.shape[i] / vmag.shape[i] for i in range(3))
-        vx_f = ndimage.zoom(ux_c, zoom, order=1)
-        vy_f = ndimage.zoom(vy_c, zoom, order=1)
-        vz_f = ndimage.zoom(wz_c, zoom, order=1)
+        vx_f = _resample_to_grid(ux_c, origin_c, dx_c, orig_grid.shape, orig_origin, orig_dx)
+        vy_f = _resample_to_grid(vy_c, origin_c, dx_c, orig_grid.shape, orig_origin, orig_dx)
+        vz_f = _resample_to_grid(wz_c, origin_c, dx_c, orig_grid.shape, orig_origin, orig_dx)
 
-    fine_metal = grid > 0
+    fine_metal = orig_grid > 0
     velocity = np.stack(
         [
             np.where(fine_metal, vx_f, 0.0),
