@@ -503,12 +503,12 @@ class MainWindow(QtWidgets.QMainWindow):
         vis_layout.addWidget(self.porosity_toggle)
 
         self.porosity_noise_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.porosity_noise_slider.setMinimum(1)    # 0.01%
-        self.porosity_noise_slider.setMaximum(300)  # 3.00%
-        self.porosity_noise_slider.setValue(300)    # default 3.00%
-        self.porosity_noise_slider.setToolTip("Porozite gürültü filtresi: tek slider, ama Makro/Mikro daha geniş, İnce daha dar gösterir")
+        self.porosity_noise_slider.setMinimum(0)      # 0.00%
+        self.porosity_noise_slider.setMaximum(10000)   # 100.00%
+        self.porosity_noise_slider.setValue(10000)     # default: tüm sınıf
+        self.porosity_noise_slider.setToolTip("Porozite bulutunda görünür risk yüzdesi: 100 = sınıfın tamamı, 0 = sadece en yüksek risk")
         self.porosity_noise_slider.valueChanged.connect(self.on_porosity_noise_changed)
-        self.porosity_noise_label = QtWidgets.QLabel("Filtre: %3.00")
+        self.porosity_noise_label = QtWidgets.QLabel("Risk: %100.00")
         vis_layout.addWidget(self.porosity_noise_label)
         vis_layout.addWidget(self.porosity_noise_slider)
 
@@ -643,7 +643,10 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
         splitter.setSizes([560, 680, 560]) 
-        
+
+        # Sync porosity size-filter labels with the default alloy.
+        self._update_porosity_filter_labels(get_alloy(self.alloy_combo.currentData()))
+
         # Add splitter to main VBox
         main_vbox.addWidget(splitter, stretch=1)
 
@@ -1414,7 +1417,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_porosity_noise_changed(self, value: int):
         noise_percent = value / 100.0
-        self.porosity_noise_label.setText(f"Filtre: %{noise_percent:.2f}")
+        self.porosity_noise_label.setText(f"Risk: %{noise_percent:.2f}")
         if self._analysis and self.porosity_toggle.isChecked():
             noise, mp, size_filter = self._porosity_cloud_params()
             self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
@@ -1425,7 +1428,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
 
     def _porosity_cloud_params(self) -> Tuple[float, int, str]:
-        noise_percent = self.porosity_noise_slider.value() / 100.0  # 0.01 .. 3.00
+        noise_percent = self.porosity_noise_slider.value() / 100.0  # 0.00 .. 100.00
         max_points = 5000
         size_filter = str(self.porosity_size_filter.currentData() or "all")
         return float(noise_percent), int(max_points), size_filter

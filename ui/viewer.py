@@ -300,17 +300,17 @@ class Analyzer3DViewer(QtInteractor):
     def show_porosity_cloud(
         self,
         result: Optional[AnalysisResult],
-        noise_percent: float = 3.0,
+        noise_percent: float = 100.0,
         max_points: int = 5000,
         pore_size_filter: Optional[str] = None,
     ):
         """Porosity point cloud colored by estimated pore size.
 
-        Only the top ``noise_percent``% of the displayed scalar is rendered so
-        that numerical / physical noise is suppressed.  ``pore_size_filter``
-        restricts the cloud to ``macro``, ``micro`` or ``fine`` classes.
-        Falls back to the slowest-solidifying regions only when pore-size data
-        are not available or the user has not requested a specific class.
+        ``pore_size_filter`` restricts the cloud to ``macro``, ``micro`` or
+        ``fine`` size classes; when ``all`` or empty the whole pore-size field
+        is shown.  ``noise_percent`` selects the fraction of the highest-risk
+        voxels inside the chosen class that are displayed (100 = whole class,
+        0 = only the very highest risk).  Class limits come from the alloy.
         """
         if self._porosity_actor is not None:
             self.remove_actor(self._porosity_actor)
@@ -324,13 +324,9 @@ class Analyzer3DViewer(QtInteractor):
             return
 
         pore_size_filter = (pore_size_filter or "").lower()
-        # v9.2: visualize the shrinkage-only pore-size field; the gas/oxide
-        # baseline would otherwise make every voxel positive and dominate the cloud.
-        shrinkage_um = getattr(result, "pore_size_shrinkage_um", None)
-        if shrinkage_um is not None and shrinkage_um.size == part_mask.size:
-            pore_size_um = np.asarray(shrinkage_um)
-        else:
-            pore_size_um = np.asarray(result.pore_size_um) if result.pore_size_um is not None else np.array([])
+        # v10.0: use the final physical pore size (shrinkage + gas/entrainment)
+        # for color and class masks; class limits come from the alloy.
+        pore_size_um = np.asarray(result.pore_size_um) if result.pore_size_um is not None else np.array([])
         has_pore_size = pore_size_um.size and pore_size_um.shape == part_mask.shape
 
         class_mask = np.zeros_like(part_mask, dtype=bool)
@@ -340,8 +336,6 @@ class Analyzer3DViewer(QtInteractor):
             if class_mask is None or class_mask.size == 0:
                 class_mask = np.zeros_like(part_mask, dtype=bool)
             use_pore_size = class_mask.any()
-            # v9.1: if the user explicitly selected a class, do not fall back to
-            # solidification-time/risk clouds; show nothing for that class.
             if not use_pore_size:
                 return
         elif has_pore_size and pore_size_filter in ("", "all"):
@@ -365,13 +359,12 @@ class Analyzer3DViewer(QtInteractor):
                 return
             class_mask = part_mask
 
-        # v9.3: use the risk field to suppress low-probability shrinkage noise.
-        # The slider selects the top noise_percent% of risk within the chosen class;
-        # the displayed scalar remains the shrinkage pore size.  No empirical
-        # top-percent class filters are used; class limits come from the alloy.
+        # Use the risk field to thin very low-probability voxels while still
+        # honouring the selected size class.  noise_percent=100 means the whole
+        # class is shown; lower values keep only the highest-risk portion.
         risk = np.asarray(result.risk) if result.risk is not None else np.array([])
         has_risk = risk.size and risk.shape == part_mask.shape
-        if use_pore_size and has_risk and 0.0 < noise_percent < 100.0:
+        if use_pore_size and has_risk and 0.0 <= noise_percent < 100.0:
             risk_values = risk[class_mask & (risk > 0.0)]
             if risk_values.size == 0:
                 return

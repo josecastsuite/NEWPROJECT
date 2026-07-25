@@ -407,15 +407,24 @@ def compute_pore_size(
     gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
     fill_time: Optional[np.ndarray] = None,
     darcy_factor: Optional[np.ndarray] = None,
+    velocity_magnitude: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Estimate pore size from the Carlson-Beckermann dimensionless Niyama model.
 
     The engine Niyama field is converted to the dimensionless Ny* via the alloy
     niyama_star_scale, then the published Carlson-Beckermann curve gives the
     shrinkage pore volume percentage gp.  gp is reduced by the directional
-    feeding efficiency and mapped to a size proxy (µm) using
-    pore_size_um_per_porosity_pct so the macro/micro/fine class thresholds
-    (500/50 µm) correspond to physically meaningful volume-fraction levels.
+    feeding efficiency and amplified where the Darcy pressure head cannot
+    overcome the mushy-zone resistance.
+
+    The pore size is then computed physically from the volume fraction:
+    shrinkage pore diameter scales with the cube-root of gp and a local
+    characteristic length L = max(2*M_mod, SDAS).  This naturally separates
+    micro-shrinkage (L ~ SDAS) from macro-shrinkage (L ~ section thickness).
+    A separate gas/oxide micro-porosity contribution is driven by the local
+    melt velocity: velocities above the alloy critical entrainment velocity
+    (Campbell ~0.5 m/s for Al, higher for ferrous alloys) increase bifilm/gas
+    pore size, so gate velocity and gate area have a direct effect on porosity.
 
     ``fill_time`` supplies per-voxel metal arrival time (s) so that a feeder reached
     late is penalised.  ``darcy_factor`` (>1 where pressure head cannot overcome the
@@ -448,17 +457,33 @@ def compute_pore_size(
     else:
         gp_pct = np.where(valid, gp_pct * feed_factor, 0.0)
 
-    # Convert predicted volume percentage to a size proxy for visualization/class.
-    size_scale = alloy.pore_size_um_per_porosity_pct
-    shrinkage_pore_size_um = gp_pct * size_scale
-    shrinkage_pore_size_um = np.nan_to_num(
-        shrinkage_pore_size_um, nan=0.0, posinf=0.0, neginf=0.0
+    # Convert predicted volume percentage to a physical pore size.
+    # gp is in percent; gp_frac is the volume fraction.
+    gp_frac = np.where(valid, gp_pct / 100.0, 0.0)
+
+    # Local characteristic length: a shrinkage pore cannot be larger than the
+    # local section thickness (2*M_mod) but micro-pores are bounded by SDAS.
+    sdas_um = alloy.dendrite_spacing_mm * 1000.0
+    L_um = (
+        np.maximum(2.0 * M_mod * 1000.0, sdas_um)
+        * alloy.pore_size_length_factor
     )
 
-    # Real-life baseline: dissolved gas/oxides always leave some micro pores.
-    # Thicker/slower-solidifying sections and lower-Niyama regions retain larger
-    # gas pores, so the baseline is spatially modulated instead of uniform.
-    sdas_um = alloy.dendrite_spacing_mm * 1000.0
+    # Shrinkage pore diameter from volume fraction using a spherical-equivalent
+    # cube-root scaling: d = cbrt(6/pi * gp) * L.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d_shrinkage_um = np.where(
+            valid,
+            alloy.pore_size_cube_root_factor
+            * np.cbrt(np.maximum(6.0 / np.pi * gp_frac, 0.0))
+            * L_um,
+            0.0,
+        )
+    d_shrinkage_um = np.nan_to_num(d_shrinkage_um, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Gas/oxide micro-porosity baseline: always present, larger in thicker /
+    # lower-Niyama regions.  It is further amplified when the local melt velocity
+    # exceeds the critical entrainment velocity (gate velocity -> bifilms).
     baseline_min_um = max(alloy.gas_pore_baseline_um, sdas_um * 0.02)
     raw_micro = np.clip(1.0 - niyama / max(alloy.niyama_shrinkage, 1e-9), 0.0, 1.0)
     m_max = float(np.max(M_mod[part_mask])) if np.any(part_mask) else 1.0
@@ -470,11 +495,28 @@ def compute_pore_size(
     )
     baseline_um = baseline_min_um * np.clip(baseline_factor, 1.0, None)
 
-    pore_size_um = np.where(
-        part_mask,
-        np.maximum(shrinkage_pore_size_um, baseline_um),
-        0.0,
+    v_mag = (
+        np.asarray(velocity_magnitude, dtype=np.float64)
+        if velocity_magnitude is not None
+        else np.zeros_like(part_mask, dtype=np.float64)
     )
+    entrainment = np.zeros_like(part_mask, dtype=np.float64)
+    v_crit = float(alloy.critical_entrainment_velocity_m_s)
+    if v_crit > 1e-9:
+        v_over = np.where(
+            part_mask,
+            np.maximum(v_mag - v_crit, 0.0) / v_crit,
+            0.0,
+        )
+        entrainment = np.where(
+            part_mask,
+            np.power(v_over, alloy.pore_entrainment_exponent),
+            0.0,
+        )
+    d_gas_um = baseline_um * (1.0 + alloy.pore_entrainment_factor * entrainment)
+
+    shrinkage_pore_size_um = d_shrinkage_um
+    pore_size_um = np.where(part_mask, np.maximum(d_shrinkage_um, d_gas_um), 0.0)
     pore_size_mm = pore_size_um / 1000.0
 
     pore_size_um = np.nan_to_num(pore_size_um, nan=0.0, posinf=0.0, neginf=0.0)
@@ -482,12 +524,22 @@ def compute_pore_size(
 
     macro_thr = alloy.macro_pore_limit_um
     micro_thr = alloy.micro_pore_limit_um
-    # Class masks are based on the shrinkage component, not the gas baseline.
-    macro_mask = (shrinkage_pore_size_um >= macro_thr) & part_mask
+
+    # Local defect risk: shrinkage volume relative to the macro reference plus
+    # the velocity-driven entrainment term.  This is used to keep the class masks
+    # from being dominated by the ever-present gas baseline.
+    gp_ref = alloy.macro_pore_limit_um / max(alloy.pore_size_um_per_porosity_pct, 1e-9)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        defect_risk = np.clip(gp_pct / max(gp_ref, 1e-9) + entrainment, 0.0, 50.0)
+    risk_local = 1.0 - np.exp(-defect_risk)
+
+    macro_mask = (pore_size_um >= macro_thr) & part_mask & (risk_local > 0.01)
     micro_mask = (
-        (shrinkage_pore_size_um >= micro_thr) & (shrinkage_pore_size_um < macro_thr) & part_mask
+        (pore_size_um >= micro_thr) & (pore_size_um < macro_thr) & part_mask & (risk_local > 0.01)
     )
-    fine_mask = (shrinkage_pore_size_um > 0.0) & (shrinkage_pore_size_um < micro_thr) & part_mask
+    fine_mask = (
+        (pore_size_um > 0.0) & (pore_size_um < micro_thr) & part_mask & (risk_local > 0.01)
+    )
 
     return (
         pore_size_um,
@@ -2510,6 +2562,11 @@ def analyze(
         feed_risk = np.clip(np.nan_to_num(feed_risk, nan=1.0, posinf=1.0, neginf=1.0), 0.0, 1.0)
 
     # v8.8: estimate pore size from the Carlson-Beckermann dimensionless Niyama model.
+    velocity_magnitude = (
+        flow_result_for_thermal.velocity_magnitude
+        if flow_result_for_thermal is not None and flow_result_for_thermal.velocity_magnitude is not None
+        else None
+    )
     pore_size_um, pore_size_mm, pore_macro_mask, pore_micro_mask, pore_fine_mask, pore_shrinkage_um, pore_volume_pct = compute_pore_size(
         niyama,
         M_mod,
@@ -2522,6 +2579,7 @@ def analyze(
         gravity_vector=gravity_vector,
         fill_time=fill_time_s,
         darcy_factor=darcy_factor,
+        velocity_magnitude=velocity_magnitude,
     )
 
     # AŞAMA 9: Risk map aligned with the Carlson-Beckermann porosity volume.

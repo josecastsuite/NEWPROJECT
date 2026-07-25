@@ -1770,6 +1770,8 @@ def _gating_node_velocities(
             )
         )
 
+    part_edges: List[Dict] = []
+
     for cid in order:
         Q = Q_in[cid]
         out_edges = outgoing.get(cid, [])
@@ -1842,8 +1844,59 @@ def _gating_node_velocities(
             c["Q_branch"] = Q_branch
             c["v_branch"] = v_branch
             down_id = c["down_id"]
-            if down_id != part_id:
-                Q_in[down_id] += Q_branch
+            if down_id == part_id:
+                # Postpone INGATE->PART nodes until a second pass that equalises
+                # the exit velocity of all ingates fed by the same distributor.
+                part_edges.append({
+                    "cid": cid,
+                    "c": c,
+                    "A": A,
+                    "Q_branch": Q_branch,
+                    "v_branch": v_branch,
+                })
+                continue
+            Q_in[down_id] += Q_branch
+            print(
+                f"[GATING_NODE] {comp_meta[cid][1]} -> {comp_meta[down_id][1]}  "
+                f"area_cm2={A*1e4:.4f}  Q_L_s={Q_branch*1e3:.4f}  v_m_s={v_branch:.4f}",
+                flush=True,
+            )
+            node = _make_node(cid, down_id, A, Q_branch, c["centroid_mm"], flow_rate_m3_s=Q_branch)
+            nodes.append(node)
+
+    # Second pass: all INGATE -> PART edges fed by the same upstream distributor
+    # share a common exit velocity.  This reflects a manifold: the pressure at
+    # the distributor is (nearly) uniform, so each gate velocity is the same
+    # while the flow rate Q = v * A follows the individual gate cross-section.
+    from collections import defaultdict
+    part_groups: Dict[Tuple[int, BodyType], List[Dict]] = defaultdict(list)
+    for e in part_edges:
+        cid = e["cid"]
+        c = e["c"]
+        down_id = c["down_id"]
+        up_parent = parent.get(cid, -1)
+        part_groups[(up_parent, comp_meta[down_id][0])].append(e)
+
+    for group in part_groups.values():
+        if len(group) < 2:
+            pass
+        else:
+            q_sum = sum(e["Q_branch"] for e in group)
+            a_sum = sum(e["A"] for e in group)
+            if a_sum > 1e-18:
+                v_common_part = q_sum / a_sum
+                for e in group:
+                    e["Q_branch"] = v_common_part * e["A"]
+                    e["v_branch"] = e["Q_branch"] / e["A"]
+        for e in group:
+            cid = e["cid"]
+            c = e["c"]
+            A = e["A"]
+            Q_branch = float(e["Q_branch"])
+            v_branch = float(e["v_branch"])
+            c["Q_branch"] = Q_branch
+            c["v_branch"] = v_branch
+            down_id = c["down_id"]
             print(
                 f"[GATING_NODE] {comp_meta[cid][1]} -> {comp_meta[down_id][1]}  "
                 f"area_cm2={A*1e4:.4f}  Q_L_s={Q_branch*1e3:.4f}  v_m_s={v_branch:.4f}",

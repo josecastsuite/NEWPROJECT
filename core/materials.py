@@ -90,12 +90,22 @@ class Alloy:
     # curve_key selects the published fit ("WCB", "A356", "AZ91D").
     # niyama_star_scale converts the engine's Niyama [sqrt(K s)/mm] to the
     # dimensionless Ny* used by the Carlson curve.  If <= 0 it is solved from
-    # niyama_macro and macro_pore_limit_um so N=niyama_macro gives a pore-size
-    # proxy equal to the macro limit.  pore_size_um_per_porosity_pct turns the
-    # predicted porosity volume percentage into a size proxy for visualization.
+    # niyama_macro and macro_pore_limit_um so N=niyama_macro gives a reference
+    # pore-volume percentage for risk calibration.
+    # pore_size_um_per_porosity_pct is kept for that risk reference.
     carlson_curve_key: str = "WCB"
     niyama_star_scale: float = 0.0
     pore_size_um_per_porosity_pct: float = 1000.0
+    # Ingate/gate velocity above which surface turbulence entraps oxide films / air.
+    # Campbell and Hojjat/Beckermann give ~0.45-0.5 m/s for Al; steels are less
+    # oxide-sensitive, so a higher value is used for ferrous alloys.
+    critical_entrainment_velocity_m_s: float = 0.5
+    pore_entrainment_exponent: float = 1.5
+    pore_entrainment_factor: float = 1.0
+    # Physical size model: d = cbrt(6/pi * gp) * L, where L is the local
+    # characteristic length (max(2*M_mod, SDAS)) scaled by this factor.
+    pore_size_length_factor: float = 1.0
+    pore_size_cube_root_factor: float = 1.0
 
     def __post_init__(self):
         if self.density_g_cm3 == 0.0:
@@ -214,6 +224,7 @@ ALLOYS: Dict[str, Alloy] = {
         niyama_macro=0.775,
         niyama_shrinkage=1.5,
         carlson_curve_key="A356",
+        critical_entrainment_velocity_m_s=0.5,
     ),
     "GGG40": Alloy(
         key="GGG40",
@@ -236,6 +247,7 @@ ALLOYS: Dict[str, Alloy] = {
         niyama_macro=0.775,
         niyama_shrinkage=1.5,
         carlson_curve_key="WCB",
+        critical_entrainment_velocity_m_s=0.6,
     ),
     "42CrMo4": Alloy(
         key="42CrMo4",
@@ -258,6 +270,7 @@ ALLOYS: Dict[str, Alloy] = {
         niyama_macro=0.775,
         niyama_shrinkage=1.5,
         carlson_curve_key="WCB",
+        critical_entrainment_velocity_m_s=1.0,
     ),
     "bronze": Alloy(
         key="bronze",
@@ -280,6 +293,7 @@ ALLOYS: Dict[str, Alloy] = {
         niyama_macro=0.775,
         niyama_shrinkage=1.5,
         carlson_curve_key="WCB",
+        critical_entrainment_velocity_m_s=0.5,
     ),
 }
 
