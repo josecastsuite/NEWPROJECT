@@ -719,14 +719,15 @@ def _mesh_throat_area_m2(
     mesh: trimesh.Trimesh,
     plane_origin: np.ndarray,
     plane_normal: np.ndarray,
+    body_centroid: Optional[np.ndarray] = None,
     n_sweep: int = 5,
 ) -> float:
     """Return the throat cross-section area (m²) of ``mesh`` near ``plane_origin``.
 
-    The plane is perpendicular to ``plane_normal`` (the local flow direction) and
-    is swept a short distance around ``plane_origin`` to avoid tiny slivers caused
-    by the plane clipping only a corner of the body.  The largest valid polygon
-    area is returned.
+    The plane is perpendicular to ``plane_normal`` (the local flow direction).  To
+    avoid cutting the body only at a sharp corner or end cap, the plane is swept
+    a short distance *into* the body (toward ``body_centroid``) and the largest
+    valid polygon area is returned.
     """
     if mesh is None or len(mesh.faces) == 0:
         return 0.0
@@ -738,10 +739,22 @@ def _mesh_throat_area_m2(
         n = n / n_norm
 
     origin = np.asarray(plane_origin, dtype=np.float64)
+
+    # Ensure the sweep goes into the body, not out into empty space.
+    if body_centroid is not None:
+        to_centroid = np.asarray(body_centroid, dtype=np.float64) - origin
+        if float(np.dot(to_centroid, n)) < -1e-12:
+            n = -n
+
     bbox = np.asarray(mesh.bounds, dtype=np.float64)
     diag = float(np.linalg.norm(bbox[1] - bbox[0]))
-    L = max(diag * 0.01, 0.05)
-    steps = [0.0] if n_sweep <= 1 else np.linspace(-L, L, n_sweep)
+    # Move far enough into the body to skip a possible open end-cap, but not
+    # more than a small fraction of the body diagonal.
+    L = max(diag * 0.05, 0.5)
+    if n_sweep <= 1:
+        steps = [0.0]
+    else:
+        steps = np.linspace(0.0, L, n_sweep)
 
     best = 0.0
     for s in steps:
@@ -764,21 +777,25 @@ def _first_valid_throat_area_m2(
     mesh: trimesh.Trimesh,
     plane_origin: np.ndarray,
     normals: List[np.ndarray],
+    body_centroid: Optional[np.ndarray] = None,
     n_sweep: int = 5,
 ) -> Tuple[float, Optional[np.ndarray]]:
     """Return the first valid throat area (m²) and the normal that produced it.
 
-    The list ``normals`` is ordered from most-physical (e.g. Darcy flow
-    direction) to geometric fallbacks (centroid direction, gravity).  The first
-    direction that produces a non-zero section is used, so we do not accidentally
-    pick a smaller, non-flow-aligned slice of the body.
+    The list ``normals`` is ordered from most-physical (e.g. the body's own
+    entry-to-exit flow axis) to geometric fallbacks.  The first direction that
+    produces a non-zero section is used, so we do not accidentally pick a smaller,
+    non-flow-aligned slice of the body.  ``body_centroid`` makes the sweep move
+    into the body instead of out into empty space.
     """
     for n in normals:
         n = np.asarray(n, dtype=np.float64)
         n_norm = float(np.linalg.norm(n))
         if n_norm < 1e-12:
             continue
-        a = _mesh_throat_area_m2(mesh, plane_origin, n / n_norm, n_sweep=n_sweep)
+        a = _mesh_throat_area_m2(
+            mesh, plane_origin, n / n_norm, body_centroid=body_centroid, n_sweep=n_sweep
+        )
         if a > 1e-18:
             return a, n / n_norm
     return 0.0, None
@@ -1707,6 +1724,21 @@ def _gating_node_velocities(
             queue.append(other)
             order.append(other)
 
+    # Entry / exit contacts for each gating component.  These allow the local
+    # flow axis through a body to be recovered from the assembly graph instead
+    # of relying on the coarse Darcy velocity or the global centroid vector.
+    body_entry: Dict[int, Dict] = {}
+    for cid, p in parent.items():
+        if p == -1:
+            continue
+        for oc in outgoing.get(p, []):
+            if oc.get("down_id") == cid:
+                body_entry[cid] = oc
+                break
+    body_exits: Dict[int, List[Dict]] = {
+        cid: list(outgoing.get(cid, [])) for cid in comp_meta if cid != part_id
+    }
+
     unvisited = [
         cid for cid in gating_ids
         if cid not in visited and comp_meta[cid][0] != BodyType.RISER
@@ -1921,36 +1953,105 @@ def _gating_node_velocities(
         body_up = comp_body.get(up)
         body_down = comp_body.get(down)
 
-        # Throat plane normals ordered from most-physical to geometric fallback:
-        # 1) Darcy velocity direction at the contact (true local flow axis).
-        # 2) Component centroid direction (sequential flow path).
-        # 3) Gravity (vertical flow paths).
-        k = int(min(up, down)) * mult + int(max(up, down))
-        V = V_flow_pair[:, k]
-        v_norm = float(np.linalg.norm(V))
-
+        # Sequential flow axis through a body is the line joining its entry
+        # contact to the relevant exit contact.  The throat cross-section is
+        # perpendicular to this axis.  We also keep the contact face normal and
+        # gravity as fallbacks if a body has no entry/exit pair yet.
         d = comp_centroids[down] - comp_centroids[up]
         d_norm = float(np.linalg.norm(d))
         d_unit = d / d_norm if d_norm > 1e-12 else -g_u
 
-        normals: List[np.ndarray] = []
-        if v_norm > 1e-12:
-            normals.append(V / v_norm)
-            normals.append(-V / v_norm)
-        normals.append(d_unit)
-        normals.append(-d_unit)
-        normals.append(-g_u)
-        normals.append(g_u)
+        n_voxel = c.get("normal")
+        if n_voxel is not None:
+            n_voxel = np.asarray(n_voxel, dtype=np.float64)
+            n_voxel_norm = float(np.linalg.norm(n_voxel))
+            if n_voxel_norm > 1e-12:
+                n_voxel = n_voxel / n_voxel_norm
+            else:
+                n_voxel = None
+        else:
+            n_voxel = None
+
+        def _flow_axis(cid: int, is_entry: bool) -> np.ndarray:
+            # Flow enters at the body's entry contact and leaves through the
+            # current (exit) contact, or enters at the current contact and
+            # leaves through the body's exit contacts.
+            if is_entry:
+                exit_contacts = body_exits.get(cid, [])
+                if exit_contacts:
+                    exit_centroid = np.mean(
+                        [np.asarray(e["centroid_mm"], dtype=np.float64) for e in exit_contacts],
+                        axis=0,
+                    )
+                    axis = exit_centroid - np.asarray(c["centroid_mm"], dtype=np.float64)
+                else:
+                    # No further exit (part or leaf): use the contact normal
+                    # or the direction toward the part centroid.
+                    if n_voxel is not None:
+                        axis = np.asarray(n_voxel, dtype=np.float64)
+                    else:
+                        axis = comp_centroids.get(down, comp_centroids[part_id]) - np.asarray(
+                            c["centroid_mm"], dtype=np.float64
+                        )
+            else:
+                entry_c = body_entry.get(cid)
+                if entry_c is not None:
+                    axis = np.asarray(c["centroid_mm"], dtype=np.float64) - np.asarray(
+                        entry_c["centroid_mm"], dtype=np.float64
+                    )
+                else:
+                    # Source component: direction from its own centroid to contact.
+                    axis = np.asarray(c["centroid_mm"], dtype=np.float64) - comp_centroids[cid]
+                    if float(np.linalg.norm(axis)) < 1e-12:
+                        if n_voxel is not None:
+                            axis = np.asarray(n_voxel, dtype=np.float64)
+                        else:
+                            axis = d_unit
+            a_norm = float(np.linalg.norm(axis))
+            if a_norm < 1e-12:
+                axis = d_unit if d_norm > 1e-12 else -g_u
+                a_norm = float(np.linalg.norm(axis))
+            if a_norm < 1e-12:
+                axis = -g_u
+                a_norm = float(np.linalg.norm(axis))
+            return axis / a_norm if a_norm > 1e-12 else -g_u
+
+        axis_up = _flow_axis(up, is_entry=False)
+        axis_down = _flow_axis(down, is_entry=True)
+
+        normals_up: List[np.ndarray] = [axis_up, -axis_up]
+        if n_voxel is not None:
+            # The voxel face normal is trustworthy if it is aligned with the
+            # sequential flow axis recovered from the graph.
+            if abs(float(np.dot(axis_up, n_voxel))) > 0.5:
+                normals_up.extend([n_voxel, -n_voxel])
+        normals_up.extend([d_unit, -d_unit, -g_u, g_u])
+
+        normals_down: List[np.ndarray] = [axis_down, -axis_down]
+        if n_voxel is not None:
+            if abs(float(np.dot(axis_down, n_voxel))) > 0.5:
+                normals_down.extend([n_voxel, -n_voxel])
+        normals_down.extend([d_unit, -d_unit, -g_u, g_u])
 
         a_up = 0.0
         a_down = 0.0
-        normal = normals[0] if normals else -g_u
+        normal = axis_up
         if body_up is not None:
-            a_up, n_up = _first_valid_throat_area_m2(body_up.mesh, c["centroid_mm"], normals)
+            a_up, n_up = _first_valid_throat_area_m2(
+                body_up.mesh,
+                c["centroid_mm"],
+                normals_up,
+                body_centroid=comp_centroids[up],
+            )
             if n_up is not None:
                 normal = n_up
         if body_down is not None:
-            a_down, n_down = _first_valid_throat_area_m2(body_down.mesh, c["centroid_mm"], normals)
+            a_down, n_down = _first_valid_throat_area_m2(
+                body_down.mesh,
+                c["centroid_mm"],
+                normals_down,
+                body_centroid=comp_centroids[down],
+            )
             if a_down > 1e-18 and (a_up <= 1e-18 or a_down < a_up) and n_down is not None:
                 normal = n_down
 
