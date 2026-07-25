@@ -1902,9 +1902,13 @@ def _gating_node_velocities(
         else:
             interior_dir = -normal
 
-        # Try the obvious interior offset first.
+        # The throat area is the cross-section of the throat body perpendicular
+        # to its own axis (contact -> body centroid).  This is the real
+        # overlapping/channel throat, independent of local Darcy swirl or a
+        # centroid sitting near an edge.
         eps = max(0.05, dx_mm * 0.05)
         origin = centroid + interior_dir * eps
+        normal = interior_dir
         a_geo = _body_throat_area_m2(body.mesh, origin, normal)
 
         # If the contact centroid sits on the far side of the shared surface,
