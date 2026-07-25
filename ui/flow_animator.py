@@ -1000,8 +1000,8 @@ class FlowAnimator(QtCore.QObject):
         self._clear_actors()
         self._current_frame = 0
         self._current_time = 0.0
-        if self._frame_times is not None and len(self._frame_times) > 0:
-            self._update_scene()
+        # Do NOT re-render frame 0 here; stop() means "hide the animation".
+        # set_result() calls _update_scene() itself when frames are ready.
 
     def _clear_actors(self) -> None:
         if self._streamline_actor is not None:

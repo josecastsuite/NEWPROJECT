@@ -124,8 +124,21 @@ class FlowVelocityGraph(QtWidgets.QDialog):
                     s=60,
                     label="Gating düğümleri",
                 )
-                for x, y, name in zip(node_times, node_vels, node_names):
-                    ax.annotate(name, (x, y), textcoords="offset points", xytext=(5, 5), fontsize=7)
+                for i, (x, y, name) in enumerate(zip(node_times, node_vels, node_names)):
+                    # Fan labels in alternating quadrants to reduce overlap.
+                    xoff = 8 if i % 2 == 0 else -8
+                    yoff = 8 if (i // 2) % 2 == 0 else -10
+                    ax.annotate(
+                        name,
+                        (x, y),
+                        textcoords="offset points",
+                        xytext=(xoff, yoff),
+                        fontsize=6,
+                        ha="left" if xoff > 0 else "right",
+                        va="bottom" if yoff > 0 else "top",
+                        bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.75),
+                        arrowprops=dict(arrowstyle="-", color="gray", lw=0.5),
+                    )
 
         if flow.fill_time_s > 0.0:
             ax.axvline(

@@ -66,12 +66,23 @@ BODY_OPACITY_POST = {
 }
 
 
-def _scalar_bar_args(title: str, pos: Tuple[float, float]) -> dict:
+def _scalar_bar_args(title: str, pos: Tuple[float, float], clim: Optional[Tuple[float, float]] = None) -> dict:
+    """Build scalar-bar args that avoid label overlap for the value range."""
+    fmt = "%.2f"
+    if clim is not None:
+        vmax = max(abs(float(clim[0])), abs(float(clim[1])))
+        if vmax >= 1000.0:
+            fmt = "%.0f"
+        elif vmax >= 100.0:
+            fmt = "%.1f"
+        elif vmax < 1.0:
+            fmt = "%.3f"
     return {
         "color": "#00ffff",
-        "title_font_size": 12,
-        "label_font_size": 10,
-        "fmt": "%.2f",
+        "title_font_size": 10,
+        "label_font_size": 8,
+        "fmt": fmt,
+        "n_labels": 5,
         "vertical": False,
         "position_x": pos[0],
         "position_y": pos[1],
@@ -293,7 +304,7 @@ class Analyzer3DViewer(QtInteractor):
             opacity=0.65,
             clim=[0.0, 1.0],
             show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Risk", (0.82, 0.02)),
+            scalar_bar_args=_scalar_bar_args("Risk", (0.82, 0.02), clim=[0.0, 1.0]),
             smooth_shading=True,
         )
 
@@ -429,7 +440,7 @@ class Analyzer3DViewer(QtInteractor):
             opacity=1.0,
             lighting=False,
             show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args(title, (0.82, 0.02)),
+            scalar_bar_args=_scalar_bar_args(title, (0.82, 0.02), clim=[0.0, max(hi, 1.0)]),
         )
 
     def show_niyama_isosurfaces(self, result: Optional[AnalysisResult]):
@@ -461,7 +472,7 @@ class Analyzer3DViewer(QtInteractor):
             opacity=0.8,
             clim=[0.0, alloy.niyama_shrinkage * 2.0],
             show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Niyama", (0.82, 0.16)),
+            scalar_bar_args=_scalar_bar_args("Niyama", (0.82, 0.16), clim=[0.0, alloy.niyama_shrinkage * 2.0]),
             smooth_shading=True,
         )
         self._niyama_actors.append(actor)
@@ -493,7 +504,7 @@ class Analyzer3DViewer(QtInteractor):
             opacity=1.0,
             clim=[0.0, max(vmax, 1e-3)],
             show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.64, 0.02)),
+            scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.64, 0.02), clim=[0.0, max(vmax, 1e-3)]),
             smooth_shading=True,
         )
 
@@ -597,6 +608,20 @@ class Analyzer3DViewer(QtInteractor):
             return
         data, title, cmap = field_map[field]
 
+        finite_data = data[np.isfinite(data)]
+        if finite_data.size == 0:
+            return
+        dmin = float(finite_data.min())
+        dmax = float(finite_data.max())
+        if field == "risk":
+            slice_clim = (0.0, 1.0)
+        elif field == "mat_id":
+            slice_clim = (dmin, dmax)
+        elif field == "niyama":
+            slice_clim = (max(0.0, dmin), dmax)
+        else:
+            slice_clim = (dmin, dmax)
+
         grid = self._make_grid(result, data, field)
         domain = self._part_only(grid) if field in ("risk", "niyama") else self._metal_only(grid)
         if domain.n_cells == 0:
@@ -615,8 +640,8 @@ class Analyzer3DViewer(QtInteractor):
                 cmap=cmap,
                 opacity=0.95,
                 show_scalar_bar=first_bar,
-                scalar_bar_args=_scalar_bar_args(title, (0.82, 0.18)),
-                clim=[0.0, 1.0] if field == "risk" else None,
+                scalar_bar_args=_scalar_bar_args(title, (0.82, 0.18), clim=slice_clim),
+                clim=slice_clim,
             )
             self._slice_actors.append(actor)
             first_bar = False
