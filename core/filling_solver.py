@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
+import pyvista as pv
 import trimesh
 from scipy import ndimage
 from scipy.sparse import csr_matrix
@@ -693,6 +694,63 @@ def _inlet_face_area_m2(
     return A
 
 
+def _mesh_surface_pv(mesh: trimesh.Trimesh) -> Optional[pv.PolyData]:
+    """Return a PyVista surface of a trimesh for inside/outside tests."""
+    if mesh is None or len(mesh.faces) == 0:
+        return None
+    try:
+        faces = np.asarray(mesh.faces)
+        if faces.ndim != 2 or faces.shape[1] != 3:
+            faces = mesh.triangles
+        n_faces = faces.shape[0]
+        if n_faces == 0:
+            return None
+        faces_arr = np.hstack(
+            [np.full((n_faces, 1), 3, dtype=faces.dtype), faces]
+        ).ravel()
+        return pv.PolyData(
+            np.asarray(mesh.vertices, dtype=np.float64), faces_arr
+        )
+    except Exception:
+        return None
+
+
+def _origin_inside_body(
+    mesh_pv: pv.PolyData,
+    centroid: np.ndarray,
+    interior_dir: np.ndarray,
+    body_centroid: np.ndarray,
+    eps: float,
+) -> Optional[np.ndarray]:
+    """Find a point inside ``mesh_pv`` along the ray from ``centroid`` to ``body_centroid``.
+
+    The contact centroid is sometimes just outside the throat body (e.g. the
+    voxel contact sits on the upstream side).  This helper marches from the
+    contact toward the body interior and returns a point a small ``eps``
+    inside the surface.
+    """
+    direction = np.asarray(interior_dir, dtype=np.float64)
+    direction = direction / max(float(np.linalg.norm(direction)), 1e-18)
+    dist = float(np.linalg.norm(np.asarray(body_centroid) - np.asarray(centroid)))
+    if dist <= 1e-9:
+        return None
+    # Sample the ray and use PyVista to find the first inside point.
+    n_samples = 200
+    ts = np.linspace(0.0, dist, n_samples)
+    points = np.asarray(centroid)[None, :] + ts[:, None] * direction[None, :]
+    try:
+        cloud = pv.PolyData(points)
+        result = cloud.select_interior_points(surface=mesh_pv)
+        sel = result["selected_points"].astype(bool)
+    except Exception:
+        return None
+    idx = int(np.argmax(sel))
+    if not sel[idx]:
+        return None
+    origin = points[idx] + direction * eps
+    return origin
+
+
 def _body_throat_area_m2(
     mesh: Optional[trimesh.Trimesh],
     plane_origin: np.ndarray,
@@ -707,22 +765,36 @@ def _body_throat_area_m2(
     """
     if mesh is None or len(mesh.faces) == 0:
         return None
-    try:
-        section = mesh.section(
-            plane_origin=np.asarray(plane_origin, dtype=np.float64),
-            plane_normal=np.asarray(plane_normal, dtype=np.float64),
-        )
-        if section is None or getattr(section, "is_empty", True):
+    origin = np.asarray(plane_origin, dtype=np.float64)
+    normal = np.asarray(plane_normal, dtype=np.float64)
+    normal = normal / max(float(np.linalg.norm(normal)), 1e-18)
+
+    def _area_at(o: np.ndarray) -> Optional[float]:
+        try:
+            section = mesh.section(
+                plane_origin=o,
+                plane_normal=normal,
+            )
+            if section is None or getattr(section, "is_empty", True):
+                return None
+            p2d = section.to_2D()
+            if isinstance(p2d, tuple):
+                p2d = p2d[0]
+            if p2d is None or not getattr(p2d, "polygons_closed", None):
+                return None
+            return float(sum(float(p.area) for p in p2d.polygons_closed))
+        except Exception:
             return None
-        p2d = section.to_2D()
-        if isinstance(p2d, tuple):
-            p2d = p2d[0]
-        if p2d is None or not getattr(p2d, "polygons_closed", None):
-            return None
-        area_mm2 = float(sum(float(p.area) for p in p2d.polygons_closed))
-        return area_mm2 * 1e-6
-    except Exception:
-        return None
+
+    # Try the requested origin and a small step on either side.  This handles
+    # cases where the contact centroid sits exactly on a sharp edge and the
+    # initial offset pointed outside the body.
+    eps = 0.1
+    for o in (origin, origin + normal * eps, origin - normal * eps):
+        area_mm2 = _area_at(o)
+        if area_mm2 is not None and area_mm2 > 1e-9:
+            return area_mm2 * 1e-6
+    return None
 
 
 def _inlet_flux_m3_s(
@@ -863,7 +935,11 @@ def _compute_user_flow_rate(
     fine_cavity: Optional[np.ndarray] = None,
     fine_dx_m: Optional[float] = None,
 ) -> Tuple[float, float, str]:
-    """Convert user velocity, fill time, or design velocity into a total flow rate Q."""
+    """Convert user velocity, fill time, or design velocity into a total flow rate Q.
+
+    No automatic fallback: if the requested section has no measurable cross-section
+    and no design area is supplied, the solver stops with a clear error.
+    """
     a_grid = fine_grid if fine_grid is not None else grid
     a_cavity = fine_cavity if fine_cavity is not None else cavity
     a_dx = fine_dx_m if fine_dx_m is not None else dx_m
@@ -872,42 +948,44 @@ def _compute_user_flow_rate(
     design_section = (design_section_key or used_section).upper()
 
     if velocity_m_s > 0.0:
-        # Absolute UI input: if a reference area is provided it wins over any
-        # automatic voxel/face area measurement.  used_section follows the
-        # user's selected section key so the source node label is correct.
         if design_area_m2 > 1e-18:
             area_m2 = float(design_area_m2)
             used_section = design_section
         else:
-            face, used_section = _section_face_cells(a_grid, a_cavity, section_key, g)
+            face, used_section = _section_face_cells(a_grid, a_cavity, section_key, g, allow_fallback=False)
             area_m2 = float(face.sum()) * (a_dx * a_dx)
-        if area_m2 > 0.0:
-            Q = velocity_m_s * area_m2
-            return Q, area_m2, used_section
-    elif fill_time_s > 0.0 and part_volume_m3 > 0.0:
-        face, used_section = _section_face_cells(a_grid, a_cavity, section_key, g)
+        if area_m2 <= 0.0:
+            raise GatingVelocityError(
+                f"Giriş debisi hesaplanamadı: {used_section} kesit alanı ölçülemedi ve "
+                f"tasarım alanı verilmedi."
+            )
+        Q = velocity_m_s * area_m2
+        return Q, area_m2, used_section
+
+    if fill_time_s > 0.0 and part_volume_m3 > 0.0:
+        face, used_section = _section_face_cells(a_grid, a_cavity, section_key, g, allow_fallback=False)
         area_m2 = float(face.sum()) * (a_dx * a_dx)
         Q = part_volume_m3 / fill_time_s
         return Q, area_m2, used_section
-    elif design_velocity_m_s > 0.0:
-        used_section = design_section
-        face, _ = _section_face_cells(a_grid, a_cavity, design_section_key, g)
-        area_m2 = float(face.sum()) * (a_dx * a_dx)
-        # Use the design reference area (e.g. choke area from the gating engine)
-        # instead of the raw voxel face area, so Q is consistent with the design.
-        Q_area_m2 = design_area_m2 if design_area_m2 > 1e-18 else area_m2
-        Q = design_velocity_m_s * Q_area_m2
-        return Q, Q_area_m2, used_section
 
-    # Last resort: a tiny flow to allow a solve; caller will report no user input.
-    if "area_m2" not in locals():
-        face, used_section = _section_face_cells(a_grid, a_cavity, section_key, g)
-        area_m2 = float(face.sum()) * (a_dx * a_dx)
-    if area_m2 > 0.0:
-        Q = 0.01 * area_m2
-    else:
-        Q = 1.0
-    return Q, area_m2, used_section
+    if design_velocity_m_s > 0.0:
+        used_section = design_section
+        if design_area_m2 > 1e-18:
+            area_m2 = float(design_area_m2)
+        else:
+            face, _ = _section_face_cells(a_grid, a_cavity, design_section_key, g, allow_fallback=False)
+            area_m2 = float(face.sum()) * (a_dx * a_dx)
+        if area_m2 <= 0.0:
+            raise GatingVelocityError(
+                f"Tasarım debisi hesaplanamadı: {used_section} kesit alanı ölçülemedi."
+            )
+        Q = design_velocity_m_s * area_m2
+        return Q, area_m2, used_section
+
+    raise GatingVelocityError(
+        "Akış girişi eksik: ne hız (ingate_velocity_m_s), ne doldurma süresi "
+        "(t_fill_s), ne de tasarım hızı (design_choke_velocity_m_s) verilmemiş."
+    )
 
 
 def _compute_fill_time(
@@ -1761,15 +1839,9 @@ def _gating_node_velocities(
         k = int(min(up, down)) * mult + int(max(up, down))
         c["flux_m3_s"] = float(flux_pair[k])
         c["area_real_m2"] = float(area_pair[k])
-        # The node velocity uses the projected Darcy contact area.  If the flux
-        # integration did not produce a measurable projected area (e.g. the
-        # velocity field is zero), fall back to the raw voxel contact area so the
-        # Q = v * A relation remains defined.
-        a = float(area_pair[k])
-        if a <= 1e-12:
-            a = float(c.get("voxel_area_m2", 0.0))
-        c["area_m2"] = a
-        c["area_raw_m2"] = a
+        # The final area is set below from the real CAD geometry; if that fails
+        # the solver stops instead of silently falling back to an approximation.
+        c["area_m2"] = float(area_pair[k])
 
     # ------------------------------------------------------------------
     # Replace the projected Darcy contact area with the real geometric throat
@@ -1777,12 +1849,22 @@ def _gating_node_velocities(
     # centroid and oriented perpendicular to the local Darcy flow direction.
     # For a gate->part node the throat is the gate (upstream); for all other
     # gating->gating nodes it is the downstream channel.
+    # No voxel/design fallback: if the geometry cannot be sectioned, we stop.
+    # Contacts that carry no Darcy flux (dead branches) keep the Darcy area for
+    # reporting and are skipped in the node list.
     # ------------------------------------------------------------------
     for c in contacts:
         up = c.get("up_id")
         down = c.get("down_id")
         if up is None or down is None:
             continue
+        flux = float(c.get("flux_m3_s", 0.0))
+        if abs(flux) < 1e-18:
+            # Dead branch: velocity is zero, area is only for reporting.
+            c["area_m2"] = float(max(c.get("area_real_m2", 0.0), 1e-12))
+            c["skip_node"] = True
+            continue
+
         k = int(min(up, down)) * mult + int(max(up, down))
         V = V_flow_pair[:, k]
         v_norm = float(np.linalg.norm(V))
@@ -1800,19 +1882,54 @@ def _gating_node_velocities(
         if down == part_id:
             # Gate -> Part: the throat is the gate cross-section.
             body = comp_body.get(up)
-            # Move the plane slightly upstream (into the gate) so it does not
-            # sit exactly on the boundary and degenerate.
-            origin = np.asarray(c["centroid_mm"], dtype=np.float64) - normal * max(0.05, dx_mm * 0.05)
         else:
             # All other transitions: throat is the downstream channel.
             body = comp_body.get(down)
-            # Move the plane slightly downstream (into the channel).
-            origin = np.asarray(c["centroid_mm"], dtype=np.float64) + normal * max(0.05, dx_mm * 0.05)
 
-        a_geo = _body_throat_area_m2(body.mesh if body is not None else None, origin, normal)
-        if a_geo is not None and a_geo > 1e-18:
-            c["area_m2"] = float(a_geo)
-            c["area_geo_m2"] = float(a_geo)
+        if body is None or body.mesh is None or len(body.mesh.faces) == 0:
+            raise GatingVelocityError(
+                f"Düğüm hızı için gövde mesh'i bulunamadı: "
+                f"{comp_meta.get(up, (None, str(up)))[1]} -> "
+                f"{comp_meta.get(down, (None, str(down)))[1]}."
+            )
+
+        centroid = np.asarray(c["centroid_mm"], dtype=np.float64)
+        body_centroid = body.mesh.centroid
+        to_body = body_centroid - centroid
+        to_body_norm = float(np.linalg.norm(to_body))
+        if to_body_norm > 1e-12:
+            interior_dir = to_body / to_body_norm
+        else:
+            interior_dir = -normal
+
+        # Try the obvious interior offset first.
+        eps = max(0.05, dx_mm * 0.05)
+        origin = centroid + interior_dir * eps
+        a_geo = _body_throat_area_m2(body.mesh, origin, normal)
+
+        # If the contact centroid sits on the far side of the shared surface,
+        # the simple offset can miss the body.  Use PyVista to find the actual
+        # entry point into the body interior and retry.
+        if a_geo is None or a_geo <= 1e-18:
+            mesh_pv = _mesh_surface_pv(body.mesh)
+            if mesh_pv is not None:
+                robust_origin = _origin_inside_body(
+                    mesh_pv, centroid, interior_dir, body_centroid, eps
+                )
+                if robust_origin is not None:
+                    a_geo = _body_throat_area_m2(body.mesh, robust_origin, normal)
+
+        if a_geo is None or a_geo <= 1e-18:
+            up_name = comp_meta.get(up, (None, str(up)))[1]
+            down_name = comp_meta.get(down, (None, str(down)))[1]
+            raise GatingVelocityError(
+                f"Düğüm hızı için geometrik boğaz alanı hesaplanamadı: "
+                f"{up_name} -> {down_name}. CAD geometrisi kapalı/watertight olmayabilir "
+                f"veya temas noktası dejeneredir."
+            )
+        c["area_m2"] = float(a_geo)
+        c["area_geo_m2"] = float(a_geo)
+        c["skip_node"] = False
 
     # Propagate Q and compute velocities.
     Q_in: Dict[int, float] = {cid: 0.0 for cid in comp_meta if cid != part_id}
@@ -1856,14 +1973,11 @@ def _gating_node_velocities(
 
     for cid in order:
         Q = Q_in[cid]
-        out_edges = outgoing.get(cid, [])
+        out_edges = [c for c in outgoing.get(cid, []) if not c.get("skip_node")]
         if comp_meta[cid][0] in {BodyType.RISER, BodyType.CURUFLUK}:
             continue
         if not out_edges:
-            raise GatingVelocityError(
-                f"Düğüm hızları çözülemedi: {comp_meta[cid][1]} elemanının çıkış bağlantısı yok. "
-                "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
-            )
+            continue
         A_total = sum(c["area_m2"] for c in out_edges)
         if A_total <= 1e-18:
             raise GatingVelocityError(
@@ -1886,33 +2000,12 @@ def _gating_node_velocities(
 
         if raw_total > 1e-18:
             Q_branches = raw_fluxes * (Q / raw_total)
-        elif A_total > 1e-18:
-            v_common = Q / A_total
-            Q_branches = areas * v_common
         else:
-            raise GatingVelocityError(
-                f"Düğüm hızları çözülemedi: {comp_meta[cid][1]} elemanının "
-                "çıkış akı toplamı ve kesit alanı sıfır. "
-                "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
-            )
+            # No Darcy flux measured on active outlets: zero flow for all.
+            Q_branches = np.zeros_like(raw_fluxes)
 
-        # For outlets of the SAME body type leaving the SAME parent, use a common
-        # velocity so symmetric gates report the same speed while still allowing
-        # different cross-sectional areas (Q = v_common * A).  Different body
-        # types or different parents keep their own Darcy-derived split.
-        by_down_type: Dict[BodyType, List[int]] = {}
-        for i, c in enumerate(out_edges):
-            by_down_type.setdefault(comp_meta[c["down_id"]][0], []).append(i)
-        for idxs in by_down_type.values():
-            if len(idxs) < 2:
-                continue
-            q_sum = float(Q_branches[idxs].sum())
-            a_sum = float(areas[idxs].sum())
-            if a_sum > 1e-18:
-                v_common_type = q_sum / a_sum
-                for i in idxs:
-                    Q_branches[i] = v_common_type * areas[i]
-
+        # Each outlet keeps its own Darcy-derived flow share.  No automatic
+        # equalisation across same-type outlets is applied; v = Q_i / A_i.
         for i, c in enumerate(out_edges):
             A = float(c["area_m2"])
             if A <= 1e-18:
@@ -1946,46 +2039,24 @@ def _gating_node_velocities(
             node = _make_node(cid, down_id, A, Q_branch, c["centroid_mm"], flow_rate_m3_s=Q_branch)
             nodes.append(node)
 
-    # Second pass: all INGATE -> PART edges fed by the same upstream distributor
-    # share a common exit velocity.  This reflects a manifold: the pressure at
-    # the distributor is (nearly) uniform, so each gate velocity is the same
-    # while the flow rate Q = v * A follows the individual gate cross-section.
-    from collections import defaultdict
-    part_groups: Dict[Tuple[int, BodyType], List[Dict]] = defaultdict(list)
+    # INGATE -> PART nodes are emitted with their own Darcy-derived flow share.
+    # No common exit velocity is forced; v = Q_i / A_i for each gate.
     for e in part_edges:
         cid = e["cid"]
         c = e["c"]
+        A = e["A"]
+        Q_branch = float(e["Q_branch"])
+        v_branch = float(e["v_branch"])
+        c["Q_branch"] = Q_branch
+        c["v_branch"] = v_branch
         down_id = c["down_id"]
-        up_parent = parent.get(cid, -1)
-        part_groups[(up_parent, comp_meta[down_id][0])].append(e)
-
-    for group in part_groups.values():
-        if len(group) < 2:
-            pass
-        else:
-            q_sum = sum(e["Q_branch"] for e in group)
-            a_sum = sum(e["A"] for e in group)
-            if a_sum > 1e-18:
-                v_common_part = q_sum / a_sum
-                for e in group:
-                    e["Q_branch"] = v_common_part * e["A"]
-                    e["v_branch"] = e["Q_branch"] / e["A"]
-        for e in group:
-            cid = e["cid"]
-            c = e["c"]
-            A = e["A"]
-            Q_branch = float(e["Q_branch"])
-            v_branch = float(e["v_branch"])
-            c["Q_branch"] = Q_branch
-            c["v_branch"] = v_branch
-            down_id = c["down_id"]
-            print(
-                f"[GATING_NODE] {comp_meta[cid][1]} -> {comp_meta[down_id][1]}  "
-                f"area_cm2={A*1e4:.4f}  Q_L_s={Q_branch*1e3:.4f}  v_m_s={v_branch:.4f}",
-                flush=True,
-            )
-            node = _make_node(cid, down_id, A, Q_branch, c["centroid_mm"], flow_rate_m3_s=Q_branch)
-            nodes.append(node)
+        print(
+            f"[GATING_NODE] {comp_meta[cid][1]} -> {comp_meta[down_id][1]}  "
+            f"area_cm2={A*1e4:.4f}  Q_L_s={Q_branch*1e3:.4f}  v_m_s={v_branch:.4f}",
+            flush=True,
+        )
+        node = _make_node(cid, down_id, A, Q_branch, c["centroid_mm"], flow_rate_m3_s=Q_branch)
+        nodes.append(node)
 
     if not nodes:
         raise GatingVelocityError(
@@ -2184,8 +2255,10 @@ def solve_filling_flow(
     # Total flux leaving the inlet region in the raw pressure field.
     Q_raw = _inlet_flux_m3_s(u, v, w, inlet_cells, cavity, dx_m, face_fractions)
     if abs(Q_raw) < 1e-18:
-        # Degenerate geometry (e.g. disconnected inlet).  Fall back to area average.
-        Q_raw = float(np.maximum(np.abs(u).sum(), 1e-18)) * (dx_m * dx_m)
+        raise GatingVelocityError(
+            "Girişten çıkan Darcy akı sıfır. Giriş bölgesi boşlukla bağlantılı değil "
+            "veya geometri dejeneredir. Otomatik akı tahmini uygulanmıyor."
+        )
     scale = Q_user / Q_raw
     # scale carries units of pressure (Pa) because the matrix was built with
     # K/mu and dimensionless Dirichlet p=1/0; it is the pressure drop needed
