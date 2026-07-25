@@ -2020,12 +2020,13 @@ def solve_filling_flow(
     # Real source throat area (for reporting / validation only).
     source_real_area_m2 = _inlet_face_area_m2(inlet_cells, cavity, dx_m, face_fractions)
 
-    # Local isotropic permeability from the distance to the nearest solid wall.
-    # Narrow channels (small hydraulic radius) get small K, wide cavities large K,
-    # so the Darcy pressure field resolves local hydraulic resistance.
-    distance_voxels = ndimage.distance_transform_edt(cavity)
-    permeability_m2 = (distance_voxels * dx_m) ** 2
-    permeability_m2 = np.maximum(permeability_m2, (dx_m * 0.01) ** 2)
+    # Uniform isotropic permeability: the Darcy pressure field is used only to
+    # determine the flow direction/split, while the absolute velocity comes from
+    # the user Q and the real voxel contact area (Q = v × A).  Face fractions
+    # already carry the local cross-sectional area, so we do not add an extra
+    # narrow-channel penalty that would make diagonal/small gates artificially
+    # more resistive than the physics of the user-specified design implies.
+    permeability_m2 = np.full(cavity.shape, (dx_m * 0.5) ** 2, dtype=np.float64)
 
     if progress_callback:
         progress_callback(25)
