@@ -2041,6 +2041,9 @@ def analyze(
         progress_callback=progress_callback,
         fill_time_s=fill_time_s,
         velocity_m_s=velocity_m_s,
+        gravity_vector=tuple(casting_params.gravity_vector)
+        if casting_params is not None
+        else (0.0, 0.0, -1.0),
     )
     # v9.3: account for feeder sleeves/exothermic/chilled type by scaling the
     # solidification time of RISER voxels.  With the body-index grid, each

@@ -22,7 +22,7 @@ from scipy import ndimage, sparse
 from scipy.sparse import linalg as spla
 
 from core.materials import Alloy, MoldMaterial
-from core.types import BODY_METAL_TYPES
+from core.types import BODY_METAL_TYPES, BodyType
 
 
 def _scheil_fs(
@@ -167,18 +167,20 @@ def _upwind_advection(
     fill_c: Optional[np.ndarray],
     sub_t: float,
     is_metal: np.ndarray,
+    t_solidus: float = -np.inf,
 ) -> np.ndarray:
     """First-order upwind explicit advection of temperature.
 
     ``velocity`` is (3, nx, ny, nz) with [x, y, z] components.  For each axis the
     derivative is taken from the upwind side, which is stable for CFL <= 1.  The
     result is masked to metal cells that have already been filled at time
-    ``sub_t``.
+    ``sub_t`` and are still at least partly liquid (T > t_solidus).
     """
     if fill_c is not None:
         active = (sub_t >= fill_c) & is_metal
     else:
         active = is_metal
+    active &= (T > t_solidus)
     if not np.any(active):
         return np.zeros_like(T)
 
@@ -220,6 +222,8 @@ def solve_3d_thermal(
     progress_callback: Optional[callable] = None,
     fill_time_s: Optional[np.ndarray] = None,
     velocity_m_s: Optional[np.ndarray] = None,
+    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
+    feed_velocity_m_s: float = 0.005,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Implicit 3-D enthalpy thermal solver with optional Darcy-velocity advection.
@@ -283,6 +287,7 @@ def solve_3d_thermal(
     # SPRUE, SPRUE_THROAT, POURING_BASIN). Chill/filter are excluded.
     casting_metal_ids = [int(t) for t in BODY_METAL_TYPES]
     is_metal_c = np.isin(grid_c, casting_metal_ids)
+    is_gating = is_metal_c & (grid_c != int(BodyType.PART))
     chill_mask_3d = grid_c == 11  # COOLING_SPRUE
 
     rho = np.where(is_metal_c, alloy.rho_kg_m3, mold.rho_kg_m3).astype(np.float64).ravel()
@@ -332,16 +337,24 @@ def solve_3d_thermal(
     t = 0.0
     step = 0
 
-    # Advective CFL limit; only used while metal is still being filled and a
-    # velocity field is supplied.  After filling the diffusion time-step is
-    # restored because the explicit advection term is no longer physically
-    # relevant for a stationary solidifying metal.
+    # Advective CFL limit.  During filling the Darcy velocity field is used.
+    # After filling a small gravity-driven feed velocity is added so feeders/risers
+    # keep supplying hot metal to the part as they solidify (çekme / feeding).
+    g_vec = np.array(gravity_vector, dtype=np.float64)
+    g_norm = float(np.linalg.norm(g_vec))
+    g_unit = g_vec / g_norm if g_norm > 1e-9 else np.array([0.0, 0.0, -1.0])
+    v_feed = np.zeros((3, nx, ny, nz), dtype=np.float64)
+    if feed_velocity_m_s > 0.0:
+        for i in range(3):
+            v_feed[i, ...] = g_unit[i] * feed_velocity_m_s
+
     if velocity_c is not None:
         vmax = float(np.max(np.linalg.norm(velocity_c, axis=0))) if np.any(velocity_c) else 0.0
         dt_adv = 0.3 * dx_m / max(vmax, 1e-6)
     else:
         vmax = 0.0
         dt_adv = np.inf
+    dt_feed = 0.3 * dx_m / max(feed_velocity_m_s, 1e-6) if feed_velocity_m_s > 0.0 else np.inf
     fill_end = max_fill if fill_c is not None and np.isfinite(max_fill) else 0.0
 
     t_liq = np.full((nx, ny, nz), np.inf, dtype=np.float64)
@@ -385,16 +398,24 @@ def solve_3d_thermal(
         # then that pre-advected field becomes the initial condition for the
         # implicit diffusion solve over the same interval.
         T_adv = T_old.copy()
-        # Advect only while the metal front is still filling.  After fill_end the
-        # velocity field is no longer physically active (metal is stationary),
-        # and continuing to sub-cycle would explode the run-time.
-        if velocity_c is not None and t < fill_end:
-            adv_dt = min(dt, fill_end - t)
-            n_sub = max(1, int(np.ceil(adv_dt / dt_adv))) if np.isfinite(dt_adv) else 1
+
+        # During filling use the Darcy velocity field; after filling switch to
+        # a small gravity-aligned feed velocity so risers continue to supply
+        # (or draw) liquid metal while they solidify.
+        if (velocity_c is not None and t < fill_end) or (feed_velocity_m_s > 0.0 and t >= fill_end):
+            if velocity_c is not None and t < fill_end:
+                v_adv = velocity_c
+                adv_dt = min(dt, fill_end - t)
+                dt_adv_local = dt_adv
+            else:
+                v_adv = v_feed
+                adv_dt = dt
+                dt_adv_local = dt_feed
+            n_sub = max(1, int(np.ceil(adv_dt / dt_adv_local))) if np.isfinite(dt_adv_local) else 1
             sub_dt = adv_dt / n_sub
             for k in range(n_sub):
                 sub_t = t + (k + 0.5) * sub_dt
-                adv = _upwind_advection(T_adv, velocity_c, dx_m, fill_c, sub_t, is_metal_c)
+                adv = _upwind_advection(T_adv, v_adv, dx_m, fill_c, sub_t, is_metal_c, t_solidus=Ts)
                 T_adv = T_adv - sub_dt * adv
             # Clip to physical bounds after explicit advection.
             T_adv = np.clip(T_adv, T0, alloy.t_pour_c)
@@ -421,6 +442,13 @@ def solve_3d_thermal(
         # Guard against NaN/Inf from the linear solver before clipping/gradient.
         T_new = np.nan_to_num(T_new, nan=T0, posinf=alloy.t_pour_c, neginf=T0)
         T_new = np.clip(T_new, T0, alloy.t_pour_c)
+
+        # Do not allow the gating system to drop below the liquidus while the
+        # mould is still being filled; the runner/ingate must stay liquid until
+        # the pour is complete.  After fill_end it cools normally.
+        if t + dt <= fill_end:
+            gating_cold = is_gating & (T_new < Tl)
+            T_new[gating_cold] = Tl
 
         # Record solidification times and local G/R
         if is_metal_c.any():

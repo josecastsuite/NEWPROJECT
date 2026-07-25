@@ -1815,9 +1815,9 @@ def _gating_node_velocities(
         # Split the incoming flow among the outgoing branches using the real
         # 3B Darcy flux integrated across each contact (flux_m3_s).  The flux
         # proportions come directly from the solved velocity field; the total is
-        # then scaled to enforce continuity at the node, and identical
-        # downstream components receive the mean flow so physical symmetry is
-        # preserved while the Q = v * A relation remains exact.
+        # then scaled to enforce continuity at the node.  Each branch uses its
+        # own contact area, so gates with different cross-sections keep their
+        # distinct velocity values.
         raw_fluxes = np.array(
             [abs(float(c.get("flux_m3_s", 0.0))) for c in out_edges],
             dtype=np.float64,
@@ -1838,24 +1838,10 @@ def _gating_node_velocities(
                 "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
             )
 
-        # Average flows for identical downstream outlets (same BodyType and same
-        # analytical area) so symmetric gates are exactly equal.
-        group_map: Dict[Tuple[BodyType, int], List[int]] = {}
-        for idx, c in enumerate(out_edges):
-            down_id = c["down_id"]
-            btype = comp_meta[down_id][0]
-            area_key = int(round(areas[idx] * 1e7))
-            group_map.setdefault((btype, area_key), []).append(idx)
-        for idxs in group_map.values():
-            if len(idxs) > 1:
-                mean_q = float(Q_branches[idxs].mean())
-                for i in idxs:
-                    Q_branches[i] = mean_q
-
-        # Re-normalize so the sum of the branch flows equals the node inflow Q.
-        branch_sum = float(Q_branches.sum())
-        if branch_sum > 1e-18:
-            Q_branches = Q_branches * (Q / branch_sum)
+        # Q is distributed branch-by-branch by the Darcy velocity field and each
+        # branch keeps its own real contact area.  No area-based averaging is
+        # applied, so gates with the same body type but different cross-sections
+        # keep their distinct Q and velocity values.
 
         for i, c in enumerate(out_edges):
             A = float(c["area_m2"])
