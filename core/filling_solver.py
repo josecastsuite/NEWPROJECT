@@ -693,6 +693,38 @@ def _inlet_face_area_m2(
     return A
 
 
+def _body_throat_area_m2(
+    mesh: Optional[trimesh.Trimesh],
+    plane_origin: np.ndarray,
+    plane_normal: np.ndarray,
+) -> Optional[float]:
+    """Return the geometric throat cross-sectional area (m²) of a body.
+
+    The plane passes through ``plane_origin`` and is perpendicular to the
+    local flow direction ``plane_normal``.  This gives the real channel
+    cross-section used in ``v = Q / A`` for a node, independent of the voxel
+    grid resolution.
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return None
+    try:
+        section = mesh.section(
+            plane_origin=np.asarray(plane_origin, dtype=np.float64),
+            plane_normal=np.asarray(plane_normal, dtype=np.float64),
+        )
+        if section is None or getattr(section, "is_empty", True):
+            return None
+        p2d = section.to_2D()
+        if isinstance(p2d, tuple):
+            p2d = p2d[0]
+        if p2d is None or not getattr(p2d, "polygons_closed", None):
+            return None
+        area_mm2 = float(sum(float(p.area) for p in p2d.polygons_closed))
+        return area_mm2 * 1e-6
+    except Exception:
+        return None
+
+
 def _inlet_flux_m3_s(
     u: np.ndarray,
     v: np.ndarray,
@@ -1241,8 +1273,11 @@ def _gating_node_velocities(
     comp_body: Dict[int, Body] = {}
 
     bodies_by_type: Dict[BodyType, List[Body]] = {}
+    part_body: Optional[Body] = None
     for b in bodies:
         bodies_by_type.setdefault(b.body_type, []).append(b)
+        if b.body_type == BodyType.PART and part_body is None:
+            part_body = b
 
     next_id = 2
     for gtype in gating_types:
@@ -1288,6 +1323,10 @@ def _gating_node_velocities(
             comp_cells[next_id] = idx
             comp_body[next_id] = matched.get(label_id)
             next_id += 1
+
+    # Make the part mesh reachable as well so gate->part contacts can be
+    # sectioned on the gate (upstream) body when needed.
+    comp_body[part_id] = part_body
 
     # Correct part centroid (it is used for the main flow direction of gate→part contacts).
     part_idx = np.argwhere(grid == BodyType.PART)
@@ -1731,6 +1770,49 @@ def _gating_node_velocities(
             a = float(c.get("voxel_area_m2", 0.0))
         c["area_m2"] = a
         c["area_raw_m2"] = a
+
+    # ------------------------------------------------------------------
+    # Replace the projected Darcy contact area with the real geometric throat
+    # cross-section from the CAD mesh.  The plane is placed at the contact
+    # centroid and oriented perpendicular to the local Darcy flow direction.
+    # For a gate->part node the throat is the gate (upstream); for all other
+    # gating->gating nodes it is the downstream channel.
+    # ------------------------------------------------------------------
+    for c in contacts:
+        up = c.get("up_id")
+        down = c.get("down_id")
+        if up is None or down is None:
+            continue
+        k = int(min(up, down)) * mult + int(max(up, down))
+        V = V_flow_pair[:, k]
+        v_norm = float(np.linalg.norm(V))
+        if v_norm > 1e-12:
+            normal = V / v_norm
+        else:
+            # No Darcy direction: point from upstream centroid toward downstream.
+            d = comp_centroids[down] - comp_centroids[up]
+            d_norm = float(np.linalg.norm(d))
+            if d_norm > 1e-12:
+                normal = d / d_norm
+            else:
+                normal = -g_u
+
+        if down == part_id:
+            # Gate -> Part: the throat is the gate cross-section.
+            body = comp_body.get(up)
+            # Move the plane slightly upstream (into the gate) so it does not
+            # sit exactly on the boundary and degenerate.
+            origin = np.asarray(c["centroid_mm"], dtype=np.float64) - normal * max(0.05, dx_mm * 0.05)
+        else:
+            # All other transitions: throat is the downstream channel.
+            body = comp_body.get(down)
+            # Move the plane slightly downstream (into the channel).
+            origin = np.asarray(c["centroid_mm"], dtype=np.float64) + normal * max(0.05, dx_mm * 0.05)
+
+        a_geo = _body_throat_area_m2(body.mesh if body is not None else None, origin, normal)
+        if a_geo is not None and a_geo > 1e-18:
+            c["area_m2"] = float(a_geo)
+            c["area_geo_m2"] = float(a_geo)
 
     # Propagate Q and compute velocities.
     Q_in: Dict[int, float] = {cid: 0.0 for cid in comp_meta if cid != part_id}
