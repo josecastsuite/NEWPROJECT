@@ -715,6 +715,75 @@ def _mesh_surface_pv(mesh: trimesh.Trimesh) -> Optional[pv.PolyData]:
         return None
 
 
+def _mesh_throat_area_m2(
+    mesh: trimesh.Trimesh,
+    plane_origin: np.ndarray,
+    plane_normal: np.ndarray,
+    n_sweep: int = 5,
+) -> float:
+    """Return the throat cross-section area (m²) of ``mesh`` near ``plane_origin``.
+
+    The plane is perpendicular to ``plane_normal`` (the local flow direction) and
+    is swept a short distance around ``plane_origin`` to avoid tiny slivers caused
+    by the plane clipping only a corner of the body.  The largest valid polygon
+    area is returned.
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return 0.0
+    n = np.asarray(plane_normal, dtype=np.float64)
+    n_norm = float(np.linalg.norm(n))
+    if n_norm < 1e-18:
+        n = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+    else:
+        n = n / n_norm
+
+    origin = np.asarray(plane_origin, dtype=np.float64)
+    bbox = np.asarray(mesh.bounds, dtype=np.float64)
+    diag = float(np.linalg.norm(bbox[1] - bbox[0]))
+    L = max(diag * 0.01, 0.05)
+    steps = [0.0] if n_sweep <= 1 else np.linspace(-L, L, n_sweep)
+
+    best = 0.0
+    for s in steps:
+        try:
+            section = mesh.section(plane_origin=origin + s * n, plane_normal=n)
+            if section is None:
+                continue
+            path2d = section.to_2D()
+            if isinstance(path2d, tuple):
+                path2d = path2d[0]
+            area_mm2 = float(path2d.area)
+            if area_mm2 > best:
+                best = area_mm2
+        except Exception:
+            continue
+    return float(best * 1e-6)
+
+
+def _first_valid_throat_area_m2(
+    mesh: trimesh.Trimesh,
+    plane_origin: np.ndarray,
+    normals: List[np.ndarray],
+    n_sweep: int = 5,
+) -> Tuple[float, Optional[np.ndarray]]:
+    """Return the first valid throat area (m²) and the normal that produced it.
+
+    The list ``normals`` is ordered from most-physical (e.g. Darcy flow
+    direction) to geometric fallbacks (centroid direction, gravity).  The first
+    direction that produces a non-zero section is used, so we do not accidentally
+    pick a smaller, non-flow-aligned slice of the body.
+    """
+    for n in normals:
+        n = np.asarray(n, dtype=np.float64)
+        n_norm = float(np.linalg.norm(n))
+        if n_norm < 1e-12:
+            continue
+        a = _mesh_throat_area_m2(mesh, plane_origin, n / n_norm, n_sweep=n_sweep)
+        if a > 1e-18:
+            return a, n / n_norm
+    return 0.0, None
+
+
 def _origin_inside_body(
     mesh_pv: pv.PolyData,
     centroid: np.ndarray,
@@ -1841,40 +1910,67 @@ def _gating_node_velocities(
         c["area_m2"] = c["area_real_m2"]
 
     # ------------------------------------------------------------------
-    # DIRECT CONTACT - temas direk: A = voxel temas alanı
+    # THROAT AREA - temas darboğaz alanı (trimesh CAD kesiti, voksel fallback yok)
     # ------------------------------------------------------------------
     for c in contacts:
         up = c.get("up_id")
         down = c.get("down_id")
         if up is None or down is None:
             continue
-        flux = float(c.get("flux_m3_s", 0.0))
-        if abs(flux) < 1e-18:
-            c["area_m2"] = float(max(c.get("area_real_m2", 0.0), 1e-12))
-            c["skip_node"] = True
-            continue
 
+        body_up = comp_body.get(up)
+        body_down = comp_body.get(down)
+
+        # Throat plane normals ordered from most-physical to geometric fallback:
+        # 1) Darcy velocity direction at the contact (true local flow axis).
+        # 2) Component centroid direction (sequential flow path).
+        # 3) Gravity (vertical flow paths).
         k = int(min(up, down)) * mult + int(max(up, down))
         V = V_flow_pair[:, k]
         v_norm = float(np.linalg.norm(V))
-        if v_norm > 1e-12:
-            normal = V / v_norm
-        else:
-            d = comp_centroids[down] - comp_centroids[up]
-            d_norm = float(np.linalg.norm(d))
-            normal = d / d_norm if d_norm > 1e-12 else -g_u
 
-        a_contact = float(c.get("area_real_m2", 0.0))
-        if a_contact <= 1e-18:
+        d = comp_centroids[down] - comp_centroids[up]
+        d_norm = float(np.linalg.norm(d))
+        d_unit = d / d_norm if d_norm > 1e-12 else -g_u
+
+        normals: List[np.ndarray] = []
+        if v_norm > 1e-12:
+            normals.append(V / v_norm)
+            normals.append(-V / v_norm)
+        normals.append(d_unit)
+        normals.append(-d_unit)
+        normals.append(-g_u)
+        normals.append(g_u)
+
+        a_up = 0.0
+        a_down = 0.0
+        normal = normals[0] if normals else -g_u
+        if body_up is not None:
+            a_up, n_up = _first_valid_throat_area_m2(body_up.mesh, c["centroid_mm"], normals)
+            if n_up is not None:
+                normal = n_up
+        if body_down is not None:
+            a_down, n_down = _first_valid_throat_area_m2(body_down.mesh, c["centroid_mm"], normals)
+            if a_down > 1e-18 and (a_up <= 1e-18 or a_down < a_up) and n_down is not None:
+                normal = n_down
+
+        if a_up > 1e-18 and a_down > 1e-18:
+            a_contact = float(min(a_up, a_down))
+        elif a_up > 1e-18:
+            a_contact = float(a_up)
+        elif a_down > 1e-18:
+            a_contact = float(a_down)
+        else:
             up_name = comp_meta.get(up, (None, str(up)))[1]
             down_name = comp_meta.get(down, (None, str(down)))[1]
             raise GatingVelocityError(
-                f"Temas alanı sıfır: {up_name} -> {down_name}."
+                f"Temas alanı (mesh kesit) hesaplanamadı: {up_name} -> {down_name}."
             )
+
         c["area_m2"] = a_contact
         c["area_geo_m2"] = a_contact
-        c["area_up_m2"] = a_contact
-        c["area_down_m2"] = a_contact
+        c["area_up_m2"] = a_up
+        c["area_down_m2"] = a_down
         c["flow_normal"] = normal
         c["skip_node"] = False
 
@@ -1916,8 +2012,6 @@ def _gating_node_velocities(
             )
         )
 
-    part_edges: List[Dict] = []
-
     for cid in order:
         Q = Q_in[cid]
         out_edges = [c for c in outgoing.get(cid, []) if not c.get("skip_node")]
@@ -1931,28 +2025,20 @@ def _gating_node_velocities(
                 f"Düğüm hızları çözülemedi: {comp_meta[cid][1]} elemanının toplam çıkış kesit alanı sıfır. "
                 "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
             )
-        # Split the incoming flow among the outgoing branches using the real
-        # 3B Darcy flux integrated across each contact (flux_m3_s).  The flux
-        # proportions come directly from the solved velocity field; the total is
-        # then scaled to enforce continuity at the node.  Each branch uses its
-        # own contact area, so gates with different cross-sections keep their
-        # distinct velocity values.
-        raw_fluxes = np.array(
-            [abs(float(c.get("flux_m3_s", 0.0))) for c in out_edges],
-            dtype=np.float64,
-        )
-        raw_total = float(raw_fluxes.sum())
+        # Basit + akıllı hesap: gelen toplam debi, çıkış darboğaz
+        # alanlarına göre orantılı bölünür.  Akış yolunda her kavşakta
+        # v_common = Q / A_total ve Q_i = v_common * A_i; düğüm hızı
+        # v_i = Q_i / A_i = v_common olur.  Darcy flux paylaşımına dönülmez.
         areas = np.array([float(c["area_m2"]) for c in out_edges], dtype=np.float64)
         A_total = float(areas.sum())
+        if A_total <= 1e-18:
+            raise GatingVelocityError(
+                f"Düğüm hızları çözülemedi: {comp_meta[cid][1]} elemanının toplam çıkış kesit alanı sıfır. "
+                "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
+            )
 
-        if raw_total > 1e-18:
-            Q_branches = raw_fluxes * (Q / raw_total)
-        else:
-            # No Darcy flux measured on active outlets: zero flow for all.
-            Q_branches = np.zeros_like(raw_fluxes)
+        Q_branches = Q * (areas / A_total)
 
-        # Each outlet keeps its own Darcy-derived flow share.  No automatic
-        # equalisation across same-type outlets is applied; v = Q_i / A_i.
         for i, c in enumerate(out_edges):
             A = float(c["area_m2"])
             if A <= 1e-18:
@@ -1966,18 +2052,6 @@ def _gating_node_velocities(
             c["Q_branch"] = Q_branch
             c["v_branch"] = v_branch
             down_id = c["down_id"]
-            if down_id == part_id:
-                # Postpone INGATE->PART nodes until a second pass that equalises
-                # the exit velocity of all ingates fed by the same distributor.
-                part_edges.append({
-                    "cid": cid,
-                    "c": c,
-                    "A": A,
-                    "Q_branch": Q_branch,
-                    "v_branch": v_branch,
-                })
-                continue
-            Q_in[down_id] += Q_branch
             print(
                 f"[GATING_NODE] {comp_meta[cid][1]} -> {comp_meta[down_id][1]}  "
                 f"area_cm2={A*1e4:.4f}  Q_L_s={Q_branch*1e3:.4f}  v_m_s={v_branch:.4f}",
@@ -1985,25 +2059,8 @@ def _gating_node_velocities(
             )
             node = _make_node(cid, down_id, A, Q_branch, c["centroid_mm"], flow_rate_m3_s=Q_branch)
             nodes.append(node)
-
-    # INGATE -> PART nodes are emitted with their own Darcy-derived flow share.
-    # No common exit velocity is forced; v = Q_i / A_i for each gate.
-    for e in part_edges:
-        cid = e["cid"]
-        c = e["c"]
-        A = e["A"]
-        Q_branch = float(e["Q_branch"])
-        v_branch = float(e["v_branch"])
-        c["Q_branch"] = Q_branch
-        c["v_branch"] = v_branch
-        down_id = c["down_id"]
-        print(
-            f"[GATING_NODE] {comp_meta[cid][1]} -> {comp_meta[down_id][1]}  "
-            f"area_cm2={A*1e4:.4f}  Q_L_s={Q_branch*1e3:.4f}  v_m_s={v_branch:.4f}",
-            flush=True,
-        )
-        node = _make_node(cid, down_id, A, Q_branch, c["centroid_mm"], flow_rate_m3_s=Q_branch)
-        nodes.append(node)
+            if down_id != part_id:
+                Q_in[down_id] += Q_branch
 
     if not nodes:
         raise GatingVelocityError(
