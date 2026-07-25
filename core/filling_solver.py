@@ -756,45 +756,37 @@ def _body_throat_area_m2(
     plane_origin: np.ndarray,
     plane_normal: np.ndarray,
 ) -> Optional[float]:
-    """Return the geometric throat cross-sectional area (m²) of a body.
+    """Pure geometric cross-section, no fallback, no sweep.
 
-    The plane passes through ``plane_origin`` and is perpendicular to the
-    local flow direction ``plane_normal``.  This gives the real channel
-    cross-section used in ``v = Q / A`` for a node, independent of the voxel
-    grid resolution.
+    Plane passes through plane_origin, perpendicular to plane_normal (body axis).
+    Returns area in m², or None if section fails.
     """
     if mesh is None or len(mesh.faces) == 0:
         return None
     origin = np.asarray(plane_origin, dtype=np.float64)
     normal = np.asarray(plane_normal, dtype=np.float64)
-    normal = normal / max(float(np.linalg.norm(normal)), 1e-18)
-
-    def _area_at(o: np.ndarray) -> Optional[float]:
-        try:
-            section = mesh.section(
-                plane_origin=o,
-                plane_normal=normal,
-            )
-            if section is None or getattr(section, "is_empty", True):
-                return None
-            p2d = section.to_2D()
-            if isinstance(p2d, tuple):
-                p2d = p2d[0]
-            if p2d is None or not getattr(p2d, "polygons_closed", None):
-                return None
-            return float(sum(float(p.area) for p in p2d.polygons_closed))
-        except Exception:
+    n = float(np.linalg.norm(normal))
+    if n < 1e-18:
+        return None
+    normal = normal / n
+    try:
+        section = mesh.section(plane_origin=origin, plane_normal=normal)
+        if section is None or getattr(section, "is_empty", True):
             return None
-
-    # Try the requested origin and a small step on either side.  This handles
-    # cases where the contact centroid sits exactly on a sharp edge and the
-    # initial offset pointed outside the body.
-    eps = 0.1
-    for o in (origin, origin + normal * eps, origin - normal * eps):
-        area_mm2 = _area_at(o)
-        if area_mm2 is not None and area_mm2 > 1e-9:
-            return area_mm2 * 1e-6
-    return None
+        p2d = section.to_2D()
+        if isinstance(p2d, tuple):
+            p2d = p2d[0]
+        if p2d is None or not getattr(p2d, "polygons_closed", None):
+            return None
+        polys = getattr(p2d, "polygons_closed", None)
+        if not polys:
+            return None
+        area_mm2 = float(sum(float(p.area) for p in polys))
+        if area_mm2 <= 1e-12:
+            return None
+        return area_mm2 * 1e-6
+    except Exception:
+        return None
 
 
 def _inlet_flux_m3_s(
@@ -1830,7 +1822,7 @@ def _gating_node_velocities(
             flux_pair += np.bincount(k_arr, weights=Q_face, minlength=n_keys)
             area_pair += np.bincount(k_arr, weights=A_proj_face, minlength=n_keys)
 
-    # Assign the integrated Darcy flux and projected contact area to each contact.
+    # Assign flux and direct contact area (no trimesh, no fallback)
     for c in contacts:
         up = c.get("up_id")
         down = c.get("down_id")
@@ -1838,20 +1830,18 @@ def _gating_node_velocities(
             continue
         k = int(min(up, down)) * mult + int(max(up, down))
         c["flux_m3_s"] = float(flux_pair[k])
-        c["area_real_m2"] = float(area_pair[k])
-        # The final area is set below from the real CAD geometry; if that fails
-        # the solver stops instead of silently falling back to an approximation.
-        c["area_m2"] = float(area_pair[k])
+        # area_b = raw (merdivenli), area_pair = projected A*cos (akışa dik)
+        # Gerçek CAD boğazı akışa dik, o yüzden projected kullanıyoruz
+        # Sen verdin: 886 vs 908 (projected), raw 1623 oluyor fazla
+        raw_a = float(area_b[k])
+        proj_a = float(area_pair[k])
+        c["area_real_m2"] = proj_a if proj_a > 1e-18 else raw_a
+        c["area_raw_m2"] = raw_a
+        c["area_proj_m2"] = proj_a
+        c["area_m2"] = c["area_real_m2"]
 
     # ------------------------------------------------------------------
-    # Replace the projected Darcy contact area with the real geometric throat
-    # cross-section from the CAD mesh.  The plane is placed at the contact
-    # centroid and oriented perpendicular to the local Darcy flow direction.
-    # For a gate->part node the throat is the gate (upstream); for all other
-    # gating->gating nodes it is the downstream channel.
-    # No voxel/design fallback: if the geometry cannot be sectioned, we stop.
-    # Contacts that carry no Darcy flux (dead branches) keep the Darcy area for
-    # reporting and are skipped in the node list.
+    # DIRECT CONTACT - temas direk: A = voxel temas alanı
     # ------------------------------------------------------------------
     for c in contacts:
         up = c.get("up_id")
@@ -1860,7 +1850,6 @@ def _gating_node_velocities(
             continue
         flux = float(c.get("flux_m3_s", 0.0))
         if abs(flux) < 1e-18:
-            # Dead branch: velocity is zero, area is only for reporting.
             c["area_m2"] = float(max(c.get("area_real_m2", 0.0), 1e-12))
             c["skip_node"] = True
             continue
@@ -1871,68 +1860,22 @@ def _gating_node_velocities(
         if v_norm > 1e-12:
             normal = V / v_norm
         else:
-            # No Darcy direction: point from upstream centroid toward downstream.
             d = comp_centroids[down] - comp_centroids[up]
             d_norm = float(np.linalg.norm(d))
-            if d_norm > 1e-12:
-                normal = d / d_norm
-            else:
-                normal = -g_u
+            normal = d / d_norm if d_norm > 1e-12 else -g_u
 
-        if down == part_id:
-            # Gate -> Part: the throat is the gate cross-section.
-            body = comp_body.get(up)
-        else:
-            # All other transitions: throat is the downstream channel.
-            body = comp_body.get(down)
-
-        if body is None or body.mesh is None or len(body.mesh.faces) == 0:
-            raise GatingVelocityError(
-                f"Düğüm hızı için gövde mesh'i bulunamadı: "
-                f"{comp_meta.get(up, (None, str(up)))[1]} -> "
-                f"{comp_meta.get(down, (None, str(down)))[1]}."
-            )
-
-        centroid = np.asarray(c["centroid_mm"], dtype=np.float64)
-        body_centroid = body.mesh.centroid
-        to_body = body_centroid - centroid
-        to_body_norm = float(np.linalg.norm(to_body))
-        if to_body_norm > 1e-12:
-            interior_dir = to_body / to_body_norm
-        else:
-            interior_dir = -normal
-
-        # The throat area is the cross-section of the throat body perpendicular
-        # to its own axis (contact -> body centroid).  This is the real
-        # overlapping/channel throat, independent of local Darcy swirl or a
-        # centroid sitting near an edge.
-        eps = max(0.05, dx_mm * 0.05)
-        origin = centroid + interior_dir * eps
-        normal = interior_dir
-        a_geo = _body_throat_area_m2(body.mesh, origin, normal)
-
-        # If the contact centroid sits on the far side of the shared surface,
-        # the simple offset can miss the body.  Use PyVista to find the actual
-        # entry point into the body interior and retry.
-        if a_geo is None or a_geo <= 1e-18:
-            mesh_pv = _mesh_surface_pv(body.mesh)
-            if mesh_pv is not None:
-                robust_origin = _origin_inside_body(
-                    mesh_pv, centroid, interior_dir, body_centroid, eps
-                )
-                if robust_origin is not None:
-                    a_geo = _body_throat_area_m2(body.mesh, robust_origin, normal)
-
-        if a_geo is None or a_geo <= 1e-18:
+        a_contact = float(c.get("area_real_m2", 0.0))
+        if a_contact <= 1e-18:
             up_name = comp_meta.get(up, (None, str(up)))[1]
             down_name = comp_meta.get(down, (None, str(down)))[1]
             raise GatingVelocityError(
-                f"Düğüm hızı için geometrik boğaz alanı hesaplanamadı: "
-                f"{up_name} -> {down_name}. CAD geometrisi kapalı/watertight olmayabilir "
-                f"veya temas noktası dejeneredir."
+                f"Temas alanı sıfır: {up_name} -> {down_name}."
             )
-        c["area_m2"] = float(a_geo)
-        c["area_geo_m2"] = float(a_geo)
+        c["area_m2"] = a_contact
+        c["area_geo_m2"] = a_contact
+        c["area_up_m2"] = a_contact
+        c["area_down_m2"] = a_contact
+        c["flow_normal"] = normal
         c["skip_node"] = False
 
     # Propagate Q and compute velocities.
