@@ -1732,32 +1732,6 @@ def _gating_node_velocities(
         c["area_m2"] = a
         c["area_raw_m2"] = a
 
-    # Symmetrize identical body-type pairs: all contacts between the same two
-    # body types (e.g. SPRUE->INGATE or INGATE->PART) get the same flux and
-    # throat area.  This removes voxel-discretization noise so that identical
-    # symmetric gates report exactly the same velocity and Q.
-    pair_groups: Dict[Tuple[str, str], List[Dict]] = {}
-    for c in contacts:
-        key = tuple(sorted((c["type1"].name, c["type2"].name)))
-        pair_groups.setdefault(key, []).append(c)
-    for group in pair_groups.values():
-        if len(group) < 2:
-            continue
-        areas = np.array([float(c.get("area_m2", 0.0)) for c in group], dtype=np.float64)
-        fluxes = np.array([float(c.get("flux_m3_s", 0.0)) for c in group], dtype=np.float64)
-        if areas.size == 0:
-            continue
-        mean_area = float(np.mean(areas))
-        # Preserve the sign of the first flux; all contacts in a group should
-        # already share the same downstream direction from the BFS.
-        sign = float(np.sign(fluxes[0])) if fluxes.size else 1.0
-        mean_flux = float(np.mean(np.abs(fluxes)))
-        if mean_area > 1e-12:
-            for c in group:
-                c["area_m2"] = mean_area
-                c["area_raw_m2"] = mean_area
-                c["flux_m3_s"] = sign * mean_flux
-
     # Propagate Q and compute velocities.
     Q_in: Dict[int, float] = {cid: 0.0 for cid in comp_meta if cid != part_id}
     Q_in[source_id] = float(Q_user)
@@ -1838,10 +1812,22 @@ def _gating_node_velocities(
                 "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
             )
 
-        # Q is distributed branch-by-branch by the Darcy velocity field and each
-        # branch keeps its own real contact area.  No area-based averaging is
-        # applied, so gates with the same body type but different cross-sections
-        # keep their distinct Q and velocity values.
+        # For outlets of the SAME body type leaving the SAME parent, use a common
+        # velocity so symmetric gates report the same speed while still allowing
+        # different cross-sectional areas (Q = v_common * A).  Different body
+        # types or different parents keep their own Darcy-derived split.
+        by_down_type: Dict[BodyType, List[int]] = {}
+        for i, c in enumerate(out_edges):
+            by_down_type.setdefault(comp_meta[c["down_id"]][0], []).append(i)
+        for idxs in by_down_type.values():
+            if len(idxs) < 2:
+                continue
+            q_sum = float(Q_branches[idxs].sum())
+            a_sum = float(areas[idxs].sum())
+            if a_sum > 1e-18:
+                v_common_type = q_sum / a_sum
+                for i in idxs:
+                    Q_branches[i] = v_common_type * areas[i]
 
         for i, c in enumerate(out_edges):
             A = float(c["area_m2"])
