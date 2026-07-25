@@ -385,9 +385,13 @@ def solve_3d_thermal(
         # then that pre-advected field becomes the initial condition for the
         # implicit diffusion solve over the same interval.
         T_adv = T_old.copy()
-        if velocity_c is not None:
-            n_sub = max(1, int(np.ceil(dt / dt_adv))) if np.isfinite(dt_adv) else 1
-            sub_dt = dt / n_sub
+        # Advect only while the metal front is still filling.  After fill_end the
+        # velocity field is no longer physically active (metal is stationary),
+        # and continuing to sub-cycle would explode the run-time.
+        if velocity_c is not None and t < fill_end:
+            adv_dt = min(dt, fill_end - t)
+            n_sub = max(1, int(np.ceil(adv_dt / dt_adv))) if np.isfinite(dt_adv) else 1
+            sub_dt = adv_dt / n_sub
             for k in range(n_sub):
                 sub_t = t + (k + 0.5) * sub_dt
                 adv = _upwind_advection(T_adv, velocity_c, dx_m, fill_c, sub_t, is_metal_c)
