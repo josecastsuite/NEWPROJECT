@@ -21,6 +21,7 @@ velocity and an optional per-voxel fill-time estimate.
 """
 import heapq
 from dataclasses import dataclass, field
+from itertools import combinations
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -801,6 +802,231 @@ def _first_valid_throat_area_m2(
     return 0.0, None
 
 
+def _build_mesh_contacts(
+    comp_body: Dict[int, Body],
+    comp_meta: Dict[int, Tuple[BodyType, str]],
+    comp_centroids: Dict[int, np.ndarray],
+    g: np.ndarray,
+    part_id: int,
+    max_gap_mm: float = 0.5,
+    max_query: int = 5000,
+    verbose: bool = True,
+) -> List[Dict]:
+    """Build the contact graph directly from CAD mesh proximity.
+
+    Every pair of bodies whose surface points are within ``max_gap_mm`` is
+    considered a gating contact.  The contact centroid is the midpoint of the
+    closest source/target surface pair, so the downstream area calculation starts
+    at the real geometric interface instead of a coarse voxel face centre.
+
+    Flow orientation is decided in three steps:
+      1. Any contact involving the part: the non-part body is upstream.
+      2. Otherwise the weighted average contact normal on each body is compared
+         with gravity; the body whose contact surface points downward is upstream.
+      3. If the normals are ambiguous (typical for side contacts), fall back to
+         the gating-type hierarchy and, as a last resort, to the higher centroid
+         along the reverse gravity direction.
+    """
+    ids = sorted(
+        cid
+        for cid, b in comp_body.items()
+        if b is not None and b.mesh is not None and len(b.mesh.faces) > 0
+    )
+    contacts: List[Dict] = []
+    if len(ids) < 2:
+        return contacts
+
+    g_vec = np.asarray(g, dtype=np.float64)
+    g_norm = float(np.linalg.norm(g_vec))
+    g_u = g_vec / g_norm if g_norm > 1e-12 else np.array([0.0, 0.0, -1.0])
+
+    def _rank(cid: int) -> float:
+        return float(-np.dot(comp_centroids.get(cid, np.zeros(3)), g_u))
+
+    type_order = {
+        BodyType.POURING_BASIN: 0,
+        BodyType.SPRUE_THROAT: 1,
+        BodyType.SPRUE: 2,
+        BodyType.RUNNER: 3,
+        BodyType.DISTRIBUTOR: 4,
+        BodyType.CURUFLUK: 5,
+        BodyType.FILTER: 6,
+        BodyType.INGATE: 7,
+        BodyType.RISER: 8,
+        BodyType.PART: 9,
+        BodyType.EMPTY: 10,
+        BodyType.CORE: 11,
+        BodyType.COOLING_SPRUE: 12,
+    }
+
+    def _order(cid: int) -> int:
+        bt = comp_meta.get(cid, (BodyType.EMPTY, ""))[0]
+        return type_order.get(bt, 10)
+
+    for i, j in combinations(ids, 2):
+        mesh_a = comp_body[i].mesh
+        mesh_b = comp_body[j].mesh
+        if mesh_a is mesh_b:
+            continue
+        name_a = comp_meta.get(i, (BodyType.EMPTY, f"Body_{i}"))[1]
+        name_b = comp_meta.get(j, (BodyType.EMPTY, f"Body_{j}"))[1]
+
+        sep = np.maximum(0.0, mesh_a.bounds[0] - mesh_b.bounds[1]).max()
+        sep = max(sep, float(np.maximum(0.0, mesh_b.bounds[0] - mesh_a.bounds[1]).max()))
+        bbox_sep = float(np.linalg.norm(np.maximum(0.0, np.maximum(mesh_a.bounds[0] - mesh_b.bounds[1], mesh_b.bounds[0] - mesh_a.bounds[1]))))
+
+        if bbox_sep > max_gap_mm:
+            if verbose:
+                print(
+                    f"[CONTACT_DISCOVERY] {name_a} <-> {name_b}: "
+                    f"bbox_sep={bbox_sep:.2f} mm (> {max_gap_mm} mm) -> skip",
+                    flush=True,
+                )
+            continue
+
+        # Query the smaller mesh against the larger one; its face centres are
+        # denser near the contact patch.
+        if float(mesh_a.area) > float(mesh_b.area):
+            source, target = mesh_b, mesh_a
+            source_cid, target_cid = j, i
+        else:
+            source, target = mesh_a, mesh_b
+            source_cid, target_cid = i, j
+
+        centers = np.asarray(source.triangles_center, dtype=np.float64)
+        face_indices = np.arange(centers.shape[0], dtype=np.int64)
+
+        if centers.shape[0] > max_query:
+            step = centers.shape[0] / max_query
+            sample_idx = (np.arange(max_query) * step).astype(int)
+            sample_idx[-1] = min(sample_idx[-1], centers.shape[0] - 1)
+            local_centers = centers[sample_idx]
+            local_face_indices = face_indices[sample_idx]
+        else:
+            local_centers = centers
+            local_face_indices = face_indices
+
+        try:
+            closest, dist, tgt_face_idx = trimesh.proximity.closest_point(target, local_centers)
+        except Exception as exc:
+            if verbose:
+                print(
+                    f"[CONTACT_DISCOVERY] {name_a} <-> {name_b}: "
+                    f"closest_point failed ({exc}) -> skip",
+                    flush=True,
+                )
+            continue
+
+        min_idx = int(np.argmin(dist))
+        d_min = float(dist[min_idx])
+        if d_min > max_gap_mm:
+            if verbose:
+                print(
+                    f"[CONTACT_DISCOVERY] {name_a} <-> {name_b}: "
+                    f"d_min={d_min:.3f} mm (> {max_gap_mm} mm) -> skip",
+                    flush=True,
+                )
+            continue
+
+        # Collect all sampled source faces within the contact tolerance to build a
+        # robust patch-averaged normal.  This smooths out single-triangle noise on
+        # side contacts.
+        dist_arr = np.asarray(dist, dtype=np.float64)
+        patch_mask = dist_arr <= max_gap_mm
+        if not patch_mask.any():
+            patch_mask[min_idx] = True
+
+        src_faces = local_face_indices[patch_mask]
+        tgt_faces = tgt_face_idx[patch_mask].astype(np.int64)
+        src_areas = source.area_faces[src_faces] if len(src_faces) > 0 else np.ones(1)
+        tgt_areas = target.area_faces[tgt_faces] if len(tgt_faces) > 0 else np.ones(1)
+        src_normals = source.face_normals[src_faces]
+        tgt_normals = target.face_normals[tgt_faces]
+        if src_areas.sum() > 1e-18:
+            n_src = np.sum(src_normals * src_areas[:, None], axis=0) / src_areas.sum()
+        else:
+            n_src = src_normals.mean(axis=0) if src_normals.size else g_u
+        if tgt_areas.sum() > 1e-18:
+            n_tgt = np.sum(tgt_normals * tgt_areas[:, None], axis=0) / tgt_areas.sum()
+        else:
+            n_tgt = tgt_normals.mean(axis=0) if tgt_normals.size else -g_u
+        n_src = n_src / (np.linalg.norm(n_src) + 1e-18)
+        n_tgt = n_tgt / (np.linalg.norm(n_tgt) + 1e-18)
+
+        p_src = local_centers[min_idx]
+        p_tgt = np.asarray(closest[min_idx], dtype=np.float64)
+
+        # Determine flow direction (up_id -> down_id).
+        if source_cid == part_id:
+            up_id, down_id = target_cid, source_cid
+            up_pt, down_pt = p_tgt, p_src
+        elif target_cid == part_id:
+            up_id, down_id = source_cid, target_cid
+            up_pt, down_pt = p_src, p_tgt
+        else:
+            dot_src = float(np.dot(n_src, g_u))
+            dot_tgt = float(np.dot(n_tgt, g_u))
+            if dot_src > dot_tgt + 0.3:
+                up_id, down_id = source_cid, target_cid
+                up_pt, down_pt = p_src, p_tgt
+            elif dot_tgt > dot_src + 0.3:
+                up_id, down_id = target_cid, source_cid
+                up_pt, down_pt = p_tgt, p_src
+            else:
+                # Side/ambiguous contact: use the gating hierarchy and then rank.
+                o_src = _order(source_cid)
+                o_tgt = _order(target_cid)
+                if o_src == o_tgt:
+                    if _rank(source_cid) >= _rank(target_cid):
+                        up_id, down_id = source_cid, target_cid
+                        up_pt, down_pt = p_src, p_tgt
+                    else:
+                        up_id, down_id = target_cid, source_cid
+                        up_pt, down_pt = p_tgt, p_src
+                elif o_src < o_tgt:
+                    up_id, down_id = source_cid, target_cid
+                    up_pt, down_pt = p_src, p_tgt
+                else:
+                    up_id, down_id = target_cid, source_cid
+                    up_pt, down_pt = p_tgt, p_src
+
+        centroid = 0.5 * (up_pt + down_pt)
+        direction = down_pt - up_pt
+        d_norm = float(np.linalg.norm(direction))
+        if d_norm > 1e-12:
+            normal = direction / d_norm
+        else:
+            normal = g_u
+
+        contacts.append(
+            {
+                "id1": i,
+                "id2": j,
+                "up_id": up_id,
+                "down_id": down_id,
+                "type1": comp_meta.get(i, (BodyType.EMPTY, name_a))[0],
+                "type2": comp_meta.get(j, (BodyType.EMPTY, name_b))[0],
+                "name1": name_a,
+                "name2": name_b,
+                "voxel_area_m2": 0.0,
+                "centroid_mm": centroid,
+                "normal": normal,
+                "flux_m3_s": 0.0,
+            }
+        )
+        if verbose:
+            up_name = comp_meta.get(up_id, (None, str(up_id)))[1]
+            down_name = comp_meta.get(down_id, (None, str(down_id)))[1]
+            print(
+                f"[CONTACT_DISCOVERY] {name_a} <-> {name_b}: "
+                f"bbox_sep={bbox_sep:.2f} d_min={d_min:.3f} mm -> CONTACT "
+                f"centroid=({centroid[0]:.2f},{centroid[1]:.2f},{centroid[2]:.2f}) "
+                f"up={up_name} down={down_name}",
+                flush=True,
+            )
+    return contacts
+
+
 def _contact_surface_area_m2(
     mesh_a: trimesh.Trimesh,
     mesh_b: trimesh.Trimesh,
@@ -1420,6 +1646,168 @@ def _aggregate_section_velocities(
     return node_v, v_ingate_contact
 
 
+def _reclassify_comp_meta_from_graph(
+    comp_meta: Dict[int, Tuple[BodyType, str]],
+    comp_centroids: Dict[int, np.ndarray],
+    contacts: List[Dict],
+    part_id: int,
+    g: np.ndarray,
+    source_section: str,
+) -> Dict[int, Tuple[BodyType, str]]:
+    """Correct voxel-merged/misclassified body types using the CAD mesh contact graph.
+
+    The contact graph is already directed (up_id -> down_id) by surface normals.
+    This function finds the topmost source that can reach the part and re-types
+    every reachable component according to its position in the flow path.
+    Side branches (e.g. risers) that cannot reach the part are left as RISER
+    or EMPTY so they do not steal main flow.
+    """
+    g_u = np.asarray(g, dtype=np.float64)
+    norm = float(np.linalg.norm(g_u))
+    if norm > 1e-12:
+        g_u = g_u / norm
+    else:
+        g_u = np.array([0.0, 0.0, -1.0])
+
+    def _rank(cid: int) -> float:
+        return float(-np.dot(comp_centroids.get(cid, np.zeros(3)), g_u))
+
+    # Directed graph already oriented by surface normals in _build_mesh_contacts.
+    adj: Dict[int, List[int]] = {cid: [] for cid in comp_meta}
+    incoming: Dict[int, List[int]] = {cid: [] for cid in comp_meta}
+    to_part: Dict[int, bool] = {cid: False for cid in comp_meta}
+    for c in contacts:
+        up = int(c["up_id"])
+        down = int(c["down_id"])
+        if down == part_id:
+            to_part[up] = True
+            incoming[part_id].append(up)
+            continue
+        adj[up].append(down)
+        incoming[down].append(up)
+
+    # Which components can eventually reach the part?  Reverse BFS from part_id.
+    can_reach_part: Dict[int, bool] = {part_id: True}
+    queue = [part_id]
+    while queue:
+        cur = queue.pop(0)
+        for prev in incoming.get(cur, []):
+            if prev not in can_reach_part:
+                can_reach_part[prev] = True
+                queue.append(prev)
+
+    # Indegree/outdegree on the part-reachable subgraph.
+    indeg = {cid: 0 for cid in comp_meta}
+    outdeg = {cid: 0 for cid in comp_meta}
+    for c in contacts:
+        up = int(c["up_id"])
+        down = int(c["down_id"])
+        if down == part_id:
+            if can_reach_part.get(up, False):
+                outdeg[up] += 1
+            continue
+        if can_reach_part.get(up, False) and can_reach_part.get(down, False):
+            outdeg[up] += 1
+            indeg[down] += 1
+
+    non_part = [cid for cid in comp_meta if cid != part_id]
+    candidates = [
+        cid
+        for cid in non_part
+        if indeg[cid] == 0 and outdeg[cid] > 0 and can_reach_part.get(cid, False) and not to_part[cid]
+    ]
+    if not candidates:
+        candidates = [
+            cid
+            for cid in non_part
+            if outdeg[cid] > 0 and can_reach_part.get(cid, False) and not to_part[cid]
+        ]
+    if not candidates:
+        return comp_meta
+
+    source = max(candidates, key=_rank)
+
+    print(f"[RECLASSIFY] source={comp_meta[source][1]} rank={_rank(source):.2f} candidates={[comp_meta[c][1] for c in candidates]}", flush=True)
+    for cid in sorted(comp_meta):
+        if cid == part_id:
+            continue
+        reachable = can_reach_part.get(cid, False)
+        print(f"[RECLASSIFY] {comp_meta[cid][1]} rank={_rank(cid):.2f} indeg={indeg[cid]} outdeg={outdeg[cid]} to_part={to_part[cid]} can_reach_part={reachable}", flush=True)
+
+    # BFS from source along the directed, part-reachable graph.
+    parent: Dict[int, int] = {source: -1}
+    children: Dict[int, List[int]] = {source: []}
+    visited = {source}
+    queue = [source]
+    while queue:
+        cur = queue.pop(0)
+        for nxt in adj.get(cur, []):
+            if nxt in visited or not can_reach_part.get(nxt, False):
+                continue
+            visited.add(nxt)
+            parent[nxt] = cur
+            children.setdefault(cur, []).append(nxt)
+            children.setdefault(nxt, [])
+            queue.append(nxt)
+
+    new_meta = dict(comp_meta)
+    section_up = source_section.upper()
+
+    for cid in list(comp_meta.keys()):
+        if cid == part_id:
+            continue
+        bt, name = new_meta[cid]
+        is_source = cid == source
+        kids = children.get(cid, [])
+        has_part = to_part.get(cid, False)
+
+        if is_source:
+            if "THROAT" in section_up or "BOĞAZ" in section_up:
+                new_meta[cid] = (BodyType.SPRUE_THROAT, name)
+            elif "BASIN" in section_up or "HAVUZ" in section_up:
+                new_meta[cid] = (BodyType.POURING_BASIN, name)
+            else:
+                new_meta[cid] = (BodyType.SPRUE, name)
+            continue
+
+        if cid not in visited:
+            # Not on the source-to-part path: keep a riser, reset everything else.
+            if bt != BodyType.RISER:
+                new_meta[cid] = (BodyType.EMPTY, name)
+            continue
+
+        if has_part:
+            new_meta[cid] = (BodyType.INGATE, name)
+            continue
+
+        if len(kids) >= 2:
+            new_meta[cid] = (BodyType.DISTRIBUTOR, name) if parent.get(cid) != source else (BodyType.SPRUE, name)
+            continue
+
+        if len(kids) == 1:
+            new_meta[cid] = (BodyType.RUNNER, name)
+            continue
+
+        # Leaf with no downstream: keep a riser, otherwise empty.
+        if bt == BodyType.RISER:
+            continue
+        new_meta[cid] = (BodyType.EMPTY, name)
+
+    # Direct part-feeders that were not reached from the source are still gates.
+    for cid in non_part:
+        if cid not in visited and to_part.get(cid, False):
+            bt, name = new_meta[cid]
+            if bt in {BodyType.PART, BodyType.RISER, BodyType.EMPTY}:
+                new_meta[cid] = (BodyType.INGATE, name)
+
+    print("[RECLASSIFY] final types:", flush=True)
+    for cid, (bt, name) in sorted(new_meta.items()):
+        if cid == part_id:
+            continue
+        print(f"  cid={cid} name={name} type={bt.name}", flush=True)
+    return new_meta
+
+
 def _gating_node_velocities(
     grid: np.ndarray,
     origin_mm: np.ndarray,
@@ -1562,147 +1950,48 @@ def _gating_node_velocities(
     if part_idx.size:
         comp_centroids[part_id] = part_idx.mean(axis=0) * dx_mm + origin_mm
 
-    # Discover shared faces between gating components and the part.
-    max_id = int(comp_id.max())
+    # Map every real Body to a component ID, even if the voxel grid merged or
+    # missed it.  This makes the contact graph CAD-driven instead of voxel-driven.
+    body_to_cid: Dict[int, int] = {}
+    for cid, b in comp_body.items():
+        if b is not None:
+            body_to_cid[id(b)] = cid
+
+    for b in bodies:
+        if b is None or b.mesh is None or len(b.mesh.faces) == 0:
+            continue
+        if id(b) in body_to_cid:
+            continue
+        comp_body[next_id] = b
+        comp_meta[next_id] = (b.body_type, b.name)
+        comp_centroids[next_id] = np.asarray(b.center, dtype=np.float64)
+        body_to_cid[id(b)] = next_id
+        next_id += 1
+
+    # Recompute the integer key space to include all real bodies.
+    max_id = int(max(comp_meta.keys()))
     mult = max_id + 1
     n_keys = mult * mult
     area_b = np.zeros(n_keys, dtype=np.float64)
     cx_b = np.zeros(n_keys, dtype=np.float64)
     cy_b = np.zeros(n_keys, dtype=np.float64)
     cz_b = np.zeros(n_keys, dtype=np.float64)
-
     nx_b = np.zeros(n_keys, dtype=np.float64)
     ny_b = np.zeros(n_keys, dtype=np.float64)
     nz_b = np.zeros(n_keys, dtype=np.float64)
-    # Projected Darcy flux per unordered component pair is computed after BFS,
-    # once the true upstream/downstream direction of each contact is known.
 
-    def _accumulate_contact_1d(
-        id_a_1d: np.ndarray,
-        id_b_1d: np.ndarray,
-        x_1d: np.ndarray,
-        y_1d: np.ndarray,
-        z_1d: np.ndarray,
-        s_x: float,
-        s_y: float,
-        s_z: float,
-        f_A_1d: np.ndarray,
-    ) -> None:
-        nonlocal area_b, cx_b, cy_b, cz_b, nx_b, ny_b, nz_b
-        if id_a_1d.size == 0:
-            return
-        up = np.minimum(id_a_1d, id_b_1d)
-        down = np.maximum(id_a_1d, id_b_1d)
-        key = up * mult + down
-        w = area_face * f_A_1d
-        area_b += np.bincount(key, weights=w, minlength=n_keys)
-        cx_b += np.bincount(key, weights=x_1d * w, minlength=n_keys)
-        cy_b += np.bincount(key, weights=y_1d * w, minlength=n_keys)
-        cz_b += np.bincount(key, weights=z_1d * w, minlength=n_keys)
-        # Signed normal weighted by the real fractional area.  The sign is fixed
-        # by the +axis orientation and is oriented downstream later.
-        nx_b += np.bincount(key, weights=s_x * w, minlength=n_keys)
-        ny_b += np.bincount(key, weights=s_y * w, minlength=n_keys)
-        nz_b += np.bincount(key, weights=s_z * w, minlength=n_keys)
-
-    # Only orthogonal face neighbours carry hydraulic flow; diagonal/edge touches
-    # do not create a real flow path and are ignored.
-    directions = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]
-    unique_dirs = directions
-
-    for di, dj, dk in unique_dirs:
-        # Slices for id_a (lower-index cell) and id_b (higher-index cell).
-        sa0, sb0 = slice(0, -1), slice(1, None)
-        sa1, sb1 = slice(0, -1), slice(1, None)
-        sa2, sb2 = slice(0, -1), slice(1, None)
-        if di == 1:
-            pass
-        elif dj == 1:
-            sa0, sb0 = slice(None), slice(None)
-            sa1, sb1 = slice(0, -1), slice(1, None)
-            sa2, sb2 = slice(None), slice(None)
-        else:  # dk == 1
-            sa0, sb0 = slice(None), slice(None)
-            sa1, sb1 = slice(None), slice(None)
-            sa2, sb2 = slice(0, -1), slice(1, None)
-
-        id_a = comp_id[sa0, sa1, sa2]
-        id_b = comp_id[sb0, sb1, sb2]
-        valid = (id_a != 0) & (id_b != 0) & (id_a != id_b)
-        if not valid.any():
-            continue
-
-        s_x, s_y, s_z = float(di), float(dj), float(dk)
-
-        i, j, k = np.where(valid)
-        start_i = sa0.start if sa0.start is not None else 0
-        start_j = sa1.start if sa1.start is not None else 0
-        start_k = sa2.start if sa2.start is not None else 0
-        gi_i = (start_i + i).astype(np.int64)
-        gj_j = (start_j + j).astype(np.int64)
-        gk_k = (start_k + k).astype(np.int64)
-
-        # Face centre coordinates and the matching FAVOR face index.
-        gi = gi_i.astype(np.float64) + 0.5 + di * 0.5
-        gj = gj_j.astype(np.float64) + 0.5 + dj * 0.5
-        gk = gk_k.astype(np.float64) + 0.5 + dk * 0.5
-
-        if di == 1:
-            f_A_face = f_A_z[gi_i + 1, gj_j, gk_k]
-        elif dj == 1:
-            f_A_face = f_A_y[gi_i, gj_j + 1, gk_k]
-        else:
-            f_A_face = f_A_x[gi_i, gj_j, gk_k + 1]
-
-        _accumulate_contact_1d(
-            id_a[valid],
-            id_b[valid],
-            origin_mm[0] + gi * dx_mm,
-            origin_mm[1] + gj * dx_mm,
-            origin_mm[2] + gk * dx_mm,
-            s_x,
-            s_y,
-            s_z,
-            f_A_face,
-        )
-
-    contacts: List[Dict] = []
-    for key in np.nonzero(area_b)[0]:
-        id1 = int(key // mult)
-        id2 = int(key % mult)
-        if id1 == 0 or id2 == 0 or id1 == id2:
-            continue
-        btype1, name1 = comp_meta.get(id1, (BodyType.EMPTY, f"UNKNOWN_{id1}"))
-        btype2, name2 = comp_meta.get(id2, (BodyType.EMPTY, f"UNKNOWN_{id2}"))
-        area_m2 = float(area_b[key])
-        if area_m2 <= 1e-18:
-            continue
-        centroid = np.array(
-            [cx_b[key] / area_b[key], cy_b[key] / area_b[key], cz_b[key] / area_b[key]],
-            dtype=np.float64,
-        )
-        nvec = np.array([nx_b[key], ny_b[key], nz_b[key]], dtype=np.float64)
-        n_norm = float(np.linalg.norm(nvec))
-        if n_norm > 1e-18:
-            contact_normal = nvec / n_norm
-        else:
-            contact_normal = -g_u
-        # Darcy flux and flow-axis orientation are recomputed below after BFS.
-        flux_12 = 0.0
-        contacts.append(
-            {
-                "id1": id1,
-                "id2": id2,
-                "type1": btype1,
-                "type2": btype2,
-                "name1": name1,
-                "name2": name2,
-                "voxel_area_m2": area_m2,
-                "centroid_mm": centroid,
-                "normal": contact_normal,
-                "flux_m3_s": flux_12,
-            }
-        )
+    # Discover contacts directly from the CAD meshes.  Voxel adjacency is only
+    # used for the optional Darcy flux integral below, not for the node graph.
+    contacts = _build_mesh_contacts(
+        comp_body,
+        comp_meta,
+        comp_centroids,
+        g=g,
+        part_id=part_id,
+        max_gap_mm=0.5,
+        max_query=5000,
+        verbose=True,
+    )
 
     if not contacts:
         raise GatingVelocityError(
@@ -1710,10 +1999,42 @@ def _gating_node_velocities(
             "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
         )
 
-    # Source selection: use the BodyType selected by the user's velocity_section_key.
-    # Gravity is used only as a tie-breaker when multiple components of the
-    # selected type exist.
+    # The voxel grid may have merged gates into the part or mislabelled runners as
+    # risers.  Re-type components from the CAD mesh contact graph so node
+    # velocities and section reports are physically correct.
     source_section = (source_section_key or "SPRUE_THROAT").upper()
+    comp_meta = _reclassify_comp_meta_from_graph(
+        comp_meta,
+        comp_centroids,
+        contacts,
+        part_id,
+        g,
+        source_section,
+    )
+
+    # The CAD contact graph is already directed (up_id -> down_id).  First find
+    # every component on a path to the part; only reachable components can carry
+    # main flow and only reachable components can be selected as source.
+    incoming_map: Dict[int, List[int]] = {cid: [] for cid in comp_meta}
+    for c in contacts:
+        up = int(c["up_id"])
+        down = int(c["down_id"])
+        if down == part_id:
+            incoming_map[part_id].append(up)
+        else:
+            incoming_map[down].append(up)
+
+    can_reach_part: Dict[int, bool] = {part_id: True}
+    queue = [part_id]
+    while queue:
+        cur = queue.pop(0)
+        for prev in incoming_map.get(cur, []):
+            if prev not in can_reach_part:
+                can_reach_part[prev] = True
+                queue.append(prev)
+
+    # Source selection: use the BodyType selected by the user's velocity_section_key.
+    # Restrict to components that can actually reach the part.
     section_to_types = {
         "SPRUE": {BodyType.SPRUE},
         "SPRUE_BASE": {BodyType.SPRUE},
@@ -1731,13 +2052,13 @@ def _gating_node_velocities(
     )
     source_candidates = [
         cid for cid, (bt, _) in comp_meta.items()
-        if bt in allowed_source_types and cid != part_id
+        if bt in allowed_source_types and cid != part_id and can_reach_part.get(cid, False)
     ]
     if not source_candidates:
         source_candidates = [
             cid for cid, (bt, _) in comp_meta.items()
             if bt in {BodyType.POURING_BASIN, BodyType.SPRUE_THROAT, BodyType.SPRUE}
-            and cid != part_id
+            and cid != part_id and can_reach_part.get(cid, False)
         ]
 
     gating_ids = [cid for cid in comp_meta if cid != part_id]
@@ -1753,53 +2074,56 @@ def _gating_node_velocities(
     if source_candidates:
         source_id = max(source_candidates, key=_upstream_rank)
     else:
-        source_id = max(gating_ids, key=_upstream_rank)
+        reachable_gating = [cid for cid in gating_ids if can_reach_part.get(cid, False)]
+        if not reachable_gating:
+            raise GatingVelocityError(
+                "Düğüm hızları çözülemedi: hiçbir döküm elemanı parçaya ulaşan yol üzerinde değil. "
+                "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
+            )
+        source_id = max(reachable_gating, key=_upstream_rank)
 
     if source_id not in comp_meta or source_id == part_id:
         raise GatingVelocityError(
             "Düğüm hızları çözülemedi: kaynak (sprue/döküm ağzı) seçilemedi. "
             "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
         )
-    if source_area_m2 <= 1e-18 or Q_user <= 1e-18:
+    if Q_user <= 1e-18:
         raise GatingVelocityError(
-            "Düğüm hızları çözülemedi: giriş debisi/hızı tanımlanamadı. "
+            "Düğüm hızları çözülemedi: giriş debisi tanımlanamadı. "
             "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
         )
 
-    # Build undirected adjacency and orient it by BFS from the source.
-    adj: Dict[int, List[Dict]] = {cid: [] for cid in comp_meta if cid != part_id}
-    for c in contacts:
-        adj.setdefault(c["id1"], []).append(c)
-        adj.setdefault(c["id2"], []).append(c)
-
-    parent: Dict[int, int] = {source_id: -1}
+    # Prune the directed contact graph to the part-reachable subgraph so side
+    # branches (risers, isolated sprues) do not steal main flow.
     outgoing: Dict[int, List[Dict]] = {cid: [] for cid in comp_meta if cid != part_id}
-    queue = [source_id]
+    for c in contacts:
+        up = int(c["up_id"])
+        down = int(c["down_id"])
+        if can_reach_part.get(up, False) and can_reach_part.get(down, False):
+            outgoing[up].append(c)
+
+    print(f"[GATING] source_id={comp_meta[source_id][1]} can_reach={ {cid: comp_meta[cid][1] for cid, ok in can_reach_part.items() if ok} }", flush=True)
+    print(f"[GATING] outgoing sizes: { {comp_meta[cid][1]: len(v) for cid, v in outgoing.items() if v} }", flush=True)
+
+    # BFS from source along the directed, part-reachable graph.
+    parent: Dict[int, int] = {source_id: -1}
     visited = {source_id}
     order = [source_id]
-
+    queue = [source_id]
     while queue:
         current = queue.pop(0)
-        for c in adj.get(current, []):
-            other = c["id1"] if c["id2"] == current else c["id2"]
-            if other == part_id:
-                outgoing[current].append(c)
-                c["up_id"] = current
-                c["down_id"] = part_id
+        for c in outgoing.get(current, []):
+            down = int(c["down_id"])
+            if down == part_id:
                 continue
-            if other in visited:
+            if down in visited:
                 continue
-            visited.add(other)
-            parent[other] = current
-            outgoing[current].append(c)
-            c["up_id"] = current
-            c["down_id"] = other
-            queue.append(other)
-            order.append(other)
+            visited.add(down)
+            parent[down] = current
+            queue.append(down)
+            order.append(down)
 
-    # Entry / exit contacts for each gating component.  These allow the local
-    # flow axis through a body to be recovered from the assembly graph instead
-    # of relying on the coarse Darcy velocity or the global centroid vector.
+    # Entry / exit contacts for each gating component.
     body_entry: Dict[int, Dict] = {}
     for cid, p in parent.items():
         if p == -1:
@@ -1818,14 +2142,17 @@ def _gating_node_velocities(
     ]
     if unvisited:
         names = ", ".join(comp_meta[cid][1] for cid in unvisited)
-        # Warn but continue: return partial gating nodes for the reachable
-        # portion instead of crashing the whole analysis.
         import warnings
         warnings.warn(
             f"Düğüm hızları: şu elemanlar kaynaktan parçaya ulaşan zincire bağlı değil: {names}. "
             f"Yalnızca ulaşılabilir düğümler hesaplanacak.",
             RuntimeWarning,
         )
+
+    # Directions for the optional Darcy flux integral below.  The node graph
+    # itself is now built from CAD mesh proximity, but the voxel grid is still
+    # used for the 3-B Darcy field (fill time / porozite).
+    unique_dirs = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -2042,7 +2369,7 @@ def _gating_node_velocities(
                 body_up.mesh,
                 body_down.mesh,
                 np.asarray(c["centroid_mm"], dtype=np.float64),
-                tol_mm=0.2,
+                tol_mm=0.5,
                 label=label,
                 verbose=True,
             )
@@ -2144,6 +2471,7 @@ def _gating_node_velocities(
             down_id = c["down_id"]
             print(
                 f"[GATING_NODE] {comp_meta[cid][1]} -> {comp_meta[down_id][1]}  "
+                f"type={comp_meta[cid][0].name}→{comp_meta[down_id][0].name}  "
                 f"area_cm2={A*1e4:.4f}  Q_L_s={Q_branch*1e3:.4f}  v_m_s={v_branch:.4f}",
                 flush=True,
             )
