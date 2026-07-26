@@ -806,7 +806,9 @@ def _contact_surface_area_m2(
     mesh_b: trimesh.Trimesh,
     contact_centroid: np.ndarray,
     tol_mm: float = 0.2,
-) -> float:
+    label: str = "",
+    verbose: bool = False,
+) -> Tuple[float, float, float, int, int]:
     """Return the area (m²) of the geometric contact surface between two meshes.
 
     Only face centroids inside a local neighbourhood of ``contact_centroid`` are
@@ -817,41 +819,59 @@ def _contact_surface_area_m2(
     body has no triangle centers near the small contact patch.
     """
     if mesh_a is None or mesh_b is None:
-        return 0.0
+        return 0.0, 0.0, 0.0, 0, 0
     if len(mesh_a.faces) == 0 or len(mesh_b.faces) == 0:
-        return 0.0
+        return 0.0, 0.0, 0.0, 0, 0
 
     centroid = np.asarray(contact_centroid, dtype=np.float64)
 
-    def _one_way(source: trimesh.Trimesh, target: trimesh.Trimesh) -> float:
+    def _one_way(source: trimesh.Trimesh, target: trimesh.Trimesh) -> Tuple[float, int]:
         try:
             centers = np.asarray(source.triangles_center, dtype=np.float64)
             diag = float(np.linalg.norm(source.bounds[1] - source.bounds[0]))
             R = min(max(diag, 5.0), 30.0)
             local_mask = np.linalg.norm(centers - centroid, axis=1) < R
             if not np.any(local_mask):
-                return 0.0
+                return 0.0, 0
             local_centers = centers[local_mask]
             dist = trimesh.proximity.closest_point(target, local_centers)[1]
             hit = dist < tol_mm
             if not np.any(hit):
-                return 0.0
-            return float(source.area_faces[local_mask][hit].sum())
+                return 0.0, 0
+            return float(source.area_faces[local_mask][hit].sum()), int(np.count_nonzero(hit))
         except Exception:
-            return 0.0
+            return 0.0, 0
 
-    a_to_b = _one_way(mesh_a, mesh_b)
-    b_to_a = _one_way(mesh_b, mesh_a)
+    a_to_b, n_ab = _one_way(mesh_a, mesh_b)
+    b_to_a, n_ba = _one_way(mesh_b, mesh_a)
 
     if a_to_b > 1e-18 and b_to_a > 1e-18:
         area_mm2 = float(min(a_to_b, b_to_a))
+        chosen = "min(up,down)"
     elif a_to_b > 1e-18:
         area_mm2 = float(a_to_b)
+        chosen = "up_only"
     elif b_to_a > 1e-18:
         area_mm2 = float(b_to_a)
+        chosen = "down_only"
     else:
-        return 0.0
-    return float(area_mm2 * 1e-6)
+        if verbose and label:
+            print(
+                f"[CONTACT_AREA] {label}: centroid=({centroid[0]:.2f},{centroid[1]:.2f},{centroid[2]:.2f}) "
+                f"-> A_contact=0.0 (no faces within {tol_mm} mm)",
+                flush=True,
+            )
+        return 0.0, a_to_b, b_to_a, n_ab, n_ba
+
+    if verbose and label:
+        print(
+            f"[CONTACT_AREA] {label}: centroid=({centroid[0]:.2f},{centroid[1]:.2f},{centroid[2]:.2f}), "
+            f"faces_up={n_ab}, faces_down={n_ba}, "
+            f"A_up={a_to_b:.3f} mm², A_down={b_to_a:.3f} mm², "
+            f"A_contact={area_mm2:.3f} mm² ({chosen})",
+            flush=True,
+        )
+    return float(area_mm2 * 1e-6), a_to_b, b_to_a, n_ab, n_ba
 
 
 def _origin_inside_body(
@@ -2012,12 +2032,19 @@ def _gating_node_velocities(
         d_unit = d / d_norm if d_norm > 1e-12 else -g_u
 
         a_contact = 0.0
+        a_up_mm2 = 0.0
+        a_down_mm2 = 0.0
         if body_up is not None and body_down is not None:
-            a_contact = _contact_surface_area_m2(
+            up_name = comp_meta.get(up, (None, str(up)))[1]
+            down_name = comp_meta.get(down, (None, str(down)))[1]
+            label = f"{up_name} -> {down_name}"
+            a_contact, a_up_mm2, a_down_mm2, _, _ = _contact_surface_area_m2(
                 body_up.mesh,
                 body_down.mesh,
                 np.asarray(c["centroid_mm"], dtype=np.float64),
                 tol_mm=0.2,
+                label=label,
+                verbose=True,
             )
 
         if a_contact <= 1e-18:
@@ -2032,8 +2059,8 @@ def _gating_node_velocities(
 
         c["area_m2"] = a_contact
         c["area_geo_m2"] = a_contact
-        c["area_up_m2"] = a_contact
-        c["area_down_m2"] = a_contact
+        c["area_up_m2"] = a_up_mm2 * 1e-6
+        c["area_down_m2"] = a_down_mm2 * 1e-6
         c["flow_normal"] = d_unit
         c["skip_node"] = False
 
