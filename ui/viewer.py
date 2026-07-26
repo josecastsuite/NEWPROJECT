@@ -117,6 +117,7 @@ class Analyzer3DViewer(QtInteractor):
             pass
 
         self._body_actors: List = []
+        self._part_mesh_pv: Optional[pv.PolyData] = None
         self._hotspot_actors: List = []
         self._hotspot_label_actor = None
         self._risk_actor = None
@@ -136,6 +137,7 @@ class Analyzer3DViewer(QtInteractor):
         self.clear_actors()
         self.add_axes(line_width=2, color="#00ffff")
         self._body_actors.clear()
+        self._part_mesh_pv = None
         self._hotspot_actors.clear()
         self._hotspot_label_actor = None
         self._risk_actor = None
@@ -153,8 +155,12 @@ class Analyzer3DViewer(QtInteractor):
         for actor in self._body_actors:
             self.remove_actor(actor)
         self._body_actors.clear()
+        self._part_mesh_pv = None
 
         opacity_map = BODY_OPACITY_POST if analysis_mode else BODY_OPACITY
+        part_vertices: List[np.ndarray] = []
+        part_faces: List[np.ndarray] = []
+        offset = 0
         for body in bodies:
             if len(body.faces) == 0:
                 continue
@@ -171,6 +177,15 @@ class Analyzer3DViewer(QtInteractor):
                 pickable=False,
             )
             self._body_actors.append(actor)
+            if body.body_type == BodyType.PART:
+                part_vertices.append(np.asarray(body.vertices, dtype=np.float64))
+                part_faces.append(np.asarray(body.faces, dtype=np.int64) + offset)
+                offset += len(body.vertices)
+        if part_vertices:
+            merged_v = np.vstack(part_vertices)
+            merged_f = np.vstack(part_faces)
+            tri = np.c_[np.full(len(merged_f), 3, dtype=np.int64), merged_f].ravel()
+            self._part_mesh_pv = pv.PolyData(merged_v, tri)
         if reset_camera:
             self.reset_camera()
 
@@ -431,6 +446,28 @@ class Analyzer3DViewer(QtInteractor):
                 cloud.point_data[scalar_name] = vals
             else:
                 cloud = pv.PolyData(points)
+
+        # Porozite noktalarını parça dışına taşanları sil: sadece parça yüzeyi
+        # içinde kalan noktaları tut.
+        if self._part_mesh_pv is not None and self._part_mesh_pv.n_cells > 0 and cloud.n_points > 0:
+            try:
+                selected = cloud.select_enclosed_points(
+                    self._part_mesh_pv, tolerance=0.001, check_surface=True
+                )
+                inside = selected["SelectedPoints"].astype(bool)
+                if inside.any() and not inside.all():
+                    kept_points = cloud.points[inside]
+                    kept_cloud = pv.PolyData(kept_points)
+                    for name in cloud.array_names:
+                        arr = np.asarray(cloud.point_data[name])
+                        if arr.shape[0] == cloud.n_points:
+                            kept_cloud.point_data[name] = arr[inside]
+                    cloud = kept_cloud
+                elif not inside.any():
+                    # Hiçbir nokta içeride değilse gösterme.
+                    return
+            except Exception:
+                pass
 
         title = "Pore size (µm)" if scalar_name == "pore_size_um" else ("Solidification time" if scalar_name == "t_solid" else scalar_name)
         self._porosity_actor = self.add_mesh(
