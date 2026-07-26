@@ -1028,6 +1028,11 @@ class FlowAnimator(QtCore.QObject):
             except Exception:
                 pass
             self._pore_actor = None
+        # Alt renk skalasını (dolum/katılaşma sıcaklık çubuğu) da kaldır.
+        try:
+            self._viewer.remove_scalar_bar("Sıcaklık (°C)")
+        except Exception:
+            pass
 
     def _on_timer(self) -> None:
         if not self._is_running or self._frame_times is None or len(self._frame_times) == 0:
