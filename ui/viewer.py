@@ -77,6 +77,11 @@ def _scalar_bar_args(title: str, pos: Tuple[float, float], clim: Optional[Tuple[
             fmt = "%.1f"
         elif vmax < 1.0:
             fmt = "%.3f"
+    # Renk skalasını 1.5x uzatmak için boyutları ve sağa yaslı konumu güncelle.
+    width = 0.15 * 1.5
+    height = 0.08 * 1.5
+    # Sağ kenarı sabit tutmak için sol kenarı sola kaydır.
+    pos_x = max(0.0, pos[0] + 0.15 - width)
     return {
         "color": "#00ffff",
         "title_font_size": 10,
@@ -84,10 +89,10 @@ def _scalar_bar_args(title: str, pos: Tuple[float, float], clim: Optional[Tuple[
         "fmt": fmt,
         "n_labels": 5,
         "vertical": False,
-        "position_x": pos[0],
+        "position_x": pos_x,
         "position_y": pos[1],
-        "width": 0.15,
-        "height": 0.08,
+        "width": width,
+        "height": height,
         "title": title,
     }
 
