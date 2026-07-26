@@ -801,6 +801,59 @@ def _first_valid_throat_area_m2(
     return 0.0, None
 
 
+def _contact_surface_area_m2(
+    mesh_a: trimesh.Trimesh,
+    mesh_b: trimesh.Trimesh,
+    contact_centroid: np.ndarray,
+    tol_mm: float = 0.2,
+) -> float:
+    """Return the area (m²) of the geometric contact surface between two meshes.
+
+    Only face centroids inside a local neighbourhood of ``contact_centroid`` are
+    checked, so the query stays fast even for large bodies.  A face is counted
+    when its centroid is within ``tol_mm`` of the other mesh.  The result is the
+    smaller of the two one-sided contact areas (A->B and B->A).  If only one side
+    is non-zero, that side is used; this handles cases where the larger/coarser
+    body has no triangle centers near the small contact patch.
+    """
+    if mesh_a is None or mesh_b is None:
+        return 0.0
+    if len(mesh_a.faces) == 0 or len(mesh_b.faces) == 0:
+        return 0.0
+
+    centroid = np.asarray(contact_centroid, dtype=np.float64)
+
+    def _one_way(source: trimesh.Trimesh, target: trimesh.Trimesh) -> float:
+        try:
+            centers = np.asarray(source.triangles_center, dtype=np.float64)
+            diag = float(np.linalg.norm(source.bounds[1] - source.bounds[0]))
+            R = min(max(diag, 5.0), 30.0)
+            local_mask = np.linalg.norm(centers - centroid, axis=1) < R
+            if not np.any(local_mask):
+                return 0.0
+            local_centers = centers[local_mask]
+            dist = trimesh.proximity.closest_point(target, local_centers)[1]
+            hit = dist < tol_mm
+            if not np.any(hit):
+                return 0.0
+            return float(source.area_faces[local_mask][hit].sum())
+        except Exception:
+            return 0.0
+
+    a_to_b = _one_way(mesh_a, mesh_b)
+    b_to_a = _one_way(mesh_b, mesh_a)
+
+    if a_to_b > 1e-18 and b_to_a > 1e-18:
+        area_mm2 = float(min(a_to_b, b_to_a))
+    elif a_to_b > 1e-18:
+        area_mm2 = float(a_to_b)
+    elif b_to_a > 1e-18:
+        area_mm2 = float(b_to_a)
+    else:
+        return 0.0
+    return float(area_mm2 * 1e-6)
+
+
 def _origin_inside_body(
     mesh_pv: pv.PolyData,
     centroid: np.ndarray,
@@ -1942,7 +1995,7 @@ def _gating_node_velocities(
         c["area_m2"] = c["area_real_m2"]
 
     # ------------------------------------------------------------------
-    # THROAT AREA - temas darboğaz alanı (trimesh CAD kesiti, voksel fallback yok)
+    # THROAT AREA - gerçek geometrik temas yüzeyi alanı (mesh yüzey proximite)
     # ------------------------------------------------------------------
     for c in contacts:
         up = c.get("up_id")
@@ -1953,126 +2006,35 @@ def _gating_node_velocities(
         body_up = comp_body.get(up)
         body_down = comp_body.get(down)
 
-        # Sequential flow axis through a body is the line joining its entry
-        # contact to the relevant exit contact.  The throat cross-section is
-        # perpendicular to this axis.  We also keep the contact face normal and
-        # gravity as fallbacks if a body has no entry/exit pair yet.
+        # Direction for reporting/flow normal: centroid-to-centroid.
         d = comp_centroids[down] - comp_centroids[up]
         d_norm = float(np.linalg.norm(d))
         d_unit = d / d_norm if d_norm > 1e-12 else -g_u
 
-        n_voxel = c.get("normal")
-        if n_voxel is not None:
-            n_voxel = np.asarray(n_voxel, dtype=np.float64)
-            n_voxel_norm = float(np.linalg.norm(n_voxel))
-            if n_voxel_norm > 1e-12:
-                n_voxel = n_voxel / n_voxel_norm
-            else:
-                n_voxel = None
-        else:
-            n_voxel = None
-
-        def _flow_axis(cid: int, is_entry: bool) -> np.ndarray:
-            # Flow enters at the body's entry contact and leaves through the
-            # current (exit) contact, or enters at the current contact and
-            # leaves through the body's exit contacts.
-            if is_entry:
-                exit_contacts = body_exits.get(cid, [])
-                if exit_contacts:
-                    exit_centroid = np.mean(
-                        [np.asarray(e["centroid_mm"], dtype=np.float64) for e in exit_contacts],
-                        axis=0,
-                    )
-                    axis = exit_centroid - np.asarray(c["centroid_mm"], dtype=np.float64)
-                else:
-                    # No further exit (part or leaf): use the contact normal
-                    # or the direction toward the part centroid.
-                    if n_voxel is not None:
-                        axis = np.asarray(n_voxel, dtype=np.float64)
-                    else:
-                        axis = comp_centroids.get(down, comp_centroids[part_id]) - np.asarray(
-                            c["centroid_mm"], dtype=np.float64
-                        )
-            else:
-                entry_c = body_entry.get(cid)
-                if entry_c is not None:
-                    axis = np.asarray(c["centroid_mm"], dtype=np.float64) - np.asarray(
-                        entry_c["centroid_mm"], dtype=np.float64
-                    )
-                else:
-                    # Source component: direction from its own centroid to contact.
-                    axis = np.asarray(c["centroid_mm"], dtype=np.float64) - comp_centroids[cid]
-                    if float(np.linalg.norm(axis)) < 1e-12:
-                        if n_voxel is not None:
-                            axis = np.asarray(n_voxel, dtype=np.float64)
-                        else:
-                            axis = d_unit
-            a_norm = float(np.linalg.norm(axis))
-            if a_norm < 1e-12:
-                axis = d_unit if d_norm > 1e-12 else -g_u
-                a_norm = float(np.linalg.norm(axis))
-            if a_norm < 1e-12:
-                axis = -g_u
-                a_norm = float(np.linalg.norm(axis))
-            return axis / a_norm if a_norm > 1e-12 else -g_u
-
-        axis_up = _flow_axis(up, is_entry=False)
-        axis_down = _flow_axis(down, is_entry=True)
-
-        normals_up: List[np.ndarray] = [axis_up, -axis_up]
-        if n_voxel is not None:
-            # The voxel face normal is trustworthy if it is aligned with the
-            # sequential flow axis recovered from the graph.
-            if abs(float(np.dot(axis_up, n_voxel))) > 0.5:
-                normals_up.extend([n_voxel, -n_voxel])
-        normals_up.extend([d_unit, -d_unit, -g_u, g_u])
-
-        normals_down: List[np.ndarray] = [axis_down, -axis_down]
-        if n_voxel is not None:
-            if abs(float(np.dot(axis_down, n_voxel))) > 0.5:
-                normals_down.extend([n_voxel, -n_voxel])
-        normals_down.extend([d_unit, -d_unit, -g_u, g_u])
-
-        a_up = 0.0
-        a_down = 0.0
-        normal = axis_up
-        if body_up is not None:
-            a_up, n_up = _first_valid_throat_area_m2(
+        a_contact = 0.0
+        if body_up is not None and body_down is not None:
+            a_contact = _contact_surface_area_m2(
                 body_up.mesh,
-                c["centroid_mm"],
-                normals_up,
-                body_centroid=comp_centroids[up],
-            )
-            if n_up is not None:
-                normal = n_up
-        if body_down is not None:
-            a_down, n_down = _first_valid_throat_area_m2(
                 body_down.mesh,
-                c["centroid_mm"],
-                normals_down,
-                body_centroid=comp_centroids[down],
+                np.asarray(c["centroid_mm"], dtype=np.float64),
+                tol_mm=0.2,
             )
-            if a_down > 1e-18 and (a_up <= 1e-18 or a_down < a_up) and n_down is not None:
-                normal = n_down
 
-        if a_up > 1e-18 and a_down > 1e-18:
-            a_contact = float(min(a_up, a_down))
-        elif a_up > 1e-18:
-            a_contact = float(a_up)
-        elif a_down > 1e-18:
-            a_contact = float(a_down)
-        else:
-            up_name = comp_meta.get(up, (None, str(up)))[1]
-            down_name = comp_meta.get(down, (None, str(down)))[1]
-            raise GatingVelocityError(
-                f"Temas alanı (mesh kesit) hesaplanamadı: {up_name} -> {down_name}."
-            )
+        if a_contact <= 1e-18:
+            # No geometric contact surface found: this edge cannot carry flow.
+            c["area_m2"] = 0.0
+            c["area_geo_m2"] = 0.0
+            c["area_up_m2"] = 0.0
+            c["area_down_m2"] = 0.0
+            c["flow_normal"] = d_unit
+            c["skip_node"] = True
+            continue
 
         c["area_m2"] = a_contact
         c["area_geo_m2"] = a_contact
-        c["area_up_m2"] = a_up
-        c["area_down_m2"] = a_down
-        c["flow_normal"] = normal
+        c["area_up_m2"] = a_contact
+        c["area_down_m2"] = a_contact
+        c["flow_normal"] = d_unit
         c["skip_node"] = False
 
     # Propagate Q and compute velocities.
