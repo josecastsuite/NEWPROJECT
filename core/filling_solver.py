@@ -3505,9 +3505,22 @@ def solve_filling_flow(
     if progress_callback:
         progress_callback(10)
 
-    # Identify inlet (the user-selected velocity section) and vent (top of part/riser).
+    # The user's velocity/reference section (e.g. INGATE) drives Q and node
+    # velocities, but the *physical* pour inlet for the Darcy/animation front
+    # must always be the top of the sprue/pouring basin.  Decouple them so the
+    # filling simulation starts from the actual pour point, not from downstream
+    # gates chosen only for the velocity input.
     section_key = getattr(casting_params, "velocity_section_key", "SPRUE")
-    inlet_cells, inlet_name = _select_inlet_cells(grid_c, cavity, g, section_key)
+    physical_source_key = None
+    for try_key in ("SPRUE_THROAT", "POURING_BASIN", "SPRUE"):
+        inlet_cells, inlet_name = _select_inlet_cells(grid_c, cavity, g, try_key)
+        if inlet_cells.any():
+            physical_source_key = try_key
+            break
+    if not inlet_cells.any():
+        # Last resort: whatever section the user velocity refers to.
+        inlet_cells, inlet_name = _select_inlet_cells(grid_c, cavity, g, section_key)
+        physical_source_key = section_key
     vent_cells = _select_vent_cells(grid_c, cavity, g)
 
     if not inlet_cells.any():
@@ -3679,6 +3692,21 @@ def solve_filling_flow(
     ).astype(np.float32)
     vmag_fine = np.linalg.norm(velocity, axis=0)
 
+    # Source throat area for the *physical* pour point (sprue/pouring basin),
+    # independent of the user's velocity reference section.  Used for the source
+    # node in the gating graph and for the synthetic source-node label.
+    source_area_m2 = 0.0
+    if section_areas_m2:
+        source_area_m2 = float(section_areas_m2.get(physical_source_key, 0.0) or 0.0)
+    if source_area_m2 <= 1e-18:
+        face_src, _ = _section_face_cells(fine_grid, fine_cavity, physical_source_key, g, allow_fallback=False)
+        if not face_src.any():
+            face_src, _ = _section_face_cells(grid_c, cavity, physical_source_key, g, allow_fallback=False)
+        src_dx_m = fine_dx_m if face_src.shape == fine_cavity.shape else dx_m
+        source_area_m2 = float(face_src.sum()) * src_dx_m * src_dx_m
+    if source_area_m2 <= 1e-18:
+        source_area_m2 = float(area_m2)
+
     # Contact-node velocities / areas for every gating-gating and gating-part interface.
     # Use the solver (coarse) grid, the staggered face velocities and the FAVOR
     # fractional face areas so the real contact area is used in Q = v * A.
@@ -3688,8 +3716,8 @@ def solve_filling_flow(
             origin_c,
             dx_c,
             Q_user,
-            area_m2,
-            used_section,
+            source_area_m2,
+            physical_source_key,
             g,
             bodies,
             section_areas_m2=section_areas_m2,
