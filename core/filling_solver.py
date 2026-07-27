@@ -22,7 +22,7 @@ velocity and an optional per-voxel fill-time estimate.
 import heapq
 from dataclasses import dataclass, field
 from itertools import combinations
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pyvista as pv
@@ -1084,11 +1084,7 @@ def _section_area_mm2(
 def _body_principal_axis(mesh: trimesh.Trimesh, contact_centroid: np.ndarray) -> np.ndarray:
     """Return the unit OBB axis of ``mesh`` most aligned with the contact direction.
 
-    The flow through a gate/runner/sprue follows the body axis that points toward
-    the contacting neighbour (contact_centroid - body_centroid).  For a short
-    disk-like sprue throat the axis is the short (face-normal) direction; for a
-    long runner it is the long direction.  We therefore pick the OBB axis whose
-    absolute dot product with the contact direction is largest.
+    Kept as a fallback; prefer :func:`_body_flow_axis` for gating contact area.
     """
     if mesh is None or len(mesh.faces) == 0:
         return np.array([0.0, 0.0, -1.0])
@@ -1102,7 +1098,6 @@ def _body_principal_axis(mesh: trimesh.Trimesh, contact_centroid: np.ndarray) ->
             direction = np.array([0.0, 0.0, -1.0])
         else:
             direction = direction / n_dir
-        # Pick the OBB axis most aligned with the contact direction.
         dots = np.dot(axes.T, direction)
         idx = int(np.argmax(np.abs(dots)))
         axis = np.asarray(axes[:, idx], dtype=np.float64)
@@ -1116,6 +1111,97 @@ def _body_principal_axis(mesh: trimesh.Trimesh, contact_centroid: np.ndarray) ->
         return axis
     except Exception:
         return np.array([0.0, 0.0, -1.0])
+
+
+def _body_flow_axis(
+    mesh: trimesh.Trimesh,
+    contact_centroid: np.ndarray,
+    surface_normal: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Return the unit flow/throat axis of ``mesh`` at the contact.
+
+    The flow axis is the direction along which metal moves through the body,
+    i.e. the axis whose perpendicular cross-section is the real throat/opening.
+    - Long runners/sprues -> long OBB axis.
+    - Short disk-like throats/caps -> short OBB axis.
+    - Transitional shapes -> axis best aligned with the surface normal or the
+      direction toward the contact centroid.
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return np.array([0.0, 0.0, -1.0])
+    try:
+        obb = mesh.bounding_box_oriented
+        axes = np.asarray(obb.primitive.transform[:3, :3], dtype=np.float64)
+        extents = np.asarray(obb.primitive.extents, dtype=np.float64)
+        body_c = np.asarray(mesh.centroid, dtype=np.float64)
+    except Exception:
+        return np.array([0.0, 0.0, -1.0])
+
+    if extents.max() < 1e-12:
+        return np.array([0.0, 0.0, -1.0])
+
+    order = np.argsort(extents)
+    short_idx, mid_idx, long_idx = int(order[0]), int(order[1]), int(order[2])
+    r_min = extents[short_idx] / extents[long_idx]
+    r_mid = extents[mid_idx] / extents[long_idx]
+
+    # Direction from body centroid to the contact point.
+    to_contact = np.asarray(contact_centroid, dtype=np.float64) - body_c
+    n_to = float(np.linalg.norm(to_contact))
+    if n_to > 1e-12:
+        to_contact = to_contact / n_to
+    else:
+        to_contact = np.array([0.0, 0.0, -1.0])
+
+    # Surface normal at the contact point on this body, if available.
+    n = np.asarray(surface_normal, dtype=np.float64) if surface_normal is not None else None
+    if n is not None:
+        n_norm = float(np.linalg.norm(n))
+        if n_norm > 1e-12:
+            n = n / n_norm
+        else:
+            n = None
+
+    def _aligned_index(direction: np.ndarray) -> Tuple[int, float]:
+        cos_vals = np.abs(axes.T @ direction)
+        idx = int(np.argmax(cos_vals))
+        return idx, float(cos_vals[idx])
+
+    # Disk-like: one short extent and two long, similar extents.
+    if r_min < 0.25 and r_mid > 0.7:
+        idx, cos = _aligned_index(n if n is not None else to_contact)
+        # If the normal/contact points along the short axis, the face is the throat.
+        if idx == short_idx and cos > 0.6:
+            return _signed_axis(axes[:, short_idx], to_contact)
+        # Otherwise the disk is being fed from its edge: throat is still the face.
+        return _signed_axis(axes[:, short_idx], to_contact)
+
+    # Rod-like: one long extent and two short, similar extents.
+    if r_mid < 0.45 and r_min < 0.45:
+        return _signed_axis(axes[:, long_idx], to_contact)
+
+    # Transitional: use surface normal if it clearly aligns with one OBB axis,
+    # otherwise fall back to the direction toward the contact, then the long axis.
+    if n is not None:
+        idx, cos = _aligned_index(n)
+        if cos > 0.6:
+            return _signed_axis(axes[:, idx], to_contact)
+    idx, cos = _aligned_index(to_contact)
+    if cos > 0.6:
+        return _signed_axis(axes[:, idx], to_contact)
+    return _signed_axis(axes[:, long_idx], to_contact)
+
+
+def _signed_axis(axis: np.ndarray, direction: np.ndarray) -> np.ndarray:
+    """Return ``axis`` oriented to point toward ``direction``."""
+    axis = np.asarray(axis, dtype=np.float64)
+    n = float(np.linalg.norm(axis))
+    if n < 1e-12:
+        return np.array([0.0, 0.0, -1.0])
+    axis = axis / n
+    if float(np.dot(axis, direction)) < 0.0:
+        axis = -axis
+    return axis
 
 
 def _throat_area_along_axis_mm2(
@@ -1229,6 +1315,131 @@ def _throat_area_along_axis_mm2(
         return 0.0
 
 
+def _section_polygon_union(
+    mesh: trimesh.Trimesh,
+    plane_origin: np.ndarray,
+    plane_normal: np.ndarray,
+    u: Optional[np.ndarray] = None,
+    v: Optional[np.ndarray] = None,
+    tol_mm: float = 0.2,
+) -> Any:
+    """Return a shapely union of the mesh section polygons projected onto a common 2-D basis, or None.
+
+    The section is first attempted at ``plane_origin``; if that lies exactly on
+    a boundary and ``mesh.section`` returns nothing, small offsets along the
+    normal are tried.  The 2-D projection always uses ``plane_origin`` so the
+    resulting polygons from two meshes remain in the same coordinate frame.
+    """
+    try:
+        from shapely import geometry as geom
+        from shapely.ops import unary_union
+    except Exception:
+        return None
+
+    n = np.asarray(plane_normal, dtype=np.float64)
+    n_norm = float(np.linalg.norm(n))
+    if n_norm < 1e-18:
+        return None
+    n = n / n_norm
+
+    if u is None or v is None:
+        arb = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        u_vec = np.cross(arb, n)
+        u_norm = float(np.linalg.norm(u_vec))
+        if u_norm < 1e-18:
+            return None
+        u_vec = u_vec / u_norm
+        v_vec = np.cross(n, u_vec)
+    else:
+        u_vec = np.asarray(u, dtype=np.float64)
+        v_vec = np.asarray(v, dtype=np.float64)
+
+    origin = np.asarray(plane_origin, dtype=np.float64)
+    eps = max(tol_mm * 0.1, 0.01)
+
+    for offset in (0.0, eps, -eps):
+        try:
+            section = mesh.section(
+                plane_origin=origin + offset * n,
+                plane_normal=n,
+            )
+        except Exception:
+            section = None
+        if section is None or getattr(section, "is_empty", True) or len(section.entities) == 0:
+            continue
+
+        polys = []
+        for entity in section.entities:
+            pts = getattr(entity, "points", None)
+            if pts is None or len(pts) < 3:
+                continue
+            coords_3d = section.vertices[pts]
+            coords_2d = np.column_stack(
+                ((coords_3d - origin) @ u_vec, (coords_3d - origin) @ v_vec)
+            )
+            try:
+                poly = geom.Polygon(coords_2d)
+                if not poly.is_valid:
+                    poly = poly.buffer(0.0)
+                if poly.area > 1e-12:
+                    polys.append(poly)
+            except Exception:
+                continue
+        if polys:
+            return unary_union(polys)
+    return None
+
+
+def _plane_basis(normal: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Return orthonormal (u, v) spanning the plane with the given normal."""
+    n = np.asarray(normal, dtype=np.float64)
+    n = n / (float(np.linalg.norm(n)) + 1e-18)
+    arb = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(arb, n)
+    u = u / (float(np.linalg.norm(u)) + 1e-18)
+    v = np.cross(n, u)
+    return u, v
+
+
+def _contact_section_intersection(
+    mesh_a: trimesh.Trimesh,
+    mesh_b: trimesh.Trimesh,
+    centroid: np.ndarray,
+    normal: np.ndarray,
+    tol_mm: float = 0.2,
+    verbose: bool = False,
+    label: str = "",
+) -> Tuple[float, float, float, str]:
+    """Overlap area of the two body cross-sections on a common plane.
+
+    Returns ``(area_mm2, area_up_mm2, area_down_mm2, method)``.
+    """
+    u, v = _plane_basis(normal)
+    poly_a = _section_polygon_union(mesh_a, centroid, normal, u=u, v=v, tol_mm=tol_mm)
+    poly_b = _section_polygon_union(mesh_b, centroid, normal, u=u, v=v, tol_mm=tol_mm)
+    if poly_a is None or poly_b is None:
+        return 0.0, 0.0, 0.0, ""
+
+    try:
+        inter = poly_a.intersection(poly_b)
+        area = float(inter.area)
+        method = "section"
+
+        if area <= 1e-12 and tol_mm > 1e-12:
+            # Near-touch: surfaces are within tolerance but the plane sections
+            # do not formally overlap.  Buffer both by half the tolerance.
+            inter = poly_a.buffer(tol_mm * 0.5).intersection(poly_b.buffer(tol_mm * 0.5))
+            area = float(inter.area)
+            method = "section(buffer)"
+
+        if area > 1e-12:
+            return float(area), float(poly_a.area), float(poly_b.area), method
+    except Exception:
+        pass
+
+    return 0.0, 0.0, 0.0, ""
+
+
 def _contact_surface_area_m2(
     mesh_a: trimesh.Trimesh,
     mesh_b: trimesh.Trimesh,
@@ -1244,9 +1455,12 @@ def _contact_surface_area_m2(
 ) -> Tuple[float, float, float, int, int]:
     """Return the real throat/contact area (m²) between two meshes.
 
-    The throat area is the smaller full cross-section of the two bodies at the
-    contact, measured perpendicular to the local contact normal.  ``mesh_a`` is the
-    upstream body, ``mesh_b`` the downstream body.
+    The effective contact area is the smaller throat cross-section of the two
+    bodies at the joint.  For each body the throat is the stable cross-section
+    perpendicular to the body's local flow axis, which is derived from the OBB
+    shape (long axis for runners/sprues, short axis for disk-like throats).  This
+    works for end-to-end, T-junction and inclined contacts without relying on the
+    surface normal as the section plane.
     """
     if mesh_a is None or mesh_b is None:
         return 0.0, 0.0, 0.0, 0, 0
@@ -1255,25 +1469,9 @@ def _contact_surface_area_m2(
 
     centroid = np.asarray(contact_centroid, dtype=np.float64)
 
-    axis_a = None
-    axis_b = None
-    if contact_up_normal is not None:
-        n = np.asarray(contact_up_normal, dtype=np.float64)
-        n_norm = float(np.linalg.norm(n))
-        if n_norm > 1e-12:
-            axis_a = n / n_norm
-    if contact_down_normal is not None:
-        n = np.asarray(contact_down_normal, dtype=np.float64)
-        n_norm = float(np.linalg.norm(n))
-        if n_norm > 1e-12:
-            axis_b = n / n_norm
-    if axis_a is None and contact_normal is not None:
-        n = np.asarray(contact_normal, dtype=np.float64)
-        n_norm = float(np.linalg.norm(n))
-        if n_norm > 1e-12:
-            n = n / n_norm
-            axis_a = n
-            axis_b = -n
+    # Flow axes from body geometry, optionally guided by the local surface normal.
+    axis_a = _body_flow_axis(mesh_a, centroid, contact_up_normal)
+    axis_b = _body_flow_axis(mesh_b, centroid, contact_down_normal)
 
     a_a = _throat_area_along_axis_mm2(mesh_a, centroid, axis=axis_a)
     a_b = _throat_area_along_axis_mm2(mesh_b, centroid, axis=axis_b)
@@ -1289,13 +1487,25 @@ def _contact_surface_area_m2(
         area_mm2 = float(a_b)
         chosen = "throat(down)"
     else:
-        if verbose and label:
-            print(
-                f"[CONTACT_AREA] {label}: centroid=({centroid[0]:.2f},{centroid[1]:.2f},{centroid[2]:.2f}) "
-                f"-> A_contact=0.0 (section failed)",
-                flush=True,
-            )
-        return 0.0, a_a, a_b, 0, 0
+        # Last resort: try a section intersection in the contact-normal plane.
+        n = np.array([0.0, 0.0, -1.0])
+        if contact_up_normal is not None:
+            n_up = np.asarray(contact_up_normal, dtype=np.float64)
+            if float(np.linalg.norm(n_up)) > 1e-12:
+                n = n_up / float(np.linalg.norm(n_up))
+        area_mm2, a_a, a_b, _ = _contact_section_intersection(
+            mesh_a, mesh_b, centroid, n, tol_mm=tol_mm
+        )
+        if area_mm2 > 1e-12:
+            chosen = "section"
+        else:
+            if verbose and label:
+                print(
+                    f"[CONTACT_AREA] {label}: centroid=({centroid[0]:.2f},{centroid[1]:.2f},{centroid[2]:.2f}) "
+                    f"-> A_contact=0.0 (throat failed)",
+                    flush=True,
+                )
+            return 0.0, a_a, a_b, 0, 0
 
     if verbose and label:
         print(
