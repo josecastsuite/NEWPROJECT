@@ -998,6 +998,21 @@ def _build_mesh_contacts(
         else:
             normal = g_u
 
+        # Face-normal based outward normals for the up/down bodies give a far more
+        # accurate section plane than the centroid-to-centroid vector.
+        if source_cid == up_id:
+            up_normal = n_src
+            down_normal = n_tgt
+        else:
+            up_normal = n_tgt
+            down_normal = n_src
+        # Outward normal of the upstream body must point downstream.
+        if float(np.dot(up_normal, normal)) < 0.0:
+            up_normal = -up_normal
+        # Outward normal of the downstream body must point upstream.
+        if float(np.dot(down_normal, normal)) > 0.0:
+            down_normal = -down_normal
+
         contacts.append(
             {
                 "id1": i,
@@ -1011,6 +1026,8 @@ def _build_mesh_contacts(
                 "voxel_area_m2": 0.0,
                 "centroid_mm": centroid,
                 "normal": normal,
+                "up_normal": tuple(float(x) for x in up_normal),
+                "down_normal": tuple(float(x) for x in down_normal),
                 "up_pt_mm": tuple(float(x) for x in up_pt),
                 "down_pt_mm": tuple(float(x) for x in down_pt),
                 "flux_m3_s": 0.0,
@@ -1065,22 +1082,36 @@ def _section_area_mm2(
 
 
 def _body_principal_axis(mesh: trimesh.Trimesh, contact_centroid: np.ndarray) -> np.ndarray:
-    """Return the unit principal (longest) axis of ``mesh``, oriented toward ``contact_centroid``."""
+    """Return the unit OBB axis of ``mesh`` most aligned with the contact direction.
+
+    The flow through a gate/runner/sprue follows the body axis that points toward
+    the contacting neighbour (contact_centroid - body_centroid).  For a short
+    disk-like sprue throat the axis is the short (face-normal) direction; for a
+    long runner it is the long direction.  We therefore pick the OBB axis whose
+    absolute dot product with the contact direction is largest.
+    """
     if mesh is None or len(mesh.faces) == 0:
         return np.array([0.0, 0.0, -1.0])
     try:
         obb = mesh.bounding_box_oriented
-        extents = np.asarray(obb.primitive.extents, dtype=np.float64)
         axes = np.asarray(obb.primitive.transform[:3, :3], dtype=np.float64)
-        idx = int(np.argmax(extents))
-        axis = axes[:, idx]
+        body_c = np.asarray(mesh.centroid, dtype=np.float64)
+        direction = np.asarray(contact_centroid, dtype=np.float64) - body_c
+        n_dir = float(np.linalg.norm(direction))
+        if n_dir < 1e-12:
+            direction = np.array([0.0, 0.0, -1.0])
+        else:
+            direction = direction / n_dir
+        # Pick the OBB axis most aligned with the contact direction.
+        dots = np.dot(axes.T, direction)
+        idx = int(np.argmax(np.abs(dots)))
+        axis = np.asarray(axes[:, idx], dtype=np.float64)
         n = float(np.linalg.norm(axis))
         if n < 1e-12:
             axis = np.array([0.0, 0.0, -1.0])
         else:
             axis = axis / n
-        body_c = np.asarray(mesh.centroid, dtype=np.float64)
-        if np.dot(axis, contact_centroid - body_c) < 0:
+        if float(np.dot(axis, direction)) < 0.0:
             axis = -axis
         return axis
     except Exception:
@@ -1090,28 +1121,110 @@ def _body_principal_axis(mesh: trimesh.Trimesh, contact_centroid: np.ndarray) ->
 def _throat_area_along_axis_mm2(
     mesh: trimesh.Trimesh,
     contact_centroid: np.ndarray,
-    sweep_mm: Tuple[float, ...] = (-5.0, -3.0, -2.0, -1.0, -0.2, -0.05, 0.0, 0.05, 0.2, 1.0, 2.0, 3.0, 5.0),
+    axis: Optional[np.ndarray] = None,
+    sweep_mm: Optional[Tuple[float, ...]] = None,
+    plateau_tol: float = 0.15,
+    plateau_window: int = 2,
+    mode: str = "first",
+    min_area_mm2: float = 1.0,
 ) -> float:
-    """Largest cross-sectional area (mm²) of ``mesh`` perpendicular to its principal axis near the contact.
+    """Full cross-sectional area (mm²) of ``mesh`` perpendicular to ``axis``.
 
-    The throat area of an elongated body is the area of the plane cut
-    perpendicular to its longest dimension.  A short sweep is used so the cut
-    does not land exactly on a triangulated end cap (which can make
-    ``trimesh.section`` return ``None``).
+    ``mode='first'`` (default): starting at ``contact_centroid`` and moving inward,
+    return the first stable (plateau) cross-sectional area.  This is the right
+    behaviour for a contact where the entry may be a sliver and the full face is
+    a short distance inside.
+
+    ``mode='min'``: sweep the whole supplied range and return the smallest
+    non-sliver cross-sectional area.  This is used to find the geometric throat of
+    an isolated source body.
     """
     if mesh is None or len(mesh.faces) == 0:
         return 0.0
     try:
-        axis = _body_principal_axis(mesh, contact_centroid)
+        if axis is None:
+            axis = _body_principal_axis(mesh, contact_centroid)
+        axis = np.asarray(axis, dtype=np.float64)
+        n = float(np.linalg.norm(axis))
+        if n < 1e-12:
+            axis = np.array([0.0, 0.0, -1.0])
+        else:
+            axis = axis / n
+        # Ensure axis points from the body centroid toward the contact.
         body_c = np.asarray(mesh.centroid, dtype=np.float64)
+        to_contact = np.asarray(contact_centroid, dtype=np.float64) - body_c
+        if float(np.dot(to_contact, axis)) < 0.0:
+            axis = -axis
+
         t = float(np.dot(contact_centroid - body_c, axis))
         p_axis = body_c + t * axis
-        best = 0.0
+
+        if sweep_mm is None:
+            verts_t = (mesh.vertices.astype(np.float64) - body_c).dot(axis)
+            L = float(verts_t.max() - verts_t.min())
+            max_inward = min(5.0, max(1.5, 0.12 * L))
+            sweep_mm = tuple(
+                sorted(set(list(np.linspace(0.0, -max_inward, 25)) + [-0.02, -0.05, -0.1, -0.2, -0.5, -1.0, -2.0, -3.0]))
+            )
+        else:
+            sweep_mm = tuple(sorted(sweep_mm))
+
+        areas = []
         for s in sweep_mm:
             area, _ = _section_area_mm2(mesh, p_axis + axis * s, axis)
-            if area > best:
-                best = area
-        return float(best)
+            areas.append(float(area))
+
+        max_area = max(areas) if areas else 0.0
+        if max_area <= 1e-9:
+            return 0.0
+
+        if mode == "min":
+            threshold = max(max_area * 0.01, min_area_mm2)
+
+            def is_plateau(window):
+                if any(a <= threshold for a in window):
+                    return False
+                max_a = max(window)
+                if max_a <= 1e-9:
+                    return False
+                return all(abs(a - max_a) / max_a <= plateau_tol for a in window)
+
+            # First sustained plateau from the inlet end.
+            first = None
+            for i in range(len(areas) - plateau_window):
+                window = areas[i : i + plateau_window + 1]
+                if is_plateau(window):
+                    first = float(np.mean(window))
+                    break
+
+            # Last sustained plateau before the closed end.
+            last = None
+            for i in range(len(areas) - plateau_window, -1, -1):
+                window = areas[i : i + plateau_window + 1]
+                if is_plateau(window):
+                    last = float(np.mean(window))
+                    break
+
+            candidates = [a for a in (first, last) if a is not None]
+            if candidates:
+                return float(min(candidates))
+            return float(max_area)
+
+        threshold = max_area * 0.05
+        # Look for the first stable area (plateau) when moving inward from the contact.
+        for i in range(len(areas) - 1):
+            if areas[i] <= threshold:
+                continue
+            window_end = min(i + plateau_window, len(areas) - 1)
+            if window_end <= i:
+                continue
+            diffs = [abs(areas[j] - areas[i]) / max(areas[i], 1e-12) for j in range(i + 1, window_end + 1)]
+            if all(d <= plateau_tol for d in diffs):
+                return float(areas[i])
+
+        # No plateau found: use the largest measured area (full cross-section) as
+        # the best available estimate.
+        return float(max_area)
     except Exception:
         return 0.0
 
@@ -1126,12 +1239,14 @@ def _contact_surface_area_m2(
     contact_normal: Optional[np.ndarray] = None,
     contact_up_pt: Optional[np.ndarray] = None,
     contact_down_pt: Optional[np.ndarray] = None,
+    contact_up_normal: Optional[np.ndarray] = None,
+    contact_down_normal: Optional[np.ndarray] = None,
 ) -> Tuple[float, float, float, int, int]:
     """Return the real throat/contact area (m²) between two meshes.
 
-    The throat area is the smallest cross-section of the two bodies at the
-    contact, measured perpendicular to each body's own principal axis.  This is
-    the geometrically correct ``A`` in ``Q = v * A`` for a casting gate/runner.
+    The throat area is the smaller full cross-section of the two bodies at the
+    contact, measured perpendicular to the local contact normal.  ``mesh_a`` is the
+    upstream body, ``mesh_b`` the downstream body.
     """
     if mesh_a is None or mesh_b is None:
         return 0.0, 0.0, 0.0, 0, 0
@@ -1140,8 +1255,28 @@ def _contact_surface_area_m2(
 
     centroid = np.asarray(contact_centroid, dtype=np.float64)
 
-    a_a = _throat_area_along_axis_mm2(mesh_a, centroid)
-    a_b = _throat_area_along_axis_mm2(mesh_b, centroid)
+    axis_a = None
+    axis_b = None
+    if contact_up_normal is not None:
+        n = np.asarray(contact_up_normal, dtype=np.float64)
+        n_norm = float(np.linalg.norm(n))
+        if n_norm > 1e-12:
+            axis_a = n / n_norm
+    if contact_down_normal is not None:
+        n = np.asarray(contact_down_normal, dtype=np.float64)
+        n_norm = float(np.linalg.norm(n))
+        if n_norm > 1e-12:
+            axis_b = n / n_norm
+    if axis_a is None and contact_normal is not None:
+        n = np.asarray(contact_normal, dtype=np.float64)
+        n_norm = float(np.linalg.norm(n))
+        if n_norm > 1e-12:
+            n = n / n_norm
+            axis_a = n
+            axis_b = -n
+
+    a_a = _throat_area_along_axis_mm2(mesh_a, centroid, axis=axis_a)
+    a_b = _throat_area_along_axis_mm2(mesh_b, centroid, axis=axis_b)
 
     chosen = ""
     if a_a > 1e-12 and a_b > 1e-12:
@@ -1170,6 +1305,320 @@ def _contact_surface_area_m2(
             flush=True,
         )
     return float(area_mm2 * 1e-6), a_a, a_b, 0, 0
+
+
+def _nearest_other_body_centroid(source_body, bodies: List) -> np.ndarray:
+    """Return the centroid of the nearest other gating body to ``source_body``."""
+    try:
+        src_c = np.asarray(source_body.mesh.centroid, dtype=np.float64)
+    except Exception:
+        return np.zeros(3)
+    best = None
+    best_dist = float("inf")
+    for b in bodies:
+        if b is source_body or b is None or getattr(b, "mesh", None) is None or len(b.mesh.faces) == 0:
+            continue
+        try:
+            bc = np.asarray(b.mesh.centroid, dtype=np.float64)
+        except Exception:
+            continue
+        d = float(np.linalg.norm(bc - src_c))
+        if d < best_dist:
+            best_dist = d
+            best = bc
+    return best if best is not None else src_c
+
+
+def _source_body_throat_area_mm2(source_body, g_u: np.ndarray) -> float:
+    """Geometric throat area (mm²) of an isolated source body.
+
+    The sprue/runner source body is usually an extruded shape: one OBB extent is
+    the outlier (short for a disk-like throat, long for a long sprue/distributor).
+    The throat is the minimum stable cross-section perpendicular to that outlier
+    axis, swept from the upward-facing end toward the interior.  This captures the
+    small inlet of a distributor, the narrow top of a tapered sprue, the circular
+    face of a disk throat, and the bottom throat of a vertical sprue.
+    """
+    mesh = getattr(source_body, "mesh", None)
+    if mesh is None or len(mesh.faces) == 0:
+        return 0.0
+    try:
+        obb = mesh.bounding_box_oriented
+        axes = np.asarray(obb.primitive.transform[:3, :3], dtype=np.float64)
+        extents = np.asarray(obb.primitive.extents, dtype=np.float64)
+        if len(extents) < 3:
+            return 0.0
+        med = float(np.median(extents))
+        # Choose the outlier extent (most different from the median).
+        devs = np.abs(extents - med)
+        outlier = int(np.argmax(devs))
+        # If all extents are very close, there is no clear extrusion axis.
+        if devs.max() < 0.15 * max(med, 1e-9):
+            return 0.0
+        axis = np.asarray(axes[:, outlier], dtype=np.float64)
+        axis = axis / (float(np.linalg.norm(axis)) + 1e-18)
+        body_c = np.asarray(mesh.centroid, dtype=np.float64)
+        half = float(extents[outlier]) * 0.5
+        p1 = body_c + axis * half
+        p2 = body_c - axis * half
+        # The source inlet is the end that is most upward (opposite to gravity).
+        up = -np.asarray(g_u, dtype=np.float64)
+        up = up / (float(np.linalg.norm(up)) + 1e-18)
+        proj1 = float(np.dot(p1, up))
+        proj2 = float(np.dot(p2, up))
+        if proj1 >= proj2:
+            contact_pt = p1
+        else:
+            contact_pt = p2
+            axis = -axis
+        # Sweep the whole body length inward from this end.
+        sweep = tuple(float(-s) for s in np.linspace(0.0, extents[outlier], 40))
+        area = _throat_area_along_axis_mm2(
+            mesh, contact_pt, axis=axis, sweep_mm=sweep, mode="min", min_area_mm2=5.0
+        )
+        return float(area) if area > 1e-6 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _legacy_cad_source_area_m2(
+    bodies: List,
+    section_key: str,
+    g_u: np.ndarray,
+) -> float:
+    """Fallback: source body throat area from the whole-body OBB minimum section."""
+    from core.types import BodyType
+
+    section_to_types = {
+        "SPRUE": [BodyType.SPRUE, BodyType.POURING_BASIN],
+        "SPRUE_BASE": [BodyType.SPRUE],
+        "SPRUE_THROAT": [BodyType.SPRUE_THROAT, BodyType.SPRUE, BodyType.POURING_BASIN],
+        "POURING_BASIN": [BodyType.POURING_BASIN],
+        "RUNNER": [BodyType.RUNNER],
+        "DISTRIBUTOR": [BodyType.DISTRIBUTOR],
+        "CURUFLUK": [BodyType.CURUFLUK],
+        "FILTER": [BodyType.FILTER],
+        "INGATE": [BodyType.INGATE],
+        "RISER": [BodyType.RISER],
+    }
+    target_types = section_to_types.get((section_key or "SPRUE_THROAT").upper(),
+                                        [BodyType.SPRUE_THROAT, BodyType.SPRUE, BodyType.POURING_BASIN])
+    candidates = [
+        b for b in bodies
+        if getattr(b, "body_type", None) in target_types
+        and getattr(b, "mesh", None) is not None
+        and len(b.mesh.faces) > 0
+    ]
+    if not candidates:
+        return 0.0
+
+    def rank(b):
+        c = np.asarray(b.mesh.centroid, dtype=np.float64)
+        return float(-np.dot(c, g_u))
+
+    best_area = 0.0
+    for b in sorted(candidates, key=rank, reverse=True):
+        area_mm2 = _source_body_throat_area_mm2(b, g_u)
+        if area_mm2 > 0.0:
+            best_area = max(best_area, float(area_mm2 * 1e-6))
+        if best_area > 1e-12:
+            break
+    return float(best_area)
+
+
+def cad_source_area_m2(
+    bodies: List,
+    section_key: str,
+    g: np.ndarray,
+) -> float:
+    """Return the CAD source exit/contact area (m²) for the selected velocity section.
+
+    The source body is found by the same CAD contact graph used by the Darcy
+    solver, and its effective source area is the sum of the real throat/contact
+    areas of its first downstream contacts.  This makes Q = v_design * A_source
+    consistent with the actual geometric choke/exit, instead of an arbitrary
+    whole-body cross-section.
+    """
+    from core.types import BodyType
+
+    if not bodies:
+        return 0.0
+
+    g_u = np.asarray(g, dtype=np.float64)
+    g_n = float(np.linalg.norm(g_u))
+    if g_n > 1e-12:
+        g_u = g_u / g_n
+    else:
+        g_u = np.array([0.0, 0.0, -1.0])
+
+    part_candidates = [b for b in bodies if getattr(b, "body_type", None) == BodyType.PART]
+    if not part_candidates:
+        part_body = max(bodies, key=lambda b: float(getattr(b, "volume_cm3", 0.0) or 0.0))
+    else:
+        part_body = max(part_candidates, key=lambda b: float(getattr(b, "volume_cm3", 0.0) or 0.0))
+
+    part_id = 1
+    comp_meta: Dict[int, Tuple[BodyType, str]] = {
+        part_id: (BodyType.PART, getattr(part_body, "name", "Parça"))
+    }
+    comp_body: Dict[int, Body] = {part_id: part_body}
+    try:
+        part_c = np.asarray(part_body.mesh.centroid, dtype=np.float64)
+    except Exception:
+        part_c = np.asarray(getattr(part_body, "center", np.zeros(3)), dtype=np.float64)
+    comp_centroids: Dict[int, np.ndarray] = {part_id: part_c}
+
+    next_id = 2
+    for b in bodies:
+        if b is part_body:
+            continue
+        comp_meta[next_id] = (getattr(b, "body_type", BodyType.EMPTY), getattr(b, "name", f"Body_{next_id}"))
+        comp_body[next_id] = b
+        try:
+            c = np.asarray(b.mesh.centroid, dtype=np.float64)
+        except Exception:
+            c = np.asarray(getattr(b, "center", np.zeros(3)), dtype=np.float64)
+        comp_centroids[next_id] = c
+        next_id += 1
+
+    try:
+        contacts = _build_mesh_contacts(
+            comp_body,
+            comp_meta,
+            comp_centroids,
+            g_u,
+            part_id,
+            max_gap_mm=0.5,
+            max_query=5000,
+            verbose=False,
+        )
+    except Exception:
+        contacts = []
+
+    if not contacts:
+        return _legacy_cad_source_area_m2(bodies, section_key, g_u)
+
+    source_section = (section_key or "SPRUE_THROAT").upper()
+    new_meta = _reclassify_comp_meta_from_graph(
+        comp_meta, comp_centroids, contacts, part_id, g_u, source_section
+    )
+
+    # Build the part-reachable directed graph.
+    adj: Dict[int, List[int]] = {cid: [] for cid in new_meta}
+    incoming: Dict[int, List[int]] = {cid: [] for cid in new_meta}
+    to_part: Dict[int, bool] = {cid: False for cid in new_meta}
+    for c in contacts:
+        up = int(c["up_id"])
+        down = int(c["down_id"])
+        if down == part_id:
+            to_part[up] = True
+            incoming[part_id].append(up)
+            continue
+        adj[up].append(down)
+        incoming[down].append(up)
+
+    can_reach_part: Dict[int, bool] = {part_id: True}
+    queue = [part_id]
+    while queue:
+        cur = queue.pop(0)
+        for prev in incoming.get(cur, []):
+            if prev not in can_reach_part:
+                can_reach_part[prev] = True
+                queue.append(prev)
+
+    indeg = {cid: 0 for cid in new_meta}
+    outdeg = {cid: 0 for cid in new_meta}
+    for c in contacts:
+        up = int(c["up_id"])
+        down = int(c["down_id"])
+        if down == part_id:
+            if can_reach_part.get(up, False):
+                outdeg[up] += 1
+            continue
+        if can_reach_part.get(up, False) and can_reach_part.get(down, False):
+            outdeg[up] += 1
+            indeg[down] += 1
+
+    section_to_types = {
+        "SPRUE": {BodyType.SPRUE, BodyType.POURING_BASIN},
+        "SPRUE_BASE": {BodyType.SPRUE},
+        "SPRUE_THROAT": {BodyType.SPRUE_THROAT, BodyType.SPRUE, BodyType.POURING_BASIN},
+        "POURING_BASIN": {BodyType.POURING_BASIN},
+        "RUNNER": {BodyType.RUNNER},
+        "DISTRIBUTOR": {BodyType.DISTRIBUTOR},
+        "CURUFLUK": {BodyType.CURUFLUK},
+        "FILTER": {BodyType.FILTER},
+        "INGATE": {BodyType.INGATE},
+        "RISER": {BodyType.RISER},
+    }
+    allowed_source_types = section_to_types.get(
+        source_section,
+        {BodyType.SPRUE_THROAT, BodyType.SPRUE, BodyType.POURING_BASIN},
+    )
+
+    def rank(cid: int) -> float:
+        return float(-np.dot(comp_centroids.get(cid, np.zeros(3)), g_u))
+
+    non_part = [cid for cid in new_meta if cid != part_id]
+    candidates = [
+        cid for cid in non_part
+        if indeg[cid] == 0
+        and outdeg[cid] > 0
+        and can_reach_part.get(cid, False)
+        and not to_part.get(cid, False)
+        and new_meta[cid][0] in allowed_source_types
+    ]
+    if not candidates:
+        candidates = [
+            cid for cid in non_part
+            if outdeg[cid] > 0
+            and can_reach_part.get(cid, False)
+            and not to_part.get(cid, False)
+            and new_meta[cid][0] in allowed_source_types
+        ]
+    if not candidates:
+        candidates = [
+            cid for cid in non_part
+            if outdeg[cid] > 0
+            and can_reach_part.get(cid, False)
+            and new_meta[cid][0] in allowed_source_types
+        ]
+
+    if not candidates:
+        return _legacy_cad_source_area_m2(bodies, section_key, g_u)
+
+    source_id = max(candidates, key=rank)
+
+    total_area_m2 = 0.0
+    for c in contacts:
+        if int(c["up_id"]) != source_id:
+            continue
+        down = int(c["down_id"])
+        if down != part_id and not can_reach_part.get(down, False):
+            continue
+        body_up = comp_body.get(source_id)
+        body_down = comp_body.get(down)
+        if body_up is None or body_down is None:
+            continue
+        if getattr(body_up, "mesh", None) is None or getattr(body_down, "mesh", None) is None:
+            continue
+        area_m2, _, _, _, _ = _contact_surface_area_m2(
+            body_up.mesh,
+            body_down.mesh,
+            np.asarray(c["centroid_mm"], dtype=np.float64),
+            tol_mm=0.5,
+            contact_normal=np.asarray(c["normal"], dtype=np.float64) if c.get("normal") is not None else None,
+            contact_up_pt=np.asarray(c["up_pt_mm"], dtype=np.float64) if c.get("up_pt_mm") is not None else None,
+            contact_down_pt=np.asarray(c["down_pt_mm"], dtype=np.float64) if c.get("down_pt_mm") is not None else None,
+            contact_up_normal=np.asarray(c["up_normal"], dtype=np.float64) if c.get("up_normal") is not None else None,
+            contact_down_normal=np.asarray(c["down_normal"], dtype=np.float64) if c.get("down_normal") is not None else None,
+        )
+        total_area_m2 += max(float(area_m2), 0.0)
+
+    if total_area_m2 > 1e-12:
+        return float(total_area_m2)
+
+    return _legacy_cad_source_area_m2(bodies, section_key, g_u)
 
 
 def _origin_inside_body(
@@ -2446,6 +2895,12 @@ def _gating_node_velocities(
                 verbose=True,
                 contact_normal=np.asarray(c["normal"], dtype=np.float64)
                 if c.get("normal") is not None
+                else None,
+                contact_up_normal=np.asarray(c["up_normal"], dtype=np.float64)
+                if c.get("up_normal") is not None
+                else None,
+                contact_down_normal=np.asarray(c["down_normal"], dtype=np.float64)
+                if c.get("down_normal") is not None
                 else None,
                 contact_up_pt=np.asarray(c["up_pt_mm"], dtype=np.float64)
                 if c.get("up_pt_mm") is not None

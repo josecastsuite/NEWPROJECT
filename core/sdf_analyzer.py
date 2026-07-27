@@ -1820,7 +1820,7 @@ def _run_filling_flow(
     bodies: List[Body],
 ):
     """Run the 3-D Darcy filling-flow solver using the gate design/user inputs."""
-    from core.filling_solver import solve_filling_flow
+    from core.filling_solver import solve_filling_flow, cad_source_area_m2, GatingVelocityError
 
     design_section_key = (
         getattr(casting_params, "velocity_section_key", None) or "SPRUE_THROAT"
@@ -1837,27 +1837,14 @@ def _run_filling_flow(
     if user_area_cm2 > 0.0:
         design_area_cm2 = float(user_area_cm2)
     else:
-        sf = getattr(gate, "section_flows", {}) or {}
-        section_flow = sf.get(design_section_key)
-        if section_flow is not None:
-            design_area_cm2 = float(section_flow.area_cm2)
+        g_vec = getattr(casting_params, "gravity_vector", (0.0, 0.0, -1.0))
+        cad_area_m2 = cad_source_area_m2(bodies, design_section_key, g_vec)
+        if cad_area_m2 > 1e-12:
+            design_area_cm2 = float(cad_area_m2 * 1e4)
         else:
-            attr_map = {
-                "SPRUE_THROAT": "sprue_throat_area_cm2",
-                "SPRUE_BASE": "sprue_base_area_cm2",
-                "SPRUE": "sprue_base_area_cm2",
-                "RUNNER": "runner_min_area_cm2",
-                "INGATE": "total_ingate_contact_area_cm2",
-                "DISTRIBUTOR": "distributor_area_cm2",
-                "CURUFLUK": "curufluk_area_cm2",
-            }
-            design_area_cm2 = float(
-                getattr(gate, attr_map.get(design_section_key, "sprue_base_area_cm2"), 0.0)
-                or 0.0
-            )
-        if design_area_cm2 <= 0.0:
-            design_area_cm2 = float(
-                getattr(gate, "design_sprue_base_area_cm2", 0.0) or 0.0
+            raise GatingVelocityError(
+                f"{design_section_key} kesit alanı CAD geometrisinden hesaplanamadı. "
+                f"Lütfen elle kesit alanı girin veya geometriyi kontrol edin."
             )
     sprue_throat_cm2 = float(gate.sprue_throat_area_cm2) if gate.sprue_throat_area_cm2 else 0.0
     sprue_base_cm2 = float(gate.sprue_base_area_cm2) if gate.sprue_base_area_cm2 else 0.0
