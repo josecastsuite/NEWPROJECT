@@ -2314,14 +2314,7 @@ def _compute_fill_time_graph(
     shape = grid.shape
     fill = np.full(shape, np.inf, dtype=np.float64)
     cavity = grid > 0
-    if (
-        not gating_nodes
-        or not cavity.any()
-        or fill_time_s <= 1e-12
-        or body_index is None
-        or body_index.shape != grid.shape
-        or not bodies
-    ):
+    if not cavity.any() or fill_time_s <= 1e-12:
         fill[~cavity] = 0.0
         return fill
 
@@ -2330,6 +2323,41 @@ def _compute_fill_time_graph(
         g_u = g_u / np.linalg.norm(g_u)
     else:
         g_u = np.array([0.0, 0.0, -1.0])
+
+    def _fallback_fill() -> np.ndarray:
+        """Last-resort radial fill from the source region when the gating graph cannot be used."""
+        source_mask = np.zeros(shape, dtype=bool)
+        for bt in (
+            BodyType.POURING_BASIN,
+            BodyType.SPRUE_THROAT,
+            BodyType.SPRUE,
+            BodyType.RUNNER,
+            BodyType.DISTRIBUTOR,
+        ):
+            source_mask |= grid == int(bt)
+        source_mask &= cavity
+        if not source_mask.any():
+            idx = np.argwhere(cavity)
+            centers = origin_mm + (idx + 0.5) * dx_mm
+            proj = centers @ (-g_u)
+            top_n = max(1, int(0.01 * idx.shape[0]))
+            top_idx = idx[np.argpartition(-proj, top_n - 1)[:top_n]]
+            source_mask = np.zeros(shape, dtype=bool)
+            source_mask[tuple(top_idx.T)] = True
+        dist = ndimage.distance_transform_edt(~source_mask)
+        dist_m = dist * dx_mm / 1000.0
+        max_m = dist_m[cavity].max() if cavity.any() else 0.0
+        if max_m < 1e-9:
+            return np.where(cavity, fill_time_s, 0.0)
+        return np.where(cavity, (dist_m / max_m) * fill_time_s, 0.0)
+
+    if (
+        not gating_nodes
+        or body_index is None
+        or body_index.shape != grid.shape
+        or not bodies
+    ):
+        return _fallback_fill()
 
     name_to_bidx = {b.name: i for i, b in enumerate(bodies)}
     part_bidx = None
@@ -2379,8 +2407,7 @@ def _compute_fill_time_graph(
             ingate_branches[-1]["parent_bidx"] = up_bidx
 
     if source_bidx is None or part_bidx is None:
-        fill[~cavity] = 0.0
-        return fill
+        return _fallback_fill()
 
     # Source entry point: highest cell along -gravity within the source body.
     src_mask = body_index == source_bidx
@@ -2414,6 +2441,11 @@ def _compute_fill_time_graph(
             entry_point[child_bidx] = P.copy()
             v_in[child_bidx] = max(child["v"], 1e-6)
             queue.append(child_bidx)
+
+    # If the graph never reaches the part, fall back to a radial fill so the
+    # animation is not completely blank.
+    if part_bidx not in visited:
+        return _fallback_fill()
 
     # Compute cell centres once and cache per body.
     def _centres(mask: np.ndarray) -> np.ndarray:
@@ -2470,6 +2502,11 @@ def _compute_fill_time_graph(
             t_vals = np.minimum(t_vals, t0 + proj / 1000.0 / v)
         fill[mask] = t_vals
 
+    # The source body is treated as already full at t=0 so the initial frame is
+    # visible and the animation starts from a real pour entry volume.
+    if source_bidx is not None:
+        fill[body_index == source_bidx] = 0.0
+
     # Part: outward fill from each ingate. Exclude cells that belong to bodies the
     # gating graph has reclassified as part of the gating system.
     gating_bidx_arr = np.fromiter(gating_bidx, dtype=np.int64, count=len(gating_bidx))
@@ -2515,6 +2552,16 @@ def _compute_fill_time_graph(
     inf_metal = np.isinf(fill) & cavity
     if inf_metal.any():
         fill[inf_metal] = fill_time_s
+
+    # If the graph produced an almost-flat field (every cell is at fill_time_s),
+    # the body_index / grid mapping is broken for this model.  Fall back to a
+    # radial fill from the source region so the animation is still visible.
+    if cavity.any():
+        fmin = float(fill[cavity].min())
+        fmax = float(fill[cavity].max())
+        if (fmax - fmin) < 1e-3 * fill_time_s or fmin > 0.9 * fill_time_s:
+            return _fallback_fill()
+
     return fill
 
 
@@ -3937,7 +3984,7 @@ def solve_filling_flow(
     # The part cells are filled outward from each ingate so the last cell reaches
     # exactly ``fill_time_s``.
     # ------------------------------------------------------------------
-    if gating_nodes and bodies is not None and body_index is not None:
+    if bodies is not None and body_index is not None:
         fill_time_fine = _compute_fill_time_graph(
             orig_grid,
             orig_origin,
