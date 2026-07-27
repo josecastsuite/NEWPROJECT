@@ -409,9 +409,11 @@ class Analyzer3DViewer(QtInteractor):
         if not finite.any():
             return
         finite_max = float(np.max(values[finite]))
+        finite_min = float(np.min(values[finite]))
 
         # Keep all shrinkage selected by the risk filter; color by size.
-        lo = 0.0
+        # Hide zero-value cells so only real positive porosity is shown.
+        lo = max(finite_min, 1e-12)
         hi = finite_max
         if hi <= lo:
             return
