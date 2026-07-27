@@ -1850,7 +1850,7 @@ def cad_source_area_m2(
 
     source_section = (section_key or "SPRUE_THROAT").upper()
     new_meta = _reclassify_comp_meta_from_graph(
-        comp_meta, comp_centroids, contacts, part_id, g_u, source_section
+        comp_meta, comp_centroids, contacts, part_id, g_u, source_section, verbose=False
     )
 
     # Build the part-reachable directed graph.
@@ -2524,6 +2524,7 @@ def _reclassify_comp_meta_from_graph(
     part_id: int,
     g: np.ndarray,
     source_section: str,
+    verbose: bool = False,
 ) -> Dict[int, Tuple[BodyType, str]]:
     """Correct voxel-merged/misclassified body types using the CAD mesh contact graph.
 
@@ -2597,7 +2598,7 @@ def _reclassify_comp_meta_from_graph(
 
     # Orient every contact away from the chosen source toward the part.
     _reorient_contacts_to_source(
-        contacts, source, comp_meta, comp_centroids, g_u, part_id, verbose=True
+        contacts, source, comp_meta, comp_centroids, g_u, part_id, verbose=verbose
     )
 
     # Build the directed graph from the now-correctly oriented contacts and
@@ -2636,13 +2637,6 @@ def _reclassify_comp_meta_from_graph(
         if can_reach_part.get(up, False) and can_reach_part.get(down, False):
             outdeg[up] += 1
             indeg[down] += 1
-
-    print(f"[RECLASSIFY] source={comp_meta[source][1]} rank={_rank(source):.2f} candidates={[comp_meta[c][1] for c in candidates]}", flush=True)
-    for cid in sorted(comp_meta):
-        if cid == part_id:
-            continue
-        reachable = can_reach_part.get(cid, False)
-        print(f"[RECLASSIFY] {comp_meta[cid][1]} rank={_rank(cid):.2f} indeg={indeg[cid]} outdeg={outdeg[cid]} to_part={to_part[cid]} can_reach_part={reachable}", flush=True)
 
     # BFS from source along the directed, part-reachable graph.
     parent: Dict[int, int] = {source: -1}
@@ -2710,11 +2704,6 @@ def _reclassify_comp_meta_from_graph(
             if bt in {BodyType.PART, BodyType.RISER, BodyType.EMPTY}:
                 new_meta[cid] = (BodyType.INGATE, name)
 
-    print("[RECLASSIFY] final types:", flush=True)
-    for cid, (bt, name) in sorted(new_meta.items()):
-        if cid == part_id:
-            continue
-        print(f"  cid={cid} name={name} type={bt.name}", flush=True)
     return new_meta
 
 
@@ -2900,13 +2889,13 @@ def _gating_node_velocities(
         part_id=part_id,
         max_gap_mm=0.5,
         max_query=5000,
-        verbose=True,
+        verbose=False,
     )
 
     if not contacts:
         raise GatingVelocityError(
-            "Düğüm hızları çözülemedi: döküm sisteminde hiç temas yüzeyi bulunamadı. "
-            "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
+            "Temas yok: CAD mesh'lerinde birbirine değen döküm elemanı bulunamadı, "
+            "düğüm hızları hesaplanamadı."
         )
 
     # The voxel grid may have merged gates into the part or mislabelled runners as
@@ -2920,6 +2909,7 @@ def _gating_node_velocities(
         part_id,
         g,
         source_section,
+        verbose=False,
     )
 
     # Reachability is first determined on the undirected contact graph so that a
@@ -3014,9 +3004,6 @@ def _gating_node_velocities(
         if can_reach_part.get(up, False) and can_reach_part.get(down, False):
             outgoing[up].append(c)
 
-    print(f"[GATING] source_id={comp_meta[source_id][1]} can_reach={ {cid: comp_meta[cid][1] for cid, ok in can_reach_part.items() if ok} }", flush=True)
-    print(f"[GATING] outgoing sizes: { {comp_meta[cid][1]: len(v) for cid, v in outgoing.items() if v} }", flush=True)
-
     # BFS from source along the directed, part-reachable graph.
     parent: Dict[int, int] = {source_id: -1}
     visited = {source_id}
@@ -3048,17 +3035,18 @@ def _gating_node_velocities(
         cid: list(outgoing.get(cid, [])) for cid in comp_meta if cid != part_id
     }
 
-    unvisited = [
-        cid for cid in gating_ids
-        if cid not in visited and comp_meta[cid][0] != BodyType.RISER
-    ]
-    if unvisited:
-        names = ", ".join(comp_meta[cid][1] for cid in unvisited)
-        import warnings
-        warnings.warn(
-            f"Düğüm hızları: şu elemanlar kaynaktan parçaya ulaşan zincire bağlı değil: {names}. "
-            f"Yalnızca ulaşılabilir düğümler hesaplanacak.",
-            RuntimeWarning,
+    # If the source does not actually reach the part, there is no valid gating
+    # path to calculate, even when contacts exist elsewhere.
+    source_reaches_part = any(
+        int(c["down_id"]) == part_id
+        for cid in order
+        for c in outgoing.get(cid, [])
+    )
+    if not source_reaches_part:
+        raise GatingVelocityError(
+            "Düğüm hızları hesaplanamadı: seçilen kaynak parçaya ulaşan yol "
+            "üzerinde değil; CAD geometrisi kaynak ile parça arasında bağlantı "
+            " içermiyor."
         )
 
     # Directions for the optional Darcy flux integral below.  The node graph
@@ -3283,7 +3271,7 @@ def _gating_node_velocities(
                 np.asarray(c["centroid_mm"], dtype=np.float64),
                 tol_mm=0.5,
                 label=label,
-                verbose=True,
+                verbose=False,
                 contact_normal=np.asarray(c["normal"], dtype=np.float64)
                 if c.get("normal") is not None
                 else None,
@@ -3694,22 +3682,30 @@ def solve_filling_flow(
     # Contact-node velocities / areas for every gating-gating and gating-part interface.
     # Use the solver (coarse) grid, the staggered face velocities and the FAVOR
     # fractional face areas so the real contact area is used in Q = v * A.
-    gating_nodes = _gating_node_velocities(
-        grid_c,
-        origin_c,
-        dx_c,
-        Q_user,
-        area_m2,
-        used_section,
-        g,
-        bodies,
-        section_areas_m2=section_areas_m2,
-        u_m_s=u,
-        v_m_s=v,
-        w_m_s=w,
-        dx_m=dx_c / 1000.0,
-        face_fractions=face_fractions,
-    )
+    try:
+        gating_nodes = _gating_node_velocities(
+            grid_c,
+            origin_c,
+            dx_c,
+            Q_user,
+            area_m2,
+            used_section,
+            g,
+            bodies,
+            section_areas_m2=section_areas_m2,
+            u_m_s=u,
+            v_m_s=v,
+            w_m_s=w,
+            dx_m=dx_c / 1000.0,
+            face_fractions=face_fractions,
+        )
+    except GatingVelocityError as exc:
+        # Hata varsa düğüm hızı hesabını atla; Darcy/porozite devam etsin.
+        print(f"[GATING] {exc}", flush=True)
+        gating_nodes = []
+        node_v = {}
+        v_ingate_contact = 0.0
+
     # Collect every node that feeds the part directly as a "gate" (meme).
     per_gate_v = {}
     per_gate_area = {}
@@ -3728,7 +3724,11 @@ def solve_filling_flow(
 
     # Aggregate section velocities and ingate contact velocity directly from
     # the computed contact nodes so the report/viewer match the 3-D labels.
-    node_v, v_ingate_contact = _aggregate_section_velocities(gating_nodes, Q_user, area_m2)
+    if gating_nodes:
+        node_v, v_ingate_contact = _aggregate_section_velocities(gating_nodes, Q_user, area_m2)
+    else:
+        node_v = {}
+        v_ingate_contact = 0.0
     if per_gate_v:
         v_ingate_contact = float(np.mean(list(per_gate_v.values())))
 
