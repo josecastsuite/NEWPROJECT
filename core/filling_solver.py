@@ -1011,6 +1011,8 @@ def _build_mesh_contacts(
                 "voxel_area_m2": 0.0,
                 "centroid_mm": centroid,
                 "normal": normal,
+                "up_pt_mm": tuple(float(x) for x in up_pt),
+                "down_pt_mm": tuple(float(x) for x in down_pt),
                 "flux_m3_s": 0.0,
             }
         )
@@ -1027,6 +1029,93 @@ def _build_mesh_contacts(
     return contacts
 
 
+def _section_area_mm2(
+    mesh: trimesh.Trimesh,
+    plane_origin: np.ndarray,
+    plane_normal: np.ndarray,
+) -> Tuple[float, int]:
+    """Return the area (mm²) of a mesh cross-section at the given plane.
+
+    The resulting planar contour is converted to 2-D and its total area is
+    returned; ``n_loops`` is the number of closed contours found.
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return 0.0, 0
+    try:
+        origin = np.asarray(plane_origin, dtype=np.float64)
+        normal = np.asarray(plane_normal, dtype=np.float64)
+        n_norm = float(np.linalg.norm(normal))
+        if n_norm < 1e-12:
+            normal = np.array([0.0, 0.0, -1.0])
+        else:
+            normal = normal / n_norm
+        sec = mesh.section(plane_origin=origin, plane_normal=normal)
+        if sec is None or len(sec.entities) == 0:
+            return 0.0, 0
+        to_2d = getattr(sec, "to_2D", None)
+        if to_2d is None:
+            path_2d, _ = sec.to_planar()
+        else:
+            path_2d, _ = to_2d()
+        area = float(path_2d.area) if hasattr(path_2d, "area") else 0.0
+        n_loops = len(path_2d.polygons_full) if hasattr(path_2d, "polygons_full") else 0
+        return float(area), int(n_loops)
+    except Exception:
+        return 0.0, 0
+
+
+def _body_principal_axis(mesh: trimesh.Trimesh, contact_centroid: np.ndarray) -> np.ndarray:
+    """Return the unit principal (longest) axis of ``mesh``, oriented toward ``contact_centroid``."""
+    if mesh is None or len(mesh.faces) == 0:
+        return np.array([0.0, 0.0, -1.0])
+    try:
+        obb = mesh.bounding_box_oriented
+        extents = np.asarray(obb.primitive.extents, dtype=np.float64)
+        axes = np.asarray(obb.primitive.transform[:3, :3], dtype=np.float64)
+        idx = int(np.argmax(extents))
+        axis = axes[:, idx]
+        n = float(np.linalg.norm(axis))
+        if n < 1e-12:
+            axis = np.array([0.0, 0.0, -1.0])
+        else:
+            axis = axis / n
+        body_c = np.asarray(mesh.centroid, dtype=np.float64)
+        if np.dot(axis, contact_centroid - body_c) < 0:
+            axis = -axis
+        return axis
+    except Exception:
+        return np.array([0.0, 0.0, -1.0])
+
+
+def _throat_area_along_axis_mm2(
+    mesh: trimesh.Trimesh,
+    contact_centroid: np.ndarray,
+    sweep_mm: Tuple[float, ...] = (-5.0, -3.0, -2.0, -1.0, -0.2, -0.05, 0.0, 0.05, 0.2, 1.0, 2.0, 3.0, 5.0),
+) -> float:
+    """Largest cross-sectional area (mm²) of ``mesh`` perpendicular to its principal axis near the contact.
+
+    The throat area of an elongated body is the area of the plane cut
+    perpendicular to its longest dimension.  A short sweep is used so the cut
+    does not land exactly on a triangulated end cap (which can make
+    ``trimesh.section`` return ``None``).
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return 0.0
+    try:
+        axis = _body_principal_axis(mesh, contact_centroid)
+        body_c = np.asarray(mesh.centroid, dtype=np.float64)
+        t = float(np.dot(contact_centroid - body_c, axis))
+        p_axis = body_c + t * axis
+        best = 0.0
+        for s in sweep_mm:
+            area, _ = _section_area_mm2(mesh, p_axis + axis * s, axis)
+            if area > best:
+                best = area
+        return float(best)
+    except Exception:
+        return 0.0
+
+
 def _contact_surface_area_m2(
     mesh_a: trimesh.Trimesh,
     mesh_b: trimesh.Trimesh,
@@ -1034,15 +1123,15 @@ def _contact_surface_area_m2(
     tol_mm: float = 0.2,
     label: str = "",
     verbose: bool = False,
+    contact_normal: Optional[np.ndarray] = None,
+    contact_up_pt: Optional[np.ndarray] = None,
+    contact_down_pt: Optional[np.ndarray] = None,
 ) -> Tuple[float, float, float, int, int]:
-    """Return the area (m²) of the geometric contact surface between two meshes.
+    """Return the real throat/contact area (m²) between two meshes.
 
-    Only face centroids inside a local neighbourhood of ``contact_centroid`` are
-    checked, so the query stays fast even for large bodies.  A face is counted
-    when its centroid is within ``tol_mm`` of the other mesh.  The result is the
-    smaller of the two one-sided contact areas (A->B and B->A).  If only one side
-    is non-zero, that side is used; this handles cases where the larger/coarser
-    body has no triangle centers near the small contact patch.
+    The throat area is the smallest cross-section of the two bodies at the
+    contact, measured perpendicular to each body's own principal axis.  This is
+    the geometrically correct ``A`` in ``Q = v * A`` for a casting gate/runner.
     """
     if mesh_a is None or mesh_b is None:
         return 0.0, 0.0, 0.0, 0, 0
@@ -1051,53 +1140,36 @@ def _contact_surface_area_m2(
 
     centroid = np.asarray(contact_centroid, dtype=np.float64)
 
-    def _one_way(source: trimesh.Trimesh, target: trimesh.Trimesh) -> Tuple[float, int]:
-        try:
-            centers = np.asarray(source.triangles_center, dtype=np.float64)
-            diag = float(np.linalg.norm(source.bounds[1] - source.bounds[0]))
-            R = min(max(diag, 5.0), 30.0)
-            local_mask = np.linalg.norm(centers - centroid, axis=1) < R
-            if not np.any(local_mask):
-                return 0.0, 0
-            local_centers = centers[local_mask]
-            dist = trimesh.proximity.closest_point(target, local_centers)[1]
-            hit = dist < tol_mm
-            if not np.any(hit):
-                return 0.0, 0
-            return float(source.area_faces[local_mask][hit].sum()), int(np.count_nonzero(hit))
-        except Exception:
-            return 0.0, 0
+    a_a = _throat_area_along_axis_mm2(mesh_a, centroid)
+    a_b = _throat_area_along_axis_mm2(mesh_b, centroid)
 
-    a_to_b, n_ab = _one_way(mesh_a, mesh_b)
-    b_to_a, n_ba = _one_way(mesh_b, mesh_a)
-
-    if a_to_b > 1e-18 and b_to_a > 1e-18:
-        area_mm2 = float(min(a_to_b, b_to_a))
-        chosen = "min(up,down)"
-    elif a_to_b > 1e-18:
-        area_mm2 = float(a_to_b)
-        chosen = "up_only"
-    elif b_to_a > 1e-18:
-        area_mm2 = float(b_to_a)
-        chosen = "down_only"
+    chosen = ""
+    if a_a > 1e-12 and a_b > 1e-12:
+        area_mm2 = float(min(a_a, a_b))
+        chosen = "throat(min)"
+    elif a_a > 1e-12:
+        area_mm2 = float(a_a)
+        chosen = "throat(up)"
+    elif a_b > 1e-12:
+        area_mm2 = float(a_b)
+        chosen = "throat(down)"
     else:
         if verbose and label:
             print(
                 f"[CONTACT_AREA] {label}: centroid=({centroid[0]:.2f},{centroid[1]:.2f},{centroid[2]:.2f}) "
-                f"-> A_contact=0.0 (no faces within {tol_mm} mm)",
+                f"-> A_contact=0.0 (section failed)",
                 flush=True,
             )
-        return 0.0, a_to_b, b_to_a, n_ab, n_ba
+        return 0.0, a_a, a_b, 0, 0
 
     if verbose and label:
         print(
             f"[CONTACT_AREA] {label}: centroid=({centroid[0]:.2f},{centroid[1]:.2f},{centroid[2]:.2f}), "
-            f"faces_up={n_ab}, faces_down={n_ba}, "
-            f"A_up={a_to_b:.3f} mm², A_down={b_to_a:.3f} mm², "
+            f"A_up={a_a:.3f} mm², A_down={a_b:.3f} mm², "
             f"A_contact={area_mm2:.3f} mm² ({chosen})",
             flush=True,
         )
-    return float(area_mm2 * 1e-6), a_to_b, b_to_a, n_ab, n_ba
+    return float(area_mm2 * 1e-6), a_a, a_b, 0, 0
 
 
 def _origin_inside_body(
@@ -2372,6 +2444,15 @@ def _gating_node_velocities(
                 tol_mm=0.5,
                 label=label,
                 verbose=True,
+                contact_normal=np.asarray(c["normal"], dtype=np.float64)
+                if c.get("normal") is not None
+                else None,
+                contact_up_pt=np.asarray(c["up_pt_mm"], dtype=np.float64)
+                if c.get("up_pt_mm") is not None
+                else None,
+                contact_down_pt=np.asarray(c["down_pt_mm"], dtype=np.float64)
+                if c.get("down_pt_mm") is not None
+                else None,
             )
 
         if a_contact <= 1e-18:
