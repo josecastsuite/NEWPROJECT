@@ -956,39 +956,47 @@ def _build_mesh_contacts(
         p_src = local_centers[min_idx]
         p_tgt = np.asarray(closest[min_idx], dtype=np.float64)
 
-        # Determine flow direction (up_id -> down_id).
-        if source_cid == part_id:
-            up_id, down_id = target_cid, source_cid
-            up_pt, down_pt = p_tgt, p_src
-        elif target_cid == part_id:
-            up_id, down_id = source_cid, target_cid
-            up_pt, down_pt = p_src, p_tgt
+        # Map source/target normals and points back to the original ids i/j.
+        if source_cid == i:
+            n_i, n_j = n_src, n_tgt
+            p_i, p_j = p_src, p_tgt
         else:
-            dot_src = float(np.dot(n_src, g_u))
-            dot_tgt = float(np.dot(n_tgt, g_u))
-            if dot_src > dot_tgt + 0.3:
-                up_id, down_id = source_cid, target_cid
-                up_pt, down_pt = p_src, p_tgt
-            elif dot_tgt > dot_src + 0.3:
-                up_id, down_id = target_cid, source_cid
-                up_pt, down_pt = p_tgt, p_src
+            n_i, n_j = n_tgt, n_src
+            p_i, p_j = p_tgt, p_src
+
+        # Determine flow direction (up_id -> down_id).
+        if i == part_id:
+            up_id, down_id = j, i
+            up_pt, down_pt = p_j, p_i
+        elif j == part_id:
+            up_id, down_id = i, j
+            up_pt, down_pt = p_i, p_j
+        else:
+            dot_i = float(np.dot(n_i, g_u))
+            dot_j = float(np.dot(n_j, g_u))
+            if dot_i > dot_j + 0.3:
+                up_id, down_id = i, j
+                up_pt, down_pt = p_i, p_j
+            elif dot_j > dot_i + 0.3:
+                up_id, down_id = j, i
+                up_pt, down_pt = p_j, p_i
             else:
                 # Side/ambiguous contact: use the gating hierarchy and then rank.
-                o_src = _order(source_cid)
-                o_tgt = _order(target_cid)
-                if o_src == o_tgt:
-                    if _rank(source_cid) >= _rank(target_cid):
-                        up_id, down_id = source_cid, target_cid
-                        up_pt, down_pt = p_src, p_tgt
+                o_i = _order(i)
+                o_j = _order(j)
+                if o_i == o_j:
+                    if _rank(i) >= _rank(j):
+                        up_id, down_id = i, j
+                        up_pt, down_pt = p_i, p_j
                     else:
-                        up_id, down_id = target_cid, source_cid
-                        up_pt, down_pt = p_tgt, p_src
-                elif o_src < o_tgt:
-                    up_id, down_id = source_cid, target_cid
-                    up_pt, down_pt = p_src, p_tgt
+                        up_id, down_id = j, i
+                        up_pt, down_pt = p_j, p_i
+                elif o_i < o_j:
+                    up_id, down_id = i, j
+                    up_pt, down_pt = p_i, p_j
                 else:
-                    up_id, down_id = target_cid, source_cid
-                    up_pt, down_pt = p_tgt, p_src
+                    up_id, down_id = j, i
+                    up_pt, down_pt = p_j, p_i
 
         centroid = 0.5 * (up_pt + down_pt)
         direction = down_pt - up_pt
@@ -1030,6 +1038,11 @@ def _build_mesh_contacts(
                 "down_normal": tuple(float(x) for x in down_normal),
                 "up_pt_mm": tuple(float(x) for x in up_pt),
                 "down_pt_mm": tuple(float(x) for x in down_pt),
+                # Raw per-body contact points/normals used for global reorientation.
+                "p1_mm": tuple(float(x) for x in p_i),
+                "p2_mm": tuple(float(x) for x in p_j),
+                "n1": tuple(float(x) for x in n_i),
+                "n2": tuple(float(x) for x in n_j),
                 "flux_m3_s": 0.0,
             }
         )
@@ -1044,6 +1057,133 @@ def _build_mesh_contacts(
                 flush=True,
             )
     return contacts
+
+
+def _part_reachable_undirected(contacts: List[Dict], part_id: int) -> Dict[int, bool]:
+    """Return the set of contact-graph nodes in the same component as ``part_id``.
+
+    Uses ``id1``/``id2`` (the symmetric body ids), so the result does not depend
+    on the local contact orientation.
+    """
+    from collections import defaultdict, deque
+
+    graph: Dict[int, List[int]] = defaultdict(list)
+    for c in contacts:
+        u = int(c["id1"])
+        v = int(c["id2"])
+        graph[u].append(v)
+        graph[v].append(u)
+
+    if part_id not in graph:
+        return {part_id: True}
+
+    reach: Dict[int, bool] = {part_id: True}
+    q: deque[int] = deque([part_id])
+    while q:
+        cur = q.popleft()
+        for nb in graph.get(cur, []):
+            if nb not in reach:
+                reach[nb] = True
+                q.append(nb)
+    return reach
+
+
+def _reorient_contacts_to_source(
+    contacts: List[Dict],
+    source_id: int,
+    comp_meta: Dict[int, Tuple[BodyType, str]],
+    comp_centroids: Dict[int, np.ndarray],
+    g_u: np.ndarray,
+    part_id: int,
+    verbose: bool = False,
+) -> None:
+    """Point every contact away from ``source_id`` toward the part.
+
+    Distance from the source is computed on the undirected contact graph, so
+    side/T-junction contacts are oriented consistently with the main flow path
+    instead of the local face normal.
+    """
+    if not contacts or source_id is None:
+        return
+
+    from collections import defaultdict, deque
+
+    graph: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+    for idx, c in enumerate(contacts):
+        u = int(c["id1"])
+        v = int(c["id2"])
+        graph[u].append((v, idx))
+        graph[v].append((u, idx))
+
+    if source_id not in graph:
+        return
+
+    dist: Dict[int, int] = {source_id: 0}
+    q: deque[int] = deque([source_id])
+    while q:
+        cur = q.popleft()
+        for nb, _ in graph.get(cur, []):
+            if nb not in dist:
+                dist[nb] = dist[cur] + 1
+                q.append(nb)
+
+    for c in contacts:
+        u = int(c["id1"])
+        v = int(c["id2"])
+
+        # The part is always the sink; any non-part body feeding it is upstream.
+        if u == part_id:
+            up_id, down_id = v, u
+        elif v == part_id:
+            up_id, down_id = u, v
+        else:
+            du = dist.get(u)
+            dv = dist.get(v)
+            if du is None or dv is None:
+                continue
+            if du == dv:
+                # Leave the local orientation when the graph distance is ambiguous.
+                continue
+            up_id, down_id = (u, v) if du < dv else (v, u)
+
+        if c.get("up_id") == up_id and c.get("down_id") == down_id:
+            continue
+
+        # Swap raw points/normals to match the new up/down assignment.
+        p_up = np.array(c["p1_mm"] if up_id == u else c["p2_mm"], dtype=np.float64)
+        p_down = np.array(c["p2_mm"] if down_id == v else c["p1_mm"], dtype=np.float64)
+        n_up_raw = np.array(c["n1"] if up_id == u else c["n2"], dtype=np.float64)
+        n_down_raw = np.array(c["n2"] if down_id == v else c["n1"], dtype=np.float64)
+
+        direction = p_down - p_up
+        d_norm = float(np.linalg.norm(direction))
+        if d_norm > 1e-12:
+            normal = direction / d_norm
+        else:
+            normal = np.asarray(g_u, dtype=np.float64)
+
+        # Upstream body normal must point downstream; downstream body normal upstream.
+        if float(np.dot(n_up_raw, normal)) < 0.0:
+            n_up_raw = -n_up_raw
+        if float(np.dot(n_down_raw, normal)) > 0.0:
+            n_down_raw = -n_down_raw
+
+        c["up_id"] = up_id
+        c["down_id"] = down_id
+        c["up_pt_mm"] = tuple(float(x) for x in p_up)
+        c["down_pt_mm"] = tuple(float(x) for x in p_down)
+        c["up_normal"] = tuple(float(x) for x in n_up_raw)
+        c["down_normal"] = tuple(float(x) for x in n_down_raw)
+        c["centroid_mm"] = tuple(float(x) for x in (0.5 * (p_up + p_down)))
+        c["normal"] = normal
+
+        if verbose:
+            up_name = comp_meta.get(up_id, (None, str(up_id)))[1]
+            down_name = comp_meta.get(down_id, (None, str(down_id)))[1]
+            print(
+                f"[CONTACT_DISCOVERY] reoriented: up={up_name} down={down_name}",
+                flush=True,
+            )
 
 
 def _section_area_mm2(
@@ -2403,10 +2543,68 @@ def _reclassify_comp_meta_from_graph(
     def _rank(cid: int) -> float:
         return float(-np.dot(comp_centroids.get(cid, np.zeros(3)), g_u))
 
-    # Directed graph already oriented by surface normals in _build_mesh_contacts.
+    # Use the undirected contact graph for source selection; the local face-normal
+    # orientation in _build_mesh_contacts may flip side/T-junction contacts.
+    can_reach_part: Dict[int, bool] = _part_reachable_undirected(contacts, part_id)
+
+    # Distance from the part on the undirected graph (the source should be the
+    # farthest reachable component that is not itself a gate).
+    from collections import defaultdict, deque
+
+    undirected: Dict[int, List[int]] = defaultdict(list)
+    to_part: Dict[int, bool] = {cid: False for cid in comp_meta}
+    degree: Dict[int, int] = {cid: 0 for cid in comp_meta}
+    for c in contacts:
+        u = int(c["id1"])
+        v = int(c["id2"])
+        undirected[u].append(v)
+        undirected[v].append(u)
+        degree[u] += 1
+        degree[v] += 1
+        if u == part_id:
+            to_part[v] = True
+        if v == part_id:
+            to_part[u] = True
+
+    dist_from_part: Dict[int, int] = {part_id: 0}
+    q: deque[int] = deque([part_id])
+    while q:
+        cur = q.popleft()
+        for nb in undirected.get(cur, []):
+            if nb not in dist_from_part:
+                dist_from_part[nb] = dist_from_part[cur] + 1
+                q.append(nb)
+
+    non_part = [cid for cid in comp_meta if cid != part_id]
+    candidates = [
+        cid
+        for cid in non_part
+        if can_reach_part.get(cid, False)
+        and not to_part.get(cid, False)
+        and degree.get(cid, 0) > 0
+    ]
+    if not candidates:
+        candidates = [
+            cid
+            for cid in non_part
+            if can_reach_part.get(cid, False) and degree.get(cid, 0) > 0
+        ]
+    if not candidates:
+        return comp_meta
+
+    # Farthest from the part, then highest upstream (most negative dot with g_u).
+    source = max(candidates, key=lambda cid: (dist_from_part.get(cid, 0), _rank(cid)))
+
+    # Orient every contact away from the chosen source toward the part.
+    _reorient_contacts_to_source(
+        contacts, source, comp_meta, comp_centroids, g_u, part_id, verbose=True
+    )
+
+    # Build the directed graph from the now-correctly oriented contacts and
+    # recompute reachability/classification as before.
     adj: Dict[int, List[int]] = {cid: [] for cid in comp_meta}
     incoming: Dict[int, List[int]] = {cid: [] for cid in comp_meta}
-    to_part: Dict[int, bool] = {cid: False for cid in comp_meta}
+    to_part = {cid: False for cid in comp_meta}
     for c in contacts:
         up = int(c["up_id"])
         down = int(c["down_id"])
@@ -2417,8 +2615,7 @@ def _reclassify_comp_meta_from_graph(
         adj[up].append(down)
         incoming[down].append(up)
 
-    # Which components can eventually reach the part?  Reverse BFS from part_id.
-    can_reach_part: Dict[int, bool] = {part_id: True}
+    can_reach_part = {part_id: True}
     queue = [part_id]
     while queue:
         cur = queue.pop(0)
@@ -2427,7 +2624,6 @@ def _reclassify_comp_meta_from_graph(
                 can_reach_part[prev] = True
                 queue.append(prev)
 
-    # Indegree/outdegree on the part-reachable subgraph.
     indeg = {cid: 0 for cid in comp_meta}
     outdeg = {cid: 0 for cid in comp_meta}
     for c in contacts:
@@ -2440,23 +2636,6 @@ def _reclassify_comp_meta_from_graph(
         if can_reach_part.get(up, False) and can_reach_part.get(down, False):
             outdeg[up] += 1
             indeg[down] += 1
-
-    non_part = [cid for cid in comp_meta if cid != part_id]
-    candidates = [
-        cid
-        for cid in non_part
-        if indeg[cid] == 0 and outdeg[cid] > 0 and can_reach_part.get(cid, False) and not to_part[cid]
-    ]
-    if not candidates:
-        candidates = [
-            cid
-            for cid in non_part
-            if outdeg[cid] > 0 and can_reach_part.get(cid, False) and not to_part[cid]
-        ]
-    if not candidates:
-        return comp_meta
-
-    source = max(candidates, key=_rank)
 
     print(f"[RECLASSIFY] source={comp_meta[source][1]} rank={_rank(source):.2f} candidates={[comp_meta[c][1] for c in candidates]}", flush=True)
     for cid in sorted(comp_meta):
@@ -2743,26 +2922,9 @@ def _gating_node_velocities(
         source_section,
     )
 
-    # The CAD contact graph is already directed (up_id -> down_id).  First find
-    # every component on a path to the part; only reachable components can carry
-    # main flow and only reachable components can be selected as source.
-    incoming_map: Dict[int, List[int]] = {cid: [] for cid in comp_meta}
-    for c in contacts:
-        up = int(c["up_id"])
-        down = int(c["down_id"])
-        if down == part_id:
-            incoming_map[part_id].append(up)
-        else:
-            incoming_map[down].append(up)
-
-    can_reach_part: Dict[int, bool] = {part_id: True}
-    queue = [part_id]
-    while queue:
-        cur = queue.pop(0)
-        for prev in incoming_map.get(cur, []):
-            if prev not in can_reach_part:
-                can_reach_part[prev] = True
-                queue.append(prev)
+    # Reachability is first determined on the undirected contact graph so that a
+    # locally-flipped side contact (T-junction) does not hide reachable gates.
+    can_reach_part: Dict[int, bool] = _part_reachable_undirected(contacts, part_id)
 
     # Source selection: use the BodyType selected by the user's velocity_section_key.
     # Restrict to components that can actually reach the part.
@@ -2823,6 +2985,25 @@ def _gating_node_velocities(
             "Düğüm hızları çözülemedi: giriş debisi tanımlanamadı. "
             "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
         )
+
+    # Recompute reachability on the now directed graph.
+    incoming_map: Dict[int, List[int]] = {cid: [] for cid in comp_meta}
+    for c in contacts:
+        up = int(c["up_id"])
+        down = int(c["down_id"])
+        if down == part_id:
+            incoming_map[part_id].append(up)
+        else:
+            incoming_map[down].append(up)
+
+    can_reach_part = {part_id: True}
+    queue = [part_id]
+    while queue:
+        cur = queue.pop(0)
+        for prev in incoming_map.get(cur, []):
+            if prev not in can_reach_part:
+                can_reach_part[prev] = True
+                queue.append(prev)
 
     # Prune the directed contact graph to the part-reachable subgraph so side
     # branches (risers, isolated sprues) do not steal main flow.
