@@ -2294,6 +2294,230 @@ def _compute_fill_time(
     return fill
 
 
+def _compute_fill_time_graph(
+    grid: np.ndarray,
+    origin_mm: np.ndarray,
+    dx_mm: float,
+    g: np.ndarray,
+    gating_nodes: List[GatingNode],
+    bodies: List[Body],
+    body_index: Optional[np.ndarray],
+    fill_time_s: float,
+) -> np.ndarray:
+    """Compute voxel front-arrival times from the gating graph.
+
+    The Darcy velocity field is not used for timing; instead, the BFS path through
+    the gating graph and the already-computed node velocities / flow rates drive a
+    simple 1-D plug-flow estimate in each body.  The part is filled outward from
+    each ingate so that the farthest metal cell reaches exactly ``fill_time_s``.
+    """
+    shape = grid.shape
+    fill = np.full(shape, np.inf, dtype=np.float64)
+    cavity = grid > 0
+    if (
+        not gating_nodes
+        or not cavity.any()
+        or fill_time_s <= 1e-12
+        or body_index is None
+        or body_index.shape != grid.shape
+        or not bodies
+    ):
+        fill[~cavity] = 0.0
+        return fill
+
+    g_u = np.asarray(g, dtype=np.float64)
+    if np.linalg.norm(g_u) > 1e-12:
+        g_u = g_u / np.linalg.norm(g_u)
+    else:
+        g_u = np.array([0.0, 0.0, -1.0])
+
+    name_to_bidx = {b.name: i for i, b in enumerate(bodies)}
+    part_bidx = None
+    for i, b in enumerate(bodies):
+        if b.body_type == BodyType.PART:
+            part_bidx = i
+            break
+
+    children: Dict[int, List[Dict]] = {}
+    source_bidx: Optional[int] = None
+    source_v = 0.0
+    source_q = 0.0
+    source_centroid = np.zeros(3, dtype=np.float64)
+    ingate_branches: List[Dict] = []
+
+    for node in gating_nodes:
+        if "→" not in node.name or "→" not in node.body_type:
+            continue
+        up_name, down_name = [s.strip() for s in node.name.split("→")]
+        up_type, down_type = [s.strip() for s in node.body_type.split("→")]
+        if up_name == "Kaynak" or "SOURCE" in up_type:
+            source_bidx = name_to_bidx.get(down_name)
+            source_v = float(node.velocity_m_s)
+            source_q = float(node.flow_rate_m3_s)
+            source_centroid = np.asarray(node.centroid_mm, dtype=np.float64)
+            continue
+        up_bidx = name_to_bidx.get(up_name)
+        if up_bidx is None:
+            continue
+        # The downstream name is the actual body name except for the part, which
+        # the gating pipeline labels as "Parça".
+        if down_name == "Parça" or down_type == "PART":
+            down_bidx = part_bidx
+        else:
+            down_bidx = name_to_bidx.get(down_name)
+        if down_bidx is None:
+            continue
+        child = {
+            "bidx": down_bidx,
+            "point": np.asarray(node.centroid_mm, dtype=np.float64),
+            "v": float(node.velocity_m_s),
+            "q": float(node.flow_rate_m3_s),
+        }
+        children.setdefault(up_bidx, []).append(child)
+        if down_bidx == part_bidx:
+            ingate_branches.append(child.copy())
+            ingate_branches[-1]["parent_bidx"] = up_bidx
+
+    if source_bidx is None or part_bidx is None:
+        fill[~cavity] = 0.0
+        return fill
+
+    # Source entry point: highest cell along -gravity within the source body.
+    src_mask = body_index == source_bidx
+    src_entry = source_centroid
+    if src_mask.any():
+        src_idx = np.argwhere(src_mask)
+        src_centers = origin_mm + (src_idx + 0.5) * dx_mm
+        proj = src_centers @ (-g_u)
+        top_idx = src_idx[np.argmax(proj)]
+        src_entry = origin_mm + (top_idx + 0.5) * dx_mm
+
+    t_entry: Dict[int, float] = {source_bidx: 0.0}
+    entry_point: Dict[int, np.ndarray] = {source_bidx: src_entry.copy()}
+    v_in: Dict[int, float] = {source_bidx: max(source_v, 1e-6)}
+
+    # BFS over the directed gating graph (body indices).
+    queue = [source_bidx]
+    visited = {source_bidx}
+    while queue:
+        bidx = queue.pop(0)
+        for child in children.get(bidx, []):
+            child_bidx = child["bidx"]
+            if child_bidx in visited:
+                continue
+            visited.add(child_bidx)
+            P = child["point"]
+            entry = entry_point[bidx]
+            v = v_in[bidx]
+            L = float(np.linalg.norm(P - entry))
+            t_entry[child_bidx] = t_entry[bidx] + (L / 1000.0 / v if v > 1e-18 else 0.0)
+            entry_point[child_bidx] = P.copy()
+            v_in[child_bidx] = max(child["v"], 1e-6)
+            queue.append(child_bidx)
+
+    # Compute cell centres once and cache per body.
+    def _centres(mask: np.ndarray) -> np.ndarray:
+        idx = np.argwhere(mask)
+        return origin_mm + (idx + 0.5) * dx_mm, idx
+
+    # Fill time inside each gating body (use body_index, not grid body type, so
+    # graph-reclassified bodies are still timed correctly).
+    gating_bidx = visited - {part_bidx}
+    for bidx in gating_bidx:
+        mask = body_index == bidx
+        if not mask.any():
+            continue
+        centers, idx = _centres(mask)
+        t0 = t_entry[bidx]
+        v = v_in[bidx]
+        childs = children.get(bidx, [])
+        if not childs:
+            # No downstream child: flow toward the body centroid.
+            body = bodies[bidx]
+            try:
+                centroid = np.asarray(body.mesh.centroid, dtype=np.float64)
+            except Exception:
+                centroid = centers.mean(axis=0)
+            axis = centroid - entry_point[bidx]
+            L = float(np.linalg.norm(axis))
+            if L < 1e-9:
+                axis = -g_u
+                L = 1.0
+            dir_u = axis / L
+            proj = (centers - entry_point[bidx]) @ dir_u
+            proj = np.clip(proj, 0.0, L)
+            fill[mask] = t0 + proj / 1000.0 / v
+            continue
+        t_vals = np.full(idx.shape[0], np.inf, dtype=np.float64)
+        for child in childs:
+            P = child["point"]
+            axis = P - entry_point[bidx]
+            L = float(np.linalg.norm(axis))
+            if L < 1e-9:
+                body = bodies[bidx]
+                try:
+                    centroid = np.asarray(body.mesh.centroid, dtype=np.float64)
+                except Exception:
+                    centroid = centers.mean(axis=0)
+                axis = centroid - entry_point[bidx]
+                L = float(np.linalg.norm(axis))
+            if L < 1e-9:
+                axis = -g_u
+                L = 1.0
+            dir_u = axis / L
+            proj = (centers - entry_point[bidx]) @ dir_u
+            proj = np.clip(proj, 0.0, L)
+            t_vals = np.minimum(t_vals, t0 + proj / 1000.0 / v)
+        fill[mask] = t_vals
+
+    # Part: outward fill from each ingate. Exclude cells that belong to bodies the
+    # gating graph has reclassified as part of the gating system.
+    gating_bidx_arr = np.fromiter(gating_bidx, dtype=np.int64, count=len(gating_bidx))
+    on_gating = np.isin(body_index, gating_bidx_arr)
+    part_mask = (grid == BodyType.PART) & ~on_gating
+    if part_mask.any() and ingate_branches:
+        centers, _ = _centres(part_mask)
+        part_fill = np.full(centers.shape[0], np.inf, dtype=np.float64)
+        for branch in ingate_branches:
+            P = branch["point"]
+            parent_bidx = branch.get("parent_bidx")
+            if parent_bidx is None or parent_bidx not in t_entry:
+                continue
+            ingate_entry = entry_point[parent_bidx]
+            v_ingate = v_in[parent_bidx]
+            L_ingate = float(np.linalg.norm(P - ingate_entry))
+            t_ingate = t_entry[parent_bidx] + (L_ingate / 1000.0 / v_ingate if v_ingate > 1e-18 else 0.0)
+            dists = np.linalg.norm(centers - P, axis=1)
+            max_dist = float(dists.max()) if dists.size else 0.0
+            if max_dist > 1e-12 and fill_time_s > t_ingate:
+                v_eff = (max_dist / 1000.0) / (fill_time_s - t_ingate)
+            else:
+                v_eff = max(branch["v"], 1e-6)
+            part_fill = np.minimum(part_fill, t_ingate + dists / 1000.0 / v_eff)
+        # Volume-correct the part so its latest cell reaches exactly fill_time_s.
+        if part_fill.size:
+            pmin = float(part_fill.min())
+            pmax = float(part_fill.max())
+            if pmax > pmin + 1e-12 and fill_time_s > pmin:
+                scale = (fill_time_s - pmin) / (pmax - pmin)
+                part_fill = pmin + (part_fill - pmin) * scale
+            else:
+                part_fill = np.full_like(part_fill, fill_time_s)
+        fill[part_mask] = part_fill
+    else:
+        fill[part_mask] = fill_time_s
+
+    fill[~cavity] = 0.0
+    # Clamp any numerical overshoot.
+    fill[np.isfinite(fill) & cavity] = np.minimum(fill[np.isfinite(fill) & cavity], fill_time_s)
+    # Any remaining metal cells that are not reached by the source graph (e.g.
+    # risers/cooling sprues that sit above the part) still need a finite time.
+    inf_metal = np.isinf(fill) & cavity
+    if inf_metal.any():
+        fill[inf_metal] = fill_time_s
+    return fill
+
+
 def _section_downstream_flux(
     u: np.ndarray,
     v: np.ndarray,
@@ -3413,7 +3637,7 @@ def _gating_node_velocities(
         return order_index.get(cid, 9999)
 
     nodes.sort(key=_node_order)
-    return nodes
+    return nodes, comp_meta, comp_centroids, comp_id, part_id
 
 
 def solve_filling_flow(
@@ -3423,6 +3647,7 @@ def solve_filling_flow(
     casting_params,
     alloy,
     bodies=None,
+    body_index: Optional[np.ndarray] = None,
     max_solver_cells: int = 6_000_000,
     progress_callback=None,
     design_velocity_m_s: float = 0.0,
@@ -3633,42 +3858,10 @@ def solve_filling_flow(
     # Total fill time estimate: part volume / user flow rate.
     fill_time_s = part_volume_m3 / Q_user if Q_user > 1e-18 else 0.0
 
-    # Per-voxel front arrival time from the inlet.
-    fill_time_c = _compute_fill_time(vmag, cavity, inlet_cells, dx_m)
-    # Scale the raw fast-marching times so the last filled voxel equals the
-    # robust volume/Q fill time; local velocities can otherwise give unrealistically
-    # large times in stagnant pockets.
-    finite_fill = fill_time_c[np.isfinite(fill_time_c) & cavity]
-    if finite_fill.size > 0 and fill_time_s > 0.0:
-        raw_max = float(finite_fill.max())
-        if raw_max > 0.0:
-            fill_time_c = np.where(
-                cavity & np.isfinite(fill_time_c),
-                fill_time_c * (fill_time_s / raw_max),
-                fill_time_c,
-            )
-    # Resample the fill-time and velocity fields back onto the original analysis
-    # grid so that downstream modules (e.g. flow animator) see consistent shapes.
-    # Nearest-neighbour is used for fill_time because it carries an inf sentinel
-    # for unreached cells; linear interpolation is used for velocity.
-    if (
-        fill_time_c.shape == orig_grid.shape
-        and abs(dx_c - orig_dx) < 1e-9
-        and np.allclose(origin_c, orig_origin)
-    ):
-        fill_time_fine = fill_time_c
-    else:
-        fill_time_fine = _resample_to_grid(
-            fill_time_c,
-            origin_c,
-            dx_c,
-            orig_grid.shape,
-            orig_origin,
-            orig_dx,
-            fill_value=np.inf,
-            order=0,
-        )
-        fill_time_fine = np.where(orig_grid == BodyType.EMPTY, 0.0, fill_time_fine)
+    # Per-voxel fill time is computed from the gating graph after the node
+    # velocities are known.  Placeholder is created here so the variable exists;
+    # the actual computation follows ``_gating_node_velocities``.
+    fill_time_fine = np.full(orig_grid.shape, 0.0, dtype=np.float64)
 
     if (
         vmag.shape == orig_grid.shape
@@ -3711,7 +3904,7 @@ def solve_filling_flow(
     # Use the solver (coarse) grid, the staggered face velocities and the FAVOR
     # fractional face areas so the real contact area is used in Q = v * A.
     try:
-        gating_nodes = _gating_node_velocities(
+        gating_nodes, comp_meta, comp_centroids, comp_id, part_id = _gating_node_velocities(
             grid_c,
             origin_c,
             dx_c,
@@ -3731,8 +3924,31 @@ def solve_filling_flow(
         # Hata varsa düğüm hızı hesabını atla; Darcy/porozite devam etsin.
         print(f"[GATING] {exc}", flush=True)
         gating_nodes = []
+        comp_meta = {}
+        comp_centroids = {}
+        comp_id = np.zeros(grid_c.shape, dtype=np.int32)
+        part_id = 1
         node_v = {}
         v_ingate_contact = 0.0
+
+    # ------------------------------------------------------------------
+    # Graph-based fill time: use the BFS gating path and node velocities to
+    # estimate when each voxel is reached, instead of the Darcy vmag field.
+    # The part cells are filled outward from each ingate so the last cell reaches
+    # exactly ``fill_time_s``.
+    # ------------------------------------------------------------------
+    if gating_nodes and bodies is not None and body_index is not None:
+        fill_time_fine = _compute_fill_time_graph(
+            orig_grid,
+            orig_origin,
+            orig_dx,
+            g,
+            gating_nodes,
+            bodies,
+            body_index,
+            fill_time_s,
+        )
+        fill_time_fine = np.where(orig_grid == BodyType.EMPTY, 0.0, fill_time_fine)
 
     # Collect every node that feeds the part directly as a "gate" (meme).
     per_gate_v = {}

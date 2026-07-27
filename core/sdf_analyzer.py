@@ -1818,6 +1818,7 @@ def _run_filling_flow(
     dx_mm: float,
     alloy,
     bodies: List[Body],
+    body_index: Optional[np.ndarray],
 ):
     """Run the 3-D Darcy filling-flow solver using the gate design/user inputs."""
     from core.filling_solver import solve_filling_flow, cad_source_area_m2, GatingVelocityError
@@ -1877,6 +1878,7 @@ def _run_filling_flow(
         casting_params,
         alloy,
         bodies=bodies,
+        body_index=body_index,
         progress_callback=None,
         design_velocity_m_s=design_v,
         design_section_key=design_section_key,
@@ -2050,6 +2052,7 @@ def analyze(
                 dx,
                 alloy,
                 bodies,
+                body_index,
             )
         except Exception as exc:
             if isinstance(exc, GatingVelocityError):
