@@ -2544,11 +2544,32 @@ def _compute_fill_time_graph(
     else:
         fill[part_mask] = fill_time_s
 
+    # Risers/feeders fill after the part using the same source velocity.
+    # For each riser cell, start at the fill time of the nearest already-filled
+    # non-riser metal cell and add the travel distance / velocity into the riser.
+    source_v_safe = max(source_v, 1e-6)
+    riser_bidx = [i for i, b in enumerate(bodies) if getattr(b, "body_type", None) == BodyType.RISER]
+    if riser_bidx:
+        riser_mask = np.isin(body_index, np.fromiter(riser_bidx, dtype=np.int64, count=len(riser_bidx)))
+        if riser_mask.any():
+            non_riser_metal = cavity & ~riser_mask
+            if non_riser_metal.any():
+                dist, indices = ndimage.distance_transform_edt(
+                    ~non_riser_metal, return_indices=True, return_distances=True
+                )
+                nearest_fill = fill[indices[0], indices[1], indices[2]]
+                travel_m = dist[riser_mask] * dx_mm / 1000.0
+                fill[riser_mask] = nearest_fill[riser_mask] + travel_m / source_v_safe
+            else:
+                fill[riser_mask] = fill_time_s
+
     fill[~cavity] = 0.0
-    # Clamp any numerical overshoot.
-    fill[np.isfinite(fill) & cavity] = np.minimum(fill[np.isfinite(fill) & cavity], fill_time_s)
+    # Clamp any numerical overshoot in non-riser cells; risers may legitimately
+    # fill after the part and therefore exceed fill_time_s.
+    non_riser = cavity & ~riser_mask if riser_bidx else cavity
+    fill[np.isfinite(fill) & non_riser] = np.minimum(fill[np.isfinite(fill) & non_riser], fill_time_s)
     # Any remaining metal cells that are not reached by the source graph (e.g.
-    # risers/cooling sprues that sit above the part) still need a finite time.
+    # cooling sprues that sit above the part) still need a finite time.
     inf_metal = np.isinf(fill) & cavity
     if inf_metal.any():
         fill[inf_metal] = fill_time_s

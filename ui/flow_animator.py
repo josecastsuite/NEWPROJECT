@@ -116,6 +116,9 @@ class FlowAnimator(QtCore.QObject):
         self._pore_mask_full: Optional[np.ndarray] = None
         self._pore_mask_d: Optional[np.ndarray] = None
         self._phi_base_d: Optional[np.ndarray] = None
+        self._grid_d: Optional[np.ndarray] = None
+        self._dist_to_riser_d: Optional[np.ndarray] = None
+        self._feeder_actor = None
         self._gravity: np.ndarray = np.array([0.0, 0.0, -1.0], dtype=np.float64)
 
     def set_result(self, result: Optional[AnalysisResult]) -> None:
@@ -232,12 +235,15 @@ class FlowAnimator(QtCore.QObject):
         self._pore_mask_full = None
         self._pore_mask_d = None
         self._filled_d = None
+        self._grid_d = None
+        self._dist_to_riser_d = None
         self._gravity = np.array([0.0, 0.0, -1.0], dtype=np.float64)
         self._frame_actor = None
         self._frame_actor_scalar = ""
         self._streamline_actor = None
         self._marker_actor = None
         self._pore_actor = None
+        self._feeder_actor = None
 
     def _finite_max(self, arr: np.ndarray, mask: np.ndarray) -> float:
         finite = mask & np.isfinite(arr)
@@ -327,6 +333,18 @@ class FlowAnimator(QtCore.QObject):
         pore_c = self._pore_mask_full[
             bbox[0] : bbox[1], bbox[2] : bbox[3], bbox[4] : bbox[5]
         ]
+        grid_c = self._result.grid[
+            bbox[0] : bbox[1], bbox[2] : bbox[3], bbox[4] : bbox[5]
+        ].copy()
+        if (
+            self._result.dist_to_riser is not None
+            and self._result.dist_to_riser.shape == self._result.grid.shape
+        ):
+            dist_c = self._result.dist_to_riser[
+                bbox[0] : bbox[1], bbox[2] : bbox[3], bbox[4] : bbox[5]
+            ].copy()
+        else:
+            dist_c = np.full_like(fill_c, np.inf)
 
         self._sentinel = max(10.0 * self._max_time, 1e6) + 1.0
         fill_c = np.where(np.isfinite(fill_c) & metal_c, fill_c, self._sentinel)
@@ -355,12 +373,16 @@ class FlowAnimator(QtCore.QObject):
             # Trilinear interpolation for the pore mask keeps the purple cavity
             # surfaces smooth; threshold at 0.5 preserves the binary decision.
             pore_d = ndimage.zoom(pore_c.astype(np.float32), ratios, order=1) > 0.5
+            grid_d = ndimage.zoom(grid_c.astype(np.float32), ratios, order=0).astype(np.int16)
+            dist_d = ndimage.zoom(dist_c, ratios, order=1)
             fill_d = np.where(metal_d, fill_d, self._sentinel)
             solid_d = np.where(metal_d, solid_d, self._sentinel)
+            dist_d = np.where(metal_d, dist_d, np.inf)
             spacing = tuple(self._dx * crop_shape[i] / target_shape[i] for i in range(3))
             shape = target_shape
         else:
             fill_d, solid_d, metal_d, pore_d = fill_c, solid_c, metal_c, pore_c
+            grid_d, dist_d = grid_c, dist_c
             spacing = (self._dx, self._dx, self._dx)
             shape = crop_shape
 
@@ -375,6 +397,8 @@ class FlowAnimator(QtCore.QObject):
         self._solid_time_d = solid_d
         self._metal_d = metal_d
         self._pore_mask_d = pore_d
+        self._grid_d = grid_d
+        self._dist_to_riser_d = dist_d
 
         img = pv.ImageData(
             dimensions=shape, spacing=spacing, origin=origin_c
@@ -1028,6 +1052,12 @@ class FlowAnimator(QtCore.QObject):
             except Exception:
                 pass
             self._pore_actor = None
+        if self._feeder_actor is not None:
+            try:
+                self._viewer.remove_actor(self._feeder_actor)
+            except Exception:
+                pass
+            self._feeder_actor = None
         # Alt renk skalasını (dolum/katılaşma sıcaklık çubuğu) da kaldır.
         try:
             self._viewer.remove_scalar_bar("Sıcaklık (°C)")
@@ -1137,6 +1167,29 @@ class FlowAnimator(QtCore.QObject):
             # one by one as the liquid path closes.
             active_pore = self._pore_mask_d & (self._solid_time_d <= t)
 
+            # Feeder action: still-liquid risers suppress pores in their feeding
+            # range and their own metal level drops as liquid is consumed.
+            ft = self._fill_time_d
+            st = self._solid_time_d
+            metal = self._filled_d
+            riser = (self._grid_d == int(BodyType.RISER)) & metal
+            liquid_riser = riser & (st > t) & (ft <= t)
+            if liquid_riser.any() and self._dist_to_riser_d is not None:
+                feed_distance_mm = max(
+                    4.0 * getattr(self._result, "dominant_m_mm", 0.0), 50.0
+                )
+                spacing = np.asarray(self._base_image.spacing, dtype=np.float64)
+                liquid_riser_dist = ndimage.distance_transform_edt(
+                    ~liquid_riser, sampling=spacing
+                )
+                fed = (
+                    (liquid_riser_dist <= feed_distance_mm)
+                    & (self._grid_d == int(BodyType.PART))
+                    & (st > t)
+                    & (ft <= t)
+                )
+                active_pore = active_pore & ~fed
+
             # P4 prototype: gravity-driven pore rise.  Pores are buoyant in the
             # still-liquid metal and drift opposite to the gravity vector.
             # The shift is sub-voxel and grows with time since filling ended.
@@ -1158,10 +1211,14 @@ class FlowAnimator(QtCore.QObject):
                 active_pore.astype(np.float64), sigma=self.PHI_SIGMA, mode="constant", cval=0.0
             ).astype(np.float32)
 
-            # Metal level-set: smooth the (filled metal minus active pore) volume.
-            # Cells inside active pores become phi = 0, producing true holes.
+            # Metal level-set.  Non-riser cells stay at phi=1; riser cells use a
+            # liquid fraction so the surface shrinks as the feeder is consumed.
+            denom = np.maximum(st - ft, 1e-9)
+            lf = np.clip((st - t) / denom, 0.0, 1.0)
+            metal_field = np.where(riser, lf, metal.astype(np.float64))
+            metal_field = np.where(active_pore, 0.0, metal_field)
             phi_t = ndimage.gaussian_filter(
-                (self._filled_d & ~active_pore).astype(np.float64),
+                metal_field,
                 sigma=self.PHI_SIGMA,
                 mode="constant",
                 cval=0.0,
@@ -1225,6 +1282,32 @@ class FlowAnimator(QtCore.QObject):
                 else:
                     self._pore_actor.mapper.dataset = pore_surface
 
+            # Feeder action overlay: lines from each still-liquid riser to the
+            # hotspot it is feeding.  Line colour fades as the feeder solidifies.
+            feeder_poly = self._build_feeder_paths(t, ft, st)
+            if feeder_poly is not None and feeder_poly.n_points > 0:
+                if self._feeder_actor is None:
+                    self._feeder_actor = self._viewer.add_mesh(
+                        feeder_poly,
+                        cmap="autumn",
+                        scalars="liquid_fraction",
+                        clim=(0.0, 1.0),
+                        opacity=0.85,
+                        render_lines_as_tubes=True,
+                        line_width=3,
+                        show_scalar_bar=False,
+                        name="feeder_paths",
+                    )
+                else:
+                    self._feeder_actor.mapper.dataset = feeder_poly
+            else:
+                if self._feeder_actor is not None:
+                    try:
+                        self._viewer.remove_actor(self._feeder_actor)
+                    except Exception:
+                        pass
+                    self._feeder_actor = None
+
         # Optional red streamlines overlay.
         if self._show_streamlines and self._tube_mesh is not None:
             if self._streamline_actor is None:
@@ -1274,6 +1357,82 @@ class FlowAnimator(QtCore.QObject):
                 self._marker_actor = None
 
         self._viewer.render()
+
+    def _build_feeder_paths(
+        self, t: float, ft: np.ndarray, st: np.ndarray
+    ) -> Optional[pv.PolyData]:
+        """Build tube/line geometry from each still-liquid riser to its hotspot."""
+        if self._result is None or not self._result.riser_results:
+            return None
+        metal = self._filled_d
+        if metal is None or not metal.any() or self._grid_d is None:
+            return None
+
+        riser = (self._grid_d == int(BodyType.RISER)) & metal
+        if not riser.any():
+            return None
+
+        labeled, n = ndimage.label(riser, structure=np.ones((3, 3, 3), dtype=np.int32))
+        if n == 0:
+            return None
+
+        spacing = np.asarray(self._base_image.spacing, dtype=np.float64)
+        origin_c = np.asarray(self._base_image.origin, dtype=np.float64)
+        hotspots = self._result.hotspots
+        if not hotspots:
+            return None
+
+        points: List[np.ndarray] = []
+        lines: List[int] = []
+        scalars: List[float] = []
+        for i in range(1, n + 1):
+            pts = np.argwhere(labeled == i)
+            if pts.shape[0] == 0:
+                continue
+            centroid_vox = pts.mean(axis=0)
+            idx = tuple(np.round(centroid_vox).astype(int))
+            if not all(0 <= idx[k] < st.shape[k] for k in range(3)):
+                continue
+            if st[idx] <= t or ft[idx] > t:
+                continue
+            lf = float(
+                np.clip(
+                    (st[idx] - t) / max(st[idx] - ft[idx], 1e-9), 0.0, 1.0
+                )
+            )
+            centroid_mm = origin_c + (centroid_vox + 0.5) * spacing
+            # Prefer the hotspot recorded by the riser design engine.
+            target_mm: Optional[np.ndarray] = None
+            if i - 1 < len(self._result.riser_results):
+                target_arr = self._result.riser_results[i - 1].nearest_hotspot_position_mm
+                if target_arr is not None and target_arr.size >= 3:
+                    target_mm = np.asarray(target_arr[:3], dtype=np.float64)
+            # Fallback to nearest hot spot.
+            if target_mm is None:
+                best = None
+                best_d2 = float("inf")
+                for hs in hotspots:
+                    pos = np.asarray(hs.position_mm, dtype=np.float64)
+                    d2 = float(np.sum((pos - centroid_mm) ** 2))
+                    if d2 < best_d2:
+                        best_d2 = d2
+                        best = pos
+                target_mm = best
+            if target_mm is None:
+                continue
+            base = len(points)
+            points.append(centroid_mm)
+            points.append(target_mm)
+            lines.extend([2, base, base + 1])
+            scalars.extend([lf, lf])
+
+        if not points:
+            return None
+        poly = pv.PolyData(
+            np.vstack(points), np.asarray(lines, dtype=np.int64)
+        )
+        poly["liquid_fraction"] = np.asarray(scalars, dtype=np.float32)
+        return poly
 
     def _metal_cmap(self):
         # Hot metal = red (high scalar), cold/solid = blue (low scalar).
