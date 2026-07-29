@@ -20,6 +20,7 @@ High-level usage:
 velocity and an optional per-voxel fill-time estimate.
 """
 import heapq
+import os
 from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -4278,6 +4279,120 @@ def solve_filling_flow(
     if source_area_m2 <= 1e-18:
         source_area_m2 = float(area_m2)
 
+    # ------------------------------------------------------------------
+    # Optional Taichi VOF/Navier-Stokes 3-D free-surface solver.
+    # Triggered with JOSECAST_USE_TAICHI_VOF=1.  When active it replaces the
+    # Darcy fill_time and velocity fields with a physically advected front
+    # while the gating graph / node velocities remain available for reporting.
+    # ------------------------------------------------------------------
+    use_taichi_vof = os.environ.get("JOSECAST_USE_TAICHI_VOF", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    vof_res = None
+    inflow_v = 0.0
+    if use_taichi_vof:
+        try:
+            from core import taichi_ns
+
+            # Keep the VOF grid small enough for an interactive solve.
+            vof_grid, vof_origin, vof_dx = _downsample_grid(
+                grid_c, origin_c, dx_c, max_cells=50_000
+            )
+            vof_cavity = vof_grid != BodyType.EMPTY
+            vof_inlet, _ = _select_inlet_cells(
+                vof_grid, vof_cavity, g, physical_source_key
+            )
+            if not vof_inlet.any():
+                # Last resort: use the same mask selected on the coarse grid.
+                vof_inlet = (
+                    _resample_to_grid(
+                        inlet_cells.astype(np.float64),
+                        origin_c,
+                        dx_c,
+                        vof_grid.shape,
+                        vof_origin,
+                        vof_dx,
+                        fill_value=0.0,
+                        order=0,
+                    )
+                    > 0.5
+                )
+
+            rho_vof = float(getattr(alloy, "rho_liquid_kg_m3", 7000) or 7000)
+            mu_vof = float(mu)
+            inflow_v = (
+                float(user_velocity)
+                if user_velocity > 1e-9
+                else (
+                    float(Q_user / source_area_m2)
+                    if source_area_m2 > 1e-18
+                    else 1.5
+                )
+            )
+            phi_vof = np.full(vof_grid.shape, 999.0, dtype=np.float64)
+            phi_vof[vof_cavity] = 1.0
+            phi_vof[vof_inlet] = -1.0
+            t_max_vof = fill_time_s * 2.0 if fill_time_s > 0.0 else 2.0
+            vof_res = taichi_ns.solve(
+                grid=vof_grid,
+                phi_init=phi_vof,
+                source_mask=vof_inlet.astype(np.uint8),
+                dx=vof_dx / 1000.0,
+                g=g,
+                rho=rho_vof,
+                nu=mu_vof / rho_vof,
+                inflow_velocity=inflow_v,
+                t_max=t_max_vof,
+                max_steps=400,
+                pressure_iters=20,
+                reinit_iters=2,
+                cfl=1.0,
+            )
+            if vof_res is None or vof_res.get("filled_fraction", 0.0) < 1e-6:
+                vof_res = None
+        except Exception as exc:
+            print(f"[TAICHI_VOF] Hata: {exc}", flush=True)
+            vof_res = None
+
+    if vof_res is not None:
+        # Resample Taichi VOF fields to the original analysis grid.
+        fill_time_c = vof_res["fill_time"]
+        velocity_c = vof_res["velocity"]
+        vel_comps_f = [
+            _resample_to_grid(
+                velocity_c[comp],
+                vof_origin,
+                vof_dx,
+                orig_grid.shape,
+                orig_origin,
+                orig_dx,
+                fill_value=0.0,
+                order=1,
+            )
+            for comp in range(3)
+        ]
+        velocity = np.stack(vel_comps_f, axis=0).astype(np.float32)
+        fine_metal = (orig_grid > 0) & (orig_grid != BodyType.CORE)
+        velocity = np.where(fine_metal, velocity, 0.0)
+        vmag_fine = np.linalg.norm(velocity, axis=0)
+        fill_time_fine = _resample_to_grid(
+            fill_time_c,
+            vof_origin,
+            vof_dx,
+            orig_grid.shape,
+            orig_origin,
+            orig_dx,
+            fill_value=1e12,
+            order=1,
+        )
+        fill_time_fine = np.where(fine_metal, fill_time_fine, 0.0)
+        if fine_metal.any():
+            max_fill_t = float(np.nanmax(np.where(fine_metal, fill_time_fine, np.nan)))
+            if np.isfinite(max_fill_t) and max_fill_t > 0.0:
+                fill_time_s = max_fill_t
+
     # Contact-node velocities / areas for every gating-gating and gating-part interface.
     # Use the solver (coarse) grid, the staggered face velocities and the FAVOR
     # fractional face areas so the real contact area is used in Q = v * A.
@@ -4314,7 +4429,7 @@ def solve_filling_flow(
     # then the cavity fills as a single rising metal level driven by the total
     # ingate flow Q and local cavity cross-section A(z).
     # ------------------------------------------------------------------
-    if bodies is not None and body_index is not None:
+    if bodies is not None and body_index is not None and vof_res is None:
         fill_time_fine = _compute_fill_time_volume_layer(
             orig_grid,
             orig_origin,
@@ -4356,12 +4471,20 @@ def solve_filling_flow(
     if progress_callback:
         progress_callback(95)
 
-    reason = (
-        f"Darcy akış çözümü: giriş '{used_section}', Q={Q_user*6e4:.2f} L/dak, "
-        f"girdi hızı/alan={user_velocity:.3f} m/s / {area_m2*1e4:.2f} cm², "
-        f"tahmini doldurma süresi={fill_time_s:.2f} s, "
-        f"basınç düşümü={pressure_drop_pa:.1f} Pa."
-    )
+    if vof_res is not None:
+        reason = (
+            f"Taichi VOF/Navier-Stokes dolum: giriş '{used_section}', "
+            f"Q={Q_user*6e4:.2f} L/dak, kaynak hızı={inflow_v:.3f} m/s, "
+            f"tahmini doldurma süresi={fill_time_s:.2f} s, "
+            f"basınç düşümü={pressure_drop_pa:.1f} Pa."
+        )
+    else:
+        reason = (
+            f"Darcy akış çözümü: giriş '{used_section}', Q={Q_user*6e4:.2f} L/dak, "
+            f"girdi hızı/alan={user_velocity:.3f} m/s / {area_m2*1e4:.2f} cm², "
+            f"tahmini doldurma süresi={fill_time_s:.2f} s, "
+            f"basınç düşümü={pressure_drop_pa:.1f} Pa."
+        )
 
     return FillingResult(
         node_velocities=node_v,
