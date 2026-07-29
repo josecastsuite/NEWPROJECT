@@ -2815,8 +2815,6 @@ def _gating_volume_time(
     def _visit(bidx: int) -> None:
         if bidx < 0 or bidx >= n_bodies or visited[bidx]:
             return
-        for p, _ in parents.get(bidx, []):
-            _visit(p)
         visited[bidx] = True
         if bidx == source_bidx:
             t_enter[bidx] = 0.0
@@ -2824,6 +2822,10 @@ def _gating_volume_time(
             parent_exits = [t_exit[p] for p, _ in parents.get(bidx, []) if np.isfinite(t_exit[p])]
             t_enter[bidx] = float(max(parent_exits)) if parent_exits else 0.0
         t_exit[bidx] = t_enter[bidx] + body_vol[bidx] / max(Q[bidx], 1e-18)
+        for c in children.get(bidx, []):
+            cb = c.get("bidx")
+            if cb is not None:
+                _visit(cb)
 
     _visit(source_bidx)
 
