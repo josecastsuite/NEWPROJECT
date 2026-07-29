@@ -2894,6 +2894,106 @@ def _part_fill_fast_marching(
     return fill_part
 
 
+def _part_fill_volume_level(
+    grid: np.ndarray,
+    part_mask: np.ndarray,
+    origin_mm: np.ndarray,
+    dx_mm: float,
+    g: np.ndarray,
+    T_gating: np.ndarray,
+    ingate_branches: List[Dict],
+    fill_time_s: float,
+) -> np.ndarray:
+    """Exact volume-of-cavity / rising-free-surface fill time.
+
+    The part cavity is split into connected components.  For each component the
+    cells are projected onto the anti-gravity axis, the cross-sectional area
+    ``A(s)`` of each layer is measured, and the layer is filled according to
+    ``dt = A(s) ds / Q``.  This is the exact solution for an incompressible
+    liquid rising under a prescribed inlet flow, and it naturally satisfies
+    continuity in narrow/wide sections without artificial velocity caps.
+
+    Multiple ingates are assigned to the component they feed; their opening
+    times come from the gating graph and their flows add to ``Q_comp``.
+    """
+    shape = grid.shape
+    g_u = _gravity_unit(g)
+    up = -g_u
+    dx_m = dx_mm / 1000.0
+    area_per_cell = dx_m * dx_m
+    cavity_all = (grid > 0) & (grid != int(BodyType.CORE))
+    part = np.asarray(part_mask, dtype=bool) & cavity_all
+    fill_part = np.full(shape, np.inf, dtype=np.float64)
+    if not part.any() or not ingate_branches:
+        return fill_part
+
+    labeled, n_comp = ndimage.label(part, structure=np.ones((3, 3, 3), dtype=int))
+    if n_comp == 0:
+        return fill_part
+
+    branch_q = np.array(
+        [float(b.get("q", 0.0)) for b in ingate_branches], dtype=np.float64
+    )
+    branch_open = np.array(
+        [float(b.get("t_open", 0.0)) for b in ingate_branches], dtype=np.float64
+    )
+    branch_points = np.array(
+        [np.asarray(b.get("point", [0.0, 0.0, 0.0]), dtype=np.float64)
+         for b in ingate_branches],
+        dtype=np.float64,
+    )
+    total_q = float(max(branch_q.sum(), 1e-18))
+
+    # Component centroids in mm (physical coordinates)
+    comp_centroids_mm = np.empty((n_comp, 3), dtype=np.float64)
+    for c in range(1, n_comp + 1):
+        idx_c = np.argwhere(labeled == c)
+        centers_c = origin_mm + (idx_c + 0.5) * dx_mm
+        comp_centroids_mm[c - 1] = centers_c.mean(axis=0)
+
+    # Assign each branch to the nearest component.
+    diff = branch_points[:, None, :] - comp_centroids_mm[None, :, :]
+    dist2 = np.einsum("ijk,ijk->ij", diff, diff)
+    if dist2.size:
+        branch_comp = np.argmin(dist2, axis=1)
+    else:
+        branch_comp = np.zeros(len(ingate_branches), dtype=np.int64)
+
+    for c in range(1, n_comp + 1):
+        mask = labeled == c
+        idx_c = np.argwhere(mask)
+        centers_c = origin_mm + (idx_c + 0.5) * dx_mm
+        s = centers_c @ up
+
+        # Flow and start time for this component.
+        assigned = branch_comp == (c - 1)
+        if assigned.any():
+            q_c = float(branch_q[assigned].sum())
+            t_start_c = float(np.min(branch_open[assigned]))
+        else:
+            q_c = total_q
+            t_start_c = 0.0
+        q_c = max(q_c, 1e-18)
+
+        # Bin cells by gravity projection; each bin is one layer of thickness dx.
+        bin_idx = np.floor(s / max(dx_mm, 1e-9)).astype(np.int64)
+        bin_min = int(bin_idx.min())
+        rel = bin_idx - bin_min
+        counts = np.bincount(rel)
+        A_layers = counts.astype(np.float64) * area_per_cell
+        dV = A_layers * dx_m
+        # Cumulative volume up to the top of each layer.
+        cumV = np.cumsum(dV)
+        # Fill time at the centre of each layer.
+        half_dV = 0.5 * dV
+        t_layer = t_start_c + (cumV - half_dV) / q_c
+
+        rel_all = rel
+        fill_part[mask] = t_layer[rel_all]
+
+    return fill_part
+
+
 def _compute_fill_time_volume_layer(
     grid: np.ndarray,
     origin_mm: np.ndarray,
@@ -3083,7 +3183,7 @@ def _compute_fill_time_volume_layer(
             part_mask = (grid == int(BodyType.PART)) & cavity
 
         if part_mask.any():
-            fill_part = _part_fill_fast_marching(
+            fill_part = _part_fill_volume_level(
                 grid,
                 part_mask,
                 origin_mm,
