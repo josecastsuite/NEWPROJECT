@@ -2294,14 +2294,15 @@ def analyze(
             # Where the pressure head cannot drive the shrinkage demand through the
             # mushy-zone resistance, the pore volume grows.  Amplify darcy_factor
             # around this hot spot with a Gaussian falloff so the amplification is
-            # strongest at the hot-spot centre and vanishes within a few moduli,
-            # instead of filling the entire sphere uniformly.
+            # strongest at the hot-spot centre and vanishes within about one local
+            # modulus.  A high local Niyama value suppresses the amplification, because
+            # a strong thermal gradient can feed shrinkage even when the pressure
+            # head is marginal.
             if feedable_fraction < 1.0:
                 local_factor = 1.0 / max(float(feedable_fraction), 0.1)
-                # Darcy amplification should be concentrated at the hot-spot
-                # centre and decay within about one local modulus, not blanket the
-                # whole feeding-distance sphere.
-                radius_vox = max(1.5 * hs.m_value_mm / dx, 3.0)
+                # Shrink affected radius to one local modulus; decay so 90% of the
+                # extra amplification is within ~0.4 M.
+                radius_vox = max(1.0 * hs.m_value_mm / dx, 3.0)
                 centre = np.array(vox, dtype=np.float64)
                 zz, yy, xx = np.indices(grid.shape, dtype=np.float64)
                 dist2 = (
@@ -2309,9 +2310,22 @@ def analyze(
                     + (yy - centre[1]) ** 2
                     + (xx - centre[2]) ** 2
                 )
-                falloff = np.exp(-(16.0 * dist2) / (radius_vox ** 2 + 1e-9))
+                falloff = np.exp(-(24.0 * dist2) / (radius_vox ** 2 + 1e-9))
+
+                # Niyama damping: at N >= niyama_macro the feeding gradient alone
+                # is sufficient, so Darcy amplification is zero.  At lower N it ramps
+                # up linearly.
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    niyama_ratio = niyama / max(float(alloy.niyama_macro), 1e-9)
+                niyama_ratio = np.nan_to_num(niyama_ratio, nan=0.0, posinf=0.0, neginf=0.0)
+                niyama_penalty = np.clip(1.0 - niyama_ratio, 0.0, 1.0)
+                # Only act on metal/part voxels; valid mask in compute_pore_size
+                # will ignore the rest, but keep the array clean anyway.
+                niyama_penalty = np.where(part_mask, niyama_penalty, 0.0)
+
                 darcy_factor = np.maximum(
-                    darcy_factor, 1.0 + (local_factor - 1.0) * falloff
+                    darcy_factor,
+                    1.0 + (local_factor - 1.0) * falloff * niyama_penalty,
                 )
 
             hs.curvature_mean = _sample_field_at_position(
