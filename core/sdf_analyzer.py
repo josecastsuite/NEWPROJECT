@@ -456,29 +456,29 @@ def compute_pore_size(
         gp_pct = np.where(valid, gp_pct * feed_factor * darcy_factor, 0.0)
     else:
         gp_pct = np.where(valid, gp_pct * feed_factor, 0.0)
+    # Total shrinkage porosity cannot exceed the alloy's total solidification
+    # shrinkage, even where feeding is completely blocked.
+    gp_pct = np.clip(gp_pct, 0.0, b0)
 
     # Convert predicted volume percentage to a physical pore size.
-    # gp is in percent; gp_frac is the volume fraction.
-    gp_frac = np.where(valid, gp_pct / 100.0, 0.0)
-
-    # Local characteristic length: a shrinkage pore cannot be larger than the
-    # local section thickness (2*M_mod) but micro-pores are bounded by SDAS.
+    # The alloy's `pore_size_um_per_porosity_pct` calibrates the representative
+    # pore diameter directly from the predicted pore volume percentage; e.g.
+    # 1 % porosity -> 1000 um for the default alloy calibration.  This avoids
+    # the previous over-estimate caused by taking the whole section thickness
+    # (2*M_mod) as the pore spacing, which produced pores as large as the wall.
     sdas_um = alloy.dendrite_spacing_mm * 1000.0
-    L_um = (
-        np.maximum(2.0 * M_mod * 1000.0, sdas_um)
-        * alloy.pore_size_length_factor
-    )
-
-    # Shrinkage pore diameter from volume fraction using a spherical-equivalent
-    # cube-root scaling: d = cbrt(6/pi * gp) * L.
-    with np.errstate(divide="ignore", invalid="ignore"):
-        d_shrinkage_um = np.where(
-            valid,
-            alloy.pore_size_cube_root_factor
-            * np.cbrt(np.maximum(6.0 / np.pi * gp_frac, 0.0))
-            * L_um,
+    max_d_um = np.maximum(2.0 * M_mod * 1000.0, sdas_um)
+    d_shrinkage_um = np.where(
+        valid,
+        np.clip(
+            gp_pct
+            * alloy.pore_size_um_per_porosity_pct
+            * alloy.pore_size_length_factor,
             0.0,
-        )
+            max_d_um,
+        ),
+        0.0,
+    )
     d_shrinkage_um = np.nan_to_num(d_shrinkage_um, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Gas/oxide micro-porosity baseline: always present, larger in thicker /
