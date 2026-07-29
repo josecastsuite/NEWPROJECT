@@ -2442,6 +2442,24 @@ def _compute_fill_time_graph(
             v_in[child_bidx] = max(child["v"], 1e-6)
             queue.append(child_bidx)
 
+    # Synchronize sibling gates fed by the same parent: wait until the metal
+    # front reaches the farthest gate so they all start filling together.  This
+    # avoids the visually absurd "first one gate then another" sequence.
+    if t_entry:
+        parent_to_children: Dict[int, List[int]] = {}
+        for parent_bidx, childs in children.items():
+            for child in childs:
+                parent_to_children.setdefault(parent_bidx, []).append(child["bidx"])
+        for child_bidx_list in parent_to_children.values():
+            if len(child_bidx_list) <= 1:
+                continue
+            valid = [c for c in child_bidx_list if c in t_entry]
+            if not valid:
+                continue
+            max_t = max(t_entry[c] for c in valid)
+            for c in valid:
+                t_entry[c] = max_t
+
     # If the graph never reaches the part, fall back to a radial fill so the
     # animation is not completely blank.
     if part_bidx not in visited:

@@ -1168,12 +1168,14 @@ class FlowAnimator(QtCore.QObject):
             active_pore = self._pore_mask_d & (self._solid_time_d <= t)
 
             # Feeder action: still-liquid risers suppress pores in their feeding
-            # range and their own metal level drops as liquid is consumed.
+            # range.  The riser's own metal level drops from the top as liquid is
+            # consumed, rather than the whole volume shrinking uniformly.
             ft = self._fill_time_d
             st = self._solid_time_d
             metal = self._filled_d
             riser = (self._grid_d == int(BodyType.RISER)) & metal
-            liquid_riser = riser & (st > t) & (ft <= t)
+            lf = self._riser_liquid_fraction(t, ft, st)
+            liquid_riser = riser & (lf > 0.5) & (ft <= t)
             if liquid_riser.any() and self._dist_to_riser_d is not None:
                 feed_distance_mm = max(
                     4.0 * getattr(self._result, "dominant_m_mm", 0.0), 50.0
@@ -1185,7 +1187,7 @@ class FlowAnimator(QtCore.QObject):
                 fed = (
                     (liquid_riser_dist <= feed_distance_mm)
                     & (self._grid_d == int(BodyType.PART))
-                    & (st > t)
+                    & (lf > 0.5)
                     & (ft <= t)
                 )
                 active_pore = active_pore & ~fed
@@ -1212,9 +1214,8 @@ class FlowAnimator(QtCore.QObject):
             ).astype(np.float32)
 
             # Metal level-set.  Non-riser cells stay at phi=1; riser cells use a
-            # liquid fraction so the surface shrinks as the feeder is consumed.
-            denom = np.maximum(st - ft, 1e-9)
-            lf = np.clip((st - t) / denom, 0.0, 1.0)
+            # top-down liquid level so the feeder visibly empties rather than
+            # vanishing as a single shrinking block.
             metal_field = np.where(riser, lf, metal.astype(np.float64))
             metal_field = np.where(active_pore, 0.0, metal_field)
             phi_t = ndimage.gaussian_filter(
@@ -1284,7 +1285,7 @@ class FlowAnimator(QtCore.QObject):
 
             # Feeder action overlay: lines from each still-liquid riser to the
             # hotspot it is feeding.  Line colour fades as the feeder solidifies.
-            feeder_poly = self._build_feeder_paths(t, ft, st)
+            feeder_poly = self._build_feeder_paths(t, ft, st, lf)
             if feeder_poly is not None and feeder_poly.n_points > 0:
                 if self._feeder_actor is None:
                     self._feeder_actor = self._viewer.add_mesh(
@@ -1358,8 +1359,64 @@ class FlowAnimator(QtCore.QObject):
 
         self._viewer.render()
 
-    def _build_feeder_paths(
+    def _riser_liquid_fraction(
         self, t: float, ft: np.ndarray, st: np.ndarray
+    ) -> np.ndarray:
+        """Return a per-voxel liquid fraction for riser cells.
+
+        The liquid level drops from the top of each riser component toward the
+        bottom as time passes from fill_time to solid_time.  Non-riser cells are
+        assigned 1.0 (treated as fully liquid metal).
+        """
+        lf = np.ones_like(ft, dtype=np.float64)
+        if self._grid_d is None or self._base_image is None:
+            return lf
+
+        metal = ft < self._sentinel
+        riser = (self._grid_d == int(BodyType.RISER)) & metal
+        if not riser.any():
+            return lf
+
+        g_norm = float(np.linalg.norm(self._gravity))
+        g_u = (
+            self._gravity / g_norm
+            if g_norm > 1e-12
+            else np.array([0.0, 0.0, -1.0], dtype=np.float64)
+        )
+
+        shape = ft.shape
+        indices = np.indices(shape, dtype=np.float64)
+        spacing = np.asarray(self._base_image.spacing, dtype=np.float64)
+        origin_c = np.asarray(self._base_image.origin, dtype=np.float64)
+        centers = origin_c[:, None, None, None] + (indices + 0.5) * spacing[
+            :, None, None, None
+        ]
+        # Vertical coordinate: larger value = higher against gravity.
+        proj = (centers * (-g_u[:, None, None, None])).sum(axis=0)
+
+        labeled, n = ndimage.label(riser, structure=np.ones((3, 3, 3), dtype=np.int32))
+        for i in range(1, n + 1):
+            mask = labeled == i
+            z = proj[mask]
+            z_min = float(z.min())
+            z_max = float(z.max())
+            if z_max <= z_min:
+                continue
+            ft_comp = float(ft[mask].min())
+            st_comp = float(st[mask].max())
+            if t <= ft_comp:
+                continue
+            if t >= st_comp or (st_comp - ft_comp) <= 1e-12:
+                lf[mask] = 0.0
+                continue
+            level = z_max - (z_max - z_min) * (
+                (t - ft_comp) / (st_comp - ft_comp)
+            )
+            lf[mask] = (z <= level).astype(np.float64)
+        return lf
+
+    def _build_feeder_paths(
+        self, t: float, ft: np.ndarray, st: np.ndarray, lf: np.ndarray
     ) -> Optional[pv.PolyData]:
         """Build tube/line geometry from each still-liquid riser to its hotspot."""
         if self._result is None or not self._result.riser_results:
@@ -1369,10 +1426,13 @@ class FlowAnimator(QtCore.QObject):
             return None
 
         riser = (self._grid_d == int(BodyType.RISER)) & metal
-        if not riser.any():
+        liquid_riser = riser & (lf > 0.5) & (ft <= t)
+        if not liquid_riser.any():
             return None
 
-        labeled, n = ndimage.label(riser, structure=np.ones((3, 3, 3), dtype=np.int32))
+        labeled, n = ndimage.label(
+            liquid_riser, structure=np.ones((3, 3, 3), dtype=np.int32)
+        )
         if n == 0:
             return None
 
@@ -1395,16 +1455,14 @@ class FlowAnimator(QtCore.QObject):
                 continue
             if st[idx] <= t or ft[idx] > t:
                 continue
-            lf = float(
-                np.clip(
-                    (st[idx] - t) / max(st[idx] - ft[idx], 1e-9), 0.0, 1.0
-                )
-            )
+            lf_val = float(lf[idx])
             centroid_mm = origin_c + (centroid_vox + 0.5) * spacing
             # Prefer the hotspot recorded by the riser design engine.
             target_mm: Optional[np.ndarray] = None
             if i - 1 < len(self._result.riser_results):
-                target_arr = self._result.riser_results[i - 1].nearest_hotspot_position_mm
+                target_arr = self._result.riser_results[
+                    i - 1
+                ].nearest_hotspot_position_mm
                 if target_arr is not None and target_arr.size >= 3:
                     target_mm = np.asarray(target_arr[:3], dtype=np.float64)
             # Fallback to nearest hot spot.
@@ -1424,7 +1482,7 @@ class FlowAnimator(QtCore.QObject):
             points.append(centroid_mm)
             points.append(target_mm)
             lines.extend([2, base, base + 1])
-            scalars.extend([lf, lf])
+            scalars.extend([lf_val, lf_val])
 
         if not points:
             return None
