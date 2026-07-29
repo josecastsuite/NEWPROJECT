@@ -1,6 +1,7 @@
 set(JOSECAST_SOURCES
     bindings.cpp
     voxelizer.cpp
+    darcy_solver.cpp
 )
 
 nanobind_add_module(josecast_core ${JOSECAST_SOURCES})

@@ -512,6 +512,33 @@ def _build_laplace_matrix(
     return A, rhs, flat_idx, dirichlet_unknowns, dirichlet_value[cavity]
 
 
+def _solve_pressure_cpp(core, A_spd, b_spd, n_red):
+    """Try the C++ AMGCL BiCGStab+AMG pressure solver."""
+    try:
+        # Ensure CSR arrays are contiguous and typed for nanobind/AMGCL.
+        A = A_spd.astype(np.float64, copy=False)
+        if not A.has_sorted_indices:
+            A.sort_indices()
+        indptr = A.indptr.astype(np.int64)
+        indices = A.indices.astype(np.int64)
+        data = A.data.astype(np.float64)
+        rhs = np.ascontiguousarray(b_spd, dtype=np.float64)
+
+        max_iter = max(1000, min(3000, n_red + 500))
+        x = core.solve_pressure(indptr, indices, data, rhs, max_iter, 1e-7, 1e-12)
+
+        # Guard against an unconverged or nonsensical return.
+        if not np.isfinite(x).all():
+            raise RuntimeError("C++ pressure solution contains non-finite values")
+        resid = np.linalg.norm(A.dot(x) - rhs) / (np.linalg.norm(rhs) + 1e-18)
+        if resid > 1e-3:
+            raise RuntimeError(f"C++ pressure residual too large: {resid}")
+        return x
+    except Exception as exc:
+        print(f"[Darcy solver] C++ AMGCL fallback: {exc}")
+        return None
+
+
 def _solve_pressure(
     A: csr_matrix,
     rhs: np.ndarray,
@@ -543,6 +570,17 @@ def _solve_pressure(
         red[0] = False
 
     def _cg_solve(A_spd, b_spd, n_red):
+        # 0) C++ AMGCL solver (OpenVDB build path) when available.
+        if os.environ.get("JOSECAST_USE_CPP_DARCY", "1") != "0":
+            try:
+                from core.cpp_bridge import JOSECAST_CORE
+                if JOSECAST_CORE is not None:
+                    x = _solve_pressure_cpp(JOSECAST_CORE, A_spd, b_spd, n_red)
+                    if x is not None:
+                        return x
+            except Exception as exc:
+                print(f"[Darcy solver] C++ AMGCL exception: {exc}")
+
         # 1) Jacobi-preconditioned CG.
         try:
             diag = A_spd.diagonal()

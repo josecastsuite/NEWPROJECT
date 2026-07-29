@@ -4,6 +4,7 @@
 #include <nanobind/stl/tuple.h>
 
 #include "josecast/voxelizer.h"
+#include "josecast/darcy_solver.h"
 
 namespace nb = nanobind;
 
@@ -18,4 +19,9 @@ NB_MODULE(josecast_core, m) {
         .def("build", &josecast::Voxelizer::build,
              nb::arg("voxel_size"), nb::arg("origin"), nb::arg("dims"),
              "Returns (grid, body_index, sdf) as 3-D numpy arrays.");
+
+    m.def("solve_pressure", &josecast::solve_pressure,
+          nb::arg("indptr"), nb::arg("indices"), nb::arg("data"), nb::arg("rhs"),
+          nb::arg("max_iter") = 1000, nb::arg("rtol") = 1e-5, nb::arg("abstol") = 1e-12,
+          "Solve a sparse symmetric-positive-definite pressure system with AMGCL (BiCGStab + AMG).");
 }
