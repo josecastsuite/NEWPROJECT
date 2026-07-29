@@ -2729,6 +2729,128 @@ def _geodesic_gating_time(
     return T
 
 
+def _gating_volume_time(
+    grid: np.ndarray,
+    body_index: np.ndarray,
+    bodies: List[Body],
+    origin_mm: np.ndarray,
+    dx_mm: float,
+    source_bidx: int,
+    source_q: float,
+    source_centroid: np.ndarray,
+    children: Dict[int, List[Dict]],
+    q_in: Dict[int, float],
+    entry_point: Dict[int, np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return gating fill times and per-body entry/exit times.
+
+    Each gating body is treated as a plug-flow vessel: the front reaches the
+    body exit after the body volume has been filled, ``t_exit = t_enter + V/Q``.
+    For a common manifold (one parent, several children), all children start
+    at the same ``t_exit`` of the parent, so sibling ingates open together.
+    """
+    shape = grid.shape
+    n_bodies = len(bodies)
+    dx_m = dx_mm / 1000.0
+    cell_vol = dx_m ** 3
+    cavity = (grid > 0) & (grid != int(BodyType.CORE))
+
+    # Body volumes from the voxel grid.
+    body_vol = np.zeros(n_bodies, dtype=np.float64)
+    for b in range(n_bodies):
+        body_vol[b] = float(np.sum((body_index == b) & cavity)) * cell_vol
+
+    # Build parent map and weighted entry points for merged bodies.
+    parents: Dict[int, List[Tuple[int, float]]] = {}
+    entry_wsum: Dict[int, Tuple[np.ndarray, float]] = {}
+    for parent, childs in children.items():
+        for c in childs:
+            cb = c["bidx"]
+            q = float(c["q"])
+            point = np.asarray(c["point"], dtype=np.float64)
+            if cb is None:
+                continue
+            parents.setdefault(cb, []).append((parent, q))
+            ptsum, wsum = entry_wsum.get(cb, (np.zeros(3, dtype=np.float64), 0.0))
+            entry_wsum[cb] = (ptsum + point * q, wsum + q)
+    for b, (ptsum, wsum) in entry_wsum.items():
+        if wsum > 1e-18:
+            entry_point[b] = ptsum / wsum
+    entry_point[source_bidx] = source_centroid
+
+    # Default exit point = body centroid; for bodies with children use the
+    # flow-weighted average of the child contact points.
+    exit_point: Dict[int, np.ndarray] = {}
+    for b in range(n_bodies):
+        idx = np.argwhere((body_index == b) & cavity)
+        if idx.size:
+            centers = origin_mm + (idx + 0.5) * dx_mm
+            exit_point[b] = centers.mean(axis=0)
+        else:
+            exit_point[b] = np.zeros(3, dtype=np.float64)
+    for parent, childs in children.items():
+        if not childs:
+            continue
+        ptsum = np.zeros(3, dtype=np.float64)
+        wsum = 0.0
+        for c in childs:
+            q = float(c["q"])
+            ptsum += np.asarray(c["point"], dtype=np.float64) * q
+            wsum += q
+        if wsum > 1e-18:
+            exit_point[parent] = ptsum / wsum
+
+    # Through-flow per body (sum of incoming flows).
+    Q = np.zeros(n_bodies, dtype=np.float64)
+    Q[source_bidx] = source_q
+    for b, flows in parents.items():
+        Q[b] = sum(q for _, q in flows)
+    for b, q in q_in.items():
+        Q[b] = max(Q[b], q)
+
+    t_enter = np.full(n_bodies, np.inf, dtype=np.float64)
+    t_exit = np.full(n_bodies, np.inf, dtype=np.float64)
+    visited = np.zeros(n_bodies, dtype=bool)
+
+    def _visit(bidx: int) -> None:
+        if bidx < 0 or bidx >= n_bodies or visited[bidx]:
+            return
+        for p, _ in parents.get(bidx, []):
+            _visit(p)
+        visited[bidx] = True
+        if bidx == source_bidx:
+            t_enter[bidx] = 0.0
+        else:
+            parent_exits = [t_exit[p] for p, _ in parents.get(bidx, []) if np.isfinite(t_exit[p])]
+            t_enter[bidx] = float(max(parent_exits)) if parent_exits else 0.0
+        t_exit[bidx] = t_enter[bidx] + body_vol[bidx] / max(Q[bidx], 1e-18)
+
+    _visit(source_bidx)
+
+    # Per-cell gating fill time, linear from entry to exit along the local flow.
+    T = np.full(shape, np.inf, dtype=np.float64)
+    for b in range(n_bodies):
+        if not np.isfinite(t_enter[b]) or not np.isfinite(t_exit[b]):
+            continue
+        mask = (body_index == b) & cavity
+        if not mask.any():
+            continue
+        p0 = entry_point.get(b, exit_point[b])
+        p1 = exit_point.get(b, exit_point[b])
+        d = p1 - p0
+        d2 = float(np.dot(d, d))
+        idx_b = np.argwhere(mask)
+        centers = origin_mm + (idx_b + 0.5) * dx_mm
+        if d2 < 1e-6:
+            T[mask] = t_exit[b] if b != source_bidx else t_enter[b]
+            continue
+        coord = ((centers - p0) @ d) / d2
+        coord = np.clip(coord, 0.0, 1.0)
+        T[mask] = t_enter[b] + coord * (t_exit[b] - t_enter[b])
+
+    return T, t_enter, t_exit
+
+
 def _part_fill_fast_marching(
     grid: np.ndarray,
     part_mask: np.ndarray,
@@ -2965,15 +3087,17 @@ def _part_fill_volume_level(
         centers_c = origin_mm + (idx_c + 0.5) * dx_mm
         s = centers_c @ up
 
-        # Flow and start time for this component.
+        # Build the step-wise inlet schedule for this component.
         assigned = branch_comp == (c - 1)
         if assigned.any():
-            q_c = float(branch_q[assigned].sum())
-            t_start_c = float(np.min(branch_open[assigned]))
+            events = sorted(
+                zip(
+                    branch_open[assigned].tolist(),
+                    branch_q[assigned].tolist(),
+                )
+            )
         else:
-            q_c = total_q
-            t_start_c = 0.0
-        q_c = max(q_c, 1e-18)
+            events = [(0.0, total_q)]
 
         # Bin cells by gravity projection; each bin is one layer of thickness dx.
         bin_idx = np.floor(s / max(dx_mm, 1e-9)).astype(np.int64)
@@ -2982,16 +3106,62 @@ def _part_fill_volume_level(
         counts = np.bincount(rel)
         A_layers = counts.astype(np.float64) * area_per_cell
         dV = A_layers * dx_m
-        # Cumulative volume up to the top of each layer.
-        cumV = np.cumsum(dV)
-        # Fill time at the centre of each layer.
-        half_dV = 0.5 * dV
-        t_layer = t_start_c + (cumV - half_dV) / q_c
+
+        # Cumulative volume up to the centre of each layer.
+        cumV = np.cumsum(dV) - 0.5 * dV
+        cumV = np.maximum(cumV, 0.0)
+
+        # Convert cumulative volume to time for a step-wise inlet flow.
+        t_layer = _volume_to_time(cumV, events)
 
         rel_all = rel
         fill_part[mask] = t_layer[rel_all]
 
     return fill_part
+
+
+def _volume_to_time(
+    V: np.ndarray,
+    events: List[Tuple[float, float]],
+) -> np.ndarray:
+    """Solve ``V = ∫ Q(t) dt`` for a piecewise-constant inlet schedule.
+
+    ``events`` is a sorted list of ``(t_open, q)`` pairs.  At each ``t_open`` the
+    flow ``q`` is added to the active flow.  ``V`` is the cumulative volume to be
+    filled; the returned array is the time at which each volume has been added.
+    """
+    if not events:
+        return np.full_like(V, np.inf)
+    # Remove zero-flow events that have duplicate times; keep the earliest t_open.
+    events = sorted(events)
+    t_starts = np.array([e[0] for e in events], dtype=np.float64)
+    q_vals = np.array([e[1] for e in events], dtype=np.float64)
+    # Cumulative active flow during each interval.
+    Q_cum = np.cumsum(q_vals)
+    # End time of each interval (start of next event), inf for the last.
+    t_ends = np.empty_like(t_starts)
+    t_ends[:-1] = t_starts[1:]
+    t_ends[-1] = np.inf
+    # Volume capacity of each finite interval.
+    dt = t_ends[:-1] - t_starts[:-1]
+    capacity = Q_cum[:-1] * dt
+    cum_capacity = np.cumsum(np.concatenate(([0.0], capacity)))
+    # Per layer, find which interval contains the target volume.
+    out = np.empty_like(V, dtype=np.float64)
+    out[:] = np.inf
+    for i in range(len(events)):
+        if i < len(events) - 1:
+            lo = cum_capacity[i]
+            hi = cum_capacity[i + 1]
+            in_interval = (V >= lo - 1e-15) & (V < hi)
+            Q = max(Q_cum[i], 1e-18)
+            out[in_interval] = t_starts[i] + (V[in_interval] - lo) / Q
+        else:
+            lo = cum_capacity[i]
+            Q = max(Q_cum[i], 1e-18)
+            in_last = V >= lo - 1e-15
+            out[in_last] = t_starts[i] + (V[in_last] - lo) / Q
+    return out
 
 
 def _compute_fill_time_volume_layer(
@@ -3132,9 +3302,19 @@ def _compute_fill_time_volume_layer(
                 source_mask = np.zeros_like(sm)
                 source_mask[best] = True
 
-    # Geodesic arrival time through the gating system (sprue, runners, ingates).
-    T_gating = _geodesic_gating_time(
-        grid, body_index, bodies, gating_nodes, source_mask, dx_mm
+    # Volume/continuity arrival time through the gating system.
+    T_gating, t_enter_arr, t_exit_arr = _gating_volume_time(
+        grid,
+        body_index,
+        bodies,
+        origin_mm,
+        dx_mm,
+        source_bidx,
+        source_q,
+        source_centroid,
+        children,
+        q_in,
+        entry_point,
     )
 
     gating_types = {
@@ -3158,17 +3338,21 @@ def _compute_fill_time_volume_layer(
     # Entry time of each gating body (used for ingate priming).
     t_entry: Dict[int, float] = {source_bidx: 0.0} if source_bidx is not None else {}
     for bidx in range(n_bodies):
-        mask = _body_mask(bidx) & np.isfinite(T_gating)
-        if mask.any():
-            t_entry[bidx] = float(np.min(T_gating[mask]))
+        if bidx == source_bidx:
+            continue
+        if np.isfinite(t_enter_arr[bidx]):
+            mask = _body_mask(bidx)
+            if mask.any():
+                t_entry[bidx] = float(t_enter_arr[bidx])
 
-    # Compute the time each ingate is fully primed (last cell of the parent body).
+    # Compute the time each ingate is fully primed (body exit time from the
+    # volume/continuity tree).  Sibling ingates fed by the same manifold will
+    # therefore start together.
     for branch in ingate_branches:
         parent_bidx = branch.get("parent_bidx")
         if parent_bidx is not None and 0 <= parent_bidx < n_bodies:
-            parent_mask = _body_mask(parent_bidx) & np.isfinite(T_gating)
-            if parent_mask.any():
-                branch["t_open"] = float(np.max(T_gating[parent_mask]))
+            if np.isfinite(t_exit_arr[parent_bidx]):
+                branch["t_open"] = float(t_exit_arr[parent_bidx])
             else:
                 branch["t_open"] = t_entry.get(parent_bidx, 0.0)
         else:
