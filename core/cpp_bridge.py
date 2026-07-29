@@ -11,10 +11,11 @@ from core.types import Body, BodyType
 
 def _find_core_module():
     """Locate the compiled josecast_core shared module."""
-    # When running from the repo, the build tree is expected under cpp/build/src.
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    core_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.path.join(repo_root, "cpp", "build", "src"),
+        core_dir,
     ]
     for p in candidates:
         if p not in sys.path:
