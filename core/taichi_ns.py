@@ -160,20 +160,38 @@ def _set_source_fields(is_source: ti.template(), is_wall: ti.template()):
 @ti.kernel
 def _set_source_vel(vel: ti.template(), phi: ti.template(),
                     is_source: ti.template(), is_wall: ti.template(),
-                    ux: ti.f32, uy: ti.f32, uz: ti.f32):
-    for I in ti.grouped(vel):
-        if is_source[I]:
-            vel[I] = ti.Vector([ux, uy, uz])
-            phi[I] = -1.0
-            is_wall[I] = 0
+                    ux: ti.f32, uy: ti.f32, uz: ti.f32,
+                    gx: ti.f32, gy: ti.f32, gz: ti.f32,
+                    nx: ti.i32, ny: ti.i32, nz: ti.i32):
+    for i, j, k in vel:
+        if is_source[i, j, k]:
+            vel[i, j, k] = ti.Vector([ux, uy, uz])
+            phi[i, j, k] = -1.0
+            is_wall[i, j, k] = 0
+            continue
+        # Seed the immediate downstream cell(s) with the inflow velocity so the
+        # level-set can be advected out of the inlet.  Only the cell whose
+        # upstream neighbour is a source inherits the velocity.
+        di = int(ti.cast(gx, ti.i32))
+        dj = int(ti.cast(gy, ti.i32))
+        dk = int(ti.cast(gz, ti.i32))
+        si = i - di
+        sj = j - dj
+        sk = k - dk
+        if (
+            si >= 0 and si < nx and sj >= 0 and sj < ny and sk >= 0 and sk < nz
+            and not is_wall[i, j, k]
+            and is_source[si, sj, sk]
+        ):
+            vel[i, j, k] = ti.Vector([ux, uy, uz])
 
 
 @ti.kernel
 def _add_body_force(vel: ti.template(), is_wall: ti.template(),
-                    is_source: ti.template(), dt: ti.f32,
+                    is_source: ti.template(), phi: ti.template(), dt: ti.f32,
                     gx: ti.f32, gy: ti.f32, gz: ti.f32, g_mag: ti.f32):
     for I in ti.grouped(vel):
-        if is_wall[I] or is_source[I]:
+        if is_wall[I] or is_source[I] or phi[I] >= 0.0:
             continue
         vel[I] += dt * g_mag * ti.Vector([gx, gy, gz])
 
@@ -420,6 +438,36 @@ def _filled_fraction(phi: ti.template(), is_wall: ti.template()) -> ti.f32:
 
 
 @ti.kernel
+def _extrapolate_velocity(vel: ti.template(), new_vel: ti.template(), phi: ti.template(),
+                          is_wall: ti.template(), is_source: ti.template(),
+                          nx: ti.i32, ny: ti.i32, nz: ti.i32):
+    """Extend the liquid velocity into a one-cell air band for semi-Lagrangian advection."""
+    for i, j, k in vel:
+        if is_wall[i, j, k] or is_source[i, j, k] or phi[i, j, k] < 0.0:
+            new_vel[i, j, k] = vel[i, j, k]
+            continue
+        v_sum = ti.Vector([0.0, 0.0, 0.0])
+        n = 0
+        nx_i = int(nx); ny_i = int(ny); nz_i = int(nz)
+        if i + 1 < nx_i and phi[i + 1, j, k] < 0.0 and not is_wall[i + 1, j, k]:
+            v_sum += vel[i + 1, j, k]; n += 1
+        if i - 1 >= 0 and phi[i - 1, j, k] < 0.0 and not is_wall[i - 1, j, k]:
+            v_sum += vel[i - 1, j, k]; n += 1
+        if j + 1 < ny_i and phi[i, j + 1, k] < 0.0 and not is_wall[i, j + 1, k]:
+            v_sum += vel[i, j + 1, k]; n += 1
+        if j - 1 >= 0 and phi[i, j - 1, k] < 0.0 and not is_wall[i, j - 1, k]:
+            v_sum += vel[i, j - 1, k]; n += 1
+        if k + 1 < nz_i and phi[i, j, k + 1] < 0.0 and not is_wall[i, j, k + 1]:
+            v_sum += vel[i, j, k + 1]; n += 1
+        if k - 1 >= 0 and phi[i, j, k - 1] < 0.0 and not is_wall[i, j, k - 1]:
+            v_sum += vel[i, j, k - 1]; n += 1
+        if n > 0:
+            new_vel[i, j, k] = v_sum * (1.0 / n)
+        else:
+            new_vel[i, j, k] = vel[i, j, k]
+
+
+@ti.kernel
 def _zero_vel_air(vel: ti.template(), phi: ti.template(), is_wall: ti.template()):
     for I in ti.grouped(vel):
         if is_wall[I] or phi[I] >= 0.0:
@@ -434,9 +482,10 @@ def _zero_fields(phi: ti.template(), fill_time: ti.template(), vel: ti.template(
         vel[I] = ti.Vector([0.0, 0.0, 0.0])
 
 
-def _pressure_projection_sparse(
+def _pressure_projection_jacobi(
     vel,
     pressure,
+    new_pressure,
     div,
     phi,
     is_wall,
@@ -444,75 +493,20 @@ def _pressure_projection_sparse(
     nx,
     ny,
     nz,
+    iters: int,
 ):
-    """Solve the Poisson equation A p = div on the current fluid region.
+    """Solve ∇·u = 0 in the metal region with damped Jacobi iterations.
 
-    The discrete Laplacian uses a 7-point stencil with p = 0 Dirichlet on
-    air/wall neighbours and Neumann (no contribution) on domain boundaries.
-    Solving on the fluid subset only makes the matrix small and keeps the free
-    surface boundary condition exact.
+    A pure Taichi pressure projection avoids rebuilding a sparse matrix at each
+    time step and is much faster on moderate grids.  The free surface (phi>=0)
+    and walls are treated as p=0 Dirichlet points, so the velocity correction
+    only acts inside the liquid.
     """
-    if sp is None or spsolve is None:
-        return
-
-    div_np = div.to_numpy().astype(np.float64)
-    phi_np = phi.to_numpy()
-    wall_np = is_wall.to_numpy().astype(bool)
-    fluid = (phi_np < 0.0) & ~wall_np
-    if not fluid.any():
-        pressure.from_numpy(np.zeros(phi_np.shape, dtype=np.float32))
-        return
-
-    idx = np.full(phi_np.shape, -1, dtype=np.int32)
-    idx[fluid] = np.arange(int(fluid.sum()))
-
-    i, j, k = np.indices((nx, ny, nz), dtype=np.int32)
-    i_f = i[fluid]
-    j_f = j[fluid]
-    k_f = k[fluid]
-    r = idx[fluid]
-    b = div_np[fluid]
-
-    row_arr = []
-    col_arr = []
-    data_arr = []
-    ones = np.ones(r.shape[0], dtype=np.float64)
-    m_ones = -np.ones(r.shape[0], dtype=np.float64)
-
-    for di, dj, dk in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)):
-        ni = i_f + di
-        nj = j_f + dj
-        nk = k_f + dk
-        valid = (ni >= 0) & (ni < nx) & (nj >= 0) & (nj < ny) & (nk >= 0) & (nk < nz)
-        nb_idx = np.full(r.shape[0], -1, dtype=np.int32)
-        nb_idx[valid] = idx[ni[valid], nj[valid], nk[valid]]
-        fluid_nb = valid & (nb_idx >= 0)
-        non_fluid_nb = valid & (nb_idx < 0)
-        if fluid_nb.any():
-            row_arr.append(r[fluid_nb])
-            col_arr.append(nb_idx[fluid_nb])
-            data_arr.append(np.ones(fluid_nb.sum(), dtype=np.float64))
-            row_arr.append(r[fluid_nb])
-            col_arr.append(r[fluid_nb])
-            data_arr.append(-np.ones(fluid_nb.sum(), dtype=np.float64))
-        if non_fluid_nb.any():
-            row_arr.append(r[non_fluid_nb])
-            col_arr.append(r[non_fluid_nb])
-            data_arr.append(-np.ones(non_fluid_nb.sum(), dtype=np.float64))
-
-    rows = np.concatenate(row_arr) if row_arr else np.zeros(0, dtype=np.int32)
-    cols = np.concatenate(col_arr) if col_arr else np.zeros(0, dtype=np.int32)
-    data = np.concatenate(data_arr) if data_arr else np.zeros(0, dtype=np.float64)
-
-    N = int(fluid.sum())
-    A = sp.csr_matrix((data, (rows, cols)), shape=(N, N))
-    # Small regularisation protects against a fully-enclosed fluid component.
-    A = A + sp.diags(np.ones(N, dtype=np.float64) * 1e-12)
-
-    p = spsolve(A, b)
-    p_full = np.zeros(phi_np.shape, dtype=np.float64)
-    p_full[fluid] = p
-    pressure.from_numpy(p_full.astype(np.float32))
+    pressure.fill(0.0)
+    new_pressure.fill(0.0)
+    for _ in range(iters):
+        _pressure_jacobi(pressure, new_pressure, div, phi, is_wall, nx, ny, nz)
+        pressure, new_pressure = new_pressure, pressure
     _subtract_gradient(vel, pressure, phi, is_wall, is_source, nx, ny, nz)
 
 
@@ -623,26 +617,32 @@ def solve(
         if dt <= 0.0:
             break
 
-        _set_source_vel(vel, phi, is_source, is_wall, ux, uy, uz)
-        _add_body_force(vel, is_wall, is_source, dt, gx, gy, gz, g_mag)
+        _set_source_vel(vel, phi, is_source, is_wall, ux, uy, uz, gx, gy, gz, nx, ny, nz)
+        _add_body_force(vel, is_wall, is_source, phi, dt, gx, gy, gz, g_mag)
         _advect_vel(vel, new_vel, dt, nx, ny, nz, is_wall, is_source)
         vel, new_vel = new_vel, vel
-        _set_source_vel(vel, phi, is_source, is_wall, ux, uy, uz)
+        _set_source_vel(vel, phi, is_source, is_wall, ux, uy, uz, gx, gy, gz, nx, ny, nz)
         _viscosity_step(vel, new_vel, is_wall, is_source, dt, dx_grid, nu_grid)
         vel, new_vel = new_vel, vel
-        _zero_vel_air(vel, phi, is_wall)
         _divergence(vel, div, phi, is_wall, nx, ny, nz)
-        _pressure_projection_sparse(
-            vel, pressure, div, phi, is_wall, is_source, nx, ny, nz
+        _pressure_projection_jacobi(
+            vel, pressure, new_pressure, div, phi, is_wall, is_source, nx, ny, nz, pressure_iters
         )
-        _set_source_vel(vel, phi, is_source, is_wall, ux, uy, uz)
+        _set_source_vel(vel, phi, is_source, is_wall, ux, uy, uz, gx, gy, gz, nx, ny, nz)
+        # Extrapolate liquid velocity into the surrounding air band so the level-set
+        # can be advected by a continuous velocity field near the free surface.
+        for _ in range(3):
+            _extrapolate_velocity(vel, new_vel, phi, is_wall, is_source, nx, ny, nz)
+            vel, new_vel = new_vel, vel
+        _set_source_vel(vel, phi, is_source, is_wall, ux, uy, uz, gx, gy, gz, nx, ny, nz)
         _advect_scalar(vel, phi, new_phi, dt, nx, ny, nz, is_wall, is_source)
         phi, new_phi = new_phi, phi
-        _set_source_vel(vel, phi, is_source, is_wall, ux, uy, uz)
+        _set_source_vel(vel, phi, is_source, is_wall, ux, uy, uz, gx, gy, gz, nx, ny, nz)
         for _ in range(reinit_iters):
             _redistance_phi(phi, new_phi, is_wall, dx_grid, nx, ny, nz)
             phi, new_phi = new_phi, phi
-        _set_source_vel(vel, phi, is_source, is_wall, ux, uy, uz)
+        _set_source_vel(vel, phi, is_source, is_wall, ux, uy, uz, gx, gy, gz, nx, ny, nz)
+        _zero_vel_air(vel, phi, is_wall)
         _record_fill(phi, fill_time, t + dt)
 
         t += dt
@@ -661,11 +661,13 @@ def solve(
     vmag_out = (vmag.to_numpy() * dx).astype(np.float64)
     vel_np = (vel.to_numpy() * dx).astype(np.float64)  # (nx, ny, nz, 3)
     velocity_out = np.moveaxis(vel_np, -1, 0)  # (3, nx, ny, nz)
+    phi_out = phi.to_numpy().astype(np.float64)
 
     return {
         "fill_time": fill_out,
         "velocity_magnitude": vmag_out,
         "velocity": velocity_out,
+        "phi": phi_out,
         "success": success,
         "final_t": float(t),
         "filled_fraction": float(filled),

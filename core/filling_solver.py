@@ -2729,6 +2729,171 @@ def _geodesic_gating_time(
     return T
 
 
+def _part_fill_fast_marching(
+    grid: np.ndarray,
+    part_mask: np.ndarray,
+    origin_mm: np.ndarray,
+    dx_mm: float,
+    g: np.ndarray,
+    T_gating: np.ndarray,
+    ingate_branches: List[Dict],
+    fill_time_s: float,
+    gamma: float = 0.8,
+) -> np.ndarray:
+    """Gravity-aware 3-D fast-marching fill time inside the part.
+
+    Each ingate is a source seeded with its priming time from the gating graph.
+    The local front speed inside the part is ``Q_total / A(s)`` where ``A(s)`` is
+    the cross-sectional area of the cavity perpendicular to gravity at projection
+    ``s``.  Edge weights are anisotropic: downward edges are faster, upward edges
+    are slower, so the front naturally falls, spreads and rises like a real free
+    surface.  The final field is linearly scaled so the last cell reaches exactly
+    ``fill_time_s``.
+    """
+    shape = grid.shape
+    cavity_all = (grid > 0) & (grid != int(BodyType.CORE))
+    part = np.asarray(part_mask, dtype=bool) & cavity_all
+    idx = np.argwhere(part)
+    if idx.size == 0:
+        return np.full(shape, np.inf, dtype=np.float64)
+
+    node_id = np.full(shape, -1, dtype=np.int64)
+    node_id[idx[:, 0], idx[:, 1], idx[:, 2]] = np.arange(idx.shape[0])
+    N = idx.shape[0]
+
+    g_u = np.asarray(g, dtype=np.float64)
+    g_norm = np.linalg.norm(g_u)
+    if g_norm > 1e-12:
+        g_u = g_u / g_norm
+    else:
+        g_u = np.array([0.0, 0.0, -1.0])
+    up = -g_u
+
+    centers = origin_mm + (idx + 0.5) * dx_mm
+    s = centers @ up
+    bin_idx = np.round(s / max(dx_mm, 1e-9)).astype(np.int64)
+    unique_bins, inverse, counts = np.unique(bin_idx, return_inverse=True, return_counts=True)
+    dx_m = dx_mm / 1000.0
+    area_per_bin_m2 = counts.astype(np.float64) * (dx_m ** 2)
+
+    # Gate area from ingate data; use it as a floor so the front speed never
+    # exceeds the gate velocity in a single-voxel slice.
+    q_total = sum(max(float(b.get("q", 0.0)), 1e-18) for b in ingate_branches)
+    v_gate_max = max(max(float(b.get("v", 1.5)), 0.1) for b in ingate_branches)
+    A_gate_m2 = q_total / v_gate_max
+    base_v = q_total / np.maximum(area_per_bin_m2, A_gate_m2)
+    base_v_per_cell = base_v[inverse]
+    # Floor avoids huge edge weights in very wide sections; ceiling is the gate
+    # velocity (the front cannot outrun the metal entering the cavity).
+    base_v_per_cell = np.clip(base_v_per_cell, 1e-3, v_gate_max)
+
+    rows: List[np.ndarray] = []
+    cols: List[np.ndarray] = []
+    weights: List[np.ndarray] = []
+
+    # x-faces
+    valid_x = (node_id[:-1, :, :] >= 0) & (node_id[1:, :, :] >= 0)
+    r = node_id[:-1, :, :][valid_x]
+    c = node_id[1:, :, :][valid_x]
+    bv = 0.5 * (base_v_per_cell[r] + base_v_per_cell[c])
+    # forward: +x, backward: -x
+    gx = float(g_u[0])
+    w_forward = dx_m / (bv * np.maximum(0.1, 1.0 + gamma * gx))
+    w_back = dx_m / (bv * np.maximum(0.1, 1.0 - gamma * gx))
+    rows.extend([r, c])
+    cols.extend([c, r])
+    weights.extend([w_forward, w_back])
+
+    # y-faces
+    valid_y = (node_id[:, :-1, :] >= 0) & (node_id[:, 1:, :] >= 0)
+    r = node_id[:, :-1, :][valid_y]
+    c = node_id[:, 1:, :][valid_y]
+    bv = 0.5 * (base_v_per_cell[r] + base_v_per_cell[c])
+    gy = float(g_u[1])
+    w_forward = dx_m / (bv * np.maximum(0.1, 1.0 + gamma * gy))
+    w_back = dx_m / (bv * np.maximum(0.1, 1.0 - gamma * gy))
+    rows.extend([r, c])
+    cols.extend([c, r])
+    weights.extend([w_forward, w_back])
+
+    # z-faces
+    valid_z = (node_id[:, :, :-1] >= 0) & (node_id[:, :, 1:] >= 0)
+    r = node_id[:, :, :-1][valid_z]
+    c = node_id[:, :, 1:][valid_z]
+    bv = 0.5 * (base_v_per_cell[r] + base_v_per_cell[c])
+    gz = float(g_u[2])
+    w_forward = dx_m / (bv * np.maximum(0.1, 1.0 + gamma * gz))
+    w_back = dx_m / (bv * np.maximum(0.1, 1.0 - gamma * gz))
+    rows.extend([r, c])
+    cols.extend([c, r])
+    weights.extend([w_forward, w_back])
+
+    # Virtual source connected to part cells that touch a primed gating cell.
+    # The seed time is the earliest gating arrival in the 26-neighbourhood.
+    gating_seed = cavity_all & ~part & np.isfinite(T_gating) & (T_gating > -1e-9)
+    if gating_seed.any():
+        seed_w = np.full(shape, np.inf, dtype=np.float64)
+        seed_w[gating_seed] = T_gating[gating_seed]
+        min_seed_w = ndimage.minimum_filter(seed_w, size=3, mode="constant", cval=np.inf)
+        seed_mask = part & np.isfinite(min_seed_w)
+        seed_ids = node_id[seed_mask]
+        seed_weights = min_seed_w[seed_mask]
+    else:
+        seed_ids = np.array([], dtype=np.int64)
+        seed_weights = np.array([], dtype=np.float64)
+
+    if seed_ids.size == 0:
+        # No gating seed: use the highest part cells along -gravity.
+        part_idx = np.argwhere(part)
+        if part_idx.size == 0:
+            return np.full(shape, np.inf, dtype=np.float64)
+        centers_part = origin_mm + (part_idx + 0.5) * dx_mm
+        proj = centers_part @ (-g_u)
+        top_n = min(10, part_idx.shape[0])
+        top = part_idx[np.argpartition(-proj, top_n - 1)[:top_n]]
+        seed_ids = node_id[top[:, 0], top[:, 1], top[:, 2]]
+        seed_weights = np.zeros(top_n, dtype=np.float64)
+
+    virtual = N
+    rows.append(np.full(seed_ids.size, virtual, dtype=np.int64))
+    cols.append(seed_ids)
+    weights.append(seed_weights)
+
+    rows_a = np.concatenate(rows)
+    cols_a = np.concatenate(cols)
+    weights_a = np.concatenate(weights)
+    graph = csr_matrix(
+        (weights_a, (rows_a, cols_a)), shape=(virtual + 1, virtual + 1)
+    )
+    dist = csgraph.dijkstra(graph, directed=True, indices=virtual, return_predecessors=False)
+    if dist.ndim == 1:
+        dist = dist.reshape(1, -1)
+    part_times = dist[0, :N]
+
+    t_part_start = max(
+        (float(b.get("t_open", 0.0)) for b in ingate_branches),
+        default=0.0,
+    )
+
+    fill_part = np.full(shape, np.inf, dtype=np.float64)
+    fill_part[part] = part_times
+    fill_part[~part] = 0.0
+    fill_part[grid == int(BodyType.CORE)] = np.inf
+
+    if part.any():
+        pm = part & np.isfinite(fill_part)
+        if pm.any():
+            pmin = float(fill_part[pm].min())
+            pmax = float(fill_part[pm].max())
+            if pmax > pmin + 1e-12 and fill_time_s > t_part_start:
+                scale = (fill_time_s - t_part_start) / (pmax - pmin)
+                fill_part[pm] = t_part_start + (fill_part[pm] - pmin) * scale
+            else:
+                fill_part[pm] = fill_time_s
+
+    return fill_part
+
+
 def _compute_fill_time_volume_layer(
     grid: np.ndarray,
     origin_mm: np.ndarray,
@@ -2826,7 +2991,7 @@ def _compute_fill_time_volume_layer(
         }
         children.setdefault(up_bidx, []).append(child)
         if is_part:
-            ingate_branches.append({"parent_bidx": up_bidx, "point": point, "q": child["q"]})
+            ingate_branches.append({"parent_bidx": up_bidx, "point": point, "q": child["q"], "v": child["v"]})
         else:
             if down_bidx is not None:
                 entry_point[down_bidx] = point
@@ -2854,8 +3019,6 @@ def _compute_fill_time_volume_layer(
         if 0 <= bidx < n_bodies:
             mask &= grid == grid_type_for_bidx[bidx]
         return mask
-
-    voxel_volume_m3 = (dx_mm ** 3) / 1e9
 
     if source_mask is None or not source_mask.any():
         source_mask, _ = _select_inlet_cells(grid, cavity, g, "SPRUE_THROAT")
@@ -2899,26 +3062,20 @@ def _compute_fill_time_volume_layer(
         if mask.any():
             t_entry[bidx] = float(np.min(T_gating[mask]))
 
-    # Part: single rising level fed by all active ingates.
-    ingate_info = []
+    # Compute the time each ingate is fully primed (last cell of the parent body).
     for branch in ingate_branches:
-        parent_bidx = branch["parent_bidx"]
-        if parent_bidx not in t_entry:
-            continue
-        parent_mask = _body_mask(parent_bidx)
-        if parent_mask.any() and np.isfinite(T_gating[parent_mask]).any():
-            t_open = float(np.max(T_gating[parent_mask & np.isfinite(T_gating)]))
+        parent_bidx = branch.get("parent_bidx")
+        if parent_bidx is not None and 0 <= parent_bidx < n_bodies:
+            parent_mask = _body_mask(parent_bidx) & np.isfinite(T_gating)
+            if parent_mask.any():
+                branch["t_open"] = float(np.max(T_gating[parent_mask]))
+            else:
+                branch["t_open"] = t_entry.get(parent_bidx, 0.0)
         else:
-            t_open = t_entry.get(parent_bidx, 0.0)
-        q_i = max(branch["q"], 1e-18)
-        z_gate = float(branch["point"] @ up)
-        ingate_info.append((z_gate, q_i, t_open))
+            branch["t_open"] = 0.0
 
-    if ingate_info:
-        ingate_info.sort(key=lambda x: x[0])
-        t_part_start = max(t_open for _, _, t_open in ingate_info)
-        q_total = sum(q_i for _, q_i, _ in ingate_info)
-
+    # Part: gravity-aware 3-D fast-marching front from all primed ingates.
+    if ingate_branches:
         gating_bidx_arr = np.fromiter(t_entry.keys(), dtype=np.int64)
         on_gating = np.isin(body_index, gating_bidx_arr)
         part_mask = (grid == int(BodyType.PART)) & ~on_gating & cavity
@@ -2926,28 +3083,17 @@ def _compute_fill_time_volume_layer(
             part_mask = (grid == int(BodyType.PART)) & cavity
 
         if part_mask.any():
-            idx = np.argwhere(part_mask)
-            centers = origin_mm + (idx + 0.5) * dx_mm
-            z = centers @ up
-            z_unique, inv, counts = np.unique(
-                z, return_inverse=True, return_counts=True
+            fill_part = _part_fill_fast_marching(
+                grid,
+                part_mask,
+                origin_mm,
+                dx_mm,
+                g,
+                T_gating,
+                ingate_branches,
+                fill_time_s,
             )
-            # Cumulative number of cells below each unique z.
-            cum_counts = np.cumsum(counts) - counts
-            # Time for the middle of the slice, then scale to exact fill_time_s.
-            t_unique = (
-                t_part_start
-                + (cum_counts + 0.5 * counts) * voxel_volume_m3 / max(q_total, 1e-18)
-            )
-            span_actual = float(z.size) * voxel_volume_m3 / max(q_total, 1e-18)
-            if span_actual > 1e-18:
-                scale = fill_time_s / span_actual
-                t_unique = t_part_start + (t_unique - t_part_start) * scale
-                # Clamp to avoid tiny overshoot.
-                t_unique = np.clip(
-                    t_unique, t_part_start, t_part_start + fill_time_s
-                )
-            fill[part_mask] = t_unique[inv]
+            fill[part_mask] = fill_part[part_mask]
 
     # Risers/feeders: fill from the nearest already-filled non-riser metal.
     riser_bidx = [
@@ -4429,8 +4575,15 @@ def solve_filling_flow(
                     else 1.5
                 )
             )
+            # Initial signed-distance field: negative inside the inlet, positive
+            # in the empty cavity with distance measured in voxel units.  This
+            # gives the level-set advection a smooth, bounded interface.
             phi_vof = np.full(vof_grid.shape, 999.0, dtype=np.float64)
-            phi_vof[vof_cavity] = 1.0
+            with np.errstate(invalid="ignore"):
+                dist_to_inlet = ndimage.distance_transform_edt(
+                    vof_cavity & ~vof_inlet
+                )
+            phi_vof[vof_cavity] = dist_to_inlet[vof_cavity] - 1.0
             phi_vof[vof_inlet] = -1.0
             t_max_vof = fill_time_s * 2.0 if fill_time_s > 0.0 else 2.0
             vof_res = taichi_ns.solve(
@@ -4443,10 +4596,10 @@ def solve_filling_flow(
                 nu=mu_vof / rho_vof,
                 inflow_velocity=inflow_v,
                 t_max=t_max_vof,
-                max_steps=400,
-                pressure_iters=20,
+                max_steps=1200,
+                pressure_iters=40,
                 reinit_iters=2,
-                cfl=1.0,
+                cfl=2.0,
             )
             if vof_res is None or vof_res.get("filled_fraction", 0.0) < 1e-6:
                 vof_res = None
