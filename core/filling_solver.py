@@ -2604,6 +2604,293 @@ def _compute_fill_time_graph(
     return fill
 
 
+def _compute_fill_time_volume_layer(
+    grid: np.ndarray,
+    origin_mm: np.ndarray,
+    dx_mm: float,
+    g: np.ndarray,
+    gating_nodes: List[GatingNode],
+    bodies: List[Body],
+    body_index: Optional[np.ndarray],
+    fill_time_s: float,
+) -> np.ndarray:
+    """Volume-aware, gravity-aligned fill-time estimator.
+
+    The gating system is treated as a network of vessels that must each fill
+    before the downstream vessel can start.  Once the ingates are primed, the
+    casting cavity fills as a single rising metal level whose velocity depends
+    on the local cavity cross-section ``v(z) = Q_active / A(z)``.  This gives
+    a continuous, physically plausible front instead of separate expanding
+    spheres from each gate.
+    """
+    shape = grid.shape
+    fill = np.full(shape, np.inf, dtype=np.float64)
+    cavity = grid > 0
+    if not cavity.any() or fill_time_s <= 1e-12:
+        fill[~cavity] = 0.0
+        return fill
+
+    g_u = np.asarray(g, dtype=np.float64)
+    g_norm = float(np.linalg.norm(g_u))
+    if g_norm > 1e-12:
+        g_u = g_u / g_norm
+    else:
+        g_u = np.array([0.0, 0.0, -1.0])
+    up = -g_u
+
+    # Fallback: gravity rising front if no gating graph.
+    if not gating_nodes or body_index is None or body_index.shape != shape or not bodies:
+        idx = np.argwhere(cavity)
+        if idx.size:
+            centers = origin_mm + (idx + 0.5) * dx_mm
+            z = centers @ up
+            z_min = float(z.min())
+            z_max = float(z.max())
+            rng = max(z_max - z_min, 1e-6)
+            fill[cavity] = ((z - z_min) / rng) * fill_time_s
+        fill[~cavity] = 0.0
+        return fill
+
+    n_bodies = len(bodies)
+    name_to_bidx = {b.name: i for i, b in enumerate(bodies)}
+
+    # For each original body, take the most common reclassified grid type.
+    grid_type_for_bidx = np.zeros(n_bodies, dtype=np.int64)
+    for i in range(n_bodies):
+        sub = grid[body_index == i]
+        if sub.size:
+            pos = sub[sub > 0]
+            if pos.size:
+                grid_type_for_bidx[i] = int(np.bincount(pos).argmax())
+
+    # Parse gating graph and flows.
+    source_bidx: Optional[int] = None
+    source_q = 0.0
+    source_v = 0.0
+    source_centroid = origin_mm + 0.5 * np.asarray(shape, dtype=np.float64) * dx_mm
+    children: Dict[int, List[Dict]] = {}
+    entry_point: Dict[int, np.ndarray] = {}
+    q_in: Dict[int, float] = {}
+    ingate_branches: List[Dict] = []
+
+    for node in gating_nodes:
+        if "→" not in node.name or "→" not in node.body_type:
+            continue
+        up_name, down_name = [s.strip() for s in node.name.split("→")]
+        up_type, down_type = [s.strip() for s in node.body_type.split("→")]
+        point = np.asarray(node.centroid_mm, dtype=np.float64)
+        if up_name == "Kaynak" or "SOURCE" in up_type:
+            source_bidx = name_to_bidx.get(down_name)
+            source_q = float(node.flow_rate_m3_s)
+            source_v = float(node.velocity_m_s)
+            source_centroid = point
+            continue
+        up_bidx = name_to_bidx.get(up_name)
+        if up_bidx is None:
+            continue
+        is_part = down_name == "Parça" or down_type == "PART"
+        down_bidx = None if is_part else name_to_bidx.get(down_name)
+        child = {
+            "bidx": down_bidx,
+            "point": point,
+            "v": float(node.velocity_m_s),
+            "q": float(node.flow_rate_m3_s),
+        }
+        children.setdefault(up_bidx, []).append(child)
+        if is_part:
+            ingate_branches.append({"parent_bidx": up_bidx, "point": point, "q": child["q"]})
+        else:
+            if down_bidx is not None:
+                entry_point[down_bidx] = point
+                q_in[down_bidx] = q_in.get(down_bidx, 0.0) + child["q"]
+
+    if source_bidx is None or not (0 <= source_bidx < n_bodies) or not ingate_branches:
+        idx = np.argwhere(cavity)
+        if idx.size:
+            centers = origin_mm + (idx + 0.5) * dx_mm
+            z = centers @ up
+            z_min = float(z.min())
+            z_max = float(z.max())
+            rng = max(z_max - z_min, 1e-6)
+            fill[cavity] = ((z - z_min) / rng) * fill_time_s
+        fill[~cavity] = 0.0
+        return fill
+
+    q_in[source_bidx] = source_q
+    entry_point[source_bidx] = source_centroid
+
+    # Helper to make a body mask consistent with its grid type.
+    def _body_mask(bidx: int) -> np.ndarray:
+        mask = body_index == bidx
+        if 0 <= bidx < n_bodies:
+            mask &= grid == grid_type_for_bidx[bidx]
+        return mask
+
+    voxel_volume_m3 = (dx_mm ** 3) / 1e9
+    body_volume_m3: Dict[int, float] = {}
+    involved = set(children.keys())
+    for lst in children.values():
+        for c in lst:
+            if c["bidx"] is not None:
+                involved.add(c["bidx"])
+    involved.add(source_bidx)
+    for bidx in involved:
+        body_volume_m3[bidx] = float(_body_mask(bidx).sum()) * voxel_volume_m3
+
+    # Topological fill: a child starts only after its parent volume is full.
+    t_entry: Dict[int, float] = {source_bidx: 0.0}
+    queue = [source_bidx]
+    visited: Set[int] = {source_bidx}
+    while queue:
+        bidx = queue.pop(0)
+        for child in children.get(bidx, []):
+            child_bidx = child["bidx"]
+            if child_bidx is None:
+                continue
+            q_parent = q_in.get(bidx, source_q)
+            if bidx == source_bidx:
+                t_body = 0.0
+            else:
+                t_body = body_volume_m3.get(bidx, 0.0) / max(q_parent, 1e-18)
+            t_open = t_entry[bidx] + t_body
+            if child_bidx in visited:
+                if t_open < t_entry.get(child_bidx, float("inf")):
+                    t_entry[child_bidx] = t_open
+                continue
+            visited.add(child_bidx)
+            t_entry[child_bidx] = t_open
+            queue.append(child_bidx)
+
+    # Fill each gating body with a linear front from entry to exit.
+    for bidx in visited:
+        mask = _body_mask(bidx)
+        if not mask.any():
+            continue
+        idx = np.argwhere(mask)
+        centers = origin_mm + (idx + 0.5) * dx_mm
+        entry = entry_point.get(bidx, centers.mean(axis=0))
+        childs = children.get(bidx, [])
+        points = [c["point"] for c in childs]
+        if not points:
+            points = [centers.mean(axis=0)]
+        pts = np.vstack(points)
+        dirs = pts - entry
+        norms = np.linalg.norm(dirs, axis=1)
+        if norms.max() > 1e-12:
+            far = pts[np.argmax(norms)]
+            axis = far - entry
+            L = float(np.linalg.norm(axis))
+            if L > 1e-12:
+                dir_u = axis / L
+                proj = (centers - entry) @ dir_u
+                s = np.clip(proj / L, 0.0, 1.0)
+            else:
+                s = np.zeros(centers.shape[0])
+        else:
+            s = np.zeros(centers.shape[0])
+        if bidx == source_bidx:
+            t_body = 0.0
+        else:
+            q_parent = q_in.get(bidx, source_q)
+            t_body = body_volume_m3.get(bidx, 0.0) / max(q_parent, 1e-18)
+        fill[mask] = t_entry[bidx] + s * t_body
+
+    # Force the source body to appear full at t=0.
+    source_mask = _body_mask(source_bidx)
+    if source_mask.any():
+        fill[source_mask] = 0.0
+
+    # Part: single rising level fed by all active ingates.
+    ingate_info = []
+    for branch in ingate_branches:
+        parent_bidx = branch["parent_bidx"]
+        if parent_bidx not in t_entry:
+            continue
+        q_i = max(branch["q"], 1e-18)
+        t_open = t_entry[parent_bidx] + body_volume_m3.get(parent_bidx, 0.0) / q_i
+        z_gate = float(branch["point"] @ up)
+        ingate_info.append((z_gate, q_i, t_open))
+
+    if ingate_info:
+        ingate_info.sort(key=lambda x: x[0])
+        t_part_start = max(t_open for _, _, t_open in ingate_info)
+        q_total = sum(q_i for _, q_i, _ in ingate_info)
+
+        gating_bidx_arr = np.fromiter(visited, dtype=np.int64)
+        on_gating = np.isin(body_index, gating_bidx_arr)
+        part_mask = (grid == int(BodyType.PART)) & ~on_gating & cavity
+        if not part_mask.any():
+            part_mask = (grid == int(BodyType.PART)) & cavity
+
+        if part_mask.any():
+            idx = np.argwhere(part_mask)
+            centers = origin_mm + (idx + 0.5) * dx_mm
+            z = centers @ up
+            z_unique, inv, counts = np.unique(
+                z, return_inverse=True, return_counts=True
+            )
+            # Cumulative number of cells below each unique z.
+            cum_counts = np.cumsum(counts) - counts
+            # Time for the middle of the slice, then scale to exact fill_time_s.
+            t_unique = (
+                t_part_start
+                + (cum_counts + 0.5 * counts) * voxel_volume_m3 / max(q_total, 1e-18)
+            )
+            span_actual = float(z.size) * voxel_volume_m3 / max(q_total, 1e-18)
+            if span_actual > 1e-18:
+                scale = fill_time_s / span_actual
+                t_unique = t_part_start + (t_unique - t_part_start) * scale
+                # Clamp to avoid tiny overshoot.
+                t_unique = np.clip(
+                    t_unique, t_part_start, t_part_start + fill_time_s
+                )
+            fill[part_mask] = t_unique[inv]
+
+    # Risers/feeders: fill from the nearest already-filled non-riser metal.
+    riser_bidx = [
+        i
+        for i in range(n_bodies)
+        if grid_type_for_bidx[i] == int(BodyType.RISER) and i not in visited
+    ]
+    if riser_bidx:
+        riser_mask = np.isin(
+            body_index, np.fromiter(riser_bidx, dtype=np.int64, count=len(riser_bidx))
+        ) & cavity
+        if riser_mask.any():
+            non_riser_metal = cavity & ~riser_mask & np.isfinite(fill)
+            if non_riser_metal.any():
+                dist, indices = ndimage.distance_transform_edt(
+                    ~non_riser_metal, return_indices=True, return_distances=True
+                )
+                nearest_fill = fill[indices[0], indices[1], indices[2]]
+                travel_m = dist[riser_mask] * dx_mm / 1000.0
+                fill[riser_mask] = (
+                    nearest_fill[riser_mask]
+                    + travel_m / max(source_v, 1e-6)
+                )
+            else:
+                fill[riser_mask] = fill_time_s
+
+    fill[~cavity] = 0.0
+    inf_metal = np.isinf(fill) & cavity
+    if inf_metal.any():
+        fill[inf_metal] = fill_time_s
+
+    if cavity.any():
+        fmin = float(fill[cavity].min())
+        fmax = float(fill[cavity].max())
+        if (fmax - fmin) < 1e-3 * fill_time_s or fmin > 0.9 * fill_time_s:
+            idx = np.argwhere(cavity)
+            centers = origin_mm + (idx + 0.5) * dx_mm
+            z = centers @ up
+            z_min = float(z.min())
+            z_max = float(z.max())
+            rng = max(z_max - z_min, 1e-6)
+            fill[cavity] = ((z - z_min) / rng) * fill_time_s
+
+    return fill
+
+
 def _section_downstream_flux(
     u: np.ndarray,
     v: np.ndarray,
@@ -4018,13 +4305,12 @@ def solve_filling_flow(
         v_ingate_contact = 0.0
 
     # ------------------------------------------------------------------
-    # Graph-based fill time: use the BFS gating path and node velocities to
-    # estimate when each voxel is reached, instead of the Darcy vmag field.
-    # The part cells are filled outward from each ingate so the last cell reaches
-    # exactly ``fill_time_s``.
+    # Volume-aware graph-based fill time: gating vessels fill sequentially,
+    # then the cavity fills as a single rising metal level driven by the total
+    # ingate flow Q and local cavity cross-section A(z).
     # ------------------------------------------------------------------
     if bodies is not None and body_index is not None:
-        fill_time_fine = _compute_fill_time_graph(
+        fill_time_fine = _compute_fill_time_volume_layer(
             orig_grid,
             orig_origin,
             orig_dx,
