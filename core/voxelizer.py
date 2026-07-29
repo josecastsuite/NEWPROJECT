@@ -1,5 +1,6 @@
 """Convert a set of Body meshes into a single labelled voxel grid - JoseCast v7."""
 
+import os
 import warnings
 from typing import List, Optional, Tuple, Union
 
@@ -8,6 +9,16 @@ import trimesh
 from scipy import ndimage
 
 from core.types import Body, BodyType, BODY_METAL_TYPES
+
+
+def _maybe_cpp_bridge():
+    if os.environ.get("JOSECAST_USE_CPP_VOXELIZER", "0") == "1":
+        try:
+            from core.cpp_bridge import build_voxel_grid_cpp
+            return build_voxel_grid_cpp
+        except Exception:
+            return None
+    return None
 
 BASE_RES = 160
 MAX_RES = 2040
@@ -556,9 +567,15 @@ def build_voxel_grid(
     bbox_size = bbox_max - bbox_min
     margin = 4
 
-    grid, body_index, origin, dx, repaired_bodies = _voxelize_at_dim(
-        bodies, target_dim, margin, progress_callback, fix_mesh, conservative=conservative
-    )
+    cpp_build = _maybe_cpp_bridge()
+    if cpp_build is not None:
+        grid, body_index, origin, dx, repaired_bodies = cpp_build(
+            bodies, target_dim, progress_callback, fix_mesh, gravity_vector, conservative, margin
+        )
+    else:
+        grid, body_index, origin, dx, repaired_bodies = _voxelize_at_dim(
+            bodies, target_dim, margin, progress_callback, fix_mesh, conservative=conservative
+        )
 
     # Close any isolated internal voids created by voxelisation rounding so the
     # metal volume is a watertight solid while the outer shell stays open.

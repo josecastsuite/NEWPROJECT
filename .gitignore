@@ -12,3 +12,7 @@ sample_results/
 *.png
 *.jpg
 .DS_Store
+cpp/build/
+*.so
+*.dylib
+*.dll
