@@ -95,7 +95,7 @@ class Alloy:
     # pore_size_um_per_porosity_pct is kept for that risk reference.
     carlson_curve_key: str = "WCB"
     niyama_star_scale: float = 0.0
-    pore_size_um_per_porosity_pct: float = 1000.0
+    pore_size_um_per_porosity_pct: float = 400.0
     # Ingate/gate velocity above which surface turbulence entraps oxide films / air.
     # Campbell and Hojjat/Beckermann give ~0.45-0.5 m/s for Al; steels are less
     # oxide-sensitive, so a higher value is used for ferrous alloys.

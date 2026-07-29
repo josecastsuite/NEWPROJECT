@@ -2293,15 +2293,26 @@ def analyze(
 
             # Where the pressure head cannot drive the shrinkage demand through the
             # mushy-zone resistance, the pore volume grows.  Amplify darcy_factor
-            # around this hot spot (1/f, clamped so the factor stays finite).
+            # around this hot spot with a Gaussian falloff so the amplification is
+            # strongest at the hot-spot centre and vanishes within a few moduli,
+            # instead of filling the entire sphere uniformly.
             if feedable_fraction < 1.0:
                 local_factor = 1.0 / max(float(feedable_fraction), 0.1)
-                sphere = _sphere_mask(
-                    grid.shape,
-                    np.array(vox, dtype=np.float64),
-                    max(3.0 * hs.m_value_mm / dx, 3.0),
+                # Darcy amplification should be concentrated at the hot-spot
+                # centre and decay within about one local modulus, not blanket the
+                # whole feeding-distance sphere.
+                radius_vox = max(1.5 * hs.m_value_mm / dx, 3.0)
+                centre = np.array(vox, dtype=np.float64)
+                zz, yy, xx = np.indices(grid.shape, dtype=np.float64)
+                dist2 = (
+                    (zz - centre[0]) ** 2
+                    + (yy - centre[1]) ** 2
+                    + (xx - centre[2]) ** 2
                 )
-                darcy_factor[sphere] = np.maximum(darcy_factor[sphere], local_factor)
+                falloff = np.exp(-(16.0 * dist2) / (radius_vox ** 2 + 1e-9))
+                darcy_factor = np.maximum(
+                    darcy_factor, 1.0 + (local_factor - 1.0) * falloff
+                )
 
             hs.curvature_mean = _sample_field_at_position(
                 hs.position_mm, mean_curv, origin_mm, dx, order=1, default=0.0
