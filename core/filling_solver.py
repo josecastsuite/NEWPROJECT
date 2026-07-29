@@ -4542,7 +4542,7 @@ def solve_filling_flow(
 
             # Keep the VOF grid small enough for an interactive solve.
             vof_grid, vof_origin, vof_dx = _downsample_grid(
-                grid_c, origin_c, dx_c, max_cells=50_000
+                grid_c, origin_c, dx_c, max_cells=500_000
             )
             vof_cavity = vof_grid != BodyType.EMPTY
             vof_inlet, _ = _select_inlet_cells(
@@ -4575,6 +4575,20 @@ def solve_filling_flow(
                     else 1.5
                 )
             )
+            # Scale the VOF inflow velocity so the volumetric flow rate Q_user is
+            # preserved on the possibly-coarser VOF grid source cross-section.
+            vof_g = np.asarray(g, dtype=np.float64)
+            vof_axis = int(np.argmax(np.abs(vof_g)))
+            axes = [0, 1, 2]
+            axes.remove(vof_axis)
+            vof_A_source = np.sum(vof_inlet, axis=tuple(axes))
+            max_vof_source = int(vof_A_source.max())
+            vof_dx_m = vof_dx / 1000.0
+            if max_vof_source > 0 and Q_user > 1e-18:
+                vof_source_area_m2 = max_vof_source * vof_dx_m * vof_dx_m
+                vof_inflow_v = float(Q_user / max(vof_source_area_m2, 1e-18))
+            else:
+                vof_inflow_v = inflow_v
             # Initial signed-distance field: negative inside the inlet, positive
             # in the empty cavity with distance measured in voxel units.  This
             # gives the level-set advection a smooth, bounded interface.
@@ -4585,16 +4599,26 @@ def solve_filling_flow(
                 )
             phi_vof[vof_cavity] = dist_to_inlet[vof_cavity] - 1.0
             phi_vof[vof_inlet] = -1.0
-            t_max_vof = fill_time_s * 2.0 if fill_time_s > 0.0 else 2.0
+            # Allow enough simulation time; VOF itself is fast so a generous
+            # multiple of the gating fill time is fine.
+            if fill_time_s > 0.0 and np.isfinite(fill_time_s):
+                t_max_vof = max(2.0, fill_time_s * 4.0)
+            else:
+                est_volume_m3 = float(vof_cavity.sum()) * vof_dx_m ** 3
+                t_max_vof = (
+                    2.0
+                    if Q_user <= 1e-18
+                    else max(2.0, est_volume_m3 / Q_user * 4.0)
+                )
             vof_res = taichi_ns.solve(
                 grid=vof_grid,
                 phi_init=phi_vof,
                 source_mask=vof_inlet.astype(np.uint8),
-                dx=vof_dx / 1000.0,
+                dx=vof_dx_m,
                 g=g,
                 rho=rho_vof,
                 nu=mu_vof / rho_vof,
-                inflow_velocity=inflow_v,
+                inflow_velocity=vof_inflow_v,
                 t_max=t_max_vof,
                 max_steps=1200,
                 pressure_iters=40,
@@ -4639,10 +4663,23 @@ def solve_filling_flow(
             order=1,
         )
         fill_time_fine = np.where(fine_metal, fill_time_fine, 0.0)
+        vof_final_t = float(vof_res.get("final_t", 0.0))
+        vof_full = float(vof_res.get("filled_fraction", 0.0)) >= 0.9999
+        if vof_full and vof_final_t > 0.0:
+            # Cells missed by the coarse VOF grid (thin features) are treated as
+            # filled by the same total time; avoid letting the 1e12 sentinel leak
+            # into the reported fill time.
+            fill_time_fine = np.where(
+                fine_metal & (fill_time_fine > vof_final_t),
+                vof_final_t,
+                fill_time_fine,
+            )
         if fine_metal.any():
-            max_fill_t = float(np.nanmax(np.where(fine_metal, fill_time_fine, np.nan)))
-            if np.isfinite(max_fill_t) and max_fill_t > 0.0:
-                fill_time_s = max_fill_t
+            valid = fine_metal & (fill_time_fine < 1e9)
+            if valid.any():
+                max_fill_t = float(np.nanmax(np.where(valid, fill_time_fine, np.nan)))
+                if np.isfinite(max_fill_t) and max_fill_t > 0.0:
+                    fill_time_s = max_fill_t
 
     # Contact-node velocities / areas for every gating-gating and gating-part interface.
     # Use the solver (coarse) grid, the staggered face velocities and the FAVOR
