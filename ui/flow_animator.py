@@ -149,7 +149,7 @@ class FlowAnimator(QtCore.QObject):
         self._dx = float(result.dx_mm)
         self._shape = tuple(int(s) for s in result.grid.shape)
 
-        metal = result.grid > 0
+        metal = (result.grid > 0) & (result.grid != int(BodyType.CORE))
         if not metal.any():
             return
 
@@ -184,6 +184,9 @@ class FlowAnimator(QtCore.QObject):
         self._max_time = max(self._max_fill_time, self._max_solid_time)
         if self._max_time <= 0.0:
             return
+
+        alloy = get_alloy(getattr(result, "alloy_key", "42CrMo4"))
+        self._shrinkage_factor = getattr(alloy, "shrinkage_factor", 0.03)
 
         # ---- temperature bounds ----
         self._load_temperature_bounds(result)
@@ -1213,10 +1216,10 @@ class FlowAnimator(QtCore.QObject):
                 active_pore.astype(np.float64), sigma=self.PHI_SIGMA, mode="constant", cval=0.0
             ).astype(np.float32)
 
-            # Metal level-set.  Non-riser cells stay at phi=1; riser cells use a
-            # top-down liquid level so the feeder visibly empties rather than
-            # vanishing as a single shrinking block.
-            metal_field = np.where(riser, lf, metal.astype(np.float64))
+            # Metal level-set: keep the full casting geometry (including solid
+            # feeders) so the surface never disappears.  The riser liquid fraction
+            # is used only for the active feed-path overlay and pore suppression.
+            metal_field = metal.astype(np.float64)
             metal_field = np.where(active_pore, 0.0, metal_field)
             phi_t = ndimage.gaussian_filter(
                 metal_field,
@@ -1364,9 +1367,10 @@ class FlowAnimator(QtCore.QObject):
     ) -> np.ndarray:
         """Return a per-voxel liquid fraction for riser cells.
 
-        The liquid level drops from the top of each riser component toward the
-        bottom as time passes from fill_time to solid_time.  Non-riser cells are
-        assigned 1.0 (treated as fully liquid metal).
+        The liquid volume consumed by each riser is driven by the solidification
+        shrinkage of the part: as the part solidifies it demands liquid metal,
+        and the riser level drops from the top down by that volume.  Non-riser
+        cells are assigned 1.0 (treated as fully liquid metal).
         """
         lf = np.ones_like(ft, dtype=np.float64)
         if self._grid_d is None or self._base_image is None:
@@ -1393,8 +1397,25 @@ class FlowAnimator(QtCore.QObject):
         ]
         # Vertical coordinate: larger value = higher against gravity.
         proj = (centers * (-g_u[:, None, None, None])).sum(axis=0)
+        cell_volume_m3 = float(np.prod(spacing))
+
+        # Total shrinkage demand from the part up to time t.
+        part = (self._grid_d == int(BodyType.PART)) & metal
+        shrinkage_factor = float(getattr(self, "_shrinkage_factor", 0.03))
+        fed_volume_m3 = 0.0
+        if part.any() and shrinkage_factor > 0.0:
+            t_rel = (t - ft[part]) / np.maximum(st[part] - ft[part], 1e-12)
+            sf = np.clip(t_rel, 0.0, 1.0)
+            # Mask out cells that are not yet filled or have no solid time.
+            sf = np.where(np.isfinite(st[part]) & (ft[part] <= t), sf, 0.0)
+            fed_volume_m3 = shrinkage_factor * float(np.sum(sf)) * cell_volume_m3
 
         labeled, n = ndimage.label(riser, structure=np.ones((3, 3, 3), dtype=np.int32))
+        riser_volumes = np.array(
+            [float(np.sum(labeled == i)) * cell_volume_m3 for i in range(1, n + 1)],
+            dtype=np.float64,
+        )
+        total_riser_volume_m3 = float(np.sum(riser_volumes))
         for i in range(1, n + 1):
             mask = labeled == i
             z = proj[mask]
@@ -1409,9 +1430,35 @@ class FlowAnimator(QtCore.QObject):
             if t >= st_comp or (st_comp - ft_comp) <= 1e-12:
                 lf[mask] = 0.0
                 continue
-            level = z_max - (z_max - z_min) * (
-                (t - ft_comp) / (st_comp - ft_comp)
-            )
+
+            comp_volume_m3 = float(mask.sum()) * cell_volume_m3
+            if total_riser_volume_m3 > 0.0:
+                share_m3 = fed_volume_m3 * (comp_volume_m3 / total_riser_volume_m3)
+            else:
+                share_m3 = 0.0
+            remaining_volume_m3 = max(0.0, comp_volume_m3 - share_m3)
+
+            # No liquid left -> fully solid for this riser.
+            if remaining_volume_m3 <= 0.0:
+                lf[mask] = 0.0
+                continue
+
+            z_arr = np.asarray(z, dtype=np.float64)
+            order = np.argsort(z_arr, kind="mergesort")
+            z_sorted = z_arr[order]
+            # Cumulative volume from the bottom (lowest z) upward.
+            cumvol = (np.arange(1, z_arr.size + 1, dtype=np.float64)) * cell_volume_m3
+            if remaining_volume_m3 >= comp_volume_m3:
+                continue
+            idx = int(np.searchsorted(cumvol, remaining_volume_m3, side="left"))
+            if idx == 0:
+                level = z_sorted[0]
+            elif idx >= len(z_sorted):
+                level = z_sorted[-1]
+            else:
+                dz = z_sorted[idx] - z_sorted[idx - 1]
+                frac = (remaining_volume_m3 - cumvol[idx - 1]) / cell_volume_m3
+                level = z_sorted[idx - 1] + dz * frac
             lf[mask] = (z <= level).astype(np.float64)
         return lf
 

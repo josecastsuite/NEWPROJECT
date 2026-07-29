@@ -2313,9 +2313,10 @@ def _compute_fill_time_graph(
     """
     shape = grid.shape
     fill = np.full(shape, np.inf, dtype=np.float64)
-    cavity = grid > 0
+    cavity = (grid > 0) & (grid != int(BodyType.CORE))
     if not cavity.any() or fill_time_s <= 1e-12:
         fill[~cavity] = 0.0
+        fill[grid == int(BodyType.CORE)] = np.inf
         return fill
 
     g_u = np.asarray(g, dtype=np.float64)
@@ -2625,9 +2626,10 @@ def _compute_fill_time_volume_layer(
     """
     shape = grid.shape
     fill = np.full(shape, np.inf, dtype=np.float64)
-    cavity = grid > 0
+    cavity = (grid > 0) & (grid != int(BodyType.CORE))
     if not cavity.any() or fill_time_s <= 1e-12:
         fill[~cavity] = 0.0
+        fill[grid == int(BodyType.CORE)] = np.inf
         return fill
 
     g_u = np.asarray(g, dtype=np.float64)
@@ -2649,6 +2651,7 @@ def _compute_fill_time_volume_layer(
             rng = max(z_max - z_min, 1e-6)
             fill[cavity] = ((z - z_min) / rng) * fill_time_s
         fill[~cavity] = 0.0
+        fill[grid == int(BodyType.CORE)] = np.inf
         return fill
 
     n_bodies = len(bodies)
@@ -2714,6 +2717,7 @@ def _compute_fill_time_volume_layer(
             rng = max(z_max - z_min, 1e-6)
             fill[cavity] = ((z - z_min) / rng) * fill_time_s
         fill[~cavity] = 0.0
+        fill[grid == int(BodyType.CORE)] = np.inf
         return fill
 
     q_in[source_bidx] = source_q
@@ -2872,6 +2876,7 @@ def _compute_fill_time_volume_layer(
                 fill[riser_mask] = fill_time_s
 
     fill[~cavity] = 0.0
+    fill[grid == int(BodyType.CORE)] = np.inf
     inf_metal = np.isinf(fill) & cavity
     if inf_metal.any():
         fill[inf_metal] = fill_time_s
