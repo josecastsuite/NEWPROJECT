@@ -30,6 +30,7 @@ import pyvista as pv
 import trimesh
 from scipy import ndimage
 from scipy.sparse import csr_matrix
+from scipy.sparse import csgraph
 from scipy.sparse import linalg as spla
 
 from core.types import Body, BodyType, FillingResult, GatingNode, GatingVelocityError
@@ -2606,6 +2607,128 @@ def _compute_fill_time_graph(
     return fill
 
 
+def _geodesic_gating_time(
+    grid: np.ndarray,
+    body_index: np.ndarray,
+    bodies: List[Body],
+    gating_nodes: List[GatingNode],
+    source_mask: np.ndarray,
+    dx_mm: float,
+) -> np.ndarray:
+    """Geodesic arrival time (seconds) from the source through the gating system.
+
+    Each connected gating body is treated as a conduit with a local front speed
+    derived from the gating-node velocities.  The shortest-path distance within
+    the metal mask, divided by the local speed, gives a realistic time for the
+    metal front to travel from the source through sprues, runners and ingates.
+    """
+    shape = grid.shape
+    T = np.full(shape, np.inf, dtype=np.float64)
+    gating_types = {
+        int(BodyType.SPRUE),
+        int(BodyType.SPRUE_THROAT),
+        int(BodyType.POURING_BASIN),
+        int(BodyType.RUNNER),
+        int(BodyType.DISTRIBUTOR),
+        int(BodyType.INGATE),
+    }
+    gating_mask = (
+        np.isin(grid, list(gating_types))
+        & (body_index >= 0)
+        & (grid != int(BodyType.CORE))
+    )
+    if not gating_mask.any():
+        return T
+
+    n_bodies = len(bodies)
+    name_to_bidx = {b.name: i for i, b in enumerate(bodies)}
+    q_sum = np.zeros(n_bodies, dtype=np.float64)
+    a_sum = np.zeros(n_bodies, dtype=np.float64)
+    for node in gating_nodes:
+        if "→" not in node.name or "→" not in node.body_type:
+            continue
+        up_name, _ = [s.strip() for s in node.name.split("→")]
+        up_bidx = name_to_bidx.get(up_name)
+        if up_bidx is None:
+            continue
+        q = float(node.flow_rate_m3_s)
+        v = float(node.velocity_m_s)
+        if v <= 1e-18:
+            continue
+        q_sum[up_bidx] += q
+        a_sum[up_bidx] += q / v
+
+    body_speed = np.zeros(n_bodies, dtype=np.float64)
+    valid = a_sum > 1e-18
+    if valid.any():
+        body_speed[valid] = q_sum[valid] / a_sum[valid]
+    avg_speed = float(np.mean(body_speed[body_speed > 1e-18])) if np.any(body_speed > 1e-18) else 1.5
+    body_speed = np.where(body_speed > 1e-18, body_speed, avg_speed)
+
+    cell_bidx = body_index[gating_mask]
+    cell_speed = body_speed[cell_bidx]
+    speed_grid = np.zeros(shape, dtype=np.float64)
+    speed_grid[gating_mask] = cell_speed
+
+    idx = np.full(shape, -1, dtype=np.int64)
+    idx[gating_mask] = np.arange(int(gating_mask.sum()))
+    N = int(gating_mask.sum())
+
+    source_indices = idx[source_mask & gating_mask]
+    if source_indices.size == 0:
+        # Use the top-most (against gravity) gating cells as fallback seed.
+        return T
+
+    rows: List[np.ndarray] = []
+    cols: List[np.ndarray] = []
+    weights: List[np.ndarray] = []
+    dx_m = float(dx_mm) / 1000.0
+
+    # x-faces
+    valid_x = (idx[:-1, :, :] >= 0) & (idx[1:, :, :] >= 0)
+    r = idx[:-1, :, :][valid_x]
+    c = idx[1:, :, :][valid_x]
+    v_face = 0.5 * (speed_grid[:-1, :, :][valid_x] + speed_grid[1:, :, :][valid_x])
+    w = dx_m / np.maximum(v_face, 1e-6)
+    rows.extend([r, c])
+    cols.extend([c, r])
+    weights.extend([w, w])
+
+    # y-faces
+    valid_y = (idx[:, :-1, :] >= 0) & (idx[:, 1:, :] >= 0)
+    r = idx[:, :-1, :][valid_y]
+    c = idx[:, 1:, :][valid_y]
+    v_face = 0.5 * (speed_grid[:, :-1, :][valid_y] + speed_grid[:, 1:, :][valid_y])
+    w = dx_m / np.maximum(v_face, 1e-6)
+    rows.extend([r, c])
+    cols.extend([c, r])
+    weights.extend([w, w])
+
+    # z-faces
+    valid_z = (idx[:, :, :-1] >= 0) & (idx[:, :, 1:] >= 0)
+    r = idx[:, :, :-1][valid_z]
+    c = idx[:, :, 1:][valid_z]
+    v_face = 0.5 * (speed_grid[:, :, :-1][valid_z] + speed_grid[:, :, 1:][valid_z])
+    w = dx_m / np.maximum(v_face, 1e-6)
+    rows.extend([r, c])
+    cols.extend([c, r])
+    weights.extend([w, w])
+
+    if not rows:
+        return T
+
+    rows_a = np.concatenate(rows)
+    cols_a = np.concatenate(cols)
+    weights_a = np.concatenate(weights)
+    graph = csr_matrix((weights_a, (rows_a, cols_a)), shape=(N, N))
+    dist = csgraph.dijkstra(graph, directed=False, indices=source_indices, return_predecessors=False)
+    if dist.ndim == 1:
+        dist = dist.reshape(1, -1)
+    min_dist = np.min(dist, axis=0)
+    T[gating_mask] = min_dist
+    return T
+
+
 def _compute_fill_time_volume_layer(
     grid: np.ndarray,
     origin_mm: np.ndarray,
@@ -2615,6 +2738,7 @@ def _compute_fill_time_volume_layer(
     bodies: List[Body],
     body_index: Optional[np.ndarray],
     fill_time_s: float,
+    source_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Volume-aware, gravity-aligned fill-time estimator.
 
@@ -2732,78 +2856,48 @@ def _compute_fill_time_volume_layer(
         return mask
 
     voxel_volume_m3 = (dx_mm ** 3) / 1e9
-    body_volume_m3: Dict[int, float] = {}
-    involved = set(children.keys())
-    for lst in children.values():
-        for c in lst:
-            if c["bidx"] is not None:
-                involved.add(c["bidx"])
-    involved.add(source_bidx)
-    for bidx in involved:
-        body_volume_m3[bidx] = float(_body_mask(bidx).sum()) * voxel_volume_m3
 
-    # Topological fill: a child starts only after its parent volume is full.
-    t_entry: Dict[int, float] = {source_bidx: 0.0}
-    queue = [source_bidx]
-    visited: Set[int] = {source_bidx}
-    while queue:
-        bidx = queue.pop(0)
-        for child in children.get(bidx, []):
-            child_bidx = child["bidx"]
-            if child_bidx is None:
-                continue
-            q_parent = q_in.get(bidx, source_q)
-            if bidx == source_bidx:
-                t_body = 0.0
-            else:
-                t_body = body_volume_m3.get(bidx, 0.0) / max(q_parent, 1e-18)
-            t_open = t_entry[bidx] + t_body
-            if child_bidx in visited:
-                if t_open < t_entry.get(child_bidx, float("inf")):
-                    t_entry[child_bidx] = t_open
-                continue
-            visited.add(child_bidx)
-            t_entry[child_bidx] = t_open
-            queue.append(child_bidx)
+    if source_mask is None or not source_mask.any():
+        source_mask, _ = _select_inlet_cells(grid, cavity, g, "SPRUE_THROAT")
+    if source_mask is None or not source_mask.any():
+        # Fall back to the upstream-most cells of the source body.
+        if source_bidx is not None and 0 <= source_bidx < n_bodies:
+            sm = _body_mask(source_bidx)
+            if sm.any():
+                proj = _projection_along(grid.shape, origin_mm, dx_mm, g)
+                best = tuple(np.argwhere(sm)[np.argmax(proj[sm])])
+                source_mask = np.zeros_like(sm)
+                source_mask[best] = True
 
-    # Fill each gating body with a linear front from entry to exit.
-    for bidx in visited:
-        mask = _body_mask(bidx)
-        if not mask.any():
-            continue
-        idx = np.argwhere(mask)
-        centers = origin_mm + (idx + 0.5) * dx_mm
-        entry = entry_point.get(bidx, centers.mean(axis=0))
-        childs = children.get(bidx, [])
-        points = [c["point"] for c in childs]
-        if not points:
-            points = [centers.mean(axis=0)]
-        pts = np.vstack(points)
-        dirs = pts - entry
-        norms = np.linalg.norm(dirs, axis=1)
-        if norms.max() > 1e-12:
-            far = pts[np.argmax(norms)]
-            axis = far - entry
-            L = float(np.linalg.norm(axis))
-            if L > 1e-12:
-                dir_u = axis / L
-                proj = (centers - entry) @ dir_u
-                s = np.clip(proj / L, 0.0, 1.0)
-            else:
-                s = np.zeros(centers.shape[0])
-        else:
-            s = np.zeros(centers.shape[0])
-        if bidx == source_bidx:
-            t_body = 0.0
-        else:
-            q_parent = q_in.get(bidx, source_q)
-            t_body = body_volume_m3.get(bidx, 0.0) / max(q_parent, 1e-18)
-        fill[mask] = t_entry[bidx] + s * t_body
+    # Geodesic arrival time through the gating system (sprue, runners, ingates).
+    T_gating = _geodesic_gating_time(
+        grid, body_index, bodies, gating_nodes, source_mask, dx_mm
+    )
 
-    # Force the source body to appear full at t=0.
-    source_mask = _body_mask(source_bidx)
-    if source_mask.any():
-        fill[source_mask] = 0.0
+    gating_types = {
+        int(BodyType.SPRUE),
+        int(BodyType.SPRUE_THROAT),
+        int(BodyType.POURING_BASIN),
+        int(BodyType.RUNNER),
+        int(BodyType.DISTRIBUTOR),
+        int(BodyType.INGATE),
+    }
+    gating_all = np.isin(grid, list(gating_types)) & cavity
+    finite_gating = gating_all & np.isfinite(T_gating)
+    fill[finite_gating] = T_gating[finite_gating]
+
+    # Keep the source body fully visible at t=0.
+    if source_bidx is not None and 0 <= source_bidx < n_bodies:
+        source_body_mask = _body_mask(source_bidx)
+        if source_body_mask.any():
+            fill[source_body_mask] = 0.0
+
+    # Entry time of each gating body (used for ingate priming).
+    t_entry: Dict[int, float] = {source_bidx: 0.0} if source_bidx is not None else {}
+    for bidx in range(n_bodies):
+        mask = _body_mask(bidx) & np.isfinite(T_gating)
+        if mask.any():
+            t_entry[bidx] = float(np.min(T_gating[mask]))
 
     # Part: single rising level fed by all active ingates.
     ingate_info = []
@@ -2811,8 +2905,12 @@ def _compute_fill_time_volume_layer(
         parent_bidx = branch["parent_bidx"]
         if parent_bidx not in t_entry:
             continue
+        parent_mask = _body_mask(parent_bidx)
+        if parent_mask.any() and np.isfinite(T_gating[parent_mask]).any():
+            t_open = float(np.max(T_gating[parent_mask & np.isfinite(T_gating)]))
+        else:
+            t_open = t_entry.get(parent_bidx, 0.0)
         q_i = max(branch["q"], 1e-18)
-        t_open = t_entry[parent_bidx] + body_volume_m3.get(parent_bidx, 0.0) / q_i
         z_gate = float(branch["point"] @ up)
         ingate_info.append((z_gate, q_i, t_open))
 
@@ -2821,7 +2919,7 @@ def _compute_fill_time_volume_layer(
         t_part_start = max(t_open for _, _, t_open in ingate_info)
         q_total = sum(q_i for _, q_i, _ in ingate_info)
 
-        gating_bidx_arr = np.fromiter(visited, dtype=np.int64)
+        gating_bidx_arr = np.fromiter(t_entry.keys(), dtype=np.int64)
         on_gating = np.isin(body_index, gating_bidx_arr)
         part_mask = (grid == int(BodyType.PART)) & ~on_gating & cavity
         if not part_mask.any():
@@ -2855,7 +2953,7 @@ def _compute_fill_time_volume_layer(
     riser_bidx = [
         i
         for i in range(n_bodies)
-        if grid_type_for_bidx[i] == int(BodyType.RISER) and i not in visited
+        if grid_type_for_bidx[i] == int(BodyType.RISER) and i not in t_entry
     ]
     if riser_bidx:
         riser_mask = np.isin(
@@ -4441,6 +4539,17 @@ def solve_filling_flow(
             fill_time_s,
         )
         fill_time_fine = np.where(orig_grid == BodyType.EMPTY, 0.0, fill_time_fine)
+        # The reported fill time is the actual last-metal-arrival time, which
+        # includes gating priming in addition to the cavity fill.
+        fine_metal_for_time = (
+            (orig_grid > 0)
+            & (orig_grid != BodyType.CORE)
+            & np.isfinite(fill_time_fine)
+        )
+        if fine_metal_for_time.any():
+            max_fill_t = float(np.nanmax(fill_time_fine[fine_metal_for_time]))
+            if np.isfinite(max_fill_t) and max_fill_t > fill_time_s:
+                fill_time_s = max_fill_t
 
     # Collect every node that feeds the part directly as a "gate" (meme).
     per_gate_v = {}
