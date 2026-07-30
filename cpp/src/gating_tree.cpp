@@ -1,6 +1,7 @@
 #include "josecast/gating_tree.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <queue>
