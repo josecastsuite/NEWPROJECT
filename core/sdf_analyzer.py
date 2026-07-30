@@ -1860,6 +1860,7 @@ def _run_filling_flow(
     origin_mm: np.ndarray,
     dx_mm: float,
     alloy,
+    mold,
     bodies: List[Body],
     body_index: Optional[np.ndarray],
 ):
@@ -1927,6 +1928,7 @@ def _run_filling_flow(
         design_section_key=design_section_key,
         design_area_m2=design_area_cm2 * 1e-4,
         section_areas_m2=section_areas_m2,
+        mold=mold,
     )
 
 
@@ -2094,6 +2096,7 @@ def analyze(
                 origin_mm,
                 dx,
                 alloy,
+                mold,
                 bodies,
                 body_index,
             )

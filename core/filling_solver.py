@@ -4632,6 +4632,7 @@ def solve_filling_flow(
     design_section_key: str = "SPRUE_THROAT",
     design_area_m2: float = 0.0,
     section_areas_m2: Optional[Dict[str, float]] = None,
+    mold=None,
 ) -> FillingResult:
     """Run the Darcy filling-flow solver and return section/node velocities.
 
@@ -4817,6 +4818,33 @@ def solve_filling_flow(
     # K/mu and dimensionless Dirichlet p=1/0; it is the pressure drop needed
     # to drive Q_user through the Darcy medium.
     pressure_drop_pa = float(scale) if Q_raw != 0.0 else 0.0
+
+    # Phase 2: particle-based sand-mold permeability and air-leakage estimate.
+    sand_k_m2 = 0.0
+    air_leak_m3_s = 0.0
+    sand_phi = 0.0
+    sand_d_mm = 0.0
+    if mold is not None and os.environ.get("JOSECAST_USE_CPP_SAND", "0").lower() in ("1", "true", "yes"):
+        try:
+            from core.cpp_bridge import JOSECAST_CORE
+            if JOSECAST_CORE is not None:
+                wall = (~cavity) & ndimage.binary_dilation(cavity, iterations=1)
+                sand_mask = wall.astype(np.uint8)
+                p_air = max(pressure_drop_pa, 1000.0)
+                k_field, sand_k_m2, air_leak_m3_s, sand_phi, sand_d_mm = (
+                    JOSECAST_CORE.compute_sand_permeability(
+                        sand_mask,
+                        float(getattr(mold, "afs_grain_size", 50.0)),
+                        float(getattr(mold, "moisture_percent", 4.0)),
+                        float(getattr(mold, "binder_percent", 2.0)),
+                        float(getattr(mold, "compactability_percent", 45.0)),
+                        p_air,
+                        1.81e-5,
+                        dx_m,
+                    )
+                )
+        except Exception as exc:
+            print(f"[SAND] Kum geçirgenliği hesaplanamadı: {exc}", flush=True)
 
     u *= scale
     v *= scale
@@ -5261,4 +5289,8 @@ def solve_filling_flow(
         total_ingate_flow_m3_s=total_ingate_flow_m3_s,
         gating_nodes=gating_nodes,
         pressure_drop_pa=pressure_drop_pa,
+        sand_permeability_m2=sand_k_m2,
+        air_leak_rate_m3_s=air_leak_m3_s,
+        sand_porosity=sand_phi,
+        sand_grain_diameter_mm=sand_d_mm,
     )

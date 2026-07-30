@@ -4,6 +4,7 @@ set(JOSECAST_SOURCES
     gating_tree.cpp
     lbm_solver.cpp
     ns_solver.cpp
+    sand_solver.cpp
     thermal_solver.cpp
 )
 

@@ -21,6 +21,11 @@ class MoldMaterial:
     # Darcy / flow
     particle_size_mm: float = 0.25  # representative sand grain size
     permeability_proxy: float = 1.0
+    # Green-sand properties for particle-based permeability / air-leakage model
+    afs_grain_size: float = 50.0      # AFS grain fineness number (GFN)
+    moisture_percent: float = 4.0     # % moisture
+    binder_percent: float = 2.0         # % bentonite / binder
+    compactability_percent: float = 45.0  # % compactability
 
     @property
     def diffusivity_mm2_s(self) -> float:

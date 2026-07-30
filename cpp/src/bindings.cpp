@@ -12,6 +12,7 @@
 #include "josecast/gating_tree.h"
 #include "josecast/lbm_solver.h"
 #include "josecast/ns_solver.h"
+#include "josecast/sand_solver.h"
 #include "josecast/thermal_solver.h"
 
 namespace nb = nanobind;
@@ -53,6 +54,13 @@ NB_MODULE(josecast_core, m) {
           nb::arg("inflow_velocity"), nb::arg("t_max"), nb::arg("max_steps"),
           nb::arg("cfl_target") = 0.15, nb::arg("smagorinsky") = 0.18,
           "Run a 3-D D3Q19 LBM + Smagorinsky + VOF free-surface mold-filling solver.");
+
+    m.def("compute_sand_permeability", &josecast::compute_sand_permeability,
+          nb::arg("sand_mask"), nb::arg("afs_grain_size_mm"),
+          nb::arg("moisture_percent") = 4.0, nb::arg("binder_percent") = 2.0,
+          nb::arg("compactability_percent") = 45.0, nb::arg("pressure_pa") = 5000.0,
+          nb::arg("air_viscosity_pa_s") = 1.81e-5, nb::arg("dx_m") = 1e-3,
+          "Compute sand-mold permeability and air-leakage rate from AFS grain size, moisture and binder.");
 
     m.def("solve_thermal", &josecast::solve_thermal,
           nb::arg("is_metal"), nb::arg("is_gating"), nb::arg("is_chill"),

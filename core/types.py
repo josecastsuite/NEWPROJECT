@@ -278,6 +278,11 @@ class FillingResult:
     # viscosity in the Darcy matrix this is proportional to alloy.viscosity_pa_s
     # even though the scaled velocity field is independent of a uniform viscosity.
     pressure_drop_pa: float = 0.0
+    # P2: sand-mold particle-based permeability and air leakage.
+    sand_permeability_m2: float = 0.0
+    air_leak_rate_m3_s: float = 0.0
+    sand_porosity: float = 0.0
+    sand_grain_diameter_mm: float = 0.0
 
 
 @dataclass
