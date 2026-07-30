@@ -1,27 +1,35 @@
 set(JOSECAST_SOURCES
     bindings.cpp
-    voxelizer.cpp
     darcy_solver.cpp
     gating_tree.cpp
     ns_solver.cpp
     thermal_solver.cpp
 )
 
+if(JOSECAST_OPENVDB_FOUND)
+    list(APPEND JOSECAST_SOURCES voxelizer.cpp)
+endif()
+
 nanobind_add_module(josecast_core ${JOSECAST_SOURCES})
 
-target_link_libraries(josecast_core PRIVATE
-    ${OPENVDB_LIBRARY}
-    ${TBB_LIBRARY}
-    ${HALF_LIBRARY}
-    ${LOG4CPLUS_LIBRARY}
-    ${BOOST_IOSTREAMS_LIBRARY}
-    ${BLOSC_LIBRARY}
-)
+if(JOSECAST_OPENVDB_FOUND)
+    target_compile_definitions(josecast_core PRIVATE JOSECAST_HAS_OPENVDB=1)
+    if(JOSECAST_OPENVDB_TARGET)
+        target_link_libraries(josecast_core PRIVATE ${JOSECAST_OPENVDB_TARGET})
+    else()
+        target_link_libraries(josecast_core PRIVATE ${JOSECAST_OPENVDB_LIBS})
+    endif()
+    # The Linux system openvdb needs the old TBB ABI define.
+    if(NOT OpenVDB_FOUND)
+        target_compile_definitions(josecast_core PRIVATE __TBB_NO_IMPLICIT_LINKAGE=1)
+    endif()
+else()
+    message(WARNING "OpenVDB not found; C++ Voxelizer will be disabled")
+endif()
 
-# OpenVDB needs C++14/17 and TBB atomic definitions.
-target_compile_definitions(josecast_core PRIVATE
-    __TBB_NO_IMPLICIT_LINKAGE=1
-)
+if(EIGEN3_FOUND)
+    target_link_libraries(josecast_core PRIVATE Eigen3::Eigen)
+endif()
 
 # Copy the compiled extension module next to the Python package so it can be
 # imported without setting PYTHONPATH (core/josecast_core.<soab i>.so/.pyd).
