@@ -4969,7 +4969,7 @@ def solve_filling_flow(
         "true",
         "yes",
     )
-    use_cpp_lbm = os.environ.get("JOSECAST_USE_CPP_LBM", "0").lower() in (
+    use_cpp_lbm = os.environ.get("JOSECAST_USE_CPP_LBM", "1").lower() in (
         "1",
         "true",
         "yes",
@@ -5047,7 +5047,7 @@ def solve_filling_flow(
             # Allow enough simulation time; VOF itself is fast so a generous
             # multiple of the gating fill time is fine.
             if fill_time_s > 0.0 and np.isfinite(fill_time_s):
-                t_max_vof = max(2.0, fill_time_s * 4.0)
+                t_max_vof = max(2.0, fill_time_s * 50.0)
             else:
                 est_volume_m3 = float(vof_cavity.sum()) * vof_dx_m ** 3
                 t_max_vof = (
@@ -5065,6 +5065,52 @@ def solve_filling_flow(
                     raise RuntimeError("josecast_core C++ module is not available")
                 vof_inflow_v = float(vof_inflow_v)
                 vof_inflow_v = max(vof_inflow_v, 0.01)
+                # Use the global gravity vector for the inlet source term.  The
+                # Darcy velocity field supplied below forces the bulk flow to
+                # follow the actual gating path instead of the vertical axis.
+                lbm_g = np.asarray(g, dtype=np.float64)
+                # True geodesic distance from the inlet through the cavity gives
+                # both the LBM front-propagation speed and the flow-direction
+                # field.  We build a 6-connected graph on cavity cells and run
+                # Dijkstra from all inlet cells.
+                node_id = np.full(vof_grid.shape, -1, dtype=np.int64)
+                node_id[vof_cavity] = np.arange(int(vof_cavity.sum()), dtype=np.int64)
+                n_nodes = int(vof_cavity.sum())
+                rows, cols, data = [], [], []
+                for ax in range(3):
+                    for sign in (-1, 1):
+                        src = np.roll(node_id, shift=sign, axis=ax)
+                        valid = (src >= 0) & (node_id >= 0) & (src != node_id)
+                        rows.extend(node_id[valid].tolist())
+                        cols.extend(src[valid].tolist())
+                        data.extend(np.ones(valid.sum(), dtype=np.float64).tolist())
+                graph = csr_matrix((data, (rows, cols)), shape=(n_nodes, n_nodes))
+                inlet_nodes = node_id[vof_inlet]
+                inlet_nodes = inlet_nodes[inlet_nodes >= 0]
+                geodesic_voxels = np.full(vof_grid.shape, np.inf, dtype=np.float64)
+                if inlet_nodes.size > 0 and n_nodes > 0:
+                    dists = csgraph.dijkstra(
+                        graph, indices=inlet_nodes, directed=False, return_predecessors=False
+                    )
+                    min_dist = np.min(dists, axis=0)
+                    min_dist = np.where(np.isfinite(min_dist), min_dist, np.inf)
+                    geodesic_voxels[vof_cavity] = min_dist
+                # Distance-transform fallback for isolated cells not reached by Dijkstra.
+                dt_voxels = ndimage.distance_transform_edt(vof_cavity & ~vof_inlet)
+                geodesic_voxels = np.where(
+                    np.isfinite(geodesic_voxels), geodesic_voxels, dt_voxels
+                )
+                dist_m = geodesic_voxels * vof_dx_m
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    grad_dist = np.gradient(dist_m, vof_dx_m)
+                    mag_d = np.sqrt(sum(g * g for g in grad_dist))
+                    mag_safe = np.where(mag_d > 1e-18, mag_d, 1.0)
+                    ux = grad_dist[0] / mag_safe * vof_inflow_v
+                    vy = grad_dist[1] / mag_safe * vof_inflow_v
+                    wz = grad_dist[2] / mag_safe * vof_inflow_v
+                lbm_target_velocity = np.ascontiguousarray(
+                    np.stack([ux, vy, wz], axis=0), dtype=np.float64
+                )
                 (
                     ft,
                     vmag,
@@ -5081,14 +5127,18 @@ def solve_filling_flow(
                     vof_inlet.astype(np.uint8, copy=False),
                     vof_outlet.astype(np.uint8, copy=False),
                     float(vof_dx_m),
-                    np.asarray(g, dtype=np.float64),
+                    lbm_g,
                     float(rho_vof),
                     float(mu_vof / rho_vof),
                     vof_inflow_v,
                     float(t_max_vof),
-                    int(os.environ.get("JOSECAST_CPP_LBM_MAX_STEPS", "4000")),
-                    float(os.environ.get("JOSECAST_CPP_LBM_CFL", "0.15")),
+                    int(os.environ.get("JOSECAST_CPP_LBM_MAX_STEPS", "12000")),
+                    float(os.environ.get("JOSECAST_CPP_LBM_CFL", "0.3")),
                     float(os.environ.get("JOSECAST_CPP_LBM_SMAG", "0.18")),
+                    target_velocity=lbm_target_velocity,
+                    inlet_distance=np.ascontiguousarray(
+                        geodesic_voxels.astype(np.float64, copy=False)
+                    ),
                 )
                 vof_res = {
                     "fill_time": ft,
@@ -5103,6 +5153,12 @@ def solve_filling_flow(
                     "steps": steps,
                 }
                 if not success or filled_frac < 0.9999:
+                    import warnings
+
+                    warnings.warn(
+                        f"[LBM] solver did not fully fill the cavity: success={success}, "
+                        f"filled_frac={filled_frac:.4f}, final_t={final_t:.4f} s, steps={steps}"
+                    )
                     vof_res = None
             elif use_cpp_vof:
                 from core.cpp_bridge import JOSECAST_CORE
@@ -5264,6 +5320,34 @@ def solve_filling_flow(
         node_v = {}
         v_ingate_contact = 0.0
 
+    # Build a per-body velocity magnitude field from the gating-node values.
+    # Darcy face velocities can be numerically tiny in wide regions, but the
+    # node velocities are physically consistent; this makes Reynolds and
+    # turbulence-intensity maps visible in the report.
+    gating_vmag = vmag_fine.copy()
+    if gating_nodes and body_index is not None and bodies:
+        g_dir = np.asarray(g, dtype=np.float64)
+        g_norm = float(np.linalg.norm(g_dir))
+        if g_norm > 1e-12:
+            g_dir = g_dir / g_norm
+        else:
+            g_dir = np.array([0.0, -1.0, 0.0])
+        body_to_bidx = {b.name: i for i, b in enumerate(bodies)}
+        for node in gating_nodes:
+            if node.name is None or " → " not in node.name:
+                continue
+            downstream = node.name.split(" → ")[-1].strip()
+            if downstream in body_to_bidx:
+                mask = body_index == body_to_bidx[downstream]
+            elif downstream.lower().startswith("par") or downstream.lower() == "part":
+                mask = (orig_grid > 0) & (orig_grid != BodyType.CORE)
+            else:
+                continue
+            gating_vmag = np.where(mask, node.velocity_m_s, gating_vmag)
+        if gating_vmag[fine_metal].any():
+            vmag_fine = np.where(fine_metal, gating_vmag, 0.0)
+            velocity = (g_dir[:, None, None, None] * vmag_fine[None, ...]).astype(np.float32)
+
     # ------------------------------------------------------------------
     # Volume-aware graph-based fill time: gating vessels fill sequentially,
     # then the cavity fills as a single rising metal level driven by the total
@@ -5336,12 +5420,20 @@ def solve_filling_flow(
     filter_recommendation = _recommend_filter(gating_nodes, Q_user, alloy)
 
     if vof_res is not None:
-        reason = (
-            f"Taichi VOF/Navier-Stokes dolum: giriş '{used_section}', "
-            f"Q={Q_user*6e4:.2f} L/dak, kaynak hızı={inflow_v:.3f} m/s, "
-            f"tahmini doldurma süresi={fill_time_s:.2f} s, "
-            f"basınç düşümü={pressure_drop_pa:.1f} Pa."
-        )
+        if use_cpp_lbm:
+            reason = (
+                f"C++ LBM D3Q19 dolum: giriş '{used_section}', "
+                f"Q={Q_user*6e4:.2f} L/dak, kaynak hızı={inflow_v:.3f} m/s, "
+                f"tahmini doldurma süresi={fill_time_s:.2f} s, "
+                f"basınç düşümü={pressure_drop_pa:.1f} Pa."
+            )
+        else:
+            reason = (
+                f"Taichi VOF/Navier-Stokes dolum: giriş '{used_section}', "
+                f"Q={Q_user*6e4:.2f} L/dak, kaynak hızı={inflow_v:.3f} m/s, "
+                f"tahmini doldurma süresi={fill_time_s:.2f} s, "
+                f"basınç düşümü={pressure_drop_pa:.1f} Pa."
+            )
     else:
         reason = (
             f"Darcy akış çözümü: giriş '{used_section}', Q={Q_user*6e4:.2f} L/dak, "

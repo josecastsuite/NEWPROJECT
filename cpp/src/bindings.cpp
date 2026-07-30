@@ -53,6 +53,8 @@ NB_MODULE(josecast_core, m) {
           nb::arg("dx"), nb::arg("g"), nb::arg("rho"), nb::arg("nu"),
           nb::arg("inflow_velocity"), nb::arg("t_max"), nb::arg("max_steps"),
           nb::arg("cfl_target") = 0.15, nb::arg("smagorinsky") = 0.18,
+          nb::arg("target_velocity") = nb::ndarray<nb::numpy, double>(),
+          nb::arg("inlet_distance") = nb::ndarray<nb::numpy, double>(),
           "Run a 3-D D3Q19 LBM + Smagorinsky + VOF free-surface mold-filling solver.");
 
     m.def("compute_sand_permeability", &josecast::compute_sand_permeability,

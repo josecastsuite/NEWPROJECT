@@ -72,7 +72,9 @@ public:
                double t_max,
                int max_steps,
                double cfl_target,
-               double smagorinsky)
+               double smagorinsky,
+               const double* target_velocity = nullptr,
+               const double* inlet_distance = nullptr)
         : nx_(nx), ny_(ny), nz_(nz), dx_(dx), rho0_(rho),
           nu_phys_(nu), inflow_velocity_(inflow_velocity),
           t_max_(t_max), max_steps_(max_steps),
@@ -96,10 +98,17 @@ public:
             // Avoid exceeding the requested simulation time, but do not let the
             // lattice velocity grow by shrinking dt.
             t_max_ = nsteps * dt_;
-            std::cerr << "[josecast_core] LBM: t_max reduced to " << t_max_
-                      << " s so u_lb stays at " << (v * dt_ / dx_) << ".\n";
         }
         if (dt_ <= 0.0) dt_ = 1e-6;
+        target_scale_ = dt_ / dx_;
+        if (target_velocity != nullptr) {
+            target_velocity_ = target_velocity;
+            has_target_ = true;
+        }
+        if (inlet_distance != nullptr) {
+            inlet_distance_ = inlet_distance;
+            has_inlet_dist_ = true;
+        }
 
         // Lattice kinematic viscosity.  Use a minimum tau to avoid BGK instability.
         double nu_lb = nu_phys_ * dt_ / (dx_ * dx_);
@@ -113,8 +122,10 @@ public:
         flags_.assign(n_, 0);
         for (size_t i = 0; i < n_; ++i) {
             uint8_t val = grid[i];
-            if (val != 0) {
-                flags_[i] = 1; // solid (including CORE 9)
+            // grid values: 0 = solid mold/outside, 9 = sand core (solid obstacle),
+            // everything else (1..N, excluding 9) is the casting cavity.
+            if (val == 0 || val == 9) {
+                flags_[i] = 1; // solid
             } else {
                 flags_[i] = 0; // fluid/gas cavity
             }
@@ -209,7 +220,9 @@ public:
         fluid_list_.clear();
         for (size_t i = 0; i < n_; ++i) {
             if (flags_[i] != 1) {
-                ++cavity_cells_;
+                // Outlets/vents (flags == 3) remain air and should not count
+                // toward the fill-fraction denominator.
+                if (flags_[i] != 3) ++cavity_cells_;
                 fluid_list_.push_back(i);
             }
         }
@@ -218,17 +231,20 @@ public:
     void run() {
         if (cavity_cells_ == 0) return;
 
-        int entrapment_interval = std::max(1, max_steps_ / 100);
+        // Entrapment detection is O(n α(n)); run it rarely to keep the solver fast.
+        int entrapment_interval = std::max(1, max_steps_ / 20);
+        int fill_check_interval = 10;
 
         for (int step = 0; step < max_steps_; ++step) {
             if (t_ >= t_max_) break;
 
+            current_step_ = step;
             compute_macroscopic();
             advect_phi();
             update_fill_times();
             if (step % entrapment_interval == 0) detect_entrapment();
 
-            if (filled_fraction() >= 0.9999) {
+            if (step % fill_check_interval == 0 && filled_fraction() >= 0.9999) {
                 t_ += dt_;
                 ++steps_;
                 break;
@@ -248,7 +264,8 @@ public:
         if (cavity_cells_ == 0) return 0.0;
         size_t filled = 0;
         for (size_t i = 0; i < n_; ++i) {
-            if (flags_[i] != 1 && phi_[i] >= 0.5) ++filled;
+            // Inlet/source (2) and cavity (0) cells must fill; vents (3) stay empty.
+            if (flags_[i] != 1 && flags_[i] != 3 && phi_[i] >= 0.5) ++filled;
         }
         return static_cast<double>(filled) / static_cast<double>(cavity_cells_);
     }
@@ -307,6 +324,9 @@ private:
     double gx_, gy_, gz_;
     double rho_in_ = 1.0;
     double u_in_target_ = 0.0;
+    const double* target_velocity_ = nullptr;
+    bool has_target_ = false;
+    double target_scale_ = 0.0;  // (dt/dx) converts physical velocity to lattice velocity.
 
     std::vector<uint8_t> flags_;
     std::vector<std::array<double, 3>> outlet_normal_;
@@ -316,6 +336,9 @@ private:
     std::vector<double> rho_, ux_, uy_, uz_;
     std::vector<double> phi_, phi_new_;
     std::vector<double> fill_time_, trapped_time_;
+    const double* inlet_distance_ = nullptr;
+    bool has_inlet_dist_ = false;
+    int current_step_ = 0;
 
     void compute_macroscopic() {
         for (size_t idx = 0; idx < fluid_list_.size(); ++idx) {
@@ -410,14 +433,22 @@ private:
             double f_body_y = gy_ * 9.81 * dt_ * dt_ / dx_;
             double f_body_z = gz_ * 9.81 * dt_ * dt_ / dx_;
 
-            // Velocity relaxation: once the cell contains metal, gently drive
-            // the velocity toward the inflow direction.  This stabilises the
-            // filling front while still letting LBM capture turbulence.
-            const double relax_rate = 1.0;
-            if (phi_[i] > 0.5) {
-                f_body_x += relax_rate * (gx_ * u_in_target_ - u);
-                f_body_y += relax_rate * (gy_ * u_in_target_ - v);
-                f_body_z += relax_rate * (gz_ * u_in_target_ - w);
+            // Velocity relaxation: drive the velocity toward a target (e.g. from a
+            // Darcy pressure solve).  If no target is supplied, fallback to the
+            // global inflow direction once the cell contains metal.
+            double relax_rate = has_target_ ? 0.6 : 1.0;
+            if (has_target_ || phi_[i] > 0.5) {
+                double tu = gx_ * u_in_target_;
+                double tv = gy_ * u_in_target_;
+                double tw = gz_ * u_in_target_;
+                if (has_target_) {
+                    tu = target_velocity_[i] * target_scale_;
+                    tv = target_velocity_[n_ + i] * target_scale_;
+                    tw = target_velocity_[2 * n_ + i] * target_scale_;
+                }
+                f_body_x += relax_rate * (tu - u);
+                f_body_y += relax_rate * (tv - v);
+                f_body_z += relax_rate * (tw - w);
             }
 
             for (int q = 0; q < Q; ++q) {
@@ -443,13 +474,19 @@ private:
             }
             if (bad || !std::isfinite(rho_new) || rho_new < 0.5 || rho_new > 2.0 ||
                 !std::isfinite(u) || !std::isfinite(v) || !std::isfinite(w)) {
-                // For metal cells, reset to the target inflow velocity; for air
-                // cells, reset to rest.  This prevents unphysical populations from
+                // For metal cells, reset to the target velocity; for air cells,
+                // reset to rest.  This prevents unphysical populations from
                 // freezing a wrong velocity state.
                 if (phi_[i] > 0.5) {
-                    u = gx_ * u_in_target_;
-                    v = gy_ * u_in_target_;
-                    w = gz_ * u_in_target_;
+                    if (has_target_) {
+                        u = target_velocity_[i] * target_scale_;
+                        v = target_velocity_[n_ + i] * target_scale_;
+                        w = target_velocity_[2 * n_ + i] * target_scale_;
+                    } else {
+                        u = gx_ * u_in_target_;
+                        v = gy_ * u_in_target_;
+                        w = gz_ * u_in_target_;
+                    }
                 } else {
                     u = v = w = 0.0;
                 }
@@ -637,29 +674,91 @@ private:
             }
         }
 
-        // Inlet source term: the inflow volume is injected into the downstream
-        // (g-direction) neighbour so the metal front actually enters the cavity.
-        // The inlet cell itself is held full.
+        // Source term: every filled cell injects metal into its downstream
+        // (velocity-direction) neighbour.  When a Darcy target velocity is supplied,
+        // ux/uy/uz already point along the gating path, so the front follows the
+        // sprue/runner/ingate network instead of only the global gravity axis.
+        // Inlet cells are held full so the pour does not run dry.
         double u_in_lb = inflow_velocity_ * dt_ / dx_;
         if (u_in_lb > 1.0) u_in_lb = 1.0;
-        int dgx = static_cast<int>(std::round(gx_));
-        int dgy = static_cast<int>(std::round(gy_));
-        int dgz = static_cast<int>(std::round(gz_));
+        if (u_in_lb < 0.01) u_in_lb = 0.01;
+
         for (size_t i = 0; i < n_; ++i) {
-            if (flags_[i] != 2) continue;
+            if (flags_[i] == 1 || flags_[i] == 3) continue;
+            if (phi_[i] < 0.5 && flags_[i] != 2) continue;
             int x = static_cast<int>(i / (ny_ * nz_));
             int yz = static_cast<int>(i % (ny_ * nz_));
             int y = yz / nz_;
             int z = yz % nz_;
-            int sx = x + dgx;
-            int sy = y + dgy;
-            int sz = z + dgz;
-            phi_new_[i] = 1.0;  // source cell stays full
-            if (in_cell(sx, sy, sz, nx_, ny_, nz_)) {
-                size_t j = cidx(sx, sy, sz, ny_, nz_);
-                if (flags_[j] != 1) {
-                    phi_new_[j] += u_in_lb;
-                    if (phi_new_[j] > 1.0) phi_new_[j] = 1.0;
+
+            // Prefer the supplied Darcy/gating target direction; if missing, use
+            // the LBM macroscopic velocity; if that is zero, fall back to gravity.
+            double ux, uy, uz;
+            if (has_target_) {
+                double tx = target_velocity_[i];
+                double ty = target_velocity_[n_ + i];
+                double tz = target_velocity_[2 * n_ + i];
+                double tmag = std::sqrt(tx * tx + ty * ty + tz * tz);
+                if (tmag > 1e-12) {
+                    ux = tx / tmag;
+                    uy = ty / tmag;
+                    uz = tz / tmag;
+                } else {
+                    ux = gx_; uy = gy_; uz = gz_;
+                }
+            } else if (flags_[i] == 2) {
+                ux = gx_; uy = gy_; uz = gz_;
+            } else {
+                ux = ux_[i]; uy = uy_[i]; uz = uz_[i];
+                double umag = std::sqrt(ux * ux + uy * uy + uz * uz);
+                if (umag < 1e-12) {
+                    ux = gx_; uy = gy_; uz = gz_;
+                } else {
+                    ux /= umag; uy /= umag; uz /= umag;
+                }
+            }
+
+            // 6 face directions; pick the one most aligned with the velocity.
+            int best_dir = -1;
+            double best_dot = 0.0;
+            for (int d = 0; d < 6; ++d) {
+                int cx = (d == 0 ? 1 : (d == 1 ? -1 : 0));
+                int cy = (d == 2 ? 1 : (d == 3 ? -1 : 0));
+                int cz = (d == 4 ? 1 : (d == 5 ? -1 : 0));
+                double dot = ux * cx + uy * cy + uz * cz;
+                if (dot > best_dot) {
+                    best_dot = dot;
+                    best_dir = d;
+                }
+            }
+
+            phi_new_[i] = std::max(phi_new_[i], 1.0);  // filled/source cells stay full
+            if (best_dir >= 0 && best_dot > 0.1) {
+                int cx = (best_dir == 0 ? 1 : (best_dir == 1 ? -1 : 0));
+                int cy = (best_dir == 2 ? 1 : (best_dir == 3 ? -1 : 0));
+                int cz = (best_dir == 4 ? 1 : (best_dir == 5 ? -1 : 0));
+                int sx = x + cx, sy = y + cy, sz = z + cz;
+                if (in_cell(sx, sy, sz, nx_, ny_, nz_)) {
+                    size_t j = cidx(sx, sy, sz, ny_, nz_);
+                    if (flags_[j] != 1 && flags_[j] != 3) {
+                        phi_new_[j] += u_in_lb * best_dot;
+                        if (phi_new_[j] > 1.0) phi_new_[j] = 1.0;
+                    }
+                }
+            }
+        }
+
+        // Deterministic front propagation: a cell is guaranteed to be filled once
+        // the injected front has had enough time to travel its geodesic distance
+        // from the inlet.  This prevents the donor-cell advection from stalling in
+        // complex gating while still letting the LBM compute local velocity and
+        // turbulence fields.
+        if (has_inlet_dist_) {
+            double threshold = (static_cast<double>(current_step_) + 1.0) * u_in_lb;
+            for (size_t i = 0; i < n_; ++i) {
+                if (flags_[i] == 1 || flags_[i] == 3) continue;
+                if (inlet_distance_[i] >= 0.0 && inlet_distance_[i] <= threshold) {
+                    phi_new_[i] = std::max(phi_new_[i], 1.0);
                 }
             }
         }
@@ -772,7 +871,9 @@ nb::tuple solve_lbm_filling(
     double t_max,
     int max_steps,
     double cfl_target,
-    double smagorinsky)
+    double smagorinsky,
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1, -1>> target_velocity,
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> inlet_distance)
 {
     int nx = static_cast<int>(grid.shape(0));
     int ny = static_cast<int>(grid.shape(1));
@@ -783,9 +884,21 @@ nb::tuple solve_lbm_filling(
         throw std::runtime_error("solve_lbm_filling: mask shapes do not match grid");
     }
 
+    const size_t n = static_cast<size_t>(nx) * ny * nz;
+    const double* target_ptr = nullptr;
+    if (target_velocity.ndim() == 4 && target_velocity.shape(0) == 3 &&
+        static_cast<size_t>(target_velocity.size()) == 3 * n) {
+        target_ptr = target_velocity.data();
+    }
+    const double* inlet_dist_ptr = nullptr;
+    if (inlet_distance.ndim() == 3 &&
+        static_cast<size_t>(inlet_distance.size()) == n) {
+        inlet_dist_ptr = inlet_distance.data();
+    }
+
     LBMFilling solver(nx, ny, nz, grid.data(), inlet_mask.data(), outlet_mask.data(),
                       dx, g, rho, nu, inflow_velocity, t_max, max_steps,
-                      cfl_target, smagorinsky);
+                      cfl_target, smagorinsky, target_ptr, inlet_dist_ptr);
 
     solver.run();
 
@@ -796,7 +909,6 @@ nb::tuple solve_lbm_filling(
     solver.get_phi(&phi);
     solver.get_entrapment(&trap);
 
-    const size_t n = static_cast<size_t>(nx) * ny * nz;
     auto* ft_vec = new std::vector<double>(std::move(ft));
     auto* vmag_vec = new std::vector<double>(std::move(vmag));
     auto* vel_vec = new std::vector<double>(std::move(vel));

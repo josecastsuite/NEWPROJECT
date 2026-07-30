@@ -28,6 +28,8 @@ nb::tuple solve_lbm_filling(
     double t_max,
     int max_steps,
     double cfl_target,
-    double smagorinsky);
+    double smagorinsky,
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1, -1>> target_velocity = {},
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> inlet_distance = {});
 
 } // namespace josecast
