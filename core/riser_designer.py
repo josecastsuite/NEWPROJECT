@@ -427,13 +427,22 @@ def propose_risers(
                         D, H, V = D_chill, H_chill, V_chill
                         M_riser = 0.0
                     else:
-                        infeasible = True
-                        D = H = V = 0.0
+                        # Still useful: clamp to the largest feasible chill rather
+                        # than discarding the recommendation completely.
+                        D = min(D_chill, max_diameter_mm)
+                        H = min(
+                            D,
+                            max(1.0, max_volume_cm3 * 1000.0 / (np.pi * D ** 2 / 4.0))
+                        ) if D > 0.0 else 0.0
+                        V = (np.pi * D ** 2 * H / 4.0) / 1000.0
+                        shape = "chill"
                         M_riser = 0.0
+                        infeasible = True
                         warning = (
                             "Konvansiyonel, mini exotermik veya çıkıcı (chill) besleyici "
-                            "parça geometrisine sığmıyor. Öneri: bölgeye soğutucu (chill) ekleyin, "
-                            "kalın bölgeyi inceltin, geçiş yarıçapını büyütün veya parçayı yeniden tasarlayın."
+                            "parça geometrisine sığmıyor. En büyük sığabilen çıkıcı boyutları "
+                            "gösteriliyor; geometriyi inceltmek, geçiş yarıçapını büyütmek veya "
+                            "parçayı yeniden tasarlamak gerekebilir."
                         )
 
         if shape in ("cylinder", "exothermic"):
