@@ -22,7 +22,7 @@ jobs:
     env:
       VCPKG_DEFAULT_TRIPLET: x64-windows
       VCPKG_INSTALLED_DIR: '${{ github.workspace }}\vcpkg_installed'
-      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}\vcpkg_binary_cache,readwrite"
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}\vcpkg_binary_cache,readwrite'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,12 +35,14 @@ jobs:
       - name: Install Python dependencies
         run: python -m pip install --upgrade pip nanobind numpy
 
-      - name: Cache vcpkg installed packages
+      - name: Ensure vcpkg binary cache directory exists
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path vcpkg_binary_cache | Out-Null
+
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v4
         with:
-          path: |
-            ${{ github.workspace }}\vcpkg_installed
-            ${{ github.workspace }}\vcpkg_binary_cache
+          path: ${{ github.workspace }}\vcpkg_binary_cache
           key: vcpkg-${{ runner.os }}-${{ env.VCPKG_DEFAULT_TRIPLET }}-${{ hashFiles('cpp/vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
             vcpkg-${{ runner.os }}-${{ env.VCPKG_DEFAULT_TRIPLET }}-${{ hashFiles('cpp/vcpkg.json') }}-
@@ -53,7 +55,6 @@ jobs:
           vcpkgGitCommitId: '9e593bb18ea69cc5095e012465dcd675a822ed0d'
           vcpkgJsonGlob: '**/cpp/vcpkg.json'
           runVcpkgInstall: true
-          binaryCachePath: '${{ github.workspace }}\vcpkg_binary_cache'
 
       - name: Enable MSVC developer command prompt
         uses: ilammy/msvc-dev-cmd@v1
