@@ -10,6 +10,7 @@
 #endif
 #include "josecast/darcy_solver.h"
 #include "josecast/gating_tree.h"
+#include "josecast/lbm_solver.h"
 #include "josecast/ns_solver.h"
 #include "josecast/thermal_solver.h"
 
@@ -45,6 +46,13 @@ NB_MODULE(josecast_core, m) {
           nb::arg("inflow_velocity"), nb::arg("t_max"), nb::arg("max_steps"),
           nb::arg("cfl"), nb::arg("max_pressure_iter"), nb::arg("pressure_tol"),
           "Run a 3-D fractional-step Navier-Stokes + level-set mold-filling solver.");
+
+    m.def("solve_lbm_filling", &josecast::solve_lbm_filling,
+          nb::arg("grid"), nb::arg("inlet_mask"), nb::arg("outlet_mask"),
+          nb::arg("dx"), nb::arg("g"), nb::arg("rho"), nb::arg("nu"),
+          nb::arg("inflow_velocity"), nb::arg("t_max"), nb::arg("max_steps"),
+          nb::arg("cfl_target") = 0.15, nb::arg("smagorinsky") = 0.18,
+          "Run a 3-D D3Q19 LBM + Smagorinsky + VOF free-surface mold-filling solver.");
 
     m.def("solve_thermal", &josecast::solve_thermal,
           nb::arg("is_metal"), nb::arg("is_gating"), nb::arg("is_chill"),

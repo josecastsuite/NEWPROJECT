@@ -2,6 +2,7 @@ set(JOSECAST_SOURCES
     bindings.cpp
     darcy_solver.cpp
     gating_tree.cpp
+    lbm_solver.cpp
     ns_solver.cpp
     thermal_solver.cpp
 )

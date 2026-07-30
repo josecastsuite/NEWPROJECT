@@ -4893,18 +4893,26 @@ def solve_filling_flow(
         "true",
         "yes",
     )
+    use_cpp_lbm = os.environ.get("JOSECAST_USE_CPP_LBM", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     # The C++ NS pressure projection is heavier per step; keep the grid smaller.
     vof_max_cells = int(os.environ.get("JOSECAST_CPP_VOF_MAX_CELLS", "120000"))
     if not use_cpp_vof:
         vof_max_cells = 500_000
+    # LBM is lighter per step but still benefits from a coarse grid for first runs.
+    lbm_max_cells = int(os.environ.get("JOSECAST_CPP_LBM_MAX_CELLS", "120000"))
 
     vof_res = None
     inflow_v = 0.0
-    if use_cpp_vof or use_taichi_vof:
+    if use_cpp_vof or use_taichi_vof or use_cpp_lbm:
         try:
             # Keep the VOF grid small enough for an interactive solve.
+            lbm_vof_max_cells = lbm_max_cells if use_cpp_lbm else vof_max_cells
             vof_grid, vof_origin, vof_dx = _downsample_grid(
-                grid_c, origin_c, dx_c, max_cells=vof_max_cells
+                grid_c, origin_c, dx_c, max_cells=lbm_vof_max_cells
             )
             vof_cavity = vof_grid != BodyType.EMPTY
             vof_inlet, _ = _select_inlet_cells(
@@ -4972,7 +4980,55 @@ def solve_filling_flow(
                     else max(2.0, est_volume_m3 / Q_user * 4.0)
                 )
 
-            if use_cpp_vof:
+            vof_outlet = _select_vent_cells(vof_grid, vof_cavity, g)
+
+            if use_cpp_lbm:
+                from core.cpp_bridge import JOSECAST_CORE
+
+                if JOSECAST_CORE is None:
+                    raise RuntimeError("josecast_core C++ module is not available")
+                vof_inflow_v = float(vof_inflow_v)
+                vof_inflow_v = max(vof_inflow_v, 0.01)
+                (
+                    ft,
+                    vmag,
+                    vel,
+                    phi,
+                    trap,
+                    trap_volume_m3,
+                    success,
+                    final_t,
+                    filled_frac,
+                    steps,
+                ) = JOSECAST_CORE.solve_lbm_filling(
+                    vof_grid.astype(np.uint8, copy=False),
+                    vof_inlet.astype(np.uint8, copy=False),
+                    vof_outlet.astype(np.uint8, copy=False),
+                    float(vof_dx_m),
+                    np.asarray(g, dtype=np.float64),
+                    float(rho_vof),
+                    float(mu_vof / rho_vof),
+                    vof_inflow_v,
+                    float(t_max_vof),
+                    int(os.environ.get("JOSECAST_CPP_LBM_MAX_STEPS", "4000")),
+                    float(os.environ.get("JOSECAST_CPP_LBM_CFL", "0.15")),
+                    float(os.environ.get("JOSECAST_CPP_LBM_SMAG", "0.18")),
+                )
+                vof_res = {
+                    "fill_time": ft,
+                    "velocity_magnitude": vmag,
+                    "velocity": vel,
+                    "phi": phi,
+                    "air_entrapment": trap,
+                    "trapped_volume_m3": float(trap_volume_m3),
+                    "success": success,
+                    "final_t": final_t,
+                    "filled_fraction": filled_frac,
+                    "steps": steps,
+                }
+                if not success or filled_frac < 0.9999:
+                    vof_res = None
+            elif use_cpp_vof:
                 from core.cpp_bridge import JOSECAST_CORE
 
                 if JOSECAST_CORE is None:
