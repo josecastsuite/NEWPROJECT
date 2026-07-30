@@ -376,7 +376,9 @@ def propose_risers(
 
         # Feasibility envelope: a riser should not exceed the feeding-zone volume
         # by too much, nor should it grow beyond a global fraction of the part.
-        max_diameter_mm = max(t_zone * 2.0, part_smallest_dim_mm * 0.5, 20.0)
+        # The diameter is capped at half the smallest part dimension but kept
+        # large enough to cover twice the local section thickness.
+        max_diameter_mm = min(part_smallest_dim_mm * 0.5, max(t_zone * 2.0, 20.0))
         max_volume_cm3 = min(0.30 * part_volume_cm3, max(1.5 * V_c_cm3, 0.0))
 
         shape = "cylinder"
