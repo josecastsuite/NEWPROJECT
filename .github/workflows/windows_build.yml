@@ -7,6 +7,10 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-windows:
     runs-on: windows-2025-vs2026
@@ -33,14 +37,20 @@ jobs:
           vcpkgJsonGlob: '**/cpp/vcpkg.json'
           runVcpkgInstall: true
 
+      - name: Enable MSVC developer command prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Configure CMake
         shell: pwsh
         run: |
           cmake -B build -S cpp `
-            -G "Visual Studio 18 2026" -A x64 `
+            -G Ninja `
             -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}\vcpkg\scripts\buildsystems\vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
 
       - name: Build
         shell: pwsh
