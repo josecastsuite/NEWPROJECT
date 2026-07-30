@@ -70,8 +70,14 @@ def _best_surface_attachment(
     result: AnalysisResult,
     hs: HotSpot,
     search_mm: float = 40.0,
+    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
 ) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Find the best part surface point to attach a feeder/pad near a hot spot.
+    """Find the best part surface point to attach a feeder/pad on a hot spot.
+
+    The primary goal is to centre the feeder horizontally over the hot-spot
+    centre (i.e. the riser axis passes through the hotspot), then to prefer an
+    upward-facing surface so feeding comes from the top of the feeder and the
+    neck is directly above the thermal centre.
 
     Returns (surface_voxel, surface_position_mm, local_section_thickness_mm).
     """
@@ -106,17 +112,25 @@ def _best_surface_attachment(
     if len(surf_voxels) == 0:
         return hs_vox, hs.position_mm.copy(), hs.t_section_mm
 
-    # Pre-compute distances (voxel coords)
-    diff = surf_voxels - hs_vox
-    distances_vox = np.linalg.norm(diff, axis=1)
-    max_dist = max(distances_vox.max(), 1.0)
+    g = np.asarray(gravity_vector, dtype=float)
+    g_norm = float(np.linalg.norm(g)) + 1e-12
+    g = g / g_norm
 
-    scores = []
+    # Primary: centre the feeder horizontally over the hot spot.  The surface
+    # point whose projection onto the plane perpendicular to gravity is closest
+    # to the hot-spot centre gets the highest score.
+    diff = surf_voxels - hs_vox
+    vert = np.dot(diff, g)  # signed vertical offset (negative = below the hotspot)
+    horiz = diff - vert[:, None] * g
+    horiz_dist = np.linalg.norm(horiz, axis=1)
+    max_horiz = max(horiz_dist.max(), 1.0)
+
+    normals = np.array([_surface_normal(is_metal, v) for v in surf_voxels])
+    n_dot_g = np.dot(normals, g)
+    upward = n_dot_g < -0.3  # outward normal opposes gravity -> faces upward
+
     thicknesses = []
     for vox in surf_voxels:
-        n = _surface_normal(is_metal, vox)
-        # prefer upward-facing, close to the hot spot, and on a reasonably thick section
-        # estimate local thickness from metal neighbours just inside the surface
         inner_sdf_vals = []
         for d in np.array(
             [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]
@@ -131,14 +145,16 @@ def _best_surface_attachment(
                 inner_sdf_vals.append(float(sdf[nb[0], nb[1], nb[2]]))
         t_local = 2.0 * (max(inner_sdf_vals) if inner_sdf_vals else 0.0)
         thicknesses.append(t_local)
-        dist = float(np.linalg.norm(vox - hs_vox)) / max_dist
-        score = 0.5 * n[2] - 0.3 * dist + 0.2 * min(t_local / max(hs.m_value_mm, 1.0), 2.0)
-        # strongly penalise downward-facing surfaces
-        if n[2] < -0.3:
-            score -= 1.0
-        scores.append(score)
 
-    scores = np.array(scores)
+    # Score: 60% horizontal centration, 25% upward-facing, 15% section thickness.
+    # Directly above the hotspot (horiz_dist = 0) and upward-facing is ideal.
+    scores = (
+        -0.6 * (horiz_dist / max_horiz)
+        + 0.25 * (-n_dot_g)  # larger when normal opposes gravity (upward)
+        + 0.15 * np.minimum(np.array(thicknesses) / max(hs.m_value_mm, 1.0), 2.0)
+    )
+    scores[~upward] -= 2.0  # strongly prefer upward-facing surfaces
+
     best_idx = int(np.argmax(scores))
     best_vox = surf_voxels[best_idx]
     best_pos = origin + best_vox * dx
@@ -239,7 +255,10 @@ def _feeding_zone_geometry(
 
 
 def propose_risers(
-    result: AnalysisResult, alloy: Alloy, existing_riser_count: int = 0
+    result: AnalysisResult,
+    alloy: Alloy,
+    existing_riser_count: int = 0,
+    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
 ) -> List[RiserProposal]:
     """Generate concrete, geometry-aware riser / pad / chill / exothermic mini-riser
     proposals for failing hot spots.
@@ -307,8 +326,11 @@ def propose_risers(
         if hs.feed_ok and existing_riser_count > 0:
             continue
 
-        # Smart surface attachment: find the best place on the part surface.
-        surface_vox, surface_pos, t_attach = _best_surface_attachment(result, hs)
+        # Smart surface attachment: find the best place on the part surface,
+        # centring the feeder axis over the hot-spot centre.
+        surface_vox, surface_pos, t_attach = _best_surface_attachment(
+            result, hs, gravity_vector=gravity_vector
+        )
         normal = _surface_normal(result.is_metal, surface_vox)
         if normal[2] < 0:
             normal = np.array([0.0, 0.0, 1.0])

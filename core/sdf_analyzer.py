@@ -2775,7 +2775,9 @@ def analyze(
         pore_size_fine_threshold_um=pore_fine_threshold_um,
     )
 
-    result.riser_proposals = propose_risers(result, alloy, existing_riser_count=len(riser_results))
+    result.riser_proposals = propose_risers(
+        result, alloy, existing_riser_count=len(riser_results), gravity_vector=gravity_vector
+    )
 
     result.flow_result = flow_result_for_thermal
 
