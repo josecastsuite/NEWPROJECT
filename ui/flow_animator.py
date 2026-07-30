@@ -15,6 +15,7 @@ import numpy as np
 import pyvista as pv
 from PyQt6 import QtCore, QtWidgets
 from scipy import ndimage
+from scipy.special import erf, erfc
 
 try:
     from matplotlib.colors import LinearSegmentedColormap
@@ -471,18 +472,32 @@ class FlowAnimator(QtCore.QObject):
                     app.processEvents()
 
     def _build_fill_phi(self, t: float) -> Optional[np.ndarray]:
-        """Return the raveled phi level-set for the liquid front at time t."""
+        """Return the raveled phi level-set for the liquid front at time t.
+
+        Instead of a binary filled/unfilled mask, use a smooth error-function
+        transition centred on ``ft == t``.  This produces a closed, water-like
+        free surface rather than a jagged, voxelated front.
+        """
         if self._base_image is None:
             return None
 
         ft = self._fill_time_d
         metal = ft < self._sentinel
-        filled = (ft <= t) & metal
-        if not filled.any():
+        if not metal.any():
             return None
 
+        # Time thickness of the interface: at least 5 % of the total fill time
+        # or ~5 ms, whichever is larger, so the front is always several voxels
+        # wide and the isosurface is smooth.
+        sigma_t = max(0.05 * self._max_fill_time, 0.005)
+        # Smooth Heaviside: phi = 0.5 * (1 + erf((t - ft) / (sqrt(2) * sigma_t)))
+        # ft > t  -> phi < 0.5 (not yet filled)
+        # ft < t  -> phi > 0.5 (already filled)
+        # Non-metal cells keep phi = 0 because they are outside the casting.
+        dt = np.where(metal, t - ft, -self._sentinel)
+        phi = 0.5 * (1.0 + erf(dt / (np.sqrt(2.0) * sigma_t)))
         phi = ndimage.gaussian_filter(
-            filled.astype(np.float64), sigma=self.PHI_SIGMA, mode="constant", cval=0.0
+            phi, sigma=self.PHI_SIGMA, mode="constant", cval=0.0
         )
         return phi.astype(np.float32).ravel(order="F")
 
