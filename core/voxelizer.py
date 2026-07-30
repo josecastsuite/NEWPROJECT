@@ -574,7 +574,6 @@ def build_voxel_grid(
                 bodies, target_dim, progress_callback, fix_mesh, gravity_vector, conservative, margin
             )
         except Exception as exc:
-            import warnings
             warnings.warn(
                 f"C++ voxelizer could not be used ({exc}); falling back to Python voxelizer."
             )
