@@ -1,7 +1,9 @@
 """Bridge to the C++ Josecast core (OpenVDB + AMGCL + nanobind)."""
 
+import importlib.util
 import os
 import sys
+import sysconfig
 import numpy as np
 import trimesh
 from typing import List, Tuple, Optional, Callable
@@ -10,9 +12,21 @@ from core.types import Body, BodyType
 
 
 def _find_core_module():
-    """Locate the compiled josecast_core shared module."""
+    """Locate the compiled josecast_core shared module (.so / .pyd)."""
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     core_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # On Windows, make sure dependent DLLs in core/ and win_dlls/ are on the
+    # search path before attempting to import the extension.
+    if os.name == "nt":
+        for dll_dir in (core_dir, os.path.join(repo_root, "win_dlls")):
+            if os.path.isdir(dll_dir):
+                try:
+                    os.add_dll_directory(dll_dir)
+                except (AttributeError, OSError):
+                    pass
+
+    # Insert candidate directories on sys.path for a normal import.
     candidates = [
         os.path.join(repo_root, "cpp", "build", "src"),
         core_dir,
@@ -20,14 +34,49 @@ def _find_core_module():
     for p in candidates:
         if p not in sys.path:
             sys.path.insert(0, p)
+
+    # Try a normal import first (handles .so / matching .pyd already on path).
+    last_error = ""
     try:
         import josecast_core
-        return josecast_core
-    except ImportError:
-        return None
+        return josecast_core, ""
+    except Exception as exc:
+        last_error = f"import josecast_core failed: {exc}"
+
+    # Fallback: look for a .pyd/.so with a compatible ABI tag and load it
+    # explicitly. This helps when the pre-built Windows artifact name does not
+    # match what a simple `import` expects.
+    suffix = sysconfig.get_config_var("EXT_SUFFIX") or (
+        ".pyd" if os.name == "nt" else ".so"
+    )
+    for base in candidates:
+        if not os.path.isdir(base):
+            continue
+        for fname in sorted(os.listdir(base), reverse=True):
+            if fname.startswith("josecast_core") and (
+                fname.endswith(".pyd") or fname.endswith(".so")
+            ):
+                fpath = os.path.join(base, fname)
+                try:
+                    spec = importlib.util.spec_from_file_location(
+                        "josecast_core", fpath
+                    )
+                    if spec and spec.loader:
+                        mod = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(mod)
+                        return mod, ""
+                except Exception as exc:
+                    last_error = f"{fpath}: {exc}"
+                    print(f"[cpp_bridge] Could not load {fpath}: {exc}", file=sys.stderr)
+    return None, last_error
 
 
-JOSECAST_CORE = _find_core_module()
+_JOSECAST_CORE_LOAD_ERROR = ""
+_JOSECAST_CORE_OBJ = _find_core_module()
+if isinstance(_JOSECAST_CORE_OBJ, tuple):
+    JOSECAST_CORE, _JOSECAST_CORE_LOAD_ERROR = _JOSECAST_CORE_OBJ
+else:
+    JOSECAST_CORE, _JOSECAST_CORE_LOAD_ERROR = None, str(_JOSECAST_CORE_OBJ)
 
 
 def has_cpp_core() -> bool:
@@ -60,7 +109,11 @@ def build_voxel_grid_cpp(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, List[Body]]:
     """C++ OpenVDB voxelizer drop-in replacement for build_voxel_grid."""
     if JOSECAST_CORE is None:
-        raise RuntimeError("C++ core not built. Run: cd cpp && cmake -B build && cmake --build build")
+        raise RuntimeError(
+            f"C++ core not built. Python {sys.version}\nLoad error: {_JOSECAST_CORE_LOAD_ERROR}\n"
+            "Run: cd cpp && cmake -B build && cmake --build build, "
+            "or use a pre-built josecast_core.*.pyd matching your Python ABI."
+        )
 
     # Bodies are expected to have been classified already by the caller.
     mins = np.vstack([b.mesh.bounds[0] for b in bodies])

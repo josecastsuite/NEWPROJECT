@@ -569,9 +569,18 @@ def build_voxel_grid(
 
     cpp_build = _maybe_cpp_bridge()
     if cpp_build is not None:
-        grid, body_index, origin, dx, repaired_bodies = cpp_build(
-            bodies, target_dim, progress_callback, fix_mesh, gravity_vector, conservative, margin
-        )
+        try:
+            grid, body_index, origin, dx, repaired_bodies = cpp_build(
+                bodies, target_dim, progress_callback, fix_mesh, gravity_vector, conservative, margin
+            )
+        except Exception as exc:
+            import warnings
+            warnings.warn(
+                f"C++ voxelizer could not be used ({exc}); falling back to Python voxelizer."
+            )
+            grid, body_index, origin, dx, repaired_bodies = _voxelize_at_dim(
+                bodies, target_dim, margin, progress_callback, fix_mesh, conservative=conservative
+            )
     else:
         grid, body_index, origin, dx, repaired_bodies = _voxelize_at_dim(
             bodies, target_dim, margin, progress_callback, fix_mesh, conservative=conservative
