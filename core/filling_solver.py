@@ -5226,6 +5226,17 @@ def solve_filling_flow(
             if np.isfinite(max_fill_t) and max_fill_t > fill_time_s:
                 fill_time_s = max_fill_t
 
+    # Sand/air backpressure: if the mold sand cannot leak displaced air as
+    # fast as the metal is entering, the effective fill time increases because
+    # trapped air resists the advancing front.
+    if air_leak_m3_s > 1e-18 and Q_user > 1e-18:
+        p_sand = max(pressure_drop_pa, 1000.0)
+        k_sand = air_leak_m3_s / p_sand
+        p_back = min(Q_user / max(k_sand, 1e-18), p_sand)
+        p_metal = max(p_sand - p_back, 1e-12)
+        backpressure_factor = min(max(p_sand / p_metal, 1.0), 5.0)
+        fill_time_s *= backpressure_factor
+
     # Collect every node that feeds the part directly as a "gate" (meme).
     per_gate_v = {}
     per_gate_area = {}
@@ -5267,7 +5278,9 @@ def solve_filling_flow(
             f"Darcy akış çözümü: giriş '{used_section}', Q={Q_user*6e4:.2f} L/dak, "
             f"girdi hızı/alan={user_velocity:.3f} m/s / {area_m2*1e4:.2f} cm², "
             f"tahmini doldurma süresi={fill_time_s:.2f} s, "
-            f"basınç düşümü={pressure_drop_pa:.1f} Pa."
+            f"basınç düşümü={pressure_drop_pa:.1f} Pa, "
+            f"kum geçirgenliği K={sand_k_m2:.2e} m², "
+            f"hava kaçağı={air_leak_m3_s*6e4:.3f} L/dak."
         )
 
     return FillingResult(
