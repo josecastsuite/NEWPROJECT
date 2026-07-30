@@ -11,6 +11,11 @@ concurrency:
   group: windows-build-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  actions: write
+  packages: read
+
 jobs:
   build-windows:
     runs-on: windows-2025-vs2026

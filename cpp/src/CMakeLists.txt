@@ -27,7 +27,7 @@ else()
     message(WARNING "OpenVDB not found; C++ Voxelizer will be disabled")
 endif()
 
-if(EIGEN3_FOUND)
+if(Eigen3_FOUND)
     target_link_libraries(josecast_core PRIVATE Eigen3::Eigen)
 endif()
 

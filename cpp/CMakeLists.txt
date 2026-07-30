@@ -24,11 +24,12 @@ endif()
 
 # Eigen3: prefer config (vcpkg), fallback to system include path ----
 find_package(Eigen3 CONFIG QUIET)
-if(NOT EIGEN3_FOUND)
+if(NOT Eigen3_FOUND)
     find_path(EIGEN3_INCLUDE_DIR NAMES Eigen/Core PATHS /usr/include/eigen3)
     if(NOT EIGEN3_INCLUDE_DIR)
         message(FATAL_ERROR "Eigen3 headers not found")
     endif()
+    set(EIGEN3_FOUND TRUE)
 endif()
 
 # OpenVDB: prefer CMake config (vcpkg/conda), fallback to Linux -----
@@ -89,7 +90,7 @@ if(NOT OpenVDB_FOUND AND OPENVDB_LIBRARY)
     include_directories(BEFORE "${JOSECAST_OLD_TBB_ROOT}/include")
 endif()
 
-if(NOT EIGEN3_FOUND)
+if(NOT Eigen3_FOUND)
     include_directories(BEFORE "${EIGEN3_INCLUDE_DIR}")
 endif()
 
