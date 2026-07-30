@@ -455,5 +455,9 @@ class AnalysisResult:
     pore_size_fine_threshold_um: float = 0.0
     # v9.4: hot spots detected inside risers/feeders (shown separately, not part defects)
     feeder_hotspots: List[HotSpot] = field(default_factory=list)
+    # v9.5: simplified thermomechanical stress and crack risk maps
+    thermal_stress_pa: np.ndarray = field(default_factory=lambda: np.array([]))
+    hot_tear_risk: np.ndarray = field(default_factory=lambda: np.array([]))
+    cold_crack_risk: np.ndarray = field(default_factory=lambda: np.array([]))
     # metadata
     bbox_size_mm: np.ndarray = field(default_factory=lambda: np.zeros(3))

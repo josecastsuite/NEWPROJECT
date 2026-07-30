@@ -264,6 +264,45 @@ def compute_thermal_field(
     return T, cooling_rate, solid_fraction, thermal_divergence
 
 
+def compute_thermal_stress(
+    temperature: np.ndarray,
+    solid_fraction: np.ndarray,
+    alloy: Alloy,
+    is_metal: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Simplified thermomechanical stress and crack-risk maps.
+
+    Assumes fully constrained shrinkage: thermal strain = alpha * (Ts - T).
+    Stress is capped at the high-temperature yield stress.  Hot-tear risk is
+    highest in the mushy zone where liquid films remain and accumulated strain
+    exceeds the alloy's hot-tear threshold.  Cold-crack risk is evaluated near
+    room temperature against the room-temperature yield stress.
+    """
+    E = float(getattr(alloy, "young_modulus_pa", 2.1e11))
+    alpha = float(getattr(alloy, "thermal_expansion_cinv", 1.2e-5))
+    yield_h = float(getattr(alloy, "yield_strength_pa", 2.5e8))
+    yield_r = float(getattr(alloy, "room_temp_yield_pa", 4.0e8))
+    tear_thr = float(getattr(alloy, "hot_tear_threshold_strain", 0.015))
+
+    dT = np.maximum(alloy.t_solidus_c - temperature, 0.0)
+    strain = alpha * dT
+    stress = np.clip(E * strain, 0.0, yield_h)
+
+    # Hot tear: strain demand in the mushy zone (fs ~ 0.3..0.95) relative to
+    # the alloy's interdendritic ductility.
+    mushy = is_metal & (solid_fraction > 0.3) & (solid_fraction < 0.95)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        hot_tear = np.where(
+            mushy, np.clip(strain / max(tear_thr, 1e-9), 0.0, 1.0), 0.0
+        )
+
+    # Cold crack: stress relative to room-temperature yield at T <= 100 °C.
+    cold_region = is_metal & (temperature <= 100.0) & (solid_fraction >= 0.99)
+    cold_crack = np.where(cold_region, np.clip(stress / max(yield_r, 1e-9), 0.0, 1.0), 0.0)
+
+    return stress, hot_tear, cold_crack
+
+
 def compute_chvorinov_t(M_field: np.ndarray, C: float) -> np.ndarray:
     """
     Chvorinov solidification time: t_s = C * M^2  [s].
@@ -1623,6 +1662,9 @@ def _refine_region(
     T, R, fs, _ = compute_thermal_field(
         grid, is_metal, alloy, mold, dx, sdf=sdf, M_mod=M_mod
     )
+    thermal_stress, hot_tear_risk, cold_crack_risk = compute_thermal_stress(
+        T, fs, alloy, is_metal
+    )
     G, R, niyama = compute_niyama(
         sdf, M_mod, alloy, mold, dx, is_metal=is_metal,
         temperature=T, cooling_rate=R,
@@ -2132,6 +2174,9 @@ def analyze(
         gravity_vector=tuple(casting_params.gravity_vector)
         if casting_params is not None
         else (0.0, 0.0, -1.0),
+    )
+    thermal_stress, hot_tear_risk, cold_crack_risk = compute_thermal_stress(
+        temperature, solid_fraction, alloy, is_metal
     )
     # v9.3: account for feeder sleeves/exothermic/chilled type by scaling the
     # solidification time of RISER voxels.  With the body-index grid, each
@@ -2773,6 +2818,9 @@ def analyze(
         pore_size_micro_threshold_um=pore_micro_threshold_um,
         pore_size_fine_percent=pore_fine_percent,
         pore_size_fine_threshold_um=pore_fine_threshold_um,
+        thermal_stress_pa=thermal_stress,
+        hot_tear_risk=hot_tear_risk,
+        cold_crack_risk=cold_crack_risk,
     )
 
     result.riser_proposals = propose_risers(

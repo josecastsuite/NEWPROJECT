@@ -408,6 +408,25 @@ def _format_niyama_table(result: AnalysisResult) -> str:
     return "".join(rows)
 
 
+def _format_thermal_stress(result: AnalysisResult) -> str:
+    """Render a brief thermomechanical stress / hot-tear / cold-crack summary."""
+    ts = result.thermal_stress_pa
+    htr = result.hot_tear_risk
+    ccr = result.cold_crack_risk
+    if ts.size == 0:
+        return ""
+    part_mask = result.grid == 1  # BodyType.PART == 1
+    if part_mask.size != ts.size:
+        part_mask = np.ones(ts.shape, dtype=bool)
+    ts_max = float(np.max(ts[part_mask])) if part_mask.any() else 0.0
+    ht_max = float(np.max(htr[part_mask])) if part_mask.any() else 0.0
+    cc_max = float(np.max(ccr[part_mask])) if part_mask.any() else 0.0
+    return f"""
+    <h2>Termomekanik Gerilme ve Çatlak Riski (basitleştirilmiş)</h2>
+    <p>Maksimum ısıl gerilme = {ts_max/1e6:.1f} MPa, maksimum sıcak yırtılma riski = {ht_max*100:.1f}%, maksimum soğuk çatlak riski = {cc_max*100:.1f}%.</p>
+    """
+
+
 def _render_html(result: AnalysisResult, screenshot_path: Optional[str] = None) -> str:
     """Render the v8.0 Turkish report as a self-contained HTML string."""
     recs = ""
@@ -532,6 +551,8 @@ def _render_html(result: AnalysisResult, screenshot_path: Optional[str] = None) 
         <tr><th>Varyant</th><th>p5</th><th>p50</th><th>p95</th></tr>
         {_format_niyama_table(result)}
     </table>
+
+    {_format_thermal_stress(result)}
 
     <div class="page-break"></div>
     <h2>Öneriler</h2>

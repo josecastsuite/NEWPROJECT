@@ -79,6 +79,12 @@ class Alloy:
     shrinkage_factor: float = 0.03
     # Secondary dendrite arm spacing [mm] for interdendritic permeability
     dendrite_spacing_mm: float = 0.12
+    # Thermomechanical stress defaults (simplified 1-D constrained shrinkage model)
+    young_modulus_pa: float = 2.1e11
+    thermal_expansion_cinv: float = 1.2e-5
+    yield_strength_pa: float = 2.5e8
+    room_temp_yield_pa: float = 4.0e8
+    hot_tear_threshold_strain: float = 0.015
     # Practical porosity acceptance limits [µm] and unavoidable gas/oxide baseline
     micro_pore_limit_um: float = 50.0
     macro_pore_limit_um: float = 500.0
@@ -230,6 +236,10 @@ ALLOYS: Dict[str, Alloy] = {
         niyama_shrinkage=1.5,
         carlson_curve_key="A356",
         critical_entrainment_velocity_m_s=0.5,
+        young_modulus_pa=7.0e10,
+        thermal_expansion_cinv=2.3e-5,
+        yield_strength_pa=1.5e8,
+        room_temp_yield_pa=2.5e8,
     ),
     "GGG40": Alloy(
         key="GGG40",
