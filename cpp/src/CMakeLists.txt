@@ -12,6 +12,8 @@ endif()
 
 nanobind_add_module(josecast_core ${JOSECAST_SOURCES})
 
+target_compile_definitions(josecast_core PRIVATE AMGCL_NO_BOOST=1)
+
 if(JOSECAST_OPENVDB_FOUND)
     target_compile_definitions(josecast_core PRIVATE JOSECAST_HAS_OPENVDB=1)
     if(JOSECAST_OPENVDB_TARGET)
