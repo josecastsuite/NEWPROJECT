@@ -64,16 +64,18 @@ jobs:
       - name: Collect runtime DLLs
         shell: pwsh
         run: |
-          $bin = "${{ github.workspace }}\vcpkg\installed\x64-windows\bin"
+          $bin = "${{ github.workspace }}\build\vcpkg_installed\x64-windows\bin"
           if (Test-Path $bin) {
             New-Item -ItemType Directory -Force -Path win_dlls | Out-Null
             Copy-Item "$bin\*.dll" win_dlls\ -Force
+            Get-ChildItem win_dlls\*.dll | Select-Object FullName
           }
 
       - name: Show produced files
         shell: pwsh
         run: |
           Get-ChildItem -Recurse -Filter "josecast_core*.pyd" | Select-Object FullName
+          if (Test-Path "win_dlls") { Get-ChildItem win_dlls\*.dll | Select-Object FullName }
 
       - name: Upload .pyd and DLLs
         uses: actions/upload-artifact@v4
