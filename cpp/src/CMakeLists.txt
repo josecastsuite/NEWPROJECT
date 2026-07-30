@@ -4,6 +4,7 @@ set(JOSECAST_SOURCES
     darcy_solver.cpp
     gating_tree.cpp
     ns_solver.cpp
+    thermal_solver.cpp
 )
 
 nanobind_add_module(josecast_core ${JOSECAST_SOURCES})

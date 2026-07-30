@@ -53,11 +53,17 @@ if(NOT EXISTS "${AMGCL_ROOT}/amgcl/make_solver.hpp")
     message(FATAL_ERROR "AMGCL headers not found at ${AMGCL_ROOT}")
 endif()
 
+find_path(EIGEN3_INCLUDE_DIR NAMES Eigen/Core PATHS /usr/include/eigen3)
+if(NOT EIGEN3_INCLUDE_DIR)
+    message(FATAL_ERROR "Eigen3 headers not found")
+endif()
+
 include_directories(
     BEFORE
     "${JOSECAST_OLD_TBB_ROOT}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${AMGCL_ROOT}"
+    "${EIGEN3_INCLUDE_DIR}"
 )
 
 add_subdirectory(src)

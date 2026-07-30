@@ -1,6 +1,7 @@
 """SDF-based geometric + pseudo-thermal casting analyzer - JoseCast v8.0."""
 
 import math
+import os
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
@@ -25,8 +26,16 @@ from core.materials import (
     get_mold,
 )
 from core.riser_designer import propose_risers
-from core.thermal_solver import _dscheil_dT, solve_3d_thermal
+from core.thermal_solver import _alloy_to_dict, _dscheil_dT, solve_3d_thermal
 from core.voxelizer import build_part_grid
+
+USE_CPP_POROSITY = (
+    os.environ.get("JOSECAST_USE_CPP_POROSITY", "0").lower() in ("1", "true", "yes")
+)
+if USE_CPP_POROSITY:
+    from core.cpp_bridge import JOSECAST_CORE
+else:
+    JOSECAST_CORE = None
 from core.types import (
     BODY_FEEDER_TYPES,
     BODY_METAL_TYPES,
@@ -443,6 +452,40 @@ def compute_pore_size(
     feed_eff = directional_feed_efficiency(
         t_s, _feeder, part_mask, dx, gravity_vector=gravity_vector, fill_time=fill_time
     )
+
+    # Optional C++ accelerated porosity map.
+    if USE_CPP_POROSITY and JOSECAST_CORE is not None:
+        v_in = (
+            velocity_magnitude.astype(np.float64, copy=False)
+            if velocity_magnitude is not None
+            else np.empty((0,), dtype=np.float64)
+        )
+        d_in = (
+            darcy_factor.astype(np.float64, copy=False)
+            if darcy_factor is not None
+            else np.empty((0,), dtype=np.float64)
+        )
+        ps_um, ps_mm, macro, micro, fine, shrink, gp = JOSECAST_CORE.compute_porosity(
+            niyama.astype(np.float64, copy=False),
+            M_mod.astype(np.float64, copy=False),
+            feed_risk.astype(np.float64, copy=False),
+            feed_eff.astype(np.float64, copy=False),
+            part_mask.astype(np.uint8, copy=False),
+            v_in,
+            d_in,
+            _alloy_to_dict(alloy),
+            alloy.carlson_curve_key,
+        )
+        return (
+            ps_um,
+            ps_mm,
+            macro.astype(bool),
+            micro.astype(bool),
+            fine.astype(bool),
+            shrink,
+            gp,
+        )
+
     feed_factor = np.power(np.clip(feed_risk, 0.0, 1.0), alloy.feed_risk_exponent) * feed_eff
 
     # Carlson-Beckermann dimensionless Niyama -> shrinkage pore volume %.

@@ -17,12 +17,22 @@ already elapsed, so the thermal solver is coupled to the flow solution.
 
 from typing import Optional, Tuple
 
+import os
+
 import numpy as np
 from scipy import ndimage, sparse
 from scipy.sparse import linalg as spla
 
 from core.materials import Alloy, MoldMaterial
 from core.types import BODY_METAL_TYPES, BodyType
+
+USE_CPP_THERMAL = (
+    os.environ.get("JOSECAST_USE_CPP_THERMAL", "0").lower() in ("1", "true", "yes")
+)
+if USE_CPP_THERMAL:
+    from core.cpp_bridge import JOSECAST_CORE
+else:
+    JOSECAST_CORE = None
 
 
 def _scheil_fs(
@@ -107,6 +117,157 @@ def _upsample(field_c: np.ndarray, target_shape: Tuple[int, int, int], order: in
         (target_shape[0] / field_c.shape[0], target_shape[1] / field_c.shape[1], target_shape[2] / field_c.shape[2]),
         order=order,
     )
+
+
+def _alloy_to_dict(alloy: Alloy) -> dict:
+    return {
+        "rho_kg_m3": alloy.rho_kg_m3,
+        "cp_j_kgk": alloy.cp_j_kgk,
+        "k_w_mk": alloy.k_w_mk,
+        "latent_heat_j_kg": alloy.latent_heat_j_kg,
+        "t_liquidus_c": alloy.t_liquidus_c,
+        "t_solidus_c": alloy.t_solidus_c,
+        "t_pour_c": alloy.t_pour_c,
+        "partition_coefficient": alloy.partition_coefficient,
+        "shrinkage_factor": alloy.shrinkage_factor,
+        "dendrite_spacing_mm": alloy.dendrite_spacing_mm,
+        "micro_pore_limit_um": alloy.micro_pore_limit_um,
+        "macro_pore_limit_um": alloy.macro_pore_limit_um,
+        "gas_pore_baseline_um": alloy.gas_pore_baseline_um,
+        "pore_niyama_exponent": alloy.pore_niyama_exponent,
+        "feed_risk_exponent": alloy.feed_risk_exponent,
+        "gas_pore_time_factor": alloy.gas_pore_time_factor,
+        "gas_pore_niyama_factor": alloy.gas_pore_niyama_factor,
+        "critical_entrainment_velocity_m_s": alloy.critical_entrainment_velocity_m_s,
+        "pore_entrainment_exponent": alloy.pore_entrainment_exponent,
+        "pore_entrainment_factor": alloy.pore_entrainment_factor,
+        "niyama_macro": alloy.niyama_macro,
+        "niyama_shrinkage": alloy.niyama_shrinkage,
+        "niyama_star_scale": alloy.niyama_star_scale,
+        "pore_size_um_per_porosity_pct": alloy.pore_size_um_per_porosity_pct,
+        "pore_size_length_factor": alloy.pore_size_length_factor,
+    }
+
+
+def _mold_to_dict(mold: MoldMaterial) -> dict:
+    return {
+        "k_w_mk": mold.k_w_mk,
+        "cp_j_kgk": mold.cp_j_kgk,
+        "rho_kg_m3": mold.rho_kg_m3,
+        "t0_c": mold.t0_c,
+    }
+
+
+def _solve_thermal_cpp(
+    grid: np.ndarray,
+    is_metal_fine: np.ndarray,
+    alloy: Alloy,
+    mold: MoldMaterial,
+    dx: float,
+    max_time_s: float,
+    downsample: int,
+    fill_time_s: Optional[np.ndarray],
+    velocity_m_s: Optional[np.ndarray],
+    gravity_vector: Tuple[float, float, float],
+    feed_velocity_m_s: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Wrap the C++ enthalpy solver with Python downsample/upsample."""
+    if JOSECAST_CORE is None:
+        raise RuntimeError("josecast_core C++ module is not available")
+
+    fine_shape = grid.shape
+    if downsample > 1:
+        grid_c = _downsample_grid(grid, downsample)
+        dx_c_mm = dx * downsample
+        if fill_time_s is not None:
+            fill_c = ndimage.zoom(
+                fill_time_s,
+                (
+                    grid_c.shape[0] / fill_time_s.shape[0],
+                    grid_c.shape[1] / fill_time_s.shape[1],
+                    grid_c.shape[2] / fill_time_s.shape[2],
+                ),
+                order=0,
+            )
+        else:
+            fill_c = None
+        if velocity_m_s is not None and velocity_m_s.ndim == 4:
+            ratios = (
+                grid_c.shape[0] / velocity_m_s.shape[1],
+                grid_c.shape[1] / velocity_m_s.shape[2],
+                grid_c.shape[2] / velocity_m_s.shape[3],
+            )
+            velocity_c = np.stack(
+                [ndimage.zoom(velocity_m_s[i], ratios, order=1) for i in range(3)],
+                axis=0,
+            )
+        else:
+            velocity_c = None
+    else:
+        grid_c = grid
+        dx_c_mm = dx
+        fill_c = fill_time_s
+        velocity_c = velocity_m_s
+
+    if fill_c is not None:
+        max_fill = float(np.nanmax(fill_c[np.isfinite(fill_c)])) if np.isfinite(fill_c).any() else 0.0
+        max_time_s = max(max_time_s, max_fill + max_time_s)
+
+    casting_metal_ids = [int(t) for t in BODY_METAL_TYPES]
+    is_metal_c = np.isin(grid_c, casting_metal_ids)
+    is_gating_c = is_metal_c & (grid_c != int(BodyType.PART))
+    chill_mask_c = grid_c == 11
+
+    is_metal_u8 = is_metal_c.astype(np.uint8, copy=False)
+    is_gating_u8 = is_gating_c.astype(np.uint8, copy=False)
+    is_chill_u8 = chill_mask_c.astype(np.uint8, copy=False)
+
+    fill_in = fill_c.astype(np.float64, copy=False) if fill_c is not None else np.empty((0,), dtype=np.float64)
+    vel_in = velocity_c.astype(np.float64, copy=False) if velocity_c is not None else np.empty((0,), dtype=np.float64)
+
+    n_steps = 0  # let C++ use its default
+    T_c, fs_c, t_liq_c, t_sol_c, G_c, R_c, niyama_c = JOSECAST_CORE.solve_thermal(
+        is_metal_u8,
+        is_gating_u8,
+        is_chill_u8,
+        fill_in,
+        vel_in,
+        float(dx_c_mm),
+        float(max_time_s),
+        int(n_steps),
+        _alloy_to_dict(alloy),
+        _mold_to_dict(mold),
+        float(feed_velocity_m_s),
+        np.asarray(gravity_vector, dtype=np.float64),
+    )
+
+    T_fine = _upsample(T_c, fine_shape, order=1)
+    fs_fine = _upsample(fs_c, fine_shape, order=1)
+    G_fine = _upsample(G_c, fine_shape, order=1)
+    R_fine = _upsample(R_c, fine_shape, order=1)
+    niyama_fine = _upsample(niyama_c, fine_shape, order=1)
+    t_liq_fine = _upsample(t_liq_c, fine_shape, order=0)
+    t_sol_fine = _upsample(t_sol_c, fine_shape, order=0)
+
+    if fill_time_s is not None:
+        fill_time_fine = _upsample(fill_time_s, fine_shape, order=0)
+        fill_time_fine = np.where(is_metal_fine, fill_time_fine, 0.0)
+        with np.errstate(invalid="ignore"):
+            t_liq_fine = np.where(
+                is_metal_fine & np.isfinite(t_liq_fine) & np.isfinite(fill_time_fine),
+                t_liq_fine + fill_time_fine,
+                t_liq_fine,
+            )
+            t_sol_fine = np.where(
+                is_metal_fine & np.isfinite(t_sol_fine) & np.isfinite(fill_time_fine),
+                t_sol_fine + fill_time_fine,
+                t_sol_fine,
+            )
+
+    for arr in (niyama_fine, G_fine, R_fine, t_liq_fine, t_sol_fine, fs_fine):
+        arr[:] = np.where(is_metal_fine, arr, 0.0)
+
+    return T_fine, fs_fine, t_liq_fine, t_sol_fine, G_fine, R_fine, niyama_fine
 
 
 def _build_laplacian(k: np.ndarray, dx: float) -> sparse.csc_matrix:
@@ -241,6 +402,15 @@ def solve_3d_thermal(
     T_final, fs_final, t_liquidus, t_solidus, G_at_ts, R_at_ts, niyama
     """
     fine_shape = grid.shape
+    is_metal_fine = np.isin(grid, [int(t) for t in BODY_METAL_TYPES])
+
+    if USE_CPP_THERMAL and JOSECAST_CORE is not None:
+        return _solve_thermal_cpp(
+            grid, is_metal_fine, alloy, mold, dx, max_time_s,
+            downsample, fill_time_s, velocity_m_s, gravity_vector,
+            feed_velocity_m_s,
+        )
+
     if downsample > 1:
         grid_c = _downsample_grid(grid, downsample)
         dx_c_mm = dx * downsample
