@@ -289,9 +289,23 @@ def _format_flow_result(flow) -> str:
         </table>
         """
 
+    reynolds = getattr(flow, "reynolds", None)
+    turb_intensity = getattr(flow, "turbulence_intensity", None)
+    turb_html = ""
+    if reynolds is not None and reynolds.size:
+        re_max = float(reynolds.max())
+        re_mean = float(reynolds.mean())
+        ti_max = float(turb_intensity.max()) if turb_intensity is not None else 0.0
+        turb_html = (
+            f"<p><strong>Akış türbülansı:</strong> max Re = {re_max:.0f}, "
+            f"ortalama Re = {re_mean:.0f}, maksimum türbülans yoğunluğu I = {ti_max*100:.1f}% "
+            f"({'türbülanslı' if re_max > 2300 else 'laminar'})</p>"
+        )
+
     return f"""
     <h3>3-B Darcy Akış Simülasyonu (v9.3)</h3>
     <p>Toplam debi Q = {flow.Q_m3_s*1e3:.3f} L/s | Giriş alanı = {flow.inlet_area_m2*1e4:.2f} cm² | Tahmini doldurma süresi = {flow.fill_time_s:.2f} s | Meme temas hızı = {flow.ingate_contact_velocity_m_s:.3f} m/s</p>
+    {turb_html}
     {graph_html}
     <table>
         <tr><th>Kesit</th><th>Hız (m/s)</th><th>Hız (cm/s)</th></tr>

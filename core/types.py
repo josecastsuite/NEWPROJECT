@@ -283,6 +283,9 @@ class FillingResult:
     air_leak_rate_m3_s: float = 0.0
     sand_porosity: float = 0.0
     sand_grain_diameter_mm: float = 0.0
+    # Filling turbulence metrics (Darcy / LBM post-processed).
+    reynolds: Optional[np.ndarray] = None  # per-voxel Reynolds number
+    turbulence_intensity: Optional[np.ndarray] = None  # I = 0.16 Re^-0.08 (pipe fit)
 
 
 @dataclass

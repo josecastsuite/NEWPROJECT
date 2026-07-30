@@ -4843,6 +4843,10 @@ def solve_filling_flow(
                         dx_m,
                     )
                 )
+                # The C++ leak model treats the sand wall as one voxel thick;
+                # scale to a realistic mold wall thickness (≥5 voxels or 50 mm).
+                wall_thickness_m = max(5.0 * dx_m, 0.05)
+                air_leak_m3_s *= dx_m / wall_thickness_m
         except Exception as exc:
             print(f"[SAND] Kum geçirgenliği hesaplanamadı: {exc}", flush=True)
 
@@ -5166,6 +5170,25 @@ def solve_filling_flow(
                 if np.isfinite(max_fill_t) and max_fill_t > 0.0:
                     fill_time_s = max_fill_t
 
+    # Post-process 3-D flow turbulence metrics (Re, turbulent intensity).
+    orig_dx_m = orig_dx / 1000.0
+    if fine_metal.any():
+        dt_m = ndimage.distance_transform_edt(fine_metal, sampling=orig_dx_m)
+        D_h = 2.0 * dt_m
+        rho_liq = float(getattr(alloy, "rho_liquid_kg_m3", 7000.0))
+        reynolds_field = np.where(
+            fine_metal & (D_h > 0.0), rho_liq * vmag_fine * D_h / mu, 0.0
+        )
+        with np.errstate(divide="ignore", invalid="ignore"):
+            turb_intensity = np.where(
+                fine_metal & (reynolds_field > 1.0),
+                0.16 * np.power(reynolds_field, -0.125),
+                0.0,
+            )
+    else:
+        reynolds_field = np.zeros_like(vmag_fine)
+        turb_intensity = np.zeros_like(vmag_fine)
+
     # Contact-node velocities / areas for every gating-gating and gating-part interface.
     # Use the solver (coarse) grid, the staggered face velocities and the FAVOR
     # fractional face areas so the real contact area is used in Q = v * A.
@@ -5306,4 +5329,6 @@ def solve_filling_flow(
         air_leak_rate_m3_s=air_leak_m3_s,
         sand_porosity=sand_phi,
         sand_grain_diameter_mm=sand_d_mm,
+        reynolds=reynolds_field.astype(np.float32),
+        turbulence_intensity=turb_intensity.astype(np.float32),
     )
