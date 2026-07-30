@@ -2838,34 +2838,65 @@ def _gating_volume_time(
         if wsum > 1e-18:
             exit_point[parent] = ptsum / wsum
 
-    # Through-flow per body (sum of incoming flows).
-    Q = np.zeros(n_bodies, dtype=np.float64)
-    Q[source_bidx] = source_q
-    for b, flows in parents.items():
-        Q[b] = sum(q for _, q in flows)
-    for b, q in q_in.items():
-        Q[b] = max(Q[b], q)
-
+    # Through-flow per body and gating arrival times.
     t_enter = np.full(n_bodies, np.inf, dtype=np.float64)
     t_exit = np.full(n_bodies, np.inf, dtype=np.float64)
-    visited = np.zeros(n_bodies, dtype=bool)
 
-    def _visit(bidx: int) -> None:
-        if bidx < 0 or bidx >= n_bodies or visited[bidx]:
-            return
-        visited[bidx] = True
-        if bidx == source_bidx:
-            t_enter[bidx] = 0.0
-        else:
-            parent_exits = [t_exit[p] for p, _ in parents.get(bidx, []) if np.isfinite(t_exit[p])]
-            t_enter[bidx] = float(max(parent_exits)) if parent_exits else 0.0
-        t_exit[bidx] = t_enter[bidx] + body_vol[bidx] / max(Q[bidx], 1e-18)
-        for c in children.get(bidx, []):
-            cb = c.get("bidx")
-            if cb is not None:
-                _visit(cb)
+    if os.environ.get("JOSECAST_USE_CPP_GATING", "1") != "0":
+        try:
+            from core.cpp_bridge import JOSECAST_CORE
+            if JOSECAST_CORE is not None:
+                edge_rows = []
+                edge_qs = []
+                for parent, childs in children.items():
+                    for c in childs:
+                        cb = c.get("bidx")
+                        if cb is None:
+                            continue
+                        edge_rows.append([int(parent), int(cb)])
+                        edge_qs.append(float(c["q"]))
+                if edge_rows:
+                    edges = np.asarray(edge_rows, dtype=np.int32).reshape(-1, 2)
+                    edge_q = np.asarray(edge_qs, dtype=np.float64)
+                else:
+                    edges = np.empty((0, 2), dtype=np.int32)
+                    edge_q = np.empty(0, dtype=np.float64)
+                q_in_arr = np.zeros(n_bodies, dtype=np.float64)
+                for b, q in q_in.items():
+                    q_in_arr[int(b)] = float(q)
+                t_enter, t_exit, _ = JOSECAST_CORE.solve_gating_times(
+                    int(source_bidx), float(source_q), body_vol, edges, edge_q, q_in_arr
+                )
+        except Exception as exc:
+            print(f"[Gating] C++ solver fallback: {exc}")
 
-    _visit(source_bidx)
+    if not np.isfinite(t_exit[source_bidx]):
+        # Fallback Python DFS (or if C++ path was skipped/failed).
+        Q = np.zeros(n_bodies, dtype=np.float64)
+        Q[source_bidx] = source_q
+        for b, flows in parents.items():
+            Q[b] = sum(q for _, q in flows)
+        for b, q in q_in.items():
+            Q[b] = max(Q[b], q)
+
+        visited = np.zeros(n_bodies, dtype=bool)
+
+        def _visit(bidx: int) -> None:
+            if bidx < 0 or bidx >= n_bodies or visited[bidx]:
+                return
+            visited[bidx] = True
+            if bidx == source_bidx:
+                t_enter[bidx] = 0.0
+            else:
+                parent_exits = [t_exit[p] for p, _ in parents.get(bidx, []) if np.isfinite(t_exit[p])]
+                t_enter[bidx] = float(max(parent_exits)) if parent_exits else 0.0
+            t_exit[bidx] = t_enter[bidx] + body_vol[bidx] / max(Q[bidx], 1e-18)
+            for c in children.get(bidx, []):
+                cb = c.get("bidx")
+                if cb is not None:
+                    _visit(cb)
+
+        _visit(source_bidx)
 
     # Per-cell gating fill time, linear from entry to exit along the local flow.
     T = np.full(shape, np.inf, dtype=np.float64)

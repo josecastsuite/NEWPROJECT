@@ -5,6 +5,7 @@
 
 #include "josecast/voxelizer.h"
 #include "josecast/darcy_solver.h"
+#include "josecast/gating_tree.h"
 
 namespace nb = nanobind;
 
@@ -24,4 +25,9 @@ NB_MODULE(josecast_core, m) {
           nb::arg("indptr"), nb::arg("indices"), nb::arg("data"), nb::arg("rhs"),
           nb::arg("max_iter") = 1000, nb::arg("rtol") = 1e-5, nb::arg("abstol") = 1e-12,
           "Solve a sparse symmetric-positive-definite pressure system with AMGCL (BiCGStab + AMG).");
+
+    m.def("solve_gating_times", &josecast::solve_gating_times,
+          nb::arg("source_bidx"), nb::arg("source_q"),
+          nb::arg("body_volumes"), nb::arg("edges"), nb::arg("edge_q"), nb::arg("q_in"),
+          "Compute t_enter/t_exit/Q for the gating tree using Kahn topological sort.");
 }
