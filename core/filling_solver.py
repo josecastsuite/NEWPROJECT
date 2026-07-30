@@ -72,6 +72,50 @@ def _downsample_grid(
     return grid_c.astype(grid.dtype), origin_c, dx_c
 
 
+def _recommend_filter(
+    gating_nodes: List[Any], Q_m3_s: float, alloy: Any
+) -> Optional[str]:
+    """Suggest a ceramic filter size/location when the runner flow is turbulent.
+
+    Uses a simple Darcy-Forchheimer-style loss estimate.  The filter area is
+    sized so the face velocity stays below a metal-dependent limit.
+    """
+    if not gating_nodes or Q_m3_s <= 1e-12:
+        return None
+    # Prefer the first RUNNER node; fall back to SPRUE_THROAT, then first node.
+    target_node = None
+    for n in gating_nodes:
+        if "RUNNER" in n.body_type:
+            target_node = n
+            break
+    if target_node is None:
+        for n in gating_nodes:
+            if "SPRUE_THROAT" in n.body_type or "SPRUE" in n.body_type:
+                target_node = n
+                break
+    if target_node is None:
+        target_node = gating_nodes[0]
+
+    v_node = max(target_node.velocity_m_s, 1e-6)
+    rho = float(getattr(alloy, "rho_liquid_kg_m3", 2700.0))
+    # Al: face velocity through filter should stay < ~0.5 m/s.
+    v_filter_max = 0.45
+    A_f = Q_m3_s / v_filter_max
+    D_f = np.sqrt(4.0 * A_f / np.pi) * 1000.0  # mm
+    thickness_mm = 15.0
+    ppi = 20
+    # Rough pressure drop coefficient for a 20 PPI ceramic filter.
+    K_filter = 4.0 + 0.05 * ppi
+    dp_pa = 0.5 * rho * (v_node ** 2) * K_filter
+    loc = target_node.name or target_node.body_type
+    return (
+        f"Seramik filtre önerisi: '{loc}' bölgesine Ø{D_f:.0f} mm, "
+        f"{ppi} PPI, {thickness_mm:.0f} mm kalınlık; "
+        f"yaklaşık {dp_pa:.0f} Pa ek basınç düşümü, "
+        f"yüzey hızı ~{v_filter_max:.2f} m/s."
+    )
+
+
 def _flow_refined_grid(
     bodies: List[Body],
     casting_params,
@@ -5289,6 +5333,8 @@ def solve_filling_flow(
     if progress_callback:
         progress_callback(95)
 
+    filter_recommendation = _recommend_filter(gating_nodes, Q_user, alloy)
+
     if vof_res is not None:
         reason = (
             f"Taichi VOF/Navier-Stokes dolum: giriş '{used_section}', "
@@ -5331,4 +5377,5 @@ def solve_filling_flow(
         sand_grain_diameter_mm=sand_d_mm,
         reynolds=reynolds_field.astype(np.float32),
         turbulence_intensity=turb_intensity.astype(np.float32),
+        filter_recommendation=filter_recommendation,
     )

@@ -302,10 +302,14 @@ def _format_flow_result(flow) -> str:
             f"({'türbülanslı' if re_max > 2300 else 'laminar'})</p>"
         )
 
+    filter_rec = getattr(flow, "filter_recommendation", None) or ""
+    filter_html = f"<p><strong>Filtre önerisi:</strong> {filter_rec}</p>" if filter_rec else ""
+
     return f"""
     <h3>3-B Darcy Akış Simülasyonu (v9.3)</h3>
     <p>Toplam debi Q = {flow.Q_m3_s*1e3:.3f} L/s | Giriş alanı = {flow.inlet_area_m2*1e4:.2f} cm² | Tahmini doldurma süresi = {flow.fill_time_s:.2f} s | Meme temas hızı = {flow.ingate_contact_velocity_m_s:.3f} m/s</p>
     {turb_html}
+    {filter_html}
     {graph_html}
     <table>
         <tr><th>Kesit</th><th>Hız (m/s)</th><th>Hız (cm/s)</th></tr>
@@ -774,6 +778,8 @@ def _generate_report_fpdf2(
         pdf.cell(0, 6, f"Bernoulli: {'Geçer' if gr.bernoulli_ok else 'Geçersiz'} (dirsek kaybi: {gr.elbow_count}, {gr.head_loss_mm:.1f} mm)", ln=True)
         pdf.cell(0, 6, f"Meme kalın bölgede: {'Evet' if gr.ingate_on_thick_region else 'Hayır'} "
                        f"(ortalama M={gr.ingate_avg_m_mm:.2f} mm)", ln=True)
+        if result.flow_result and getattr(result.flow_result, "filter_recommendation", None):
+            pdf.cell(0, 6, f"Filtre: {result.flow_result.filter_recommendation}", ln=True)
         pdf.ln(4)
 
     if result.thermal_stress_pa.size:

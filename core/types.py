@@ -286,6 +286,8 @@ class FillingResult:
     # Filling turbulence metrics (Darcy / LBM post-processed).
     reynolds: Optional[np.ndarray] = None  # per-voxel Reynolds number
     turbulence_intensity: Optional[np.ndarray] = None  # I = 0.16 Re^-0.08 (pipe fit)
+    # Phase 5: automatic ceramic filter recommendation for high-turbulence gating.
+    filter_recommendation: Optional[str] = None
 
 
 @dataclass
