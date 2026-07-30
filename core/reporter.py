@@ -776,6 +776,21 @@ def _generate_report_fpdf2(
                        f"(ortalama M={gr.ingate_avg_m_mm:.2f} mm)", ln=True)
         pdf.ln(4)
 
+    if result.thermal_stress_pa.size:
+        part_mask = result.grid == 1
+        if part_mask.size != result.thermal_stress_pa.size:
+            part_mask = np.ones(result.thermal_stress_pa.shape, dtype=bool)
+        ts_max = float(np.max(result.thermal_stress_pa[part_mask])) if part_mask.any() else 0.0
+        ht_max = float(np.max(result.hot_tear_risk[part_mask])) if part_mask.any() else 0.0
+        cc_max = float(np.max(result.cold_crack_risk[part_mask])) if part_mask.any() else 0.0
+        pdf.set_font(font, "", 13)
+        pdf.cell(0, 8, "Termomekanik Gerilme ve Catlak Riski (basitlestirilmis)", ln=True)
+        pdf.set_font(font, "", 10)
+        pdf.cell(0, 6, f"Maksimum isil gerilme: {ts_max/1e6:.1f} MPa", ln=True)
+        pdf.cell(0, 6, f"Maksimum sicak yirtilma riski: {ht_max*100:.1f}%", ln=True)
+        pdf.cell(0, 6, f"Maksimum soguk catlak riski: {cc_max*100:.1f}%", ln=True)
+        pdf.ln(4)
+
     pdf.set_font(font, "", 13)
     pdf.cell(0, 8, "Öneriler", ln=True)
     pdf.set_font(font, "", 10)
