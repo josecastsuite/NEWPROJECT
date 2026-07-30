@@ -4879,25 +4879,32 @@ def solve_filling_flow(
         source_area_m2 = float(area_m2)
 
     # ------------------------------------------------------------------
-    # Optional Taichi VOF/Navier-Stokes 3-D free-surface solver.
-    # Triggered with JOSECAST_USE_TAICHI_VOF=1.  When active it replaces the
-    # Darcy fill_time and velocity fields with a physically advected front
-    # while the gating graph / node velocities remain available for reporting.
+    # Optional 3-D free-surface Navier-Stokes / level-set solvers.
+    # JOSECAST_USE_CPP_VOF=1   -> C++ fractional-step NS (OpenVDB-free dense grid)
+    # JOSECAST_USE_TAICHI_VOF=1 -> Python/Taichi plug-flow VOF
     # ------------------------------------------------------------------
+    use_cpp_vof = os.environ.get("JOSECAST_USE_CPP_VOF", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     use_taichi_vof = os.environ.get("JOSECAST_USE_TAICHI_VOF", "0").lower() in (
         "1",
         "true",
         "yes",
     )
+    # The C++ NS pressure projection is heavier per step; keep the grid smaller.
+    vof_max_cells = int(os.environ.get("JOSECAST_CPP_VOF_MAX_CELLS", "120000"))
+    if not use_cpp_vof:
+        vof_max_cells = 500_000
+
     vof_res = None
     inflow_v = 0.0
-    if use_taichi_vof:
+    if use_cpp_vof or use_taichi_vof:
         try:
-            from core import taichi_ns
-
             # Keep the VOF grid small enough for an interactive solve.
             vof_grid, vof_origin, vof_dx = _downsample_grid(
-                grid_c, origin_c, dx_c, max_cells=500_000
+                grid_c, origin_c, dx_c, max_cells=vof_max_cells
             )
             vof_cavity = vof_grid != BodyType.EMPTY
             vof_inlet, _ = _select_inlet_cells(
@@ -4945,8 +4952,7 @@ def solve_filling_flow(
             else:
                 vof_inflow_v = inflow_v
             # Initial signed-distance field: negative inside the inlet, positive
-            # in the empty cavity with distance measured in voxel units.  This
-            # gives the level-set advection a smooth, bounded interface.
+            # in the empty cavity with distance measured in voxel units.
             phi_vof = np.full(vof_grid.shape, 999.0, dtype=np.float64)
             with np.errstate(invalid="ignore"):
                 dist_to_inlet = ndimage.distance_transform_edt(
@@ -4965,25 +4971,65 @@ def solve_filling_flow(
                     if Q_user <= 1e-18
                     else max(2.0, est_volume_m3 / Q_user * 4.0)
                 )
-            vof_res = taichi_ns.solve(
-                grid=vof_grid,
-                phi_init=phi_vof,
-                source_mask=vof_inlet.astype(np.uint8),
-                dx=vof_dx_m,
-                g=g,
-                rho=rho_vof,
-                nu=mu_vof / rho_vof,
-                inflow_velocity=vof_inflow_v,
-                t_max=t_max_vof,
-                max_steps=1200,
-                pressure_iters=40,
-                reinit_iters=2,
-                cfl=2.0,
-            )
-            if vof_res is None or vof_res.get("filled_fraction", 0.0) < 1e-6:
-                vof_res = None
+
+            if use_cpp_vof:
+                from core.cpp_bridge import JOSECAST_CORE
+
+                if JOSECAST_CORE is None:
+                    raise RuntimeError("josecast_core C++ module is not available")
+                vof_inflow_v = float(vof_inflow_v)
+                vof_inflow_v = max(vof_inflow_v, 0.01)
+                ft, vmag, vel, phi, success, final_t, filled_frac, steps = (
+                    JOSECAST_CORE.solve_ns_vof(
+                        vof_grid.astype(np.uint8, copy=False),
+                        phi_vof,
+                        vof_inlet.astype(np.uint8, copy=False),
+                        float(vof_dx_m),
+                        np.asarray(g, dtype=np.float64),
+                        float(rho_vof),
+                        float(mu_vof / rho_vof),
+                        vof_inflow_v,
+                        float(t_max_vof),
+                        int(os.environ.get("JOSECAST_CPP_VOF_MAX_STEPS", "1200")),
+                        float(os.environ.get("JOSECAST_CPP_VOF_CFL", "2.0")),
+                        int(os.environ.get("JOSECAST_CPP_VOF_PRESSURE_ITERS", "40")),
+                        float(os.environ.get("JOSECAST_CPP_VOF_PRESSURE_TOL", "1e-5")),
+                    )
+                )
+                vof_res = {
+                    "fill_time": ft,
+                    "velocity_magnitude": vmag,
+                    "velocity": vel,
+                    "phi": phi,
+                    "success": success,
+                    "final_t": final_t,
+                    "filled_fraction": filled_frac,
+                    "steps": steps,
+                }
+                if not success or filled_frac < 0.9999:
+                    vof_res = None
+            elif use_taichi_vof:
+                from core import taichi_ns
+
+                vof_res = taichi_ns.solve(
+                    grid=vof_grid,
+                    phi_init=phi_vof,
+                    source_mask=vof_inlet.astype(np.uint8),
+                    dx=vof_dx_m,
+                    g=g,
+                    rho=rho_vof,
+                    nu=mu_vof / rho_vof,
+                    inflow_velocity=vof_inflow_v,
+                    t_max=t_max_vof,
+                    max_steps=1200,
+                    pressure_iters=40,
+                    reinit_iters=2,
+                    cfl=2.0,
+                )
+                if vof_res is None or vof_res.get("filled_fraction", 0.0) < 1e-6:
+                    vof_res = None
         except Exception as exc:
-            print(f"[TAICHI_VOF] Hata: {exc}", flush=True)
+            print(f"[VOF] Hata: {exc}", flush=True)
             vof_res = None
 
     if vof_res is not None:
