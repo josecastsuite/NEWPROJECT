@@ -12,7 +12,7 @@ from core.types import Body, BodyType, BODY_METAL_TYPES
 
 
 def _maybe_cpp_bridge():
-    if os.environ.get("JOSECAST_USE_CPP_VOXELIZER", "0") == "1":
+    if os.environ.get("JOSECAST_USE_CPP_VOXELIZER", "1") == "1":
         try:
             from core.cpp_bridge import build_voxel_grid_cpp
             return build_voxel_grid_cpp

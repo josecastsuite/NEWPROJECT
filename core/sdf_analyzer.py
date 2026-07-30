@@ -30,7 +30,7 @@ from core.thermal_solver import _alloy_to_dict, _dscheil_dT, solve_3d_thermal
 from core.voxelizer import build_part_grid
 
 USE_CPP_POROSITY = (
-    os.environ.get("JOSECAST_USE_CPP_POROSITY", "0").lower() in ("1", "true", "yes")
+    os.environ.get("JOSECAST_USE_CPP_POROSITY", "1").lower() in ("1", "true", "yes")
 )
 if USE_CPP_POROSITY:
     from core.cpp_bridge import JOSECAST_CORE

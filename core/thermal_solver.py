@@ -27,7 +27,7 @@ from core.materials import Alloy, MoldMaterial
 from core.types import BODY_METAL_TYPES, BodyType
 
 USE_CPP_THERMAL = (
-    os.environ.get("JOSECAST_USE_CPP_THERMAL", "0").lower() in ("1", "true", "yes")
+    os.environ.get("JOSECAST_USE_CPP_THERMAL", "1").lower() in ("1", "true", "yes")
 )
 if USE_CPP_THERMAL:
     from core.cpp_bridge import JOSECAST_CORE
