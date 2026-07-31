@@ -202,9 +202,12 @@ class BodyRowWidget(QtWidgets.QWidget):
         name_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         name_label.setStyleSheet(
             "background-color: #27272a; color: #00ffff; border: 1px solid #52525b; "
-            "border-radius: 4px; padding: 1px; font-size: 11px; font-weight: bold;"
+            "border-radius: 4px; padding: 3px; font-size: 11px; font-weight: bold; "
+            "min-height: 20px;"
         )
         name_label.setMaximumWidth(70)
+        name_label.setMinimumHeight(26)
+        name_label.setMaximumHeight(28)
         name_label.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Maximum,
             QtWidgets.QSizePolicy.Policy.Fixed,
@@ -267,13 +270,13 @@ class BodyRowWidget(QtWidgets.QWidget):
         self._sand_type_combo.currentIndexChanged.connect(self._on_sand_type_changed)
         layout.addWidget(self._sand_type_combo)
 
-        self._sand_prop_btn = QtWidgets.QPushButton()
+        self._sand_prop_btn = QtWidgets.QPushButton("Parametreler")
         self._sand_prop_btn.setToolTip(
             "Kum parametrelerini düzenle (AFS tane, nem %, bağlayıcı %, compactability %)"
         )
         self._sand_prop_btn.setStyleSheet(
             "background-color: #27272a; color: #00ffff; border: 1px solid #00ffff; "
-            "border-radius: 4px; padding: 2px; font-size: 10px; font-weight: bold; "
+            "border-radius: 4px; padding: 2px; font-size: 11px; font-weight: bold; "
             "text-align: center;"
         )
         self._sand_prop_btn.setSizePolicy(
@@ -281,7 +284,9 @@ class BodyRowWidget(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Policy.Fixed,
         )
         self._sand_prop_btn.setMinimumWidth(80)
-        self._sand_prop_btn.setMaximumWidth(110)
+        self._sand_prop_btn.setMaximumWidth(95)
+        self._sand_prop_btn.setMinimumHeight(26)
+        self._sand_prop_btn.setMaximumHeight(28)
         self._sand_prop_btn.clicked.connect(self._on_sand_properties)
         layout.addWidget(self._sand_prop_btn)
 
@@ -306,7 +311,6 @@ class BodyRowWidget(QtWidgets.QWidget):
 
             sidx = self._sand_type_combo.findData(self._body.mold_preset or "")
             self._sand_type_combo.setCurrentIndex(sidx if sidx >= 0 else 0)
-            self._update_sand_prop_btn_text()
         finally:
             self._block_updates = False
 
@@ -355,22 +359,9 @@ class BodyRowWidget(QtWidgets.QWidget):
             return
         key = self._sand_type_combo.itemData(index) or "green_sand"
         self._body.mold_preset = key
-        self._update_sand_prop_btn_text()
         self.mold_settings_changed.emit(self._body)
-
-    def _update_sand_prop_btn_text(self) -> None:
-        preset = self._body.mold_preset or "green_sand"
-        base = MOLDS.get(preset, MOLDS["green_sand"])
-        afs = self._body.mold_afs_grain_size or base.afs_grain_size
-        n = self._body.mold_moisture_percent or base.moisture_percent
-        b = self._body.mold_binder_percent or base.binder_percent
-        c = self._body.mold_compactability_percent or base.compactability_percent
-        text = f"AFS{afs:g} N{n:g} B{b:g} C{c:g}"
-        self._sand_prop_btn.setText(text)
-        self._sand_prop_btn.updateGeometry()
 
     def _on_sand_properties(self) -> None:
         dialog = MoldPropertiesDialog(self._body, self)
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            self._update_sand_prop_btn_text()
             self.mold_settings_changed.emit(self._body)
