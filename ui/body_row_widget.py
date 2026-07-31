@@ -142,7 +142,11 @@ class BodyRowWidget(QtWidgets.QWidget):
         self._type_combo.setSizeAdjustPolicy(
             QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents
         )
-        self._type_combo.setMaximumWidth(110)
+        self._type_combo.setMinimumWidth(90)
+        self._type_combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         for bt, label in self._body_type_names.items():
             self._type_combo.addItem(label, int(bt))
         self._type_combo.currentIndexChanged.connect(self._on_type_changed)
@@ -153,7 +157,11 @@ class BodyRowWidget(QtWidgets.QWidget):
         self._feeder_type_combo.setSizeAdjustPolicy(
             QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents
         )
-        self._feeder_type_combo.setMaximumWidth(120)
+        self._feeder_type_combo.setMinimumWidth(90)
+        self._feeder_type_combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         self._feeder_type_combo.setToolTip("Besleyici tipi")
         for key, name in FEEDER_TYPE_NAMES.items():
             self._feeder_type_combo.addItem(name, key)
@@ -175,7 +183,11 @@ class BodyRowWidget(QtWidgets.QWidget):
         self._sand_type_combo.setSizeAdjustPolicy(
             QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents
         )
-        self._sand_type_combo.setMaximumWidth(110)
+        self._sand_type_combo.setMinimumWidth(90)
+        self._sand_type_combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         self._sand_type_combo.setToolTip("Kum tipi")
         for key, name in SAND_PRESET_NAMES.items():
             self._sand_type_combo.addItem(name, key)
@@ -189,17 +201,6 @@ class BodyRowWidget(QtWidgets.QWidget):
         )
         self._sand_prop_btn.clicked.connect(self._on_sand_properties)
         layout.addWidget(self._sand_prop_btn)
-
-        # Expanding filler that visually closes the right-hand gap by using
-        # the same dark background as the compact control widgets.
-        self._row_filler = QtWidgets.QWidget()
-        self._row_filler.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Expanding,
-        )
-        self._row_filler.setAutoFillBackground(True)
-        self._row_filler.setStyleSheet("background-color: #27272a; border: none;")
-        layout.addWidget(self._row_filler)
 
     def body(self) -> Body:
         return self._body
