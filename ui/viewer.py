@@ -20,16 +20,16 @@ from ui.flow_animator import FlowAnimator
 
 BODY_COLORS = {
     BodyType.PART: "#E0E0E0",
-    BodyType.RISER: "#4CAF50",
-    BodyType.INGATE: "#2196F3",
-    BodyType.RUNNER: "#FF9800",
+    BodyType.RISER: "#00C853",
+    BodyType.INGATE: "#2962FF",
+    BodyType.RUNNER: "#FF6D00",
     BodyType.SPRUE: "#9C27B0",
     BodyType.CORE: "#795548",
     BodyType.COOLING_SPRUE: "#00BCD4",
     BodyType.FILTER: "#607D8B",
-    BodyType.POURING_BASIN: "#3F51B5",
-    BodyType.SPRUE_THROAT: "#CDDC39",
-    BodyType.DISTRIBUTOR: "#BA68C8",
+    BodyType.POURING_BASIN: "#7C4DFF",
+    BodyType.SPRUE_THROAT: "#E040FB",
+    BodyType.DISTRIBUTOR: "#2E7D32",
     BodyType.CURUFLUK: "#009688",
 }
 
