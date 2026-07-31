@@ -195,7 +195,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ---------------- LEFT PANEL (scrollable) ----------------
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidgetResizable(True)
-        left_scroll.setMinimumWidth(560) 
+        left_scroll.setMinimumWidth(460) 
         
         left_panel = QtWidgets.QWidget()
         left_scroll.setWidget(left_panel)
@@ -641,7 +641,7 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([560, 680, 560]) 
+        splitter.setSizes([500, 760, 560]) 
 
         # Sync porosity size-filter labels with the default alloy.
         self._update_porosity_filter_labels(get_alloy(self.alloy_combo.currentData()))
