@@ -33,15 +33,21 @@ UNIT_SCALE = {
 
 
 def apply_unit_scale(bodies: List[Body], unit: str) -> float:
-    """Scale all body meshes to millimeters and return the scale factor."""
+    """Scale all body meshes from their original size to millimeters.
+
+    The original mesh is kept so that switching units in the UI is idempotent;
+    changing from cm to mm and back to cm does not accumulate scale factors.
+    """
     scale = UNIT_SCALE.get(unit, 1.0)
-    if scale == 1.0:
-        for b in bodies:
-            b.surface_area_cm2 = b.mesh.area / 100.0
-            b.volume_cm3 = b.mesh.volume / 1000.0
-        return 1.0
     for b in bodies:
-        b.mesh.apply_scale(scale)
+        # Preserve the unscaled mesh the first time this function is called;
+        # later calls restart from that original geometry.
+        if not hasattr(b, "_orig_mesh") or b._orig_mesh is None:
+            b._orig_mesh = b.mesh.copy()
+            b._orig_vertices = b.vertices.copy()
+        b.mesh = b._orig_mesh.copy()
+        if scale != 1.0:
+            b.mesh.apply_scale(scale)
         b.vertices = b.mesh.vertices.copy()
         b.center = b.mesh.center_mass if b.mesh.is_watertight else b.mesh.centroid
         b.volume_cm3 = b.mesh.volume / 1000.0

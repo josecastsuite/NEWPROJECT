@@ -776,8 +776,6 @@ class MainWindow(QtWidgets.QMainWindow):
             idx = self.unit_combo.findData(suggested)
             if idx >= 0:
                 self.unit_combo.setCurrentIndex(idx)
-            self.aiLog(f"Önerilen birim: {suggested}", "info")
-
             self.viewer.clear_scene()
             self.viewer.show_bodies(self._bodies)
             self.status_label.setText(
@@ -806,7 +804,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.aiLog("Birim değişikliği için STEP'i yeniden yükleyin.", "warn")
             return
         self._unit_scale = apply_unit_scale(self._bodies, unit)
-        self.aiLog(f"Birim ölçeği uygulandı: {unit} (x{self._unit_scale:.2f})", "ok")
         self.viewer.show_bodies(self._bodies)
 
     def on_body_type_changed(self, body: Body, body_type_value: int):
