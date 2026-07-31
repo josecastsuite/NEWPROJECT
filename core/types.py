@@ -29,9 +29,9 @@ class CastingParameters:
     # v10.0: hot-spot detection thresholds exposed to the user
     hotspot_min_size_mm: float = 0.0
     hotspot_cluster_eps_mm: float = 0.0
-    # v10.1: experimental local 3-D gate mesh Darcy–Forchheimer solve.
-    # Disabled by default until it is validated on a wider geometry set.
-    enable_gate_mesh: bool = False
+    # v10.1: local 3-D gate mesh Darcy–Forchheimer solve.
+    # Active by default; the meshpy/TetGen path is loaded lazily per gate body.
+    enable_gate_mesh: bool = True
 
     @property
     def superheat_c(self) -> float:

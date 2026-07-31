@@ -54,7 +54,6 @@ def main():
         "scipy",
         "trimesh",
         "meshpy",
-        "fast_simplification",
         "skimage",
         "sklearn",
         "imageio",

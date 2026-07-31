@@ -19,7 +19,6 @@ dependencies = [
     "scikit-image>=0.25.0",
     "weasyprint>=60.0",
     "meshpy>=2026.1",
-    "fast-simplification>=0.1.13",
 ]
 
 [project.optional-dependencies]
