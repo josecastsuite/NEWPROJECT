@@ -150,9 +150,12 @@ def main():
         if fr.fill_time is not None and fr.fill_time.size and result.is_metal is not None:
             ft = fr.fill_time
             metal = result.is_metal
-            filled = int((metal & (ft > 0)).sum())
+            unfilled = metal & (ft >= 1e9)
+            inlet_cells = metal & (ft == 0.0)
+            filled = int((metal & np.isfinite(ft) & (ft < 1e9)).sum())
             total = int(metal.sum())
             print(f"    fill_time coverage: {filled}/{total} metal voxels ({100*filled/total:.2f}%)")
+            print(f"    inlet cells (ft=0): {inlet_cells.sum()}, unfilled (ft>=sentinel): {unfilled.sum()}")
 
     print("Generating HTML report ...")
     html_path = os.path.join(args.out_dir, "test_report.html")
