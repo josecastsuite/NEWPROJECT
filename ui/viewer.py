@@ -28,9 +28,9 @@ BODY_COLORS = {
     BodyType.COOLING_SPRUE: "#00BCD4",
     BodyType.FILTER: "#607D8B",
     BodyType.POURING_BASIN: "#3F51B5",
-    BodyType.SPRUE_THROAT: "#673AB7",
-    BodyType.DISTRIBUTOR: "#FFC107",
-    BodyType.CURUFLUK: "#795548",
+    BodyType.SPRUE_THROAT: "#CDDC39",
+    BodyType.DISTRIBUTOR: "#BA68C8",
+    BodyType.CURUFLUK: "#009688",
 }
 
 BODY_OPACITY = {
