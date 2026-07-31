@@ -5263,7 +5263,11 @@ def solve_filling_flow(
 
     if vof_res is not None:
         # Resample Taichi VOF fields to the original analysis grid.
-        fill_time_c = vof_res["fill_time"]
+        fill_time_c = np.asarray(vof_res["fill_time"], dtype=np.float64)
+        # Coarse cells that the LBM did not reach carry inf.  Trilinear
+        # resampling of inf creates NaN on the fine grid, so replace them with a
+        # finite sentinel before resampling and clamp later.
+        fill_time_c = np.where(np.isfinite(fill_time_c), fill_time_c, 1e12)
         velocity_c = vof_res["velocity"]
         vel_comps_f = [
             _resample_to_grid(
@@ -5316,6 +5320,13 @@ def solve_filling_flow(
                 vof_final_t,
                 fill_time_fine,
             )
+        # Guard against any NaN/inf leaked by the interpolator around coarse
+        # sentinel cells; these cells are still part of the filled metal domain.
+        fill_time_fine = np.where(
+            fine_metal,
+            np.nan_to_num(fill_time_fine, nan=vof_final_t, posinf=vof_final_t, neginf=vof_final_t),
+            0.0,
+        )
         if fine_metal.any():
             valid = fine_metal & (fill_time_fine < 1e9)
             if valid.any():
