@@ -37,6 +37,65 @@ def _is_gating_body(body: Body) -> bool:
     return body.body_type in _GATING_TYPES
 
 
+def _decimate_surface(mesh: trimesh.Trimesh, target_faces: int = 1000) -> trimesh.Trimesh:
+    """Reduce ``mesh`` to approximately ``target_faces`` faces.
+
+    First tries trimesh's quadric decimation (fast-simplification).  If that
+    package is missing or the decimation produces an unusable mesh, fall back to
+    a coarse voxelised marching-cubes remesh.  The fallback is robust and does
+    not require optional dependencies.
+    """
+    if len(mesh.faces) <= target_faces:
+        return mesh
+
+    try:
+        dec = mesh.simplify_quadric_decimation(face_count=target_faces)
+        if dec is not None and len(dec.faces) > 0 and len(dec.faces) <= int(target_faces * 1.5):
+            return dec
+    except Exception:
+        pass
+
+    # Fallback: marching cubes on a coarse voxel grid.
+    surface_area = float(mesh.area)
+    if surface_area <= 1e-12:
+        return mesh
+
+    extents = mesh.bounding_box.extents
+    min_extent = float(np.asarray(extents).min()) if extents is not None else 0.0
+
+    # Estimate pitch from target face count.  Marching cubes typically produces
+    # ~2 * area / pitch^2 faces for a closed surface, so overshoot pitch a bit.
+    pitch = max(0.01, (surface_area / (target_faces * 2.0)) ** 0.5)
+    if min_extent > 0.0:
+        pitch = min(pitch, min_extent / 4.0)
+
+    best = mesh
+    best_count = len(mesh.faces)
+    for _ in range(5):
+        try:
+            voxelized = mesh.voxelized(pitch=pitch)
+            mc = getattr(voxelized, "marching_cubes", None)
+            if mc is not None and len(mc.faces) > 0:
+                if abs(len(mc.faces) - target_faces) < abs(best_count - target_faces):
+                    best = mc
+                    best_count = len(mc.faces)
+                if best_count <= target_faces:
+                    break
+            # Coarsen / refine for next iteration.
+            if best_count > target_faces:
+                pitch *= 1.4
+            else:
+                pitch *= 0.8
+        except Exception:
+            pitch *= 1.5
+
+    if best is not mesh:
+        best.merge_vertices(merge_tex=False, merge_norm=False)
+        best.fix_normals()
+        best.fill_holes()
+    return best
+
+
 def _face_normal_area(
     nodes: np.ndarray, face: np.ndarray
 ) -> Tuple[np.ndarray, float]:
@@ -283,26 +342,22 @@ def build_gate_mesh(
     if mesh is None or len(mesh.faces) == 0:
         raise ValueError(f"Body {body.name} has no surface mesh")
 
-    # Make a clean watertight copy.
+    # Make a clean watertight copy and decimate it so TetGen can build a
+    # tetrahedral mesh quickly.  The decimation routine has a voxel/marching-cubes
+    # fallback so missing ``fast-simplification`` no longer leaves a dense
+    # surface for TetGen to hang on.
+    _MAX_GATE_FACES: int = 1200
+    _TARGET_GATE_FACES: int = 1000
     clean = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, process=True)
     clean.merge_vertices(merge_tex=False, merge_norm=False)
     clean.fix_normals()
     clean.fill_holes()
 
-    # Surface decimation keeps the tetrahedral mesh fast while preserving the
-    # gate geometry.  Only decimate overly dense gate bodies.  If the optional
-    # fast-simplification package is missing, skip decimation and let TetGen
-    # deal with the denser input.
-    _MAX_GATE_FACES: int = 1200
-    _TARGET_GATE_FACES: int = 1000
     if len(clean.faces) > _MAX_GATE_FACES:
-        try:
-            clean = clean.simplify_quadric_decimation(face_count=_TARGET_GATE_FACES)
-            clean.merge_vertices(merge_tex=False, merge_norm=False)
-            clean.fix_normals()
-            clean.fill_holes()
-        except Exception:
-            pass
+        clean = _decimate_surface(clean, target_faces=_TARGET_GATE_FACES)
+        clean.merge_vertices(merge_tex=False, merge_norm=False)
+        clean.fix_normals()
+        clean.fill_holes()
 
     verts = clean.vertices.astype(float)
     faces = clean.faces.astype(np.int32)  # meshpy expects 0-based
