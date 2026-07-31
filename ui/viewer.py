@@ -171,8 +171,11 @@ class Analyzer3DViewer(QtInteractor):
             entries.append([label, color, "circle"])
 
         n = len(entries)
-        height = min(0.45, max(0.08, 0.047 * n))
-        width = 0.22
+        line_height = 0.035
+        height = min(0.45, max(0.06, line_height * n))
+        max_chars = max(len(entry[0]) for entry in entries)
+        width = min(0.30, max(0.12, max_chars * 0.011))
+
         self._body_legend_actor = self.add_legend(
             labels=entries,
             loc="upper right",
@@ -182,6 +185,20 @@ class Analyzer3DViewer(QtInteractor):
             size=(width, height),
             name="body_legend",
         )
+
+        # PyVista's default loc math treats the vertical size as the right margin,
+        # so override the viewport position explicitly to keep the legend inside
+        # the viewer area and away from the right scrollbar/panel.
+        right_margin = 0.08
+        top_margin = 0.05
+        x = 1.0 - width - right_margin
+        y = 1.0 - height - top_margin
+        self._body_legend_actor.SetPosition(x, y)
+        self._body_legend_actor.SetPosition2(width, height)
+        self._body_legend_actor.SetPadding(2)
+        text_prop = self._body_legend_actor.GetEntryTextProperty()
+        text_prop.SetFontSize(11)
+        text_prop.SetBold(0)
 
     def clear_scene(self):
         self.flow_animator.stop()
