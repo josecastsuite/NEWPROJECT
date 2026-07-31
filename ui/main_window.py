@@ -26,7 +26,7 @@ from core import (
 )
 from core.materials import chvorinov_c_from_properties
 from core.types import Body, BodyType, CastingParameters
-from ui.feeder_dialog import FeederDialog, FEEDER_TYPE_NAMES
+from ui.body_row_widget import BodyRowWidget, FEEDER_TYPE_NAMES
 from ui.section_dialog import SectionDialog
 from ui.viewer import Analyzer3DViewer
 
@@ -92,9 +92,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._user_section_area_cm2 = 0.0
         self._user_section_key = "SPRUE_THROAT"
         self._user_section_body_name = ""
-        self._body_feeder_buttons: Dict[str, QtWidgets.QPushButton] = {}
-        self._body_feeder_labels: Dict[str, QtWidgets.QLabel] = {}
         self._body_items: Dict[str, QtWidgets.QListWidgetItem] = {}
+        self._body_rows: Dict[str, BodyRowWidget] = {}
 
 
         self._build_ui()
@@ -744,67 +743,20 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QCoreApplication.processEvents()
 
     def _add_body_row(self, body: Body):
+        """Add a body row with a dynamic, body-type aware property panel."""
         item = QtWidgets.QListWidgetItem()
-        widget = QtWidgets.QWidget()
-        row = QtWidgets.QHBoxLayout(widget)
-        row.setContentsMargins(2, 1, 2, 1)
-        row.setSpacing(2)
+        widget = BodyRowWidget(body, BODY_TYPE_NAMES)
 
-        # Compact body label; full volume/centroid info in tooltip.
-        label = QtWidgets.QLabel(body.name)
-        label.setToolTip(
-            f"Hacim: {body.volume_cm3:.2f} cm³\nMerkez: {body.center}"
-        )
-        label.setStyleSheet("font-size: 11px;")
-        label.setMaximumWidth(80)
-        label.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
-        )
-        row.addWidget(label)
-
-        # Feeder type controls (always visible; dialog warns if not a RISER).
-        feeder_btn = QtWidgets.QPushButton("Besleyici tipi")
-        feeder_btn.setToolTip("Bu besleyicinin tipini ve opsiyonel modülünü ayarla")
-        feeder_btn.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
-        )
-        feeder_btn.clicked.connect(lambda _, b=body: self.on_body_feeder(b))
-        row.addWidget(feeder_btn)
-        self._body_feeder_buttons[body.name] = feeder_btn
-
-        combo = QtWidgets.QComboBox()
-        combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
-        combo.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed
-        )
-        combo.setMaximumWidth(120)
-        for bt in (
-            BodyType.PART,
-            BodyType.RISER,
-            BodyType.INGATE,
-            BodyType.RUNNER,
-            BodyType.SPRUE,
-            BodyType.SPRUE_THROAT,
-            BodyType.DISTRIBUTOR,
-            BodyType.CURUFLUK,
-            BodyType.COOLING_SPRUE,
-            BodyType.FILTER,
-            BodyType.POURING_BASIN,
-            BodyType.CORE,
-        ):
-            combo.addItem(BODY_TYPE_NAMES[bt], bt)
-        combo.setCurrentIndex(combo.findData(body.body_type))
-        combo.currentIndexChanged.connect(
-            lambda _, b=body, c=combo: self.on_body_type_changed(b, c)
-        )
-        row.addWidget(combo)
+        widget.body_type_changed.connect(self.on_body_type_changed)
+        widget.feeder_type_changed.connect(self.on_body_feeder_type_changed)
+        widget.feeder_m_changed.connect(self.on_body_feeder_m_changed)
+        widget.feeder_note_changed.connect(self.on_body_feeder_note_changed)
 
         self._body_items[body.name] = item
+        self._body_rows[body.name] = widget
 
         self.body_list.addItem(item)
         self.body_list.setItemWidget(item, widget)
-        self._update_body_row_state(body)
-        self._update_body_feeder_label(body.name)
         item.setSizeHint(widget.sizeHint())
 
     def on_load_step(self):
@@ -834,8 +786,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.voxelize_btn.setEnabled(True)
             self.analyze_btn.setEnabled(False)
             self._analysis = None
-            self._body_feeder_buttons.clear()
-            self._body_feeder_labels.clear()
+            self._body_rows.clear()
             self._body_items.clear()
 
             self._clear_checklist()
@@ -858,84 +809,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self.aiLog(f"Birim ölçeği uygulandı: {unit} (x{self._unit_scale:.2f})", "ok")
         self.viewer.show_bodies(self._bodies)
 
-    def on_body_type_changed(self, body: Body, combo: QtWidgets.QComboBox):
-        data = combo.currentData()
+    def on_body_type_changed(self, body: Body, body_type_value: int):
+        """A body row changed type; update the 3-D preview."""
         try:
-            new_type = BodyType(data) if isinstance(data, int) else data
+            new_type = BodyType(body_type_value)
         except Exception:
             new_type = BodyType.PART
-
-        old_type = body.body_type
         body.body_type = new_type
-
-        # If the body is no longer a riser, clear feeder overrides.
-        if old_type != new_type and new_type != BodyType.RISER:
+        if new_type != BodyType.RISER:
             body.feeder_type = ""
             body.feeder_m_mm = 0.0
             body.feeder_note = ""
-            self._update_body_feeder_label(body.name)
-
-        self._update_body_row_state(body)
         self.viewer.show_bodies(self._bodies)
 
-    def _update_body_row_state(self, body: Body):
-        # Keeping this hook for any future row-specific updates.
-        pass
+    def on_body_feeder_type_changed(self, body: Body, feeder_type: str):
+        self.aiLog(
+            f"{body.name} - besleyici tipi: {FEEDER_TYPE_NAMES.get(feeder_type, feeder_type)}",
+            "ok",
+        )
 
-    def _update_body_feeder_label(self, body_name: str):
-        label = self._body_feeder_labels.get(body_name)
-        if label is None:
-            return
-        body = next((b for b in self._bodies if b.name == body_name), None)
-        if body is None or not body.feeder_type:
-            label.setText("")
-            return
-        short_names = {
-            "conventional": "konv",
-            "exothermic": "ekzo",
-            "insulated": "izol",
-            "sleeve": "göm",
-            "chilled": "chill",
-            "side": "yan",
-            "blind": "kör",
-        }
-        type_text = short_names.get(body.feeder_type, body.feeder_type[:4])
-        m_text = f" M={body.feeder_m_mm:.1f}" if body.feeder_m_mm > 0 else " auto"
-        label.setText(f"{type_text}{m_text}")
-
-    def on_body_feeder(self, body: Body):
-        """Open the per-riser feeder type / optional modulus dialog."""
-        if body is None:
-            return
-        try:
-            bt = BodyType(body.body_type) if isinstance(body.body_type, int) else body.body_type
-        except Exception:
-            bt = body.body_type
-        if bt != BodyType.RISER:
-            QtWidgets.QMessageBox.information(
-                self, "Tip Uyarısı",
-                "Besleyici tipi seçimi sadece BESLEYİCİ (RISER) tipindeki body'ler için geçerlidir.\n"
-                "Lütfen önce body tipini değiştirin."
-            )
-            return
-
-        try:
-            dialog = FeederDialog(body, parent=self)
-        except Exception as e:
-            self.aiLog(f"Besleyici dialogu açılamadı: {e}", "crit")
-            QtWidgets.QMessageBox.critical(self, "Hata", f"Besleyici dialogu açılamadı:\n{e}")
-            return
-
-        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            body.feeder_type = dialog.feeder_type or "conventional"
-            body.feeder_m_mm = float(dialog.feeder_m_mm)
-            body.feeder_note = dialog.feeder_note
-            self._update_body_feeder_label(body.name)
+    def on_body_feeder_m_changed(self, body: Body, feeder_m_mm: float):
+        if feeder_m_mm > 0:
             self.aiLog(
-                f"{body.name} - besleyici tipi: {FEEDER_TYPE_NAMES.get(body.feeder_type, body.feeder_type)}"
-                f"{', M=' + f'{body.feeder_m_mm:.2f} mm' if body.feeder_m_mm > 0 else ''}",
-                "ok",
+                f"{body.name} - besleyici modülü: M={feeder_m_mm / 10.0:.2f} cm",
+                "info",
             )
+
+    def on_body_feeder_note_changed(self, body: Body, note: str):
+        if note:
+            self.aiLog(f"{body.name} - besleyici notu: {note}", "info")
 
     def on_pick_section(self):
         """Open SectionDialog for the selected velocity-section body."""
