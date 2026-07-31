@@ -750,7 +750,6 @@ class MainWindow(QtWidgets.QMainWindow):
         widget.body_type_changed.connect(self.on_body_type_changed)
         widget.feeder_type_changed.connect(self.on_body_feeder_type_changed)
         widget.feeder_m_changed.connect(self.on_body_feeder_m_changed)
-        widget.feeder_note_changed.connect(self.on_body_feeder_note_changed)
 
         self._body_items[body.name] = item
         self._body_rows[body.name] = widget
@@ -816,7 +815,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if new_type != BodyType.RISER:
             body.feeder_type = ""
             body.feeder_m_mm = 0.0
-            body.feeder_note = ""
         self.viewer.show_bodies(self._bodies)
 
     def on_body_feeder_type_changed(self, body: Body, feeder_type: str):
@@ -831,10 +829,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"{body.name} - besleyici modülü: M={feeder_m_mm / 10.0:.2f} cm",
                 "info",
             )
-
-    def on_body_feeder_note_changed(self, body: Body, note: str):
-        if note:
-            self.aiLog(f"{body.name} - besleyici notu: {note}", "info")
 
     def on_pick_section(self):
         """Open SectionDialog for the selected velocity-section body."""

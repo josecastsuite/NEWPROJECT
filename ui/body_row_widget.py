@@ -6,7 +6,6 @@ Each body occupies one horizontal row:
 - optional feeder controls (visible only when body type == RISER)
     - feeder type
     - modulus (cm)
-    - note
 
 This keeps the body list compact and avoids large stacked panels.
 """
@@ -34,7 +33,6 @@ class BodyRowWidget(QtWidgets.QWidget):
     body_type_changed = QtCore.pyqtSignal(Body, int)
     feeder_type_changed = QtCore.pyqtSignal(Body, str)
     feeder_m_changed = QtCore.pyqtSignal(Body, float)
-    feeder_note_changed = QtCore.pyqtSignal(Body, str)
 
     def __init__(
         self,
@@ -99,13 +97,6 @@ class BodyRowWidget(QtWidgets.QWidget):
         self._feeder_m_spin.valueChanged.connect(self._on_feeder_m_changed)
         layout.addWidget(self._feeder_m_spin)
 
-        self._feeder_note_edit = QtWidgets.QLineEdit()
-        self._feeder_note_edit.setPlaceholderText("Not")
-        self._feeder_note_edit.setToolTip("Besleyici notu (örn: exotermik %40)")
-        self._feeder_note_edit.setMaximumWidth(100)
-        self._feeder_note_edit.textChanged.connect(self._on_feeder_note_changed)
-        layout.addWidget(self._feeder_note_edit)
-
         layout.addStretch()
 
     def body(self) -> Body:
@@ -128,7 +119,6 @@ class BodyRowWidget(QtWidgets.QWidget):
                 self._feeder_type_combo.setCurrentIndex(0)
             # stored in mm, shown in cm
             self._feeder_m_spin.setValue((self._body.feeder_m_mm or 0.0) / 10.0)
-            self._feeder_note_edit.setText(self._body.feeder_note or "")
         finally:
             self._block_updates = False
 
@@ -136,7 +126,6 @@ class BodyRowWidget(QtWidgets.QWidget):
         is_riser = body_type == BodyType.RISER
         self._feeder_type_combo.setVisible(is_riser)
         self._feeder_m_spin.setVisible(is_riser)
-        self._feeder_note_edit.setVisible(is_riser)
 
     def _on_type_changed(self, index: int) -> None:
         if self._block_updates:
@@ -150,7 +139,6 @@ class BodyRowWidget(QtWidgets.QWidget):
         if new_type != BodyType.RISER:
             self._body.feeder_type = ""
             self._body.feeder_m_mm = 0.0
-            self._body.feeder_note = ""
             self._sync_from_body()
         self._update_visibility(new_type)
         self.body_type_changed.emit(self._body, int(new_type))
@@ -167,9 +155,3 @@ class BodyRowWidget(QtWidgets.QWidget):
             return
         self._body.feeder_m_mm = float(value) * 10.0
         self.feeder_m_changed.emit(self._body, self._body.feeder_m_mm)
-
-    def _on_feeder_note_changed(self, text: str) -> None:
-        if self._block_updates:
-            return
-        self._body.feeder_note = text.strip()
-        self.feeder_note_changed.emit(self._body, self._body.feeder_note)
