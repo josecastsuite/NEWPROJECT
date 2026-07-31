@@ -237,49 +237,58 @@ def solve_gate_flows(
 
         results[body.name] = result
 
-        # Update gating nodes that leave this gate body.
-        total_downstream_q = 0.0
+        # The 3-D mesh computes the total flow rate through the gate.  The
+        # per-contact velocity is the mesh flux distributed over each contact
+        # (from the gating graph) divided by that contact's geometric area.  This
+        # is the physically consistent contact-surface velocity and is what
+        # labels/reports display.
+        outlet_nodes: List[GatingNode] = []
+        inlet_nodes: List[GatingNode] = []
         for node in gating_nodes:
             if node.name is None or " → " not in node.name:
                 continue
-            up_name = node.name.split(" → ")[0]
-            if up_name != body.name:
-                continue
-            total_downstream_q += max(float(node.flow_rate_m3_s or 0.0), 0.0)
+            parts = [p.strip() for p in node.name.split(" → ")]
+            if parts[0] == body.name:
+                outlet_nodes.append(node)
+            if parts[-1] == body.name:
+                inlet_nodes.append(node)
 
-        outlet_flux = max(abs(result.outlet_flux_m3_s), 1e-18)
-        for node in gating_nodes:
-            if node.name is None or " → " not in node.name:
-                continue
-            up_name = node.name.split(" → ")[0]
-            if up_name != body.name:
-                continue
-            frac = 1.0
-            if total_downstream_q > 1e-18:
-                frac = max(float(node.flow_rate_m3_s or 0.0), 0.0) / total_downstream_q
-            node_q = outlet_flux * frac
-            area_m2 = max(float(node.section_area_cm2 or 0.0) * 1e-4, 1e-18)
-            node.flow_rate_m3_s = float(node_q)
-            node.velocity_m_s = float(node_q / area_m2)
-            # The section velocity reported at a gating node is the physically
-            # consistent mean contact velocity (Q / A) for that branch.  The
-            # local 3-D mesh refines the *pressure drop* and captures the *peak*
-            # cell velocity for diagnostics, but using the raw mesh max for
-            # labels gave absurdly high values.
-            node.max_velocity_m_s = float(node.velocity_m_s)
+        def _set_contact_velocities(
+            nodes: List[GatingNode], total_flux_m3_s: float
+        ) -> List[float]:
+            total_node_q = sum(
+                max(float(n.flow_rate_m3_s or 0.0), 0.0) for n in nodes
+            )
+            scale = 1.0
+            if total_node_q > 1e-18 and total_flux_m3_s > 1e-18:
+                scale = float(total_flux_m3_s) / total_node_q
+            velocities: List[float] = []
+            for n in nodes:
+                node_q = max(float(n.flow_rate_m3_s or 0.0), 0.0) * scale
+                area_m2 = max(float(n.section_area_cm2 or 0.0) * 1e-4, 1e-18)
+                v = node_q / area_m2
+                if v > 1e-12:
+                    n.max_velocity_m_s = float(v)
+                    velocities.append(v)
+            return velocities
 
-        # For the body-level summary, use the total outlet flux divided by the
-        # summed downstream contact areas.  This makes the 3-D mesh section
-        # velocity match the Q/A values shown in labels and reports.
-        downstream_area_m2 = 0.0
-        for node in gating_nodes:
-            if node.name is None or " → " not in node.name:
-                continue
-            up_name = node.name.split(" → ")[0]
-            if up_name != body.name:
-                continue
-            downstream_area_m2 += max(float(node.section_area_cm2 or 0.0) * 1e-4, 0.0)
-        if downstream_area_m2 > 1e-18:
-            result.section_velocity_m_s = float(abs(result.outlet_flux_m3_s) / downstream_area_m2)
+        # The outlet flux is the mesh-computed, target-enforced total flow rate.
+        # Use it for both inlet and outlet contacts; inlet flux from the cell
+        # centred field can be noisy near the boundary.
+        flux = abs(result.outlet_flux_m3_s)
+        if flux <= 1e-18:
+            flux = max(
+                sum(
+                    max(float(n.flow_rate_m3_s or 0.0), 0.0)
+                    for n in outlet_nodes + inlet_nodes
+                ),
+                1e-18,
+            )
+
+        outlet_velocities = _set_contact_velocities(outlet_nodes, flux)
+        _set_contact_velocities(inlet_nodes, flux)
+
+        if outlet_velocities:
+            result.section_velocity_m_s = float(np.mean(outlet_velocities))
 
     return results, list(gating_nodes)

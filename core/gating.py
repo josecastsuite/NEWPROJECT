@@ -113,8 +113,14 @@ def _section_flows_from_flow(
         up = _upstream_section_key(node.body_type or "")
         if not up:
             continue
+        # Prefer the 3-D mesh contact-surface velocity when available.
+        v_report = (
+            node.max_velocity_m_s
+            if node.max_velocity_m_s > 1e-12
+            else node.velocity_m_s
+        )
         section_data.setdefault(up, []).append(
-            (node.velocity_m_s, node.section_area_cm2, node.flow_rate_m3_s)
+            (v_report, node.section_area_cm2, node.flow_rate_m3_s)
         )
     out: Dict[str, SectionFlow] = {}
     for up_section, rows in section_data.items():

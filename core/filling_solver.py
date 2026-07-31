@@ -98,7 +98,12 @@ def _recommend_filter(
     if target_node is None:
         target_node = gating_nodes[0]
 
-    v_node = max(target_node.velocity_m_s, 1e-6)
+    v_node = max(
+        target_node.max_velocity_m_s
+        if target_node.max_velocity_m_s > 1e-12
+        else target_node.velocity_m_s,
+        1e-6,
+    )
     rho = float(getattr(alloy, "rho_liquid_kg_m3", 2700.0))
     # Al: face velocity through filter should stay < ~0.5 m/s.
     v_filter_max = 0.45
@@ -2467,7 +2472,11 @@ def _compute_fill_time_graph(
         up_type, down_type = [s.strip() for s in node.body_type.split("→")]
         if up_name == "Kaynak" or "SOURCE" in up_type:
             source_bidx = name_to_bidx.get(down_name)
-            source_v = float(node.velocity_m_s)
+            source_v = float(
+                node.max_velocity_m_s
+                if node.max_velocity_m_s > 1e-12
+                else node.velocity_m_s
+            )
             source_q = float(node.flow_rate_m3_s)
             source_centroid = np.asarray(node.centroid_mm, dtype=np.float64)
             continue
@@ -2485,7 +2494,11 @@ def _compute_fill_time_graph(
         child = {
             "bidx": down_bidx,
             "point": np.asarray(node.centroid_mm, dtype=np.float64),
-            "v": float(node.velocity_m_s),
+            "v": float(
+                node.max_velocity_m_s
+                if node.max_velocity_m_s > 1e-12
+                else node.velocity_m_s
+            ),
             "q": float(node.flow_rate_m3_s),
         }
         children.setdefault(up_bidx, []).append(child)
@@ -2736,7 +2749,11 @@ def _geodesic_gating_time(
         if up_bidx is None:
             continue
         q = float(node.flow_rate_m3_s)
-        v = float(node.velocity_m_s)
+        v = float(
+            node.max_velocity_m_s
+            if node.max_velocity_m_s > 1e-12
+            else node.velocity_m_s
+        )
         if v <= 1e-18:
             continue
         q_sum[up_bidx] += q
@@ -3362,7 +3379,11 @@ def _compute_fill_time_volume_layer(
         if up_name == "Kaynak" or "SOURCE" in up_type:
             source_bidx = name_to_bidx.get(down_name)
             source_q = float(node.flow_rate_m3_s)
-            source_v = float(node.velocity_m_s)
+            source_v = float(
+                node.max_velocity_m_s
+                if node.max_velocity_m_s > 1e-12
+                else node.velocity_m_s
+            )
             source_centroid = point
             continue
         up_bidx = name_to_bidx.get(up_name)
@@ -3373,7 +3394,11 @@ def _compute_fill_time_volume_layer(
         child = {
             "bidx": down_bidx,
             "point": point,
-            "v": float(node.velocity_m_s),
+            "v": float(
+                node.max_velocity_m_s
+                if node.max_velocity_m_s > 1e-12
+                else node.velocity_m_s
+            ),
             "q": float(node.flow_rate_m3_s),
         }
         children.setdefault(up_bidx, []).append(child)
