@@ -1686,12 +1686,12 @@ def _contact_surface_area_m2(
 ) -> Tuple[float, float, float, int, int]:
     """Return the real throat/contact area (m²) between two meshes.
 
-    The effective contact area is the smaller throat cross-section of the two
-    bodies at the joint.  For each body the throat is the stable cross-section
-    perpendicular to the body's local flow axis, which is derived from the OBB
-    shape (long axis for runners/sprues, short axis for disk-like throats).  This
-    works for end-to-end, T-junction and inclined contacts without relying on the
-    surface normal as the section plane.
+    The contact area is the common interface where the two bodies meet.  It is
+    computed by slicing both bodies on the plane perpendicular to the *smaller*
+    body's local flow axis at the actual contact point, then taking the smaller
+    stable end cross-section.  This limits the throat correctly for side and
+    T-junction contacts.  If the section is unstable we fall back to the global
+    throat area along each body's own flow axis.
     """
     if mesh_a is None or mesh_b is None:
         return 0.0, 0.0, 0.0, 0, 0
@@ -1700,49 +1700,69 @@ def _contact_surface_area_m2(
 
     centroid = np.asarray(contact_centroid, dtype=np.float64)
 
-    # Flow axes from body geometry, optionally guided by the local surface normal.
+    # Pick the smaller body; its end face at the contact is usually the throat.
+    try:
+        vol_a = float(mesh_a.bounding_box.volume) if mesh_a.bounding_box else 0.0
+    except Exception:
+        vol_a = 0.0
+    try:
+        vol_b = float(mesh_b.bounding_box.volume) if mesh_b.bounding_box else 0.0
+    except Exception:
+        vol_b = 0.0
+    if vol_a <= 0.0 and vol_b <= 0.0:
+        vol_a = float(len(mesh_a.faces))
+        vol_b = float(len(mesh_b.faces))
+
+    if vol_a <= vol_b:
+        small_mesh, large_mesh = mesh_a, mesh_b
+        small_pt = np.asarray(contact_up_pt, dtype=np.float64) if contact_up_pt is not None else centroid
+        small_normal = contact_up_normal
+    else:
+        small_mesh, large_mesh = mesh_b, mesh_a
+        small_pt = np.asarray(contact_down_pt, dtype=np.float64) if contact_down_pt is not None else centroid
+        small_normal = contact_down_normal
+
+    # Plane normal = smaller body's flow axis (or its surface normal if reliable).
+    small_axis = _body_flow_axis(small_mesh, small_pt, small_normal)
+
+    # Stable cross-section of each body near the contact, perpendicular to the
+    # smaller body's axis.  We sweep a short distance inward to avoid the exact
+    # surface slice, which often returns a sliver.
+    short_sweep = (0.0, -0.1, -0.2, -0.3, -0.5, -1.0, -2.0, -3.0)
+    a_small_end = _throat_area_along_axis_mm2(
+        small_mesh, small_pt, axis=small_axis, sweep_mm=short_sweep, mode="first", min_area_mm2=1.0
+    )
+    a_large_end = _throat_area_along_axis_mm2(
+        large_mesh, small_pt, axis=small_axis, sweep_mm=short_sweep, mode="first", min_area_mm2=1.0
+    )
+
+    # Independent throat areas (global) for a sanity ceiling.
     axis_a = _body_flow_axis(mesh_a, centroid, contact_up_normal)
     axis_b = _body_flow_axis(mesh_b, centroid, contact_down_normal)
+    a_a_throat = _throat_area_along_axis_mm2(mesh_a, centroid, axis=axis_a)
+    a_b_throat = _throat_area_along_axis_mm2(mesh_b, centroid, axis=axis_b)
 
-    a_a = _throat_area_along_axis_mm2(mesh_a, centroid, axis=axis_a)
-    a_b = _throat_area_along_axis_mm2(mesh_b, centroid, axis=axis_b)
+    # The contact area is the smallest plausible end cross-section.
+    candidates = [a for a in (a_small_end, a_large_end, a_a_throat, a_b_throat) if a > 1e-12]
+    if not candidates:
+        if verbose and label:
+            print(
+                f"[CONTACT_AREA] {label}: centroid=({centroid[0]:.2f},{centroid[1]:.2f},{centroid[2]:.2f}) "
+                f"-> A_contact=0.0 (section+throat failed)",
+                flush=True,
+            )
+        return 0.0, 0.0, 0.0, 0, 0
 
-    chosen = ""
-    if a_a > 1e-12 and a_b > 1e-12:
-        area_mm2 = float(min(a_a, a_b))
-        chosen = "throat(min)"
-    elif a_a > 1e-12:
-        area_mm2 = float(a_a)
-        chosen = "throat(up)"
-    elif a_b > 1e-12:
-        area_mm2 = float(a_b)
-        chosen = "throat(down)"
-    else:
-        # Last resort: try a section intersection in the contact-normal plane.
-        n = np.array([0.0, 0.0, -1.0])
-        if contact_up_normal is not None:
-            n_up = np.asarray(contact_up_normal, dtype=np.float64)
-            if float(np.linalg.norm(n_up)) > 1e-12:
-                n = n_up / float(np.linalg.norm(n_up))
-        area_mm2, a_a, a_b, _ = _contact_section_intersection(
-            mesh_a, mesh_b, centroid, n, tol_mm=tol_mm
-        )
-        if area_mm2 > 1e-12:
-            chosen = "section"
-        else:
-            if verbose and label:
-                print(
-                    f"[CONTACT_AREA] {label}: centroid=({centroid[0]:.2f},{centroid[1]:.2f},{centroid[2]:.2f}) "
-                    f"-> A_contact=0.0 (throat failed)",
-                    flush=True,
-                )
-            return 0.0, a_a, a_b, 0, 0
+    area_mm2 = float(min(candidates))
+
+    a_a = a_small_end if small_mesh is mesh_a else a_large_end
+    a_b = a_large_end if small_mesh is mesh_a else a_small_end
 
     if verbose and label:
         print(
             f"[CONTACT_AREA] {label}: centroid=({centroid[0]:.2f},{centroid[1]:.2f},{centroid[2]:.2f}), "
             f"A_up={a_a:.3f} mm², A_down={a_b:.3f} mm², "
-            f"A_contact={area_mm2:.3f} mm² ({chosen})",
+            f"A_contact={area_mm2:.3f} mm² (small_end)",
             flush=True,
         )
     return float(area_mm2 * 1e-6), a_a, a_b, 0, 0
