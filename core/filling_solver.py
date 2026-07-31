@@ -1671,6 +1671,61 @@ def _contact_section_intersection(
     return 0.0, 0.0, 0.0, ""
 
 
+def _face_contact_area_single_mm2(
+    source: trimesh.Trimesh,
+    target: trimesh.Trimesh,
+    tol_mm: float = 0.2,
+    contact_centroid: Optional[np.ndarray] = None,
+    max_source_faces: int = 50000,
+) -> float:
+    """Return the area (mm²) of source boundary faces that touch ``target``.
+
+    A source face is part of the physical contact if its outward normal points
+    toward the contact region, its centroid is within ``tol_mm`` of the target
+    surface, and the target lies on the outward normal side.  This rejects side
+    faces and back faces of the smaller body that happen to be geometrically
+    close to the larger body.
+    """
+    if source is None or target is None:
+        return 0.0
+    if len(source.faces) == 0 or len(target.faces) == 0:
+        return 0.0
+    if len(source.faces) > max_source_faces:
+        # Sample faces uniformly to cap memory/time for unexpected large inputs.
+        step = int(np.ceil(len(source.faces) / max_source_faces))
+        face_idx = np.arange(0, len(source.faces), step)
+    else:
+        face_idx = np.arange(len(source.faces))
+    try:
+        centroids = source.triangles_center[face_idx]
+        normals = source.face_normals[face_idx]
+        closest, _, _ = trimesh.proximity.closest_point(target, centroids)
+        vec = np.asarray(closest, dtype=np.float64) - np.asarray(centroids, dtype=np.float64)
+        dist = np.linalg.norm(vec, axis=1)
+        dist = np.where(dist < 1e-12, 1.0, dist)
+        cos = np.einsum("ij,ij->i", vec / dist[:, None], normals)
+
+        # Only faces that point toward the contact region are candidates.
+        if contact_centroid is not None:
+            to_contact = np.asarray(contact_centroid, dtype=np.float64) - np.asarray(
+                source.centroid, dtype=np.float64
+            )
+            n_to = float(np.linalg.norm(to_contact))
+            if n_to > 1e-12:
+                to_contact = to_contact / n_to
+                facing_contact = np.einsum("ij,j->i", normals, to_contact) > 0.5
+            else:
+                facing_contact = np.ones(len(normals), dtype=bool)
+        else:
+            facing_contact = np.ones(len(normals), dtype=bool)
+
+        # Allow slightly angled contacts but discard back-facing surfaces.
+        mask = facing_contact & (dist <= tol_mm) & (cos > 0.0)
+        return float(source.area_faces[face_idx[mask]].sum())
+    except Exception:
+        return 0.0
+
+
 def _contact_surface_area_m2(
     mesh_a: trimesh.Trimesh,
     mesh_b: trimesh.Trimesh,
@@ -1686,12 +1741,12 @@ def _contact_surface_area_m2(
 ) -> Tuple[float, float, float, int, int]:
     """Return the real throat/contact area (m²) between two meshes.
 
-    The contact area is the common interface where the two bodies meet.  It is
-    computed by slicing both bodies on the plane perpendicular to the *smaller*
-    body's local flow axis at the actual contact point, then taking the smaller
-    stable end cross-section.  This limits the throat correctly for side and
-    T-junction contacts.  If the section is unstable we fall back to the global
-    throat area along each body's own flow axis.
+    The contact area is the physical shared boundary patch.  It is estimated by
+    finding the boundary faces of the *smaller* body that are within ``tol_mm``
+    of the other body and point toward it.  This directly captures T-junctions,
+    angled contacts and complex geometry without a prescribed section plane.  If
+    the face-proximity estimate is unavailable or implausible, we fall back to a
+    section-based throat area along the smaller body's flow axis.
     """
     if mesh_a is None or mesh_b is None:
         return 0.0, 0.0, 0.0, 0, 0
@@ -1700,7 +1755,7 @@ def _contact_surface_area_m2(
 
     centroid = np.asarray(contact_centroid, dtype=np.float64)
 
-    # Pick the smaller body; its end face at the contact is usually the throat.
+    # Pick the smaller mesh as the source for the face proximity query.
     try:
         vol_a = float(mesh_a.bounding_box.volume) if mesh_a.bounding_box else 0.0
     except Exception:
@@ -1722,28 +1777,73 @@ def _contact_surface_area_m2(
         small_pt = np.asarray(contact_down_pt, dtype=np.float64) if contact_down_pt is not None else centroid
         small_normal = contact_down_normal
 
-    # Plane normal = smaller body's flow axis (or its surface normal if reliable).
+    # 1) Real shared contact-patch area from boundary-face proximity.  This is the
+    # most faithful for angled / T-junction contacts because it uses the actual
+    # surface faces that touch.
+    # Use a generous tolerance for the face-proximity query; the normal alignment
+    # test filters out faces that are merely close but not actually facing the
+    # other body.
+    # Flow axis and stable end cross-sections of both bodies on the smaller body's
+    # throat plane.  This is the physically limiting cross-section of the contact.
     small_axis = _body_flow_axis(small_mesh, small_pt, small_normal)
-
-    # Stable cross-section of each body near the contact, perpendicular to the
-    # smaller body's axis.  We sweep a short distance inward to avoid the exact
-    # surface slice, which often returns a sliver.
-    short_sweep = (0.0, -0.1, -0.2, -0.3, -0.5, -1.0, -2.0, -3.0)
     a_small_end = _throat_area_along_axis_mm2(
-        small_mesh, small_pt, axis=small_axis, sweep_mm=short_sweep, mode="first", min_area_mm2=1.0
+        small_mesh, small_pt, axis=small_axis, mode="first", min_area_mm2=1.0
     )
     a_large_end = _throat_area_along_axis_mm2(
-        large_mesh, small_pt, axis=small_axis, sweep_mm=short_sweep, mode="first", min_area_mm2=1.0
+        large_mesh, small_pt, axis=small_axis, mode="first", min_area_mm2=1.0
     )
 
-    # Independent throat areas (global) for a sanity ceiling.
-    axis_a = _body_flow_axis(mesh_a, centroid, contact_up_normal)
-    axis_b = _body_flow_axis(mesh_b, centroid, contact_down_normal)
-    a_a_throat = _throat_area_along_axis_mm2(mesh_a, centroid, axis=axis_a)
-    a_b_throat = _throat_area_along_axis_mm2(mesh_b, centroid, axis=axis_b)
+    # 1) Try to use the actual shared surface patch.  It is trustworthy only when
+    # it is a plausible fraction of the smaller body's throat; otherwise the query
+    # has either under- or over-captured the contact.
+    a_face = _face_contact_area_single_mm2(
+        small_mesh,
+        large_mesh,
+        tol_mm=max(tol_mm, 2.0),
+        contact_centroid=centroid,
+    )
+    # The shared contact patch cannot be larger than the smaller body's throat.
+    # A small slack of 5 % is allowed for discretisation; anything substantially
+    # larger means the proximity query has captured side/back faces.
+    if (
+        a_face > 1e-12
+        and a_small_end > 1e-12
+        and (0.6 * a_small_end <= a_face <= 1.05 * a_small_end)
+    ):
+        area_mm2 = float(a_face)
+        a_a = a_face if small_mesh is mesh_a else a_small_end
+        a_b = a_small_end if small_mesh is mesh_a else a_face
+        chosen = "contact_faces"
+        if verbose and label:
+            print(
+                f"[CONTACT_AREA] {label}: centroid=({centroid[0]:.2f},{centroid[1]:.2f},{centroid[2]:.2f}), "
+                f"A_up={a_a:.3f} mm², A_down={a_b:.3f} mm², "
+                f"A_contact={area_mm2:.3f} mm² ({chosen}, small_end={a_small_end:.3f})",
+                flush=True,
+            )
+        return float(area_mm2 * 1e-6), a_a, a_b, 0, 0
 
-    # The contact area is the smallest plausible end cross-section.
-    candidates = [a for a in (a_small_end, a_large_end, a_a_throat, a_b_throat) if a > 1e-12]
+    if verbose and label and a_face > 1e-12:
+        print(
+            f"[CONTACT_AREA] {label}: a_face={a_face:.3f} mm² rejected "
+            f"(small_end={a_small_end:.3f}, large_end={a_large_end:.3f} mm²)",
+            flush=True,
+        )
+
+    # 2) Fallback: the smaller of the two end cross-sections on the small-body
+    # throat plane.  This correctly limits the throat even for T-junctions and
+    # angled contacts as long as the smaller body's flow axis is identified.
+    a_a = a_small_end if small_mesh is mesh_a else a_large_end
+    a_b = a_large_end if small_mesh is mesh_a else a_small_end
+
+    candidates = [a for a in (a_small_end, a_large_end) if a > 1e-12]
+    if not candidates:
+        # Last-ditch: use the global throat of either body.
+        axis_a = _body_flow_axis(mesh_a, centroid, contact_up_normal)
+        axis_b = _body_flow_axis(mesh_b, centroid, contact_down_normal)
+        a_a_throat = _throat_area_along_axis_mm2(mesh_a, centroid, axis=axis_a)
+        a_b_throat = _throat_area_along_axis_mm2(mesh_b, centroid, axis=axis_b)
+        candidates = [a for a in (a_a_throat, a_b_throat) if a > 1e-12]
     if not candidates:
         if verbose and label:
             print(
@@ -1751,18 +1851,16 @@ def _contact_surface_area_m2(
                 f"-> A_contact=0.0 (section+throat failed)",
                 flush=True,
             )
-        return 0.0, 0.0, 0.0, 0, 0
+        return 0.0, a_a, a_b, 0, 0
 
     area_mm2 = float(min(candidates))
-
-    a_a = a_small_end if small_mesh is mesh_a else a_large_end
-    a_b = a_large_end if small_mesh is mesh_a else a_small_end
+    chosen = "section_min"
 
     if verbose and label:
         print(
             f"[CONTACT_AREA] {label}: centroid=({centroid[0]:.2f},{centroid[1]:.2f},{centroid[2]:.2f}), "
             f"A_up={a_a:.3f} mm², A_down={a_b:.3f} mm², "
-            f"A_contact={area_mm2:.3f} mm² (small_end)",
+            f"A_contact={area_mm2:.3f} mm² ({chosen})",
             flush=True,
         )
     return float(area_mm2 * 1e-6), a_a, a_b, 0, 0
@@ -5194,94 +5292,107 @@ def solve_filling_flow(
                     raise RuntimeError("josecast_core C++ module is not available")
                 vof_inflow_v = float(vof_inflow_v)
                 vof_inflow_v = max(vof_inflow_v, 0.01)
-                # Use the global gravity vector for the inlet source term.  The
-                # Darcy velocity field supplied below forces the bulk flow to
-                # follow the actual gating path instead of the vertical axis.
                 # C++ binding expects a plain Python list for the gravity vector.
                 lbm_g = [float(x) for x in g]
-                # True geodesic distance from the inlet through the cavity gives
-                # both the LBM front-propagation speed and the flow-direction
-                # field.  Use a 26-connected graph so thin diagonal passages are
-                # not lost; edge weights are the Euclidean length of the step
-                # (1, sqrt(2), sqrt(3)) so the distance is physically meaningful.
-                node_id = np.full(vof_grid.shape, -1, dtype=np.int64)
-                node_id[vof_cavity] = np.arange(int(vof_cavity.sum()), dtype=np.int64)
-                n_nodes = int(vof_cavity.sum())
-                rows, cols, data = [], [], []
-                nz, ny, nx = vof_grid.shape
-                zz, yy, xx = np.ogrid[0:nz, 0:ny, 0:nx]
-                for dz in (-1, 0, 1):
-                    for dy in (-1, 0, 1):
-                        for dx in (-1, 0, 1):
-                            if dz == 0 and dy == 0 and dx == 0:
-                                continue
-                            # Avoid wrap-around edges: the neighbour must be inside the grid.
-                            inside = (
-                                (zz + dz >= 0)
-                                & (zz + dz < nz)
-                                & (yy + dy >= 0)
-                                & (yy + dy < ny)
-                                & (xx + dx >= 0)
-                                & (xx + dx < nx)
-                            )
-                            src = np.full_like(node_id, -1)
-                            sl_z = slice(max(0, -dz), nz - max(0, dz))
-                            sl_y = slice(max(0, -dy), ny - max(0, dy))
-                            sl_x = slice(max(0, -dx), nx - max(0, dx))
-                            src_sl_z = slice(max(0, dz), nz - max(0, -dz))
-                            src_sl_y = slice(max(0, dy), ny - max(0, -dy))
-                            src_sl_x = slice(max(0, dx), nx - max(0, -dx))
-                            src[sl_z, sl_y, sl_x] = node_id[src_sl_z, src_sl_y, src_sl_x]
-                            node_id_r = node_id.ravel()
-                            src_r = src.ravel()
-                            valid = (
-                                inside.ravel()
-                                & (src_r >= 0)
-                                & (node_id_r >= 0)
-                                & (src_r != node_id_r)
-                            )
-                            edge_w = float(np.linalg.norm([dz, dy, dx]))
-                            rows.extend(node_id_r[valid].tolist())
-                            cols.extend(src_r[valid].tolist())
-                            data.extend(np.full(valid.sum(), edge_w, dtype=np.float64).tolist())
-                graph = csr_matrix((data, (rows, cols)), shape=(n_nodes, n_nodes))
-                inlet_nodes = node_id[vof_inlet]
-                inlet_nodes = inlet_nodes[inlet_nodes >= 0]
-                geodesic_voxels = np.full(vof_grid.shape, np.inf, dtype=np.float64)
-                if inlet_nodes.size > 0 and n_nodes > 0:
-                    dists = csgraph.dijkstra(
-                        graph, indices=inlet_nodes, directed=False, return_predecessors=False
-                    )
-                    min_dist = np.min(dists, axis=0)
-                    min_dist = np.where(np.isfinite(min_dist), min_dist, np.inf)
-                    geodesic_voxels[vof_cavity] = min_dist
 
-                # Fallback for isolated cells that Dijkstra could not reach (e.g.
-                # a thin pocket cut off by aggressive downsampling).  Add a
-                # distance penalty so they fill after the reachable front, but
-                # still get filled before the solver gives up.
-                finite_mask = np.isfinite(geodesic_voxels) & vof_cavity
-                max_finite = float(geodesic_voxels[finite_mask].max()) if finite_mask.any() else 0.0
-                if not finite_mask.any():
-                    max_finite = 0.0
-                dt_voxels = ndimage.distance_transform_edt(vof_cavity & ~vof_inlet)
-                fallback = np.where(
-                    np.isfinite(geodesic_voxels),
-                    geodesic_voxels,
-                    max_finite + dt_voxels + 5.0,
-                )
-                geodesic_voxels = np.where(vof_cavity, fallback, geodesic_voxels)
-                dist_m = geodesic_voxels * vof_dx_m
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    grad_dist = np.gradient(dist_m, vof_dx_m)
-                    mag_d = np.sqrt(sum(g * g for g in grad_dist))
-                    mag_safe = np.where(mag_d > 1e-18, mag_d, 1.0)
-                    ux = grad_dist[0] / mag_safe * vof_inflow_v
-                    vy = grad_dist[1] / mag_safe * vof_inflow_v
-                    wz = grad_dist[2] / mag_safe * vof_inflow_v
-                lbm_target_velocity = np.ascontiguousarray(
-                    np.stack([ux, vy, wz], axis=0), dtype=np.float64
-                )
+                # Newer .pyd/.so builds accept target_velocity/inlet_distance;
+                # older Windows wheels do not.  Detect the signature from the doc
+                # string so we keep compatibility with precompiled binaries that
+                # are not rebuilt every commit.
+                lbm_doc = getattr(JOSECAST_CORE.solve_lbm_filling, "__doc__", "") or ""
+                lbm_kwargs: Dict[str, Any] = {}
+                if (
+                    "target_velocity" in lbm_doc
+                    and "inlet_distance" in lbm_doc
+                ):
+                    # True geodesic distance from the inlet through the cavity gives
+                    # both the LBM front-propagation speed and the flow-direction
+                    # field.  Use a 26-connected graph so thin diagonal passages are
+                    # not lost; edge weights are the Euclidean length of the step
+                    # (1, sqrt(2), sqrt(3)) so the distance is physically meaningful.
+                    node_id = np.full(vof_grid.shape, -1, dtype=np.int64)
+                    node_id[vof_cavity] = np.arange(int(vof_cavity.sum()), dtype=np.int64)
+                    n_nodes = int(vof_cavity.sum())
+                    rows, cols, data = [], [], []
+                    nz, ny, nx = vof_grid.shape
+                    zz, yy, xx = np.ogrid[0:nz, 0:ny, 0:nx]
+                    for dz in (-1, 0, 1):
+                        for dy in (-1, 0, 1):
+                            for dx in (-1, 0, 1):
+                                if dz == 0 and dy == 0 and dx == 0:
+                                    continue
+                                # Avoid wrap-around edges: the neighbour must be inside the grid.
+                                inside = (
+                                    (zz + dz >= 0)
+                                    & (zz + dz < nz)
+                                    & (yy + dy >= 0)
+                                    & (yy + dy < ny)
+                                    & (xx + dx >= 0)
+                                    & (xx + dx < nx)
+                                )
+                                src = np.full_like(node_id, -1)
+                                sl_z = slice(max(0, -dz), nz - max(0, dz))
+                                sl_y = slice(max(0, -dy), ny - max(0, dy))
+                                sl_x = slice(max(0, -dx), nx - max(0, dx))
+                                src_sl_z = slice(max(0, dz), nz - max(0, -dz))
+                                src_sl_y = slice(max(0, dy), ny - max(0, -dy))
+                                src_sl_x = slice(max(0, dx), nx - max(0, -dx))
+                                src[sl_z, sl_y, sl_x] = node_id[src_sl_z, src_sl_y, src_sl_x]
+                                node_id_r = node_id.ravel()
+                                src_r = src.ravel()
+                                valid = (
+                                    inside.ravel()
+                                    & (src_r >= 0)
+                                    & (node_id_r >= 0)
+                                    & (src_r != node_id_r)
+                                )
+                                edge_w = float(np.linalg.norm([dz, dy, dx]))
+                                rows.extend(node_id_r[valid].tolist())
+                                cols.extend(src_r[valid].tolist())
+                                data.extend(np.full(valid.sum(), edge_w, dtype=np.float64).tolist())
+                    graph = csr_matrix((data, (rows, cols)), shape=(n_nodes, n_nodes))
+                    inlet_nodes = node_id[vof_inlet]
+                    inlet_nodes = inlet_nodes[inlet_nodes >= 0]
+                    geodesic_voxels = np.full(vof_grid.shape, np.inf, dtype=np.float64)
+                    if inlet_nodes.size > 0 and n_nodes > 0:
+                        dists = csgraph.dijkstra(
+                            graph, indices=inlet_nodes, directed=False, return_predecessors=False
+                        )
+                        min_dist = np.min(dists, axis=0)
+                        min_dist = np.where(np.isfinite(min_dist), min_dist, np.inf)
+                        geodesic_voxels[vof_cavity] = min_dist
+
+                    # Fallback for isolated cells that Dijkstra could not reach (e.g.
+                    # a thin pocket cut off by aggressive downsampling).  Add a
+                    # distance penalty so they fill after the reachable front, but
+                    # still get filled before the solver gives up.
+                    finite_mask = np.isfinite(geodesic_voxels) & vof_cavity
+                    max_finite = float(geodesic_voxels[finite_mask].max()) if finite_mask.any() else 0.0
+                    if not finite_mask.any():
+                        max_finite = 0.0
+                    dt_voxels = ndimage.distance_transform_edt(vof_cavity & ~vof_inlet)
+                    fallback = np.where(
+                        np.isfinite(geodesic_voxels),
+                        geodesic_voxels,
+                        max_finite + dt_voxels + 5.0,
+                    )
+                    geodesic_voxels = np.where(vof_cavity, fallback, geodesic_voxels)
+                    dist_m = geodesic_voxels * vof_dx_m
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        grad_dist = np.gradient(dist_m, vof_dx_m)
+                        mag_d = np.sqrt(sum(g * g for g in grad_dist))
+                        mag_safe = np.where(mag_d > 1e-18, mag_d, 1.0)
+                        ux = grad_dist[0] / mag_safe * vof_inflow_v
+                        vy = grad_dist[1] / mag_safe * vof_inflow_v
+                        wz = grad_dist[2] / mag_safe * vof_inflow_v
+                    lbm_target_velocity = np.ascontiguousarray(
+                        np.stack([ux, vy, wz], axis=0), dtype=np.float64
+                    )
+                    lbm_kwargs["target_velocity"] = lbm_target_velocity
+                    lbm_kwargs["inlet_distance"] = np.ascontiguousarray(
+                        geodesic_voxels.astype(np.float64, copy=False)
+                    )
+
                 (
                     ft,
                     vmag,
@@ -5306,10 +5417,7 @@ def solve_filling_flow(
                     int(os.environ.get("JOSECAST_CPP_LBM_MAX_STEPS", "12000")),
                     float(os.environ.get("JOSECAST_CPP_LBM_CFL", "0.3")),
                     float(os.environ.get("JOSECAST_CPP_LBM_SMAG", "0.18")),
-                    target_velocity=lbm_target_velocity,
-                    inlet_distance=np.ascontiguousarray(
-                        geodesic_voxels.astype(np.float64, copy=False)
-                    ),
+                    **lbm_kwargs,
                 )
                 vof_res = {
                     "fill_time": ft,

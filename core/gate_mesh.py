@@ -290,14 +290,19 @@ def build_gate_mesh(
     clean.fill_holes()
 
     # Surface decimation keeps the tetrahedral mesh fast while preserving the
-    # gate geometry.  Only decimate overly dense gate bodies.
+    # gate geometry.  Only decimate overly dense gate bodies.  If the optional
+    # fast-simplification package is missing, skip decimation and let TetGen
+    # deal with the denser input.
     _MAX_GATE_FACES: int = 1200
     _TARGET_GATE_FACES: int = 1000
     if len(clean.faces) > _MAX_GATE_FACES:
-        clean = clean.simplify_quadric_decimation(face_count=_TARGET_GATE_FACES)
-        clean.merge_vertices(merge_tex=False, merge_norm=False)
-        clean.fix_normals()
-        clean.fill_holes()
+        try:
+            clean = clean.simplify_quadric_decimation(face_count=_TARGET_GATE_FACES)
+            clean.merge_vertices(merge_tex=False, merge_norm=False)
+            clean.fix_normals()
+            clean.fill_holes()
+        except Exception:
+            pass
 
     verts = clean.vertices.astype(float)
     faces = clean.faces.astype(np.int32)  # meshpy expects 0-based
