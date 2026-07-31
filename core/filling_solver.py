@@ -33,6 +33,7 @@ from scipy.sparse import csr_matrix
 from scipy.sparse import csgraph
 from scipy.sparse import linalg as spla
 
+from core.gate_flow import solve_gate_flows
 from core.materials import MOLDS, MoldMaterial
 from core.types import Body, BodyType, FillingResult, GatingNode, GatingVelocityError
 from core.voxelizer import build_voxel_grid, compute_face_fractions
@@ -5450,6 +5451,42 @@ def solve_filling_flow(
         node_v = {}
         v_ingate_contact = 0.0
 
+    # Local 3-D anisotropic Darcy–Forchheimer on each gating body.  Boundary
+    # pressures are interpolated from the global voxel pressure field and the
+    # flow rate is fixed by the global gating graph, giving smooth wall-aligned
+    # gate velocities without disturbing the global fill solution.
+    gate_flow_results: Dict[str, Dict[str, float]] = {}
+    enable_gate_mesh = bool(getattr(casting_params, "enable_gate_mesh", False))
+    if gating_nodes and bodies and enable_gate_mesh:
+        try:
+            gate_results, gating_nodes = solve_gate_flows(
+                bodies=bodies,
+                grid=grid_c,
+                origin_mm=origin_c,
+                dx_mm=dx_c,
+                p_dim=p,
+                pressure_drop_pa=pressure_drop_pa,
+                mu_pa_s=mu,
+                rho_kg_m3=rho_liq,
+                gating_nodes=gating_nodes,
+                Q_user_m3_s=Q_user,
+                gravity_vector=g,
+            )
+            for name, r in gate_results.items():
+                gate_flow_results[name] = {
+                    "max_velocity_m_s": float(r.max_velocity_m_s),
+                    "outlet_flux_m3_s": float(r.outlet_flux_m3_s),
+                    "pressure_drop_pa": float(r.pressure_drop_pa),
+                    "forchheimer_pressure_drop_pa": float(r.forchheimer_pressure_drop_pa),
+                    "total_pressure_drop_pa": float(r.total_pressure_drop_pa),
+                    "max_reynolds": float(r.reynolds.max()),
+                    "max_froude": float(r.froude.max()),
+                    "air_entrainment_cells": int(r.air_entrainment.sum()),
+                    "n_cells": int(len(r.pressures)),
+                }
+        except Exception as exc:
+            print(f"[GATE_MESH] {exc}", flush=True)
+
     # Build a per-body velocity magnitude field from the gating-node values.
     # Darcy face velocities can be numerically tiny in wide regions, but the
     # node velocities are physically consistent; this makes Reynolds and
@@ -5600,4 +5637,5 @@ def solve_filling_flow(
         reynolds=reynolds_field.astype(np.float32),
         turbulence_intensity=turb_intensity.astype(np.float32),
         filter_recommendation=filter_recommendation,
+        gate_flow_results=gate_flow_results,
     )

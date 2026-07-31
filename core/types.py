@@ -29,6 +29,9 @@ class CastingParameters:
     # v10.0: hot-spot detection thresholds exposed to the user
     hotspot_min_size_mm: float = 0.0
     hotspot_cluster_eps_mm: float = 0.0
+    # v10.1: experimental local 3-D gate mesh Darcy–Forchheimer solve.
+    # Disabled by default until it is validated on a wider geometry set.
+    enable_gate_mesh: bool = False
 
     @property
     def superheat_c(self) -> float:
@@ -293,6 +296,8 @@ class FillingResult:
     turbulence_intensity: Optional[np.ndarray] = None  # I = 0.16 Re^-0.08 (pipe fit)
     # Phase 5: automatic ceramic filter recommendation for high-turbulence gating.
     filter_recommendation: Optional[str] = None
+    # Local 3-D Darcy–Forchheimer gate-mesh summaries, keyed by Body.name.
+    gate_flow_results: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass
