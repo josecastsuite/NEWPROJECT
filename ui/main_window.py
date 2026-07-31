@@ -216,6 +216,9 @@ class MainWindow(QtWidgets.QMainWindow):
         file_layout.addWidget(QtWidgets.QLabel("Body Listesi (Tip Ata):"))
         self.body_list = QtWidgets.QListWidget()
         self.body_list.setMinimumHeight(140)
+        self.body_list.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         file_layout.addWidget(self.body_list)
         left_layout.addWidget(file_group)
 
