@@ -114,6 +114,10 @@ class BodyRowWidget(QtWidgets.QWidget):
         self._body_type_names = body_type_names
         self._block_updates = False
 
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         self._build_ui()
         self._sync_from_body()
 
@@ -186,7 +190,15 @@ class BodyRowWidget(QtWidgets.QWidget):
         self._sand_prop_btn.clicked.connect(self._on_sand_properties)
         layout.addWidget(self._sand_prop_btn)
 
-        layout.addStretch()
+        # Invisible expanding filler so the row widget occupies the full
+        # QListWidget item width; this lets hover/selection paint across the
+        # entire row instead of leaving an empty right-hand gap.
+        self._row_filler = QtWidgets.QWidget()
+        self._row_filler.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        layout.addWidget(self._row_filler)
 
     def body(self) -> Body:
         return self._body
