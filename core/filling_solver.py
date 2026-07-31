@@ -3707,12 +3707,16 @@ def _aggregate_section_velocities(
     gating_nodes: List[GatingNode],
     Q_user: float,
     inlet_area_m2: float,
+    gate_results: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, float], float]:
     """Derive section-aggregate velocities and the ingate contact velocity.
 
     The aggregate values are taken directly from the contact-node values so the
-    report and the 3-D labels always agree.  The source (SPRUE_THROAT) velocity
-    falls back to Q / inlet_area when no upstream contact exists.
+    report and the 3-D labels always agree.  When a local 3-D gate solve is
+    available, the section velocity is taken from the solver's ``max_velocity``
+    for the corresponding body instead of the coarse Q/A interface estimate.
+    The source (SPRUE_THROAT) velocity falls back to Q / inlet_area when no
+    upstream contact exists.
     """
     section_velocities: Dict[str, List[float]] = {
         "SPRUE_THROAT": [],
@@ -3725,34 +3729,66 @@ def _aggregate_section_velocities(
         "RISER": [],
     }
 
+    def _section_for(up: str, down: str) -> Optional[str]:
+        if up == "SOURCE" and down in section_velocities:
+            return down
+        if up == "SPRUE_THROAT":
+            return "SPRUE_THROAT"
+        if up == "SPRUE" and down != "PART":
+            return "SPRUE_BASE"
+        if up == "RUNNER":
+            return "RUNNER"
+        if up == "DISTRIBUTOR":
+            return "DISTRIBUTOR"
+        if up == "CURUFLUK":
+            return "CURUFLUK"
+        if up == "FILTER":
+            return "FILTER"
+        if up == "INGATE":
+            return "INGATE"
+        if up == "RISER" or down == "RISER":
+            return "RISER"
+        return None
+
     for n in gating_nodes:
         parts = n.body_type.split("→")
         if len(parts) != 2:
             continue
         up, down = parts
-        if up == "SOURCE" and down in section_velocities:
-            section_velocities[down].append(n.velocity_m_s)
+        sec = _section_for(up, down)
+        if sec is None:
             continue
-        if up == "SPRUE_THROAT":
-            section_velocities["SPRUE_THROAT"].append(n.velocity_m_s)
-        if up == "SPRUE" and down != "PART":
-            section_velocities["SPRUE_BASE"].append(n.velocity_m_s)
-        if up == "RUNNER":
-            section_velocities["RUNNER"].append(n.velocity_m_s)
-        if up == "DISTRIBUTOR":
-            section_velocities["DISTRIBUTOR"].append(n.velocity_m_s)
-        if up == "CURUFLUK":
-            section_velocities["CURUFLUK"].append(n.velocity_m_s)
-        if up == "FILTER":
-            section_velocities["FILTER"].append(n.velocity_m_s)
-        if up == "INGATE":
-            section_velocities["INGATE"].append(n.velocity_m_s)
-        if up == "RISER" or down == "RISER":
-            section_velocities["RISER"].append(n.velocity_m_s)
+        section_velocities[sec].append(n.velocity_m_s)
 
     node_v: Dict[str, float] = {}
+    # Override with local 3-D gate solver max velocities when available.
+    if gate_results:
+        gate_section_velocities: Dict[str, List[float]] = {
+            k: [] for k in section_velocities
+        }
+        for n in gating_nodes:
+            if n.name is None or " → " not in n.name:
+                continue
+            up_name, down_name = n.name.split(" → ", 1)
+            gate_body = up_name if up_name in gate_results else down_name
+            if gate_body not in gate_results:
+                continue
+            parts = n.body_type.split("→")
+            if len(parts) != 2:
+                continue
+            up, down = parts
+            sec = _section_for(up, down)
+            if sec is None:
+                continue
+            gate_section_velocities[sec].append(
+                float(gate_results[gate_body].max_velocity_m_s)
+            )
+        for key, vals in gate_section_velocities.items():
+            if vals:
+                node_v[key] = float(np.mean(vals))
+
     for key, vals in section_velocities.items():
-        if vals:
+        if vals and key not in node_v:
             node_v[key] = float(np.mean(vals))
 
     # No upstream contact for the source sprue: use Q / inlet area.
@@ -3761,6 +3797,9 @@ def _aggregate_section_velocities(
 
     ingate_vals = section_velocities["INGATE"]
     v_ingate_contact = float(np.mean(ingate_vals)) if ingate_vals else 0.0
+    # Prefer the local 3-D gate solver value for the ingate contact velocity.
+    if "INGATE" in node_v:
+        v_ingate_contact = node_v["INGATE"]
 
     return node_v, v_ingate_contact
 
@@ -5456,6 +5495,7 @@ def solve_filling_flow(
     # flow rate is fixed by the global gating graph, giving smooth wall-aligned
     # gate velocities without disturbing the global fill solution.
     gate_flow_results: Dict[str, Dict[str, float]] = {}
+    gate_results: Dict[str, Any] = {}
     enable_gate_mesh = bool(getattr(casting_params, "enable_gate_mesh", False))
     if gating_nodes and bodies and enable_gate_mesh:
         try:
@@ -5574,11 +5614,13 @@ def solve_filling_flow(
     # Aggregate section velocities and ingate contact velocity directly from
     # the computed contact nodes so the report/viewer match the 3-D labels.
     if gating_nodes:
-        node_v, v_ingate_contact = _aggregate_section_velocities(gating_nodes, Q_user, area_m2)
+        node_v, v_ingate_contact = _aggregate_section_velocities(
+            gating_nodes, Q_user, area_m2, gate_results=gate_results or None
+        )
     else:
         node_v = {}
         v_ingate_contact = 0.0
-    if per_gate_v:
+    if per_gate_v and not gate_results:
         v_ingate_contact = float(np.mean(list(per_gate_v.values())))
 
     if progress_callback:

@@ -44,7 +44,8 @@ params=CastingParameters(
     rho_liquid_kg_m3=7850.0, viscosity_pa_s=0.005,
     gravity_vector=(0.0,-1.0,0.0),
     ingate_velocity_m_s=1.80,
-    velocity_section_key='SPRUE_THROAT'
+    velocity_section_key='SPRUE_THROAT',
+    enable_gate_mesh=True
 )
 result = analyze(
     bodies, grid, body_index, origin, dx,
@@ -57,6 +58,10 @@ print('flow result:', result.flow_result)
 fr = result.flow_result
 print('Q L/s', fr.Q_m3_s*1e3, 'fill_time_s', fr.fill_time_s, 'inlet_area_cm2', fr.inlet_area_m2*1e4)
 print('node_velocities', fr.node_velocities)
+if fr.gate_flow_results:
+    print('gate_flow_results')
+    for body_name, summary in fr.gate_flow_results.items():
+        print(' ', body_name, summary)
 
 anim = FlowAnimator(MockViewer())
 t0=time.time()
