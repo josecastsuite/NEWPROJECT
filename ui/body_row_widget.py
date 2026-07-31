@@ -250,7 +250,8 @@ class BodyRowWidget(QtWidgets.QWidget):
         self._feeder_m_spin.setSuffix(" cm")
         self._feeder_m_spin.setSpecialValueText("Auto")
         self._feeder_m_spin.setToolTip("Opsiyonel besleyici modülü (cm); 0 = otomatik")
-        self._feeder_m_spin.setMaximumWidth(60)
+        self._feeder_m_spin.setMinimumWidth(60)
+        self._feeder_m_spin.setMaximumWidth(95)
         self._feeder_m_spin.valueChanged.connect(self._on_feeder_m_changed)
         layout.addWidget(self._feeder_m_spin)
 
