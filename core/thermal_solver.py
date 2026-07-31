@@ -222,8 +222,16 @@ def _solve_thermal_cpp(
     is_gating_u8 = is_gating_c.astype(np.uint8, copy=False)
     is_chill_u8 = chill_mask_c.astype(np.uint8, copy=False)
 
-    fill_in = fill_c.astype(np.float64, copy=False) if fill_c is not None else np.empty((0,), dtype=np.float64)
-    vel_in = velocity_c.astype(np.float64, copy=False) if velocity_c is not None else np.empty((0,), dtype=np.float64)
+    if fill_c is not None:
+        fill_in = fill_c.astype(np.float64, copy=False)
+    else:
+        # C++ binding expects a 3-D array even when there is no fill-time data.
+        fill_in = np.zeros(grid_c.shape, dtype=np.float64)
+    if velocity_c is not None:
+        vel_in = velocity_c.astype(np.float64, copy=False)
+    else:
+        # C++ binding expects a 4-D (3, nz, ny, nx) velocity field.
+        vel_in = np.zeros((3,) + tuple(grid_c.shape), dtype=np.float64)
 
     n_steps = 0  # let C++ use its default
     T_c, fs_c, t_liq_c, t_sol_c, G_c, R_c, niyama_c = JOSECAST_CORE.solve_thermal(

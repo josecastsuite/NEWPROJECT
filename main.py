@@ -6,18 +6,44 @@ import sys
 import traceback
 
 
+# Console encoding on Windows defaults to cp1254/cp1252; we want UTF-8 with a
+# safe fallback so print statements containing arrows/Turkish chars do not crash.
+for _std in (sys.stdout, sys.stderr):
+    if _std is not None and hasattr(_std, "reconfigure"):
+        try:
+            _std.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 class _Tee:
     """Write stdout/stderr to both the original stream and a log file."""
 
     def __init__(self, stream, log_path):
         self._stream = stream
         self._log = open(log_path, "a", encoding="utf-8")
-        self._log.write(f"\n--- JoseCast run started ---\n")
+        self._log.write("\n--- JoseCast run started ---\n")
         self._log.flush()
 
+    def _safe_stream_write(self, data):
+        """Write to the console stream, replacing unencodable characters."""
+        try:
+            self._stream.write(data)
+            self._stream.flush()
+            return
+        except UnicodeEncodeError:
+            pass
+        # Fallback: encode with the stream's encoding and replace errors.
+        try:
+            enc = getattr(self._stream, "encoding", "utf-8") or "utf-8"
+            safe = data.encode(enc, errors="replace").decode(enc, errors="replace")
+            self._stream.write(safe)
+            self._stream.flush()
+        except Exception:
+            pass
+
     def write(self, data):
-        self._stream.write(data)
-        self._stream.flush()
+        self._safe_stream_write(data)
         try:
             self._log.write(data)
             self._log.flush()
@@ -25,7 +51,10 @@ class _Tee:
             pass
 
     def flush(self):
-        self._stream.flush()
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
         try:
             self._log.flush()
         except Exception:

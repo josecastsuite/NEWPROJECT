@@ -5174,7 +5174,8 @@ def solve_filling_flow(
                 # Use the global gravity vector for the inlet source term.  The
                 # Darcy velocity field supplied below forces the bulk flow to
                 # follow the actual gating path instead of the vertical axis.
-                lbm_g = np.asarray(g, dtype=np.float64)
+                # C++ binding expects a plain Python list for the gravity vector.
+                lbm_g = [float(x) for x in g]
                 # True geodesic distance from the inlet through the cavity gives
                 # both the LBM front-propagation speed and the flow-direction
                 # field.  Use a 26-connected graph so thin diagonal passages are
@@ -5320,7 +5321,7 @@ def solve_filling_flow(
                         phi_vof,
                         vof_inlet.astype(np.uint8, copy=False),
                         float(vof_dx_m),
-                        np.asarray(g, dtype=np.float64),
+                        [float(x) for x in g],
                         float(rho_vof),
                         float(mu_vof / rho_vof),
                         vof_inflow_v,
