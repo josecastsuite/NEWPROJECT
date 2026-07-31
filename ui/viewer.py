@@ -34,6 +34,35 @@ BODY_COLORS = {
     BodyType.CURUFLUK: "#009688",
 }
 
+BODY_LEGEND_LABELS = {
+    BodyType.PART: "Parça",
+    BodyType.RISER: "Besleyici",
+    BodyType.INGATE: "Meme",
+    BodyType.RUNNER: "Yolluk",
+    BodyType.SPRUE: "Döküm Ağzı",
+    BodyType.CORE: "Maça",
+    BodyType.COOLING_SPRUE: "Soğ. Döküm Ağzı",
+    BodyType.FILTER: "Filtre",
+    BodyType.POURING_BASIN: "Döküm Havzası",
+    BodyType.SPRUE_THROAT: "D.a Boğazı",
+    BodyType.DISTRIBUTOR: "Dağıtıcı",
+    BodyType.CURUFLUK: "Curufluk",
+}
+
+
+def _text_color_for(body_color: str) -> str:
+    """Return white for dark body colours, black for very light ones, else the colour itself."""
+    c = body_color.lstrip("#")
+    r = int(c[0:2], 16)
+    g = int(c[2:4], 16)
+    b = int(c[4:6], 16)
+    brightness = (r * 0.299 + g * 0.587 + b * 0.114)
+    if brightness > 180:
+        return "#000000"
+    if brightness < 120:
+        return "#ffffff"
+    return body_color
+
 BODY_OPACITY = {
     BodyType.PART: 0.35,
     BodyType.RISER: 1.0,
@@ -142,7 +171,6 @@ class Analyzer3DViewer(QtInteractor):
         frame.setStyleSheet(
             "#bodyLegendFrame { background-color: rgba(24, 24, 27, 220); "
             "border: 1px solid #00ffff; border-radius: 6px; padding: 4px; }"
-            "QLabel { color: #00ffff; font-weight: bold; font-size: 11px; }"
         )
         layout = QtWidgets.QVBoxLayout(frame)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -176,13 +204,17 @@ class Analyzer3DViewer(QtInteractor):
             row.setSpacing(6)
             row.setContentsMargins(0, 0, 0, 0)
             color = BODY_COLORS.get(bt, "#E0E0E0")
-            name = BODY_TYPE_LABELS.get(bt, str(bt))
+            name = BODY_LEGEND_LABELS.get(bt, str(bt))
+            text_color = _text_color_for(color)
             swatch = QtWidgets.QLabel()
-            swatch.setFixedSize(14, 14)
+            swatch.setFixedSize(12, 12)
             swatch.setStyleSheet(
-                f"background-color: {color}; border-radius: 7px; border: 1px solid #00ffff;"
+                f"background-color: {color}; border-radius: 6px; border: 1px solid #ffffff;"
             )
             label = QtWidgets.QLabel(name)
+            label.setStyleSheet(
+                f"color: {text_color}; font-weight: bold; font-size: 13px;"
+            )
             row.addWidget(swatch)
             row.addWidget(label)
             row.addStretch()
