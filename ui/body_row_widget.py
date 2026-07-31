@@ -190,14 +190,15 @@ class BodyRowWidget(QtWidgets.QWidget):
         self._sand_prop_btn.clicked.connect(self._on_sand_properties)
         layout.addWidget(self._sand_prop_btn)
 
-        # Invisible expanding filler so the row widget occupies the full
-        # QListWidget item width; this lets hover/selection paint across the
-        # entire row instead of leaving an empty right-hand gap.
+        # Expanding filler that visually closes the right-hand gap by using
+        # the same dark background as the compact control widgets.
         self._row_filler = QtWidgets.QWidget()
         self._row_filler.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Expanding,
         )
+        self._row_filler.setAutoFillBackground(True)
+        self._row_filler.setStyleSheet("background-color: #27272a; border: none;")
         layout.addWidget(self._row_filler)
 
     def body(self) -> Body:
