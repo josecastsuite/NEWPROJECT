@@ -143,9 +143,16 @@ def main():
 
     if result.flow_result:
         fr = result.flow_result
-        print("  3-B Darcy flow result:")
+        print("  Flow result:")
+        print(f"    reason={fr.reason[:120]}...")
         print(f"    Q={fr.Q_m3_s*1e3:.3f} L/s, fill={fr.fill_time_s:.2f}s, inlet_area={fr.inlet_area_m2*1e4:.2f}cm2")
         print(f"    node_v={fr.node_velocities}, contact_v={fr.ingate_contact_velocity_m_s:.3f}m/s")
+        if fr.fill_time is not None and fr.fill_time.size and result.is_metal is not None:
+            ft = fr.fill_time
+            metal = result.is_metal
+            filled = int((metal & (ft > 0)).sum())
+            total = int(metal.sum())
+            print(f"    fill_time coverage: {filled}/{total} metal voxels ({100*filled/total:.2f}%)")
 
     print("Generating HTML report ...")
     html_path = os.path.join(args.out_dir, "test_report.html")

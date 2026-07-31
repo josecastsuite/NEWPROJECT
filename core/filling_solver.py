@@ -5071,19 +5071,49 @@ def solve_filling_flow(
                 lbm_g = np.asarray(g, dtype=np.float64)
                 # True geodesic distance from the inlet through the cavity gives
                 # both the LBM front-propagation speed and the flow-direction
-                # field.  We build a 6-connected graph on cavity cells and run
-                # Dijkstra from all inlet cells.
+                # field.  Use a 26-connected graph so thin diagonal passages are
+                # not lost; edge weights are the Euclidean length of the step
+                # (1, sqrt(2), sqrt(3)) so the distance is physically meaningful.
                 node_id = np.full(vof_grid.shape, -1, dtype=np.int64)
                 node_id[vof_cavity] = np.arange(int(vof_cavity.sum()), dtype=np.int64)
                 n_nodes = int(vof_cavity.sum())
                 rows, cols, data = [], [], []
-                for ax in range(3):
-                    for sign in (-1, 1):
-                        src = np.roll(node_id, shift=sign, axis=ax)
-                        valid = (src >= 0) & (node_id >= 0) & (src != node_id)
-                        rows.extend(node_id[valid].tolist())
-                        cols.extend(src[valid].tolist())
-                        data.extend(np.ones(valid.sum(), dtype=np.float64).tolist())
+                nz, ny, nx = vof_grid.shape
+                zz, yy, xx = np.ogrid[0:nz, 0:ny, 0:nx]
+                for dz in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        for dx in (-1, 0, 1):
+                            if dz == 0 and dy == 0 and dx == 0:
+                                continue
+                            # Avoid wrap-around edges: the neighbour must be inside the grid.
+                            inside = (
+                                (zz + dz >= 0)
+                                & (zz + dz < nz)
+                                & (yy + dy >= 0)
+                                & (yy + dy < ny)
+                                & (xx + dx >= 0)
+                                & (xx + dx < nx)
+                            )
+                            src = np.full_like(node_id, -1)
+                            sl_z = slice(max(0, -dz), nz - max(0, dz))
+                            sl_y = slice(max(0, -dy), ny - max(0, dy))
+                            sl_x = slice(max(0, -dx), nx - max(0, dx))
+                            src_sl_z = slice(max(0, dz), nz - max(0, -dz))
+                            src_sl_y = slice(max(0, dy), ny - max(0, -dy))
+                            src_sl_x = slice(max(0, dx), nx - max(0, -dx))
+                            src[sl_z, sl_y, sl_x] = node_id[src_sl_z, src_sl_y, src_sl_x]
+                            node_id_r = node_id.ravel()
+                            src_r = src.ravel()
+                            valid = (
+                                inside.ravel()
+                                & (src_r >= 0)
+                                & (node_id_r >= 0)
+                                & (src_r != node_id_r)
+                            )
+                            edge_w = float(np.linalg.norm([dz, dy, dx]))
+                            rows.extend(node_id_r[valid].tolist())
+                            cols.extend(src_r[valid].tolist())
+                            data.extend(np.full(valid.sum(), edge_w, dtype=np.float64).tolist())
                 graph = csr_matrix((data, (rows, cols)), shape=(n_nodes, n_nodes))
                 inlet_nodes = node_id[vof_inlet]
                 inlet_nodes = inlet_nodes[inlet_nodes >= 0]
@@ -5095,11 +5125,22 @@ def solve_filling_flow(
                     min_dist = np.min(dists, axis=0)
                     min_dist = np.where(np.isfinite(min_dist), min_dist, np.inf)
                     geodesic_voxels[vof_cavity] = min_dist
-                # Distance-transform fallback for isolated cells not reached by Dijkstra.
+
+                # Fallback for isolated cells that Dijkstra could not reach (e.g.
+                # a thin pocket cut off by aggressive downsampling).  Add a
+                # distance penalty so they fill after the reachable front, but
+                # still get filled before the solver gives up.
+                finite_mask = np.isfinite(geodesic_voxels) & vof_cavity
+                max_finite = float(geodesic_voxels[finite_mask].max()) if finite_mask.any() else 0.0
+                if not finite_mask.any():
+                    max_finite = 0.0
                 dt_voxels = ndimage.distance_transform_edt(vof_cavity & ~vof_inlet)
-                geodesic_voxels = np.where(
-                    np.isfinite(geodesic_voxels), geodesic_voxels, dt_voxels
+                fallback = np.where(
+                    np.isfinite(geodesic_voxels),
+                    geodesic_voxels,
+                    max_finite + dt_voxels + 5.0,
                 )
+                geodesic_voxels = np.where(vof_cavity, fallback, geodesic_voxels)
                 dist_m = geodesic_voxels * vof_dx_m
                 with np.errstate(divide="ignore", invalid="ignore"):
                     grad_dist = np.gradient(dist_m, vof_dx_m)
@@ -5254,6 +5295,18 @@ def solve_filling_flow(
         fill_time_fine = np.where(fine_metal, fill_time_fine, 0.0)
         vof_final_t = float(vof_res.get("final_t", 0.0))
         vof_full = float(vof_res.get("filled_fraction", 0.0)) >= 0.9999
+
+        # LBM front arrival times are kinematic (distance / velocity); for an
+        # expanding cavity the last cell arrives much earlier than the
+        # volumetric fill time (V_part / Q).  Scale the field so the final
+        # arrival equals the volumetric estimate while keeping the front order.
+        lbm_valid = fine_metal & (fill_time_fine > 0) & np.isfinite(fill_time_fine)
+        if lbm_valid.any():
+            lbm_max_t = float(np.nanmax(fill_time_fine[lbm_valid]))
+            if fill_time_s > 1e-18 and lbm_max_t > 1e-18 and fill_time_s > lbm_max_t:
+                lbm_scale = fill_time_s / lbm_max_t
+                fill_time_fine = fill_time_fine * lbm_scale
+                vof_final_t *= lbm_scale
         if vof_full and vof_final_t > 0.0:
             # Cells missed by the coarse VOF grid (thin features) are treated as
             # filled by the same total time; avoid letting the 1e12 sentinel leak
