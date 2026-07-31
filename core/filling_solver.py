@@ -4678,6 +4678,8 @@ def _effective_mold_from_bodies(
     """
     if bodies is None or body_index is None:
         return mold
+    if not getattr(mold, "is_sand", True):
+        return mold
     core_bodies = {
         b.index: b for b in bodies
         if getattr(b, "body_type", None) == BodyType.CORE
@@ -4928,7 +4930,11 @@ def solve_filling_flow(
     air_leak_m3_s = 0.0
     sand_phi = 0.0
     sand_d_mm = 0.0
-    if mold is not None and os.environ.get("JOSECAST_USE_CPP_SAND", "1").lower() in ("1", "true", "yes"):
+    if (
+        mold is not None
+        and getattr(mold, "is_sand", True)
+        and os.environ.get("JOSECAST_USE_CPP_SAND", "1").lower() in ("1", "true", "yes")
+    ):
         try:
             from core.cpp_bridge import JOSECAST_CORE
             if JOSECAST_CORE is not None:

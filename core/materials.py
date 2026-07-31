@@ -21,6 +21,9 @@ class MoldMaterial:
     # Darcy / flow
     particle_size_mm: float = 0.25  # representative sand grain size
     permeability_proxy: float = 1.0
+    # Mold type category (sand, metal, ceramic, ...)
+    mold_type: str = "sand"
+    is_sand: bool = True
     # Green-sand properties for particle-based permeability / air-leakage model
     afs_grain_size: float = 50.0      # AFS grain fineness number (GFN)
     moisture_percent: float = 4.0     # % moisture
@@ -187,6 +190,8 @@ MOLDS: Dict[str, MoldMaterial] = {
         chvorinov_c=2.8,
         particle_size_mm=0.25,
         permeability_proxy=1.0,
+        mold_type="sand",
+        is_sand=True,
     ),
     "green_sand": MoldMaterial(
         key="green_sand",
@@ -198,6 +203,8 @@ MOLDS: Dict[str, MoldMaterial] = {
         chvorinov_c=2.8,
         particle_size_mm=0.25,
         permeability_proxy=1.0,
+        mold_type="sand",
+        is_sand=True,
         afs_grain_size=50.0,
         moisture_percent=4.0,
         binder_percent=2.0,
@@ -213,6 +220,8 @@ MOLDS: Dict[str, MoldMaterial] = {
         chvorinov_c=2.8,
         particle_size_mm=0.25,
         permeability_proxy=1.0,
+        mold_type="sand",
+        is_sand=True,
         afs_grain_size=55.0,
         moisture_percent=3.5,
         binder_percent=2.0,
@@ -228,6 +237,8 @@ MOLDS: Dict[str, MoldMaterial] = {
         chvorinov_c=2.5,
         particle_size_mm=0.30,
         permeability_proxy=0.9,
+        mold_type="sand",
+        is_sand=True,
         afs_grain_size=45.0,
         moisture_percent=3.0,
         binder_percent=2.5,
@@ -243,6 +254,8 @@ MOLDS: Dict[str, MoldMaterial] = {
         chvorinov_c=2.0,
         particle_size_mm=0.18,
         permeability_proxy=1.2,
+        mold_type="sand",
+        is_sand=True,
         afs_grain_size=65.0,
         moisture_percent=3.0,
         binder_percent=2.0,
@@ -258,6 +271,8 @@ MOLDS: Dict[str, MoldMaterial] = {
         chvorinov_c=0.8,
         particle_size_mm=0.05,
         permeability_proxy=0.05,
+        mold_type="metal",
+        is_sand=False,
     ),
     "ceramic": MoldMaterial(
         key="ceramic",
@@ -269,6 +284,8 @@ MOLDS: Dict[str, MoldMaterial] = {
         chvorinov_c=2.2,
         particle_size_mm=0.15,
         permeability_proxy=0.7,
+        mold_type="ceramic",
+        is_sand=False,
     ),
 }
 

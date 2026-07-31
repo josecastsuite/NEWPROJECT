@@ -237,6 +237,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if tooltip:
                 widget.setToolTip(tooltip)
             settings_layout.addWidget(widget)
+            widget._label = lbl
 
         self.unit_combo = QtWidgets.QComboBox()
         for unit, label in [("mm", "mm"), ("cm", "cm"), ("m", "m"), ("inch", "inch")]:
@@ -271,19 +272,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.alloy_combo.currentIndexChanged.connect(self._sync_casting_params_from_materials)
         _settings_labeled(self.alloy_combo, "Alaşım:")
 
-        self.mold_combo = QtWidgets.QComboBox()
-        for key, mold in MOLDS.items():
-            self.mold_combo.addItem(mold.name, key)
-        self.mold_combo.currentIndexChanged.connect(self._sync_casting_params_from_materials)
-        _settings_labeled(self.mold_combo, "Kalıp kumu:")
+        self.mold_type_combo = QtWidgets.QComboBox()
+        self.mold_type_combo.addItem("Kum Kalıp", "sand")
+        self.mold_type_combo.addItem("Metal Kalıp", "metal_mold")
+        self.mold_type_combo.addItem("Seramik Kalıp", "ceramic")
+        self.mold_type_combo.currentIndexChanged.connect(self._on_mold_type_changed)
+        _settings_labeled(self.mold_type_combo, "Kalıp tipi:")
 
-        # Set defaults after both combos exist; block signals to avoid partial sync.
+        self.sand_type_combo = QtWidgets.QComboBox()
+        for key, mold in MOLDS.items():
+            if getattr(mold, "is_sand", True) and key != "sand":
+                self.sand_type_combo.addItem(mold.name, key)
+        self.sand_type_combo.currentIndexChanged.connect(self._sync_casting_params_from_materials)
+        _settings_labeled(self.sand_type_combo, "Kum tipi:")
+
+        # Set defaults after combos exist; block signals to avoid partial sync.
         self.alloy_combo.blockSignals(True)
-        self.mold_combo.blockSignals(True)
+        self.mold_type_combo.blockSignals(True)
+        self.sand_type_combo.blockSignals(True)
         self.alloy_combo.setCurrentIndex(list(ALLOYS.keys()).index("42CrMo4"))
-        self.mold_combo.setCurrentIndex(list(MOLDS.keys()).index("green_sand"))
+        self.mold_type_combo.setCurrentIndex(0)
+        sand_items = [self.sand_type_combo.itemData(i) for i in range(self.sand_type_combo.count())]
+        self.sand_type_combo.setCurrentIndex(
+            sand_items.index("green_sand") if "green_sand" in sand_items else 0
+        )
         self.alloy_combo.blockSignals(False)
-        self.mold_combo.blockSignals(False)
+        self.mold_type_combo.blockSignals(False)
+        self.sand_type_combo.blockSignals(False)
+        self._update_sand_type_visibility()
 
         left_layout.addWidget(settings_group)
 
@@ -675,10 +691,26 @@ class MainWindow(QtWidgets.QMainWindow):
         
         main_vbox.addWidget(terminal_group, stretch=0)
 
+    def _current_mold_key(self) -> str:
+        mtype = self.mold_type_combo.currentData()
+        if mtype == "sand":
+            return self.sand_type_combo.currentData() or "green_sand"
+        return mtype or "green_sand"
+
+    def _update_sand_type_visibility(self):
+        is_sand = self.mold_type_combo.currentData() == "sand"
+        self.sand_type_combo.setVisible(is_sand)
+        if hasattr(self.sand_type_combo, "_label"):
+            self.sand_type_combo._label.setVisible(is_sand)
+
+    def _on_mold_type_changed(self):
+        self._update_sand_type_visibility()
+        self._sync_casting_params_from_materials()
+
     def _sync_casting_params_from_materials(self):
         """Set parameter defaults from the selected alloy and mould."""
         alloy = get_alloy(self.alloy_combo.currentData())
-        mold = get_mold(self.mold_combo.currentData())
+        mold = get_mold(self._current_mold_key())
         self.t_pour_spin.setValue(alloy.t_pour_c)
         self.t_liq_spin.setValue(alloy.t_liquidus_c)
         self.t_sol_spin.setValue(alloy.t_solidus_c)
@@ -947,7 +979,7 @@ class MainWindow(QtWidgets.QMainWindow):
             t0 = time.time()
 
             alloy_key = self.alloy_combo.currentData()
-            mold_key = self.mold_combo.currentData()
+            mold_key = self._current_mold_key()
             max_res = self.res_spin.value()
             refine_local = self.refine_check.isChecked()
             sub_voxel = self.subvox_spin.value()
