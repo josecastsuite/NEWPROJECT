@@ -1,6 +1,7 @@
 """STEP file loader based on CadQuery + Trimesh."""
 
 import os
+import re
 from typing import List, Optional
 
 import cadquery as cq
@@ -8,6 +9,53 @@ import numpy as np
 import trimesh
 
 from core.types import Body
+
+
+def _detect_step_unit(path: str) -> str:
+    """Parse the STEP file for a length unit declaration.
+
+    Common AP203/214/242 STEP files encode the unit via
+    ``SI_UNIT( .MILLI., .METRE. )``.  If no explicit length unit is found,
+    ``mm`` is returned as the safe default.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+    except Exception:
+        return "mm"
+
+    # Look for LENGTH_UNIT lines that contain an SI_UNIT; the prefix before
+    # .METRE. tells us the scale (MILLI -> mm, CENTI -> cm, etc.).
+    for line in text.splitlines():
+        if "LENGTH_UNIT" in line and "SI_UNIT" in line and ".METRE." in line.upper():
+            m = re.search(
+                r"SI_UNIT\s*\(\s*(?:\.([A-Z]+)\.|([\$\*]))\s*,\s*\.METRE\.\s*\)",
+                line,
+                re.IGNORECASE,
+            )
+            if not m:
+                # No prefix or omitted: assume metre.
+                m = re.search(r"SI_UNIT\s*\(\s*\.METRE\.\s*\)", line, re.IGNORECASE)
+                if m:
+                    return "m"
+                continue
+            prefix = (m.group(1) or "").upper()
+            if prefix == "MILLI":
+                return "mm"
+            if prefix == "CENTI":
+                return "cm"
+            if prefix == "DECI":
+                return "dm"
+            if prefix == "MICRO":
+                return "um"
+            # No prefix / omitted -> metre.
+            return "m"
+
+    # Non-SI conversion units (e.g. inch) are not SI prefixes.
+    if "CONVERSION_BASED_UNIT" in text and "INCH" in text.upper():
+        return "inch"
+
+    return "mm"
 
 
 def load_step(path: str, tolerance: Optional[float] = None, angular_tolerance: float = 0.1) -> List[Body]:
@@ -21,6 +69,7 @@ def load_step(path: str, tolerance: Optional[float] = None, angular_tolerance: f
     angular_tolerance : float
         Angular deflection for tessellation (default 0.1 rad).
     """
+    step_unit = _detect_step_unit(path)
     if not os.path.exists(path):
         raise FileNotFoundError(f"STEP dosyası bulunamadı: {path}")
 
@@ -96,6 +145,7 @@ def load_step(path: str, tolerance: Optional[float] = None, angular_tolerance: f
                 mesh=mesh,
                 volume_cm3=volume_cm3,
                 center=center,
+                source_unit=step_unit,
             )
         )
 

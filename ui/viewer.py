@@ -644,10 +644,11 @@ class Analyzer3DViewer(QtInteractor):
         points = []
         labels = []
         for node in nodes:
-            if node.velocity_m_s <= 1e-12:
+            v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
+            if v <= 1e-12:
                 continue
             points.append(node.centroid_mm)
-            labels.append(f"{node.name}\n{node.velocity_m_s:.2f} m/s")
+            labels.append(f"{node.name}\n{v:.2f} m/s")
         if not points:
             return
         points = np.asarray(points, dtype=np.float64)

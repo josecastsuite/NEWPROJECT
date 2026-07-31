@@ -261,5 +261,9 @@ def solve_gate_flows(
             area_m2 = max(float(node.section_area_cm2 or 0.0) * 1e-4, 1e-18)
             node.flow_rate_m3_s = float(node_q)
             node.velocity_m_s = float(node_q / area_m2)
+            # The 3-D gate mesh gives the true maximum inside the body; expose
+            # it for labels/reports while keeping the mean contact velocity
+            # above for fill-time calculations.
+            node.max_velocity_m_s = float(result.max_velocity_m_s)
 
     return results, list(gating_nodes)

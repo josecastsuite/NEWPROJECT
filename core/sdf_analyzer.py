@@ -29,6 +29,35 @@ from core.riser_designer import propose_risers
 from core.thermal_solver import _alloy_to_dict, _dscheil_dT, solve_3d_thermal
 from core.voxelizer import build_part_grid
 
+
+def _exposed_surface_area_mm2(mask: np.ndarray, grid: np.ndarray, dx: float) -> float:
+    """Compute the exact 6-neighbour exposed surface area of ``mask``.
+
+    Only faces whose neighbour cell is empty (``grid == 0``) count for
+    Chvorinov/modulus; this replaces the approximate ``dilated & (grid==0)``
+    voxel-shell count that can over/underestimate the cooling area by a
+    factor of several for small or thin bodies.
+    """
+    if not mask.any() or dx <= 0.0:
+        return 0.0
+    pad_m = np.pad(mask.astype(bool), 1, constant_values=False)
+    pad_e = np.pad((grid == 0), 1, constant_values=True)
+    face_area = dx * dx
+    area = 0.0
+
+    # Axis 0 (z)
+    area += float(np.sum(pad_m[:-1, :, :] & ~pad_m[1:, :, :] & pad_e[1:, :, :])) * face_area
+    area += float(np.sum(pad_m[1:, :, :] & ~pad_m[:-1, :, :] & pad_e[:-1, :, :])) * face_area
+    # Axis 1 (y)
+    area += float(np.sum(pad_m[:, :-1, :] & ~pad_m[:, 1:, :] & pad_e[:, 1:, :])) * face_area
+    area += float(np.sum(pad_m[:, 1:, :] & ~pad_m[:, :-1, :] & pad_e[:, :-1, :])) * face_area
+    # Axis 2 (x)
+    area += float(np.sum(pad_m[:, :, :-1] & ~pad_m[:, :, 1:] & pad_e[:, :, 1:])) * face_area
+    area += float(np.sum(pad_m[:, :, 1:] & ~pad_m[:, :, :-1] & pad_e[:, :, :-1])) * face_area
+
+    return float(area)
+
+
 USE_CPP_POROSITY = (
     os.environ.get("JOSECAST_USE_CPP_POROSITY", "1").lower() in ("1", "true", "yes")
 )
@@ -2509,14 +2538,17 @@ def analyze(
         if voxel_count == 0:
             continue
 
-        volume_mm3 = voxel_count * (dx ** 3)
+        # Prefer the watertight mesh volume/area when available, but fall back
+        # to exact exposed-voxel face counting for non-watertight solids.
+        if body.volume_cm3 > 0.0:
+            volume_mm3 = float(body.volume_cm3) * 1000.0
+        else:
+            volume_mm3 = voxel_count * (dx ** 3)
         volume_cm3 = volume_mm3 / 1000.0
 
-        dilated = ndimage.binary_dilation(component_mask, iterations=1)
-        # Cooling surface must exclude contact with part/runner/gating metal;
-        # only faces exposed to the mould count for Chvorinov/modulus.
-        surface_mask = dilated & (grid == 0)
-        surface_mm2 = float(surface_mask.sum()) * dx * dx
+        surface_mm2 = _exposed_surface_area_mm2(component_mask, grid, dx)
+        if surface_mm2 <= 0.0 and body.surface_area_cm2 > 0.0:
+            surface_mm2 = float(body.surface_area_cm2) * 100.0
         m_riser = volume_mm3 / surface_mm2 if surface_mm2 > 0 else 0.0
 
         riser_centroid_vox = np.array(np.argwhere(component_mask).mean(axis=0))

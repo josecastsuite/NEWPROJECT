@@ -124,6 +124,8 @@ class Body:
     body_type: BodyType = BodyType.PART
     volume_cm3: float = 0.0
     surface_area_cm2: float = 0.0
+    # STEP / CAD source length unit; used to auto-scale to mm on load.
+    source_unit: str = "mm"
     center: np.ndarray = field(default_factory=lambda: np.zeros(3))
     # v10.1: Aşama 5 mesh repair warnings to surface in the UI.
     watertight_warning: str = ""
@@ -256,6 +258,8 @@ class GatingNode:
     section_area_cm2: float
     centroid_mm: Tuple[float, float, float]
     flow_rate_m3_s: float = 0.0
+    # v10.1: local 3-D gate mesh maximum velocity used for labels/reports.
+    max_velocity_m_s: float = 0.0
 
 
 @dataclass
