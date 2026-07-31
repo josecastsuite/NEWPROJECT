@@ -45,14 +45,14 @@ class MoldPropertiesDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self._body = body
         self.setWindowTitle(f"Kum Özellikleri – {body.name}")
-        self.setMinimumWidth(340)
+        self.setMinimumWidth(300)
 
         self.setStyleSheet(
             """
             QDialog { background-color: #18181b; }
             QLabel { color: #00ffff; font-weight: 800; font-size: 13px; }
             QGroupBox {
-                color: #00ff88;
+                color: #00ffff;
                 font-weight: bold;
                 font-size: 13px;
                 border: 1px solid #3f3f46;
@@ -67,7 +67,7 @@ class MoldPropertiesDialog(QtWidgets.QDialog):
                 subcontrol-origin: margin;
                 subcontrol-position: top left;
                 left: 10px;
-                color: #00ff88;
+                color: #00ffff;
                 font-weight: bold;
             }
             QDoubleSpinBox {
@@ -80,15 +80,15 @@ class MoldPropertiesDialog(QtWidgets.QDialog):
                 font-weight: bold;
             }
             QPushButton {
-                background: #00ff88;
-                color: #000000;
-                border: none;
+                background: #27272a;
+                color: #00ffff;
+                border: 1px solid #00ffff;
                 border-radius: 6px;
                 padding: 8px 14px;
                 font-weight: bold;
                 font-size: 12px;
             }
-            QPushButton:hover { background: #00cc6a; }
+            QPushButton:hover { background: #3f3f46; }
             """
         )
 
@@ -146,13 +146,15 @@ class MoldPropertiesDialog(QtWidgets.QDialog):
 
         layout.addWidget(group)
 
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok
-            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        btn_layout = QtWidgets.QHBoxLayout()
+        btn_layout.addStretch()
+        self._cancel_btn = QtWidgets.QPushButton("İptal")
+        self._cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(self._cancel_btn)
+        self._save_btn = QtWidgets.QPushButton("Kaydet")
+        self._save_btn.clicked.connect(self._on_accept)
+        btn_layout.addWidget(self._save_btn)
+        layout.addLayout(btn_layout)
 
     def _on_accept(self) -> None:
         self._body.mold_afs_grain_size = float(self._afs_spin.value())
@@ -245,7 +247,7 @@ class BodyRowWidget(QtWidgets.QWidget):
         self._feeder_m_spin.setSuffix(" cm")
         self._feeder_m_spin.setSpecialValueText("Auto")
         self._feeder_m_spin.setToolTip("Opsiyonel besleyici modülü (cm); 0 = otomatik")
-        self._feeder_m_spin.setMaximumWidth(70)
+        self._feeder_m_spin.setMaximumWidth(60)
         self._feeder_m_spin.valueChanged.connect(self._on_feeder_m_changed)
         layout.addWidget(self._feeder_m_spin)
 
