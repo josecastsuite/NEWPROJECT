@@ -219,6 +219,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.body_list.setHorizontalScrollBarPolicy(
             QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        self.body_list.currentRowChanged.connect(self.on_body_row_selected)
         file_layout.addWidget(self.body_list)
         left_layout.addWidget(file_group)
 
@@ -852,6 +853,19 @@ class MainWindow(QtWidgets.QMainWindow):
             body.feeder_type = ""
             body.feeder_m_mm = 0.0
         self.viewer.show_bodies(self._bodies)
+
+    def on_body_row_selected(self, row: int):
+        """Highlight the selected body in the 3D viewer (red) for easier identification."""
+        if not self._bodies or row < 0:
+            self.viewer.show_bodies(self._bodies, reset_camera=False)
+            return
+        item = self.body_list.item(row)
+        if item is None:
+            return
+        widget = self.body_list.itemWidget(item)
+        if widget is None:
+            return
+        self.viewer.show_bodies(self._bodies, selected_body=widget.body(), reset_camera=False)
 
     def on_body_feeder_type_changed(self, body: Body, feeder_type: str):
         self.aiLog(

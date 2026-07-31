@@ -219,7 +219,13 @@ class Analyzer3DViewer(QtInteractor):
         self._body_legend_actor = None
         self._clear_section_actors()
 
-    def show_bodies(self, bodies: List[Body], reset_camera: bool = True, analysis_mode: bool = False):
+    def show_bodies(
+        self,
+        bodies: List[Body],
+        reset_camera: bool = True,
+        analysis_mode: bool = False,
+        selected_body: Optional[Body] = None,
+    ):
         """Display original body meshes colored by type."""
         for actor in self._body_actors:
             self.remove_actor(actor)
@@ -235,8 +241,11 @@ class Analyzer3DViewer(QtInteractor):
                 continue
             faces = np.c_[np.full(len(body.faces), 3, dtype=np.int64), body.faces].ravel()
             mesh = pv.PolyData(body.vertices, faces)
-            color = BODY_COLORS.get(body.body_type, "#E0E0E0")
-            opacity = opacity_map.get(body.body_type, 1.0)
+            is_selected = selected_body is not None and body is selected_body
+            color = "#ff0000" if is_selected else BODY_COLORS.get(body.body_type, "#F5F5F5")
+            opacity = 1.0 if is_selected else opacity_map.get(body.body_type, 1.0)
+            if selected_body is not None and not is_selected and not analysis_mode:
+                opacity = 0.25
             actor = self.add_mesh(
                 mesh,
                 color=color,
