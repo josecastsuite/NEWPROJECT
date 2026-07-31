@@ -57,30 +57,13 @@ def apply_unit_scale(bodies: List[Body], unit: str) -> float:
 
 
 def detect_unit_suggestion(bodies: List[Body]) -> str:
-    """Suggest the source length unit for the loaded STEP bodies.
+    """Return the unit that the UI should display after loading a STEP file.
 
-    If the STEP loader recorded an explicit source unit on the bodies, that
-    unit is used.  Otherwise the function falls back to a safe size-based
-    heuristic that defaults to ``mm`` and only assumes metres for very small
-    raw coordinates (a 3 mm part is therefore not mistaken for a 3 cm part
-    and scaled by 10).
+    ``load_step`` already converts every body mesh to millimetres via
+    ``_choose_mm_scale``, so the UI baseline must be ``mm`` regardless of the
+    original STEP unit.  Any further user change in the UI is then applied by
+    ``apply_unit_scale`` relative to this millimetre baseline.
     """
-    if not bodies:
-        return "mm"
-
-    # Prefer the unit parsed directly from the STEP file.
-    units = [b.source_unit for b in bodies if b.source_unit]
-    if units:
-        # Return the most common source unit; if only one body exists, use it.
-        from collections import Counter
-        return Counter(units).most_common(1)[0][0]
-
-    # Fallback: use size only when it is clearly not mm.
-    max_size = float(
-        np.max(np.array([b.mesh.bounds[1] - b.mesh.bounds[0] for b in bodies]))
-    )
-    if max_size < 0.01:
-        return "m"
     return "mm"
 
 

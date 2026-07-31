@@ -122,6 +122,65 @@ def _beta_from_geometry(
     return base_beta_1_m * (1.0 + narrow_factor * (a_ratio - 1.0))
 
 
+def _geometric_fallback_result(
+    body: Body,
+    q_m3_s: float,
+    rho_kg_m3: float,
+    mu_pa_s: float,
+    p_atm_pa: float = 101325.0,
+) -> GateFlowResult:
+    """Return a minimal ``GateFlowResult`` when gmsh cannot build a tet mesh.
+
+    The throat area is estimated from the oriented bounding-box as the product of
+    the two shorter extents; velocity is ``Q / A``.  This lets the gating-node
+    contact velocities and reports stay populated even if the 3-D mesher fails on
+    a complex gate body.
+    """
+    q = max(float(q_m3_s), 1e-18)
+    if body.mesh is not None and len(body.mesh.faces) > 0:
+        extents = np.asarray(body.mesh.bounding_box_oriented.extents, dtype=float)
+    else:
+        extents = np.ones(3, dtype=float)
+    sorted_e = np.sort(extents)
+    area_mm2 = max(sorted_e[0] * sorted_e[1], 1e-6)
+    length_mm = max(sorted_e[2], 1e-6)
+    area_m2 = area_mm2 * 1e-6
+    length_m = length_mm * 1e-3
+    v = q / area_m2
+
+    # Approximate hydraulic diameter from a rectangular cross-section with
+    # side lengths a and b.
+    a = max(sorted_e[0] * 1e-3, 1e-6)
+    b = max(sorted_e[1] * 1e-3, 1e-6)
+    p = 2.0 * (a + b)
+    d_h = (4.0 * area_m2) / p if p > 1e-12 else 2.0 * min(a, b)
+
+    re = float(rho_kg_m3 * v * d_h / max(mu_pa_s, 1e-12))
+    g_eff = 9.80665
+    fr = float(v / (np.sqrt(g_eff * d_h) + 1e-12))
+
+    return GateFlowResult(
+        pressures=np.array([p_atm_pa], dtype=float),
+        velocities=np.zeros((1, 3), dtype=float),
+        velocity_magnitudes=np.array([v], dtype=float),
+        cell_volumes=np.array([area_m2 * length_m], dtype=float),
+        inlet_flux_m3_s=q,
+        outlet_flux_m3_s=q,
+        pressure_drop_pa=0.0,
+        forchheimer_pressure_drop_pa=0.0,
+        total_pressure_drop_pa=0.0,
+        section_velocity_m_s=v,
+        peak_velocity_m_s=v,
+        max_pressure_pa=p_atm_pa,
+        min_pressure_pa=p_atm_pa,
+        reynolds=np.array([re], dtype=float),
+        froude=np.array([fr], dtype=float),
+        air_entrainment=np.array([False], dtype=bool),
+        wall_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        hydraulic_diameter_mm=np.array([d_h * 1000.0], dtype=float),
+    )
+
+
 def solve_gate_flows(
     bodies: List[Body],
     grid: np.ndarray,
@@ -193,6 +252,8 @@ def solve_gate_flows(
         if q <= 0.0:
             q = Q_user_m3_s
         print(f"[GATE_MESH] processing {body.name} type={body.body_type} q={q}", flush=True)
+        gate = None
+        result: Optional[GateFlowResult] = None
         try:
             gate = build_gate_mesh(
                 body,
@@ -202,38 +263,44 @@ def solve_gate_flows(
                 up_direction=up,
             )
         except Exception as exc:
-            print(f"[GATE_MESH] build failed {body.name}: {exc}", flush=True)
-            continue
-
-        p_in = _boundary_pressure(
-            gate, interp, pressure_drop_pa, p_atm_pa, gate.inlet_faces
-        )
-        p_out = _boundary_pressure(
-            gate, interp, pressure_drop_pa, p_atm_pa, gate.outlet_faces
-        )
-        # Ensure a positive driving pressure in spite of interpolation noise.
-        if p_in <= p_out:
-            p_in = max(p_in, p_out + 1.0)
-
-        beta = beta_1_m if beta_1_m > 0.0 else _beta_from_geometry(gate)
-
-        try:
-            result = solve_gate_flow(
-                gate,
-                p_inlet_pa=p_in,
-                p_outlet_pa=p_out,
-                mu_pa_s=mu_pa_s,
-                rho_kg_m3=rho_kg_m3,
-                K_t_m2=K_t_m2,
-                K_n_m2=K_n_m2,
-                beta_1_m=beta,
-                target_flux_m3_s=q,
-                p_atm_pa=p_atm_pa,
-                wall_layer_m=wall_layer_m,
+            print(
+                f"[GATE_MESH] {body.name} 3-D mesh failed ({exc}); "
+                "using geometric fallback for this body.",
+                flush=True,
             )
-        except Exception as exc:
-            print(f"[GATE_MESH] solve failed {body.name}: {exc}", flush=True)
-            continue
+
+        if gate is not None:
+            p_in = _boundary_pressure(
+                gate, interp, pressure_drop_pa, p_atm_pa, gate.inlet_faces
+            )
+            p_out = _boundary_pressure(
+                gate, interp, pressure_drop_pa, p_atm_pa, gate.outlet_faces
+            )
+            # Ensure a positive driving pressure in spite of interpolation noise.
+            if p_in <= p_out:
+                p_in = max(p_in, p_out + 1.0)
+
+            beta = beta_1_m if beta_1_m > 0.0 else _beta_from_geometry(gate)
+
+            try:
+                result = solve_gate_flow(
+                    gate,
+                    p_inlet_pa=p_in,
+                    p_outlet_pa=p_out,
+                    mu_pa_s=mu_pa_s,
+                    rho_kg_m3=rho_kg_m3,
+                    K_t_m2=K_t_m2,
+                    K_n_m2=K_n_m2,
+                    beta_1_m=beta,
+                    target_flux_m3_s=q,
+                    p_atm_pa=p_atm_pa,
+                    wall_layer_m=wall_layer_m,
+                )
+            except Exception as exc:
+                print(f"[GATE_MESH] solve failed {body.name}: {exc}", flush=True)
+
+        if result is None:
+            result = _geometric_fallback_result(body, q, rho_kg_m3, mu_pa_s, p_atm_pa)
 
         results[body.name] = result
 

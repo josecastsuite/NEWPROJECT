@@ -2,6 +2,7 @@
 
 import math
 import os
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
@@ -2124,6 +2125,7 @@ def analyze(
     # AŞAMA 2.5: Gating / 3-D Darcy flow (needed for fill_time before thermal).
     gate_result_for_flow = None
     flow_result_for_thermal = None
+    print(f"[ANALYZE] 28% -> gating analysis start ({time.strftime('%H:%M:%S')})", flush=True)
     try:
         from core.gating import analyze_gating
 
@@ -2152,12 +2154,15 @@ def analyze(
             bodies=bodies,
             user_section_areas_cm2=user_section_areas_cm2,
         )
+        print(f"[ANALYZE] gating done ({time.strftime('%H:%M:%S')})", flush=True)
     except Exception as exc:
         if isinstance(exc, GatingVelocityError):
             raise
+        print(f"[ANALYZE] gating failed: {exc}", flush=True)
         pass
 
     if gate_result_for_flow is not None:
+        print(f"[ANALYZE] filling flow start ({time.strftime('%H:%M:%S')})", flush=True)
         try:
             flow_result_for_thermal = _run_filling_flow(
                 gate_result_for_flow,
@@ -2178,6 +2183,8 @@ def analyze(
             print("[Darcy exception]", exc)
             traceback.print_exc()
             pass
+        else:
+            print(f"[ANALYZE] filling flow done ({time.strftime('%H:%M:%S')})", flush=True)
 
     # AŞAMA 3: Full 3-D transient enthalpy thermal solver (downsampled for speed)
     if progress_callback:

@@ -74,6 +74,84 @@ def _downsample_grid(
     return grid_c.astype(grid.dtype), origin_c, dx_c
 
 
+def _geodesic_distance_field(
+    cavity_mask: np.ndarray, inlet_mask: np.ndarray
+) -> np.ndarray:
+    """26-neighbour geodesic distance from ``inlet_mask`` within ``cavity_mask``.
+
+    Uses vectorised sparse-graph construction so 120 000-cell LBM grids do not
+    hang in Python list append loops.
+    """
+    shape = cavity_mask.shape
+    node_id = np.full(shape, -1, dtype=np.int64)
+    n_nodes = int(cavity_mask.sum())
+    if n_nodes == 0:
+        return np.full(shape, np.inf, dtype=np.float64)
+    node_id[cavity_mask] = np.arange(n_nodes, dtype=np.int64)
+    nz, ny, nx = shape
+
+    src_list: List[np.ndarray] = []
+    dst_list: List[np.ndarray] = []
+    w_list: List[np.ndarray] = []
+    # 13 unique neighbour offsets; csr_graph below is undirected.
+    for dz in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dz == 0 and dy == 0 and dx == 0:
+                    continue
+                if not (
+                    dz > 0 or (dz == 0 and dy > 0) or (dz == 0 and dy == 0 and dx > 0)
+                ):
+                    continue
+                if dz >= 0:
+                    sz = slice(0, nz - dz)
+                    dz_s = slice(dz, nz)
+                else:
+                    sz = slice(-dz, nz)
+                    dz_s = slice(0, nz + dz)
+                if dy >= 0:
+                    sy = slice(0, ny - dy)
+                    dy_s = slice(dy, ny)
+                else:
+                    sy = slice(-dy, ny)
+                    dy_s = slice(0, ny + dy)
+                if dx >= 0:
+                    sx = slice(0, nx - dx)
+                    dx_s = slice(dx, nx)
+                else:
+                    sx = slice(-dx, nx)
+                    dx_s = slice(0, nx + dx)
+                src = node_id[sz, sy, sx]
+                dst = node_id[dz_s, dy_s, dx_s]
+                valid = (src >= 0) & (dst >= 0)
+                if not valid.any():
+                    continue
+                src_list.append(src[valid])
+                dst_list.append(dst[valid])
+                weight = float(np.linalg.norm([dz, dy, dx]))
+                w_list.append(np.full(valid.sum(), weight, dtype=np.float64))
+
+    if src_list:
+        rows = np.concatenate(src_list)
+        cols = np.concatenate(dst_list)
+        data = np.concatenate(w_list)
+    else:
+        rows = cols = data = np.empty(0, dtype=np.float64)
+    graph = csr_matrix((data, (rows, cols)), shape=(n_nodes, n_nodes))
+
+    inlet_nodes = node_id[inlet_mask]
+    inlet_nodes = inlet_nodes[inlet_nodes >= 0]
+    geodesic = np.full(shape, np.inf, dtype=np.float64)
+    if inlet_nodes.size > 0:
+        dists = csgraph.dijkstra(
+            graph, indices=inlet_nodes, directed=False, return_predecessors=False
+        )
+        min_dist = np.min(dists, axis=0)
+        min_dist = np.where(np.isfinite(min_dist), min_dist, np.inf)
+        geodesic[cavity_mask] = min_dist
+    return geodesic
+
+
 def _recommend_filter(
     gating_nodes: List[Any], Q_m3_s: float, alloy: Any
 ) -> Optional[str]:
@@ -5206,7 +5284,7 @@ def solve_filling_flow(
     if not use_cpp_vof:
         vof_max_cells = 500_000
     # LBM is lighter per step but still benefits from a coarse grid for first runs.
-    lbm_max_cells = int(os.environ.get("JOSECAST_CPP_LBM_MAX_CELLS", "120000"))
+    lbm_max_cells = int(os.environ.get("JOSECAST_CPP_LBM_MAX_CELLS", "60000"))
 
     vof_res = None
     inflow_v = 0.0
@@ -5295,104 +5373,42 @@ def solve_filling_flow(
                 # C++ binding expects a plain Python list for the gravity vector.
                 lbm_g = [float(x) for x in g]
 
-                # Newer .pyd/.so builds accept target_velocity/inlet_distance;
-                # older Windows wheels do not.  Detect the signature from the doc
-                # string so we keep compatibility with precompiled binaries that
-                # are not rebuilt every commit.
-                lbm_doc = getattr(JOSECAST_CORE.solve_lbm_filling, "__doc__", "") or ""
-                lbm_kwargs: Dict[str, Any] = {}
-                if (
-                    "target_velocity" in lbm_doc
-                    and "inlet_distance" in lbm_doc
-                ):
-                    # True geodesic distance from the inlet through the cavity gives
-                    # both the LBM front-propagation speed and the flow-direction
-                    # field.  Use a 26-connected graph so thin diagonal passages are
-                    # not lost; edge weights are the Euclidean length of the step
-                    # (1, sqrt(2), sqrt(3)) so the distance is physically meaningful.
-                    node_id = np.full(vof_grid.shape, -1, dtype=np.int64)
-                    node_id[vof_cavity] = np.arange(int(vof_cavity.sum()), dtype=np.int64)
-                    n_nodes = int(vof_cavity.sum())
-                    rows, cols, data = [], [], []
-                    nz, ny, nx = vof_grid.shape
-                    zz, yy, xx = np.ogrid[0:nz, 0:ny, 0:nx]
-                    for dz in (-1, 0, 1):
-                        for dy in (-1, 0, 1):
-                            for dx in (-1, 0, 1):
-                                if dz == 0 and dy == 0 and dx == 0:
-                                    continue
-                                # Avoid wrap-around edges: the neighbour must be inside the grid.
-                                inside = (
-                                    (zz + dz >= 0)
-                                    & (zz + dz < nz)
-                                    & (yy + dy >= 0)
-                                    & (yy + dy < ny)
-                                    & (xx + dx >= 0)
-                                    & (xx + dx < nx)
-                                )
-                                src = np.full_like(node_id, -1)
-                                sl_z = slice(max(0, -dz), nz - max(0, dz))
-                                sl_y = slice(max(0, -dy), ny - max(0, dy))
-                                sl_x = slice(max(0, -dx), nx - max(0, dx))
-                                src_sl_z = slice(max(0, dz), nz - max(0, -dz))
-                                src_sl_y = slice(max(0, dy), ny - max(0, -dy))
-                                src_sl_x = slice(max(0, dx), nx - max(0, -dx))
-                                src[sl_z, sl_y, sl_x] = node_id[src_sl_z, src_sl_y, src_sl_x]
-                                node_id_r = node_id.ravel()
-                                src_r = src.ravel()
-                                valid = (
-                                    inside.ravel()
-                                    & (src_r >= 0)
-                                    & (node_id_r >= 0)
-                                    & (src_r != node_id_r)
-                                )
-                                edge_w = float(np.linalg.norm([dz, dy, dx]))
-                                rows.extend(node_id_r[valid].tolist())
-                                cols.extend(src_r[valid].tolist())
-                                data.extend(np.full(valid.sum(), edge_w, dtype=np.float64).tolist())
-                    graph = csr_matrix((data, (rows, cols)), shape=(n_nodes, n_nodes))
-                    inlet_nodes = node_id[vof_inlet]
-                    inlet_nodes = inlet_nodes[inlet_nodes >= 0]
-                    geodesic_voxels = np.full(vof_grid.shape, np.inf, dtype=np.float64)
-                    if inlet_nodes.size > 0 and n_nodes > 0:
-                        dists = csgraph.dijkstra(
-                            graph, indices=inlet_nodes, directed=False, return_predecessors=False
-                        )
-                        min_dist = np.min(dists, axis=0)
-                        min_dist = np.where(np.isfinite(min_dist), min_dist, np.inf)
-                        geodesic_voxels[vof_cavity] = min_dist
+                # Fast 26-neighbour geodesic field for the LBM initial condition.
+                geodesic_voxels = _geodesic_distance_field(vof_cavity, vof_inlet)
+                finite_mask = np.isfinite(geodesic_voxels) & vof_cavity
+                max_finite = (
+                    float(geodesic_voxels[finite_mask].max()) if finite_mask.any() else 0.0
+                )
+                dt_voxels = ndimage.distance_transform_edt(vof_cavity & ~vof_inlet)
+                geodesic_voxels = np.where(
+                    np.isfinite(geodesic_voxels),
+                    geodesic_voxels,
+                    max_finite + dt_voxels + 5.0,
+                )
+                dist_m = geodesic_voxels * vof_dx_m
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    grad_dist = np.gradient(dist_m, vof_dx_m)
+                    mag_d = np.sqrt(sum(g * g for g in grad_dist))
+                    mag_safe = np.where(mag_d > 1e-18, mag_d, 1.0)
+                    ux = grad_dist[0] / mag_safe * vof_inflow_v
+                    vy = grad_dist[1] / mag_safe * vof_inflow_v
+                    wz = grad_dist[2] / mag_safe * vof_inflow_v
+                lbm_target_velocity = np.ascontiguousarray(
+                    np.stack([ux, vy, wz], axis=0), dtype=np.float64
+                )
+                lbm_inlet_distance = np.ascontiguousarray(
+                    geodesic_voxels.astype(np.float64, copy=False)
+                )
 
-                    # Fallback for isolated cells that Dijkstra could not reach (e.g.
-                    # a thin pocket cut off by aggressive downsampling).  Add a
-                    # distance penalty so they fill after the reachable front, but
-                    # still get filled before the solver gives up.
-                    finite_mask = np.isfinite(geodesic_voxels) & vof_cavity
-                    max_finite = float(geodesic_voxels[finite_mask].max()) if finite_mask.any() else 0.0
-                    if not finite_mask.any():
-                        max_finite = 0.0
-                    dt_voxels = ndimage.distance_transform_edt(vof_cavity & ~vof_inlet)
-                    fallback = np.where(
-                        np.isfinite(geodesic_voxels),
-                        geodesic_voxels,
-                        max_finite + dt_voxels + 5.0,
-                    )
-                    geodesic_voxels = np.where(vof_cavity, fallback, geodesic_voxels)
-                    dist_m = geodesic_voxels * vof_dx_m
-                    with np.errstate(divide="ignore", invalid="ignore"):
-                        grad_dist = np.gradient(dist_m, vof_dx_m)
-                        mag_d = np.sqrt(sum(g * g for g in grad_dist))
-                        mag_safe = np.where(mag_d > 1e-18, mag_d, 1.0)
-                        ux = grad_dist[0] / mag_safe * vof_inflow_v
-                        vy = grad_dist[1] / mag_safe * vof_inflow_v
-                        wz = grad_dist[2] / mag_safe * vof_inflow_v
-                    lbm_target_velocity = np.ascontiguousarray(
-                        np.stack([ux, vy, wz], axis=0), dtype=np.float64
-                    )
-                    lbm_kwargs["target_velocity"] = lbm_target_velocity
-                    lbm_kwargs["inlet_distance"] = np.ascontiguousarray(
-                        geodesic_voxels.astype(np.float64, copy=False)
-                    )
-
+                # The compiled C++ LBM accepts target_velocity/inlet_distance as
+                # the 13th and 14th positional arguments.  Passing them as keyword
+                # arguments fails on the precompiled Windows .pyd, which exposes
+                # them as positional-only optional arguments.
+                print(
+                    f"[LBM] C++ D3Q19 solve starting: grid={vof_grid.shape}, "
+                    f"dx={vof_dx_m:.4f} m, inflow={vof_inflow_v:.3f} m/s, t_max={t_max_vof:.3f} s",
+                    flush=True,
+                )
                 (
                     ft,
                     vmag,
@@ -5417,7 +5433,8 @@ def solve_filling_flow(
                     int(os.environ.get("JOSECAST_CPP_LBM_MAX_STEPS", "12000")),
                     float(os.environ.get("JOSECAST_CPP_LBM_CFL", "0.3")),
                     float(os.environ.get("JOSECAST_CPP_LBM_SMAG", "0.18")),
-                    **lbm_kwargs,
+                    lbm_target_velocity,
+                    lbm_inlet_distance,
                 )
                 vof_res = {
                     "fill_time": ft,

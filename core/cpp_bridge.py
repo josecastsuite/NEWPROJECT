@@ -6,6 +6,8 @@ import sys
 import sysconfig
 import numpy as np
 import trimesh
+
+from core.gate_mesh import _safe_fill_holes
 from typing import List, Tuple, Optional, Callable
 
 from core.types import Body, BodyType
@@ -86,7 +88,7 @@ def has_cpp_core() -> bool:
 def _repair_mesh(body: Body) -> Body:
     mesh = body.mesh.copy()
     mesh.process(validate=True, merge_tex=True, merge_norm=True)
-    mesh.fill_holes()
+    _safe_fill_holes(mesh)
     mesh.remove_unreferenced_vertices()
     body.mesh = mesh
     body.vertices = mesh.vertices.copy()

@@ -192,12 +192,28 @@ def load_step(path: str, tolerance: Optional[float] = None, angular_tolerance: f
         # declared unit and its reciprocal and keep the scale that puts the model
         # in a sensible casting size range (10 mm .. 10 000 mm).
         scale = _choose_mm_scale(mesh, step_unit)
+        raw_diag = float(np.linalg.norm(mesh.bounding_box.extents))
+        print(
+            f"[STEP_LOADER] {os.path.basename(path)} solid {i + 1}: "
+            f"detected_unit={step_unit}, raw_diag={raw_diag:.3f}, chosen_scale={scale}",
+            flush=True,
+        )
         if abs(scale - 1.0) > 1e-9:
             mesh.apply_scale(scale)
             mesh.merge_vertices()
             mesh.remove_unreferenced_vertices()
 
-        volume_mm3 = mesh.volume
+        try:
+            volume_mm3 = float(mesh.volume)
+        except Exception:
+            # If the triangulation is not watertight, fall back to the convex
+            # hull volume so downstream code still has a sensible order of
+            # magnitude.
+            try:
+                hull = mesh.convex_hull
+                volume_mm3 = float(hull.volume)
+            except Exception:
+                volume_mm3 = 0.0
         volume_cm3 = volume_mm3 / 1000.0
         center = mesh.center_mass if mesh.is_watertight else mesh.centroid
 

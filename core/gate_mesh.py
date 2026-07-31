@@ -1,8 +1,8 @@
 """Tetrahedral 3-D mesh generation for gating bodies.
 
 Each gate body (sprue, runner, ingate, distributor, sprue throat, pouring basin,
-curufluk) is meshed independently with TetGen (via meshpy).  The boundary faces
-are classified as
+curufluk) is meshed independently with the gmsh Python API.  The boundary
+faces are classified as
 
 * INLET   – face that connects the gate to its upstream neighbour
 * OUTLET  – face(s) that connect the gate to its downstream neighbour(s)
@@ -35,6 +35,14 @@ _GATING_TYPES = {
 
 def _is_gating_body(body: Body) -> bool:
     return body.body_type in _GATING_TYPES
+
+
+def _safe_fill_holes(mesh: trimesh.Trimesh, max_iterations: int = 20) -> None:
+    """Fill mesh holes iteratively, capping the loop to avoid rare hangs."""
+    for _ in range(max_iterations):
+        if mesh.is_watertight:
+            break
+        mesh.fill_holes()
 
 
 def _decimate_surface(mesh: trimesh.Trimesh, target_faces: int = 1000) -> trimesh.Trimesh:
@@ -92,7 +100,7 @@ def _decimate_surface(mesh: trimesh.Trimesh, target_faces: int = 1000) -> trimes
     if best is not mesh:
         best.merge_vertices(merge_tex=False, merge_norm=False)
         best.fix_normals()
-        best.fill_holes()
+        _safe_fill_holes(best)
     return best
 
 
@@ -305,6 +313,103 @@ def _tet_volume(nodes: np.ndarray, tet: np.ndarray) -> float:
     return abs(float(np.dot(a, np.cross(b, c)))) / 6.0
 
 
+def _tet_mesh_gmsh(
+    verts: np.ndarray,
+    faces: np.ndarray,
+    max_volume_mm3: Optional[float] = None,
+    max_edge_length_mm: Optional[float] = None,
+    model_name: str = "gate",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build a tetrahedral mesh with the gmsh Python API.
+
+    Returns ``(nodes, tets)`` where ``nodes`` has shape ``(n_nodes, 3)`` and
+    ``tets`` has shape ``(n_tets, 4)`` 0-based indices.  The surface is supplied
+    as a closed triangle soup; gmsh creates a volume mesh from it via a
+    discrete surface import, surface classification and volume meshing.
+    """
+    import gmsh
+
+    gmsh.initialize()
+    try:
+        gmsh.option.setNumber("General.Terminal", 1)
+        gmsh.option.setNumber("General.Verbosity", 1)
+        gmsh.option.setNumber("Mesh.Optimize", 1)
+        # Delaunay tetrahedralisation; disable automatic curvature-based
+        # refinement so the already-decimated surface is respected.
+        gmsh.option.setNumber("Mesh.Algorithm3D", 1)
+        for opt in (
+            "Mesh.MeshSizeFromCurvature",
+            "Mesh.MeshSizeFromParamPoints",
+            "Mesh.MeshSizeFromPoints",
+        ):
+            try:
+                gmsh.option.setNumber(opt, 0.0)
+            except Exception:
+                pass
+
+        gmsh.model.add(model_name)
+
+        # Import the closed surface as a discrete entity.  gmsh tags are 1-based.
+        surf_tag = 1
+        gmsh.model.addDiscreteEntity(2, surf_tag)
+        n_nodes = len(verts)
+        node_tags = np.arange(1, n_nodes + 1, dtype=np.int64)
+        gmsh.model.mesh.addNodes(2, surf_tag, node_tags, verts.astype(float).ravel())
+
+        tri_tags = np.arange(1, len(faces) + 1, dtype=np.int64)
+        tri_nodes = (faces.astype(np.int64).ravel() + 1)
+        gmsh.model.mesh.addElementsByType(surf_tag, 2, tri_tags, tri_nodes)
+
+        # Set a global maximum element size before volume meshing.
+        size_max = float("inf")
+        if max_edge_length_mm is not None and max_edge_length_mm > 0:
+            size_max = max_edge_length_mm
+        if max_volume_mm3 is not None and max_volume_mm3 > 0:
+            size_from_vol = float(max_volume_mm3) ** (1.0 / 3.0)
+            size_max = min(size_max, size_from_vol)
+        if np.isfinite(size_max) and size_max > 0:
+            gmsh.option.setNumber("Mesh.MeshSizeMax", size_max)
+
+        # Classify the discrete surface, create geometry entities and mesh the
+        # enclosed volume.  If the surface is not perfectly closed, gmsh will
+        # raise an exception here and the caller (build_gate_mesh) logs it.
+        gmsh.model.mesh.classifySurfaces(40.0 * np.pi / 180.0, True, True)
+        gmsh.model.mesh.createGeometry()
+        gmsh.model.geo.synchronize()
+
+        surfs = [tag for (_, tag) in gmsh.model.getEntities(2)]
+        if not surfs:
+            raise RuntimeError("gmsh could not classify the gate surface")
+        sl = gmsh.model.geo.addSurfaceLoop(surfs)
+        vol = gmsh.model.geo.addVolume([sl])
+        gmsh.model.geo.synchronize()
+
+        gmsh.model.mesh.generate(3)
+
+        # Retrieve nodes.  getNodes returns 1-based tags and flat coordinate array.
+        node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
+        node_coords = node_coords.reshape(-1, 3)
+        tag_to_idx = {int(t): i for i, t in enumerate(node_tags)}
+
+        # Retrieve 4-node tetrahedra (element type 4 in gmsh).
+        elem_types, _, elem_node_tags = gmsh.model.mesh.getElements(dim=3, tag=vol)
+        tet_type = 4
+        if tet_type in elem_types:
+            idx = int(elem_types.tolist().index(tet_type))
+            raw_tets = elem_node_tags[idx].reshape(-1, 4)
+            tets = np.array(
+                [[tag_to_idx[int(t)] for t in tet] for tet in raw_tets],
+                dtype=np.int64,
+            )
+        else:
+            tets = np.empty((0, 4), dtype=np.int64)
+
+        nodes = np.asarray(node_coords, dtype=float)
+        return nodes, tets
+    finally:
+        gmsh.finalize()
+
+
 def build_gate_mesh(
     body: Body,
     parent_body: Optional[Body] = None,
@@ -350,53 +455,57 @@ def build_gate_mesh(
     _TARGET_GATE_FACES: int = 1000
     clean = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, process=True)
     clean.merge_vertices(merge_tex=False, merge_norm=False)
+    # Remove duplicate/degenerate faces; these can make gmsh's PLC complain
+    # about intersecting segments/facets even when the mesh is "watertight".
+    if len(clean.faces) > 0:
+        # Drop faces with zero / negative area.
+        mask = np.asarray(clean.nondegenerate_faces(), dtype=bool)
+        clean.update_faces(mask)
+        # Drop duplicate face rows (same vertex set, any order).
+        sorted_faces = np.sort(clean.faces, axis=1)
+        _, unique_idx = np.unique(sorted_faces, axis=0, return_index=True)
+        clean.faces = np.asarray(clean.faces, dtype=np.int64)[np.sort(unique_idx)]
+        clean.remove_unreferenced_vertices()
     clean.fix_normals()
-    clean.fill_holes()
+    _safe_fill_holes(clean)
 
     if len(clean.faces) > _MAX_GATE_FACES:
         clean = _decimate_surface(clean, target_faces=_TARGET_GATE_FACES)
+        if len(clean.faces) > 0:
+            mask = np.asarray(clean.nondegenerate_faces(), dtype=bool)
+            clean.update_faces(mask)
+            sorted_faces = np.sort(clean.faces, axis=1)
+            _, unique_idx = np.unique(sorted_faces, axis=0, return_index=True)
+            clean.faces = np.asarray(clean.faces, dtype=np.int64)[np.sort(unique_idx)]
+            clean.remove_unreferenced_vertices()
         clean.merge_vertices(merge_tex=False, merge_norm=False)
         clean.fix_normals()
-        clean.fill_holes()
+        _safe_fill_holes(clean)
 
     verts = clean.vertices.astype(float)
-    faces = clean.faces.astype(np.int32)  # meshpy expects 0-based
+    faces = clean.faces.astype(np.int32)
 
-    # meshpy/TetGen is only needed when a 3-D gate mesh is actually built.
-    from meshpy.tet import MeshInfo, Options, build
+    # 3-B gate mesh is built with gmsh.  This is more robust than meshpy/TetGen
+    # on Windows and avoids the fast_simplification / access-violation issues.
+    nodes, tets = _tet_mesh_gmsh(
+        verts,
+        faces,
+        max_volume_mm3=max_volume_mm3,
+        max_edge_length_mm=max_edge_length_mm,
+        model_name=f"gate_{body.name}",
+    )
 
-    info = MeshInfo()
-    info.set_points(verts.tolist())
-    info.set_facets(faces.tolist())
-
-    # TetGen 'p' builds a constrained Delaunay tetrahedralisation of the PLC.
-    # No quality/Steiner refinement is used; the surface decimation above
-    # already controls the tet count and keeps the solve tractable.
-    options = Options("p")
-    kwargs: Dict[str, object] = {"options": options}
-
-    # meshpy/TetGen internally restores the previous LC_NUMERIC locale, which can
-    # fail on some systems.  Force the C locale around the call and restore it
-    # afterwards.
-    import locale
-
-    old_locale = locale.setlocale(locale.LC_ALL, None)
-    try:
-        locale.setlocale(locale.LC_ALL, "C")
-        tet = build(info, **kwargs)
-    except Exception as exc:
-        raise RuntimeError(f"TetGen failed for gate body {body.name}: {exc}") from exc
-    finally:
-        try:
-            locale.setlocale(locale.LC_ALL, old_locale)
-        except locale.Error:
-            pass
-
-    nodes = np.asarray(tet.points, dtype=float)
-    tets = np.asarray(tet.elements, dtype=np.int64)
-
-    # meshpy may produce degenerate tets; filter them out.
-    valid = tets.min(axis=1) >= 0
+    # gmsh may produce degenerate tets; filter them out.
+    valid = (
+        (tets[:, 0] >= 0)
+        & (tets[:, 1] >= 0)
+        & (tets[:, 2] >= 0)
+        & (tets[:, 3] >= 0)
+        & (tets[:, 0] < len(nodes))
+        & (tets[:, 1] < len(nodes))
+        & (tets[:, 2] < len(nodes))
+        & (tets[:, 3] < len(nodes))
+    )
     tets = tets[valid]
 
     cell_centers = nodes[tets].mean(axis=1)

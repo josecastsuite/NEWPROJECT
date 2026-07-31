@@ -213,7 +213,9 @@ def _repair_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     """Repair a copy of the body mesh for cross-section calculations."""
     m = mesh.copy()
     try:
-        m.fill_holes()
+        # fill_holes() can be extremely slow / hang on dense meshes, so only
+        # merge vertices and remove unreferenced vertices; the section-based
+        # area calculation tolerates small non-manifold regions.
         m.merge_vertices()
         m.remove_unreferenced_vertices()
     except Exception:
@@ -331,7 +333,7 @@ def _body_flow_length(mesh: trimesh.Trimesh, axis: np.ndarray) -> float:
 def _characteristic_cross_section_area(
     mesh: trimesh.Trimesh,
     axis: np.ndarray,
-    n: int = 50,
+    n: int = 20,
 ) -> float:
     """Return the most representative cross-sectional area [mm2] perpendicular to axis.
 
@@ -417,7 +419,7 @@ def _characteristic_cross_section_area(
 def _sprue_circular_base_and_throat(
     mesh: trimesh.Trimesh,
     axis: np.ndarray,
-    n: int = 50,
+    n: int = 20,
 ) -> Tuple[float, float]:
     """Return (base_area_mm2, throat_area_mm2) for a sprue.
 
