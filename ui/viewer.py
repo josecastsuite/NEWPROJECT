@@ -4,7 +4,6 @@ from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import pyvista as pv
-from PyQt6 import QtCore, QtGui, QtWidgets
 from pyvistaqt import QtInteractor
 
 from core.gating import (
@@ -20,18 +19,18 @@ from ui.flow_animator import FlowAnimator
 
 
 BODY_COLORS = {
-    BodyType.PART: "#E0E0E0",
-    BodyType.RISER: "#00C853",
-    BodyType.INGATE: "#2962FF",
-    BodyType.RUNNER: "#FF6D00",
-    BodyType.SPRUE: "#9C27B0",
-    BodyType.CORE: "#795548",
-    BodyType.COOLING_SPRUE: "#00BCD4",
-    BodyType.FILTER: "#607D8B",
+    BodyType.PART: "#F5F5F5",
+    BodyType.RISER: "#00E676",
+    BodyType.INGATE: "#2979FF",
+    BodyType.RUNNER: "#FF9100",
+    BodyType.SPRUE: "#D500F9",
+    BodyType.CORE: "#BCAAA4",
+    BodyType.COOLING_SPRUE: "#00E5FF",
+    BodyType.FILTER: "#90A4AE",
     BodyType.POURING_BASIN: "#7C4DFF",
-    BodyType.SPRUE_THROAT: "#E040FB",
-    BodyType.DISTRIBUTOR: "#2E7D32",
-    BodyType.CURUFLUK: "#009688",
+    BodyType.SPRUE_THROAT: "#FF4081",
+    BodyType.DISTRIBUTOR: "#76FF03",
+    BodyType.CURUFLUK: "#00BFA5",
 }
 
 BODY_LEGEND_LABELS = {
@@ -48,20 +47,6 @@ BODY_LEGEND_LABELS = {
     BodyType.DISTRIBUTOR: "Dağıtıcı",
     BodyType.CURUFLUK: "Curufluk",
 }
-
-
-def _text_color_for(body_color: str) -> str:
-    """Return white for dark body colours, black for very light ones, else the colour itself."""
-    c = body_color.lstrip("#")
-    r = int(c[0:2], 16)
-    g = int(c[2:4], 16)
-    b = int(c[4:6], 16)
-    brightness = (r * 0.299 + g * 0.587 + b * 0.114)
-    if brightness > 180:
-        return "#000000"
-    if brightness < 120:
-        return "#ffffff"
-    return body_color
 
 BODY_OPACITY = {
     BodyType.PART: 0.35,
@@ -161,82 +146,42 @@ class Analyzer3DViewer(QtInteractor):
         self._flow_actor = None
         self._flow_node_actor = None
         self.flow_animator = FlowAnimator(self)
-        self._body_legend_frame = None
-        self._init_body_legend()
-
-    def _init_body_legend(self) -> None:
-        """Create the top-right overlay legend for current body types."""
-        frame = QtWidgets.QFrame(self)
-        frame.setObjectName("bodyLegendFrame")
-        frame.setStyleSheet(
-            "#bodyLegendFrame { background-color: rgba(24, 24, 27, 220); "
-            "border: 1px solid #00ffff; border-radius: 6px; padding: 4px; }"
-        )
-        layout = QtWidgets.QVBoxLayout(frame)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
-        frame.setLayout(layout)
-        frame.hide()
-        self._body_legend_frame = frame
+        self._body_legend_actor = None
 
     def _update_body_legend(self, bodies: List[Body]) -> None:
-        """Populate the legend with only body types present in the current scene."""
-        if self._body_legend_frame is None:
-            return
-        layout = self._body_legend_frame.layout()
-        if layout is None:
-            return
-        while layout.count():
-            item = layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        """Add a top-right PyVista legend showing only body types in the scene."""
+        if self._body_legend_actor is not None:
+            try:
+                self.remove_actor(self._body_legend_actor)
+            except Exception:
+                pass
+            self._body_legend_actor = None
 
-        present: set = set()
-        for body in bodies:
-            if len(body.faces) > 0:
-                present.add(body.body_type)
+        present = sorted(
+            {body.body_type for body in bodies if len(body.faces) > 0},
+            key=lambda x: int(x),
+        )
         if not present:
-            self._body_legend_frame.hide()
             return
 
-        for bt in sorted(present, key=lambda x: int(x)):
-            row = QtWidgets.QHBoxLayout()
-            row.setSpacing(6)
-            row.setContentsMargins(0, 0, 0, 0)
-            color = BODY_COLORS.get(bt, "#E0E0E0")
-            name = BODY_LEGEND_LABELS.get(bt, str(bt))
-            text_color = _text_color_for(color)
-            swatch = QtWidgets.QLabel()
-            swatch.setFixedSize(12, 12)
-            swatch.setStyleSheet(
-                f"background-color: {color}; border-radius: 6px; border: 1px solid #ffffff;"
-            )
-            label = QtWidgets.QLabel(name)
-            label.setStyleSheet(
-                f"color: {text_color}; font-weight: bold; font-size: 13px;"
-            )
-            row.addWidget(swatch)
-            row.addWidget(label)
-            row.addStretch()
-            container = QtWidgets.QWidget()
-            container.setLayout(row)
-            layout.addWidget(container)
-        self._body_legend_frame.adjustSize()
-        self._body_legend_frame.show()
-        self._position_body_legend()
+        entries = []
+        for bt in present:
+            color = BODY_COLORS.get(bt, "#F5F5F5")
+            label = BODY_LEGEND_LABELS.get(bt, str(bt))
+            entries.append([label, color, "circle"])
 
-    def _position_body_legend(self) -> None:
-        if self._body_legend_frame is None:
-            return
-        w = self._body_legend_frame.width()
-        h = self._body_legend_frame.height()
-        x = max(0, self.width() - w - 12)
-        y = 12
-        self._body_legend_frame.move(x, y)
-
-    def resizeEvent(self, event: QtGui.QResizeEvent):
-        super().resizeEvent(event)
-        self._position_body_legend()
+        n = len(entries)
+        height = min(0.45, max(0.08, 0.047 * n))
+        width = 0.22
+        self._body_legend_actor = self.add_legend(
+            labels=entries,
+            loc="upper right",
+            bcolor=(0.08, 0.08, 0.10),
+            background_opacity=0.85,
+            face="circle",
+            size=(width, height),
+            name="body_legend",
+        )
 
     def clear_scene(self):
         self.flow_animator.stop()
@@ -254,6 +199,7 @@ class Analyzer3DViewer(QtInteractor):
         self._local_actors.clear()
         self._flow_actor = None
         self._flow_node_actor = None
+        self._body_legend_actor = None
         self._clear_section_actors()
 
     def show_bodies(self, bodies: List[Body], reset_camera: bool = True, analysis_mode: bool = False):
