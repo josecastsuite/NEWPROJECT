@@ -272,13 +272,13 @@ class MainWindow(QtWidgets.QMainWindow):
         for key, mold in MOLDS.items():
             self.mold_combo.addItem(mold.name, key)
         self.mold_combo.currentIndexChanged.connect(self._sync_casting_params_from_materials)
-        _settings_labeled(self.mold_combo, "Kalıp:")
+        _settings_labeled(self.mold_combo, "Kalıp kumu:")
 
         # Set defaults after both combos exist; block signals to avoid partial sync.
         self.alloy_combo.blockSignals(True)
         self.mold_combo.blockSignals(True)
         self.alloy_combo.setCurrentIndex(list(ALLOYS.keys()).index("42CrMo4"))
-        self.mold_combo.setCurrentIndex(list(MOLDS.keys()).index("sand"))
+        self.mold_combo.setCurrentIndex(list(MOLDS.keys()).index("green_sand"))
         self.alloy_combo.blockSignals(False)
         self.mold_combo.blockSignals(False)
 
@@ -750,6 +750,7 @@ class MainWindow(QtWidgets.QMainWindow):
         widget.body_type_changed.connect(self.on_body_type_changed)
         widget.feeder_type_changed.connect(self.on_body_feeder_type_changed)
         widget.feeder_m_changed.connect(self.on_body_feeder_m_changed)
+        widget.mold_settings_changed.connect(self.on_body_mold_changed)
 
         self._body_items[body.name] = item
         self._body_rows[body.name] = widget
@@ -829,6 +830,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"{body.name} - besleyici modülü: M={feeder_m_mm / 10.0:.2f} cm",
                 "info",
             )
+
+    def on_body_mold_changed(self, body: Body):
+        preset = body.mold_preset
+        self.aiLog(
+            f"{body.name} - kalıp kumu: {preset} (AFS={body.mold_afs_grain_size:.1f}, "
+            f"nem={body.mold_moisture_percent:.1f}%, bağlayıcı={body.mold_binder_percent:.1f}%, "
+            f"compactability={body.mold_compactability_percent:.1f}%)",
+            "info",
+        )
 
     def on_pick_section(self):
         """Open SectionDialog for the selected velocity-section body."""

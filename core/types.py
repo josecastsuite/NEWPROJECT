@@ -129,7 +129,12 @@ class Body:
     section_area_cm2: float = 0.0
     feeder_type: str = ""  # conventional / exothermic / insulated / chilled / sleeve / side / blind
     feeder_m_mm: float = 0.0
-    feeder_note: str = ""
+    # v10.2: per-body mould material overrides for CORE bodies
+    mold_preset: str = ""  # green_sand / silica_sand / chromite_sand / zircon_sand
+    mold_afs_grain_size: float = 0.0       # AFS grain fineness number
+    mold_moisture_percent: float = 0.0      # % moisture
+    mold_binder_percent: float = 0.0       # % bentonite/binder
+    mold_compactability_percent: float = 0.0  # % compactability
 
 
 @dataclass

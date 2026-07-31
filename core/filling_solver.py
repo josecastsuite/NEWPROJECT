@@ -33,6 +33,7 @@ from scipy.sparse import csr_matrix
 from scipy.sparse import csgraph
 from scipy.sparse import linalg as spla
 
+from core.materials import MOLDS, MoldMaterial
 from core.types import Body, BodyType, FillingResult, GatingNode, GatingVelocityError
 from core.voxelizer import build_voxel_grid, compute_face_fractions
 
@@ -4662,6 +4663,61 @@ def _gating_node_velocities(
     return nodes, comp_meta, comp_centroids, comp_id, part_id
 
 
+def _effective_mold_from_bodies(
+    mold: MoldMaterial,
+    bodies: Optional[List[Body]],
+    body_index: Optional[np.ndarray],
+) -> MoldMaterial:
+    """Blend the global mould with per-CORE body sand overrides.
+
+    A casting assembly may contain several cores with different sands.  The
+    body_index voxel map tells us how many voxels belong to each body; the
+    returned MoldMaterial is the area-weighted average of the green-sand
+    parameters (AFS, moisture, binder, compactability).  Other thermal
+    properties keep the global mould values.
+    """
+    if bodies is None or body_index is None:
+        return mold
+    core_bodies = {
+        b.index: b for b in bodies
+        if getattr(b, "body_type", None) == BodyType.CORE
+    }
+    if not core_bodies:
+        return mold
+
+    max_idx = max(max(core_bodies.keys()), int(body_index.max()))
+    counts = np.zeros(max_idx + 1, dtype=np.float64)
+    for b in core_bodies.values():
+        if b.index < counts.size:
+            counts[b.index] = float(np.sum(body_index == b.index))
+
+    total = float(counts.sum())
+    if total < 1.0:
+        return mold
+
+    from dataclasses import replace
+
+    afs = moisture = binder = compact = 0.0
+    for b in core_bodies.values():
+        w = counts[b.index] / total
+        if b.mold_preset and b.mold_preset in MOLDS:
+            base = MOLDS[b.mold_preset]
+        else:
+            base = mold
+        afs += w * (b.mold_afs_grain_size or base.afs_grain_size)
+        moisture += w * (b.mold_moisture_percent or base.moisture_percent)
+        binder += w * (b.mold_binder_percent or base.binder_percent)
+        compact += w * (b.mold_compactability_percent or base.compactability_percent)
+
+    return replace(
+        mold,
+        afs_grain_size=afs,
+        moisture_percent=moisture,
+        binder_percent=binder,
+        compactability_percent=compact,
+    )
+
+
 def solve_filling_flow(
     grid: np.ndarray,
     origin: np.ndarray,
@@ -4718,6 +4774,10 @@ def solve_filling_flow(
     """
     if progress_callback:
         progress_callback(2)
+
+    # Blend global mould with per-CORE sand overrides before the flow solve.
+    if mold is not None:
+        mold = _effective_mold_from_bodies(mold, bodies, body_index)
 
     # The input analysis grid is kept as the reference frame for the returned
     # velocity / fill_time fields (so they match result.grid downstream).

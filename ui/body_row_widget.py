@@ -6,6 +6,9 @@ Each body occupies one horizontal row:
 - optional feeder controls (visible only when body type == RISER)
     - feeder type
     - modulus (cm)
+- optional mould-sand controls (visible only when body type == CORE)
+    - sand preset
+    - "..." button opening AFS / moisture / binder / compactability dialog
 
 This keeps the body list compact and avoids large stacked panels.
 """
@@ -13,6 +16,7 @@ from typing import Dict, Optional
 
 from PyQt6 import QtCore, QtWidgets
 
+from core.materials import MOLDS
 from core.types import Body, BodyType
 
 
@@ -26,13 +30,78 @@ FEEDER_TYPE_NAMES = {
     "blind": "Kör",
 }
 
+SAND_PRESET_NAMES = {
+    "green_sand": "Yeşil Kum",
+    "silica_sand": "Silis Kum",
+    "chromite_sand": "Kromit Kum",
+    "zircon_sand": "Zirkon Kum",
+}
+
+
+class MoldPropertiesDialog(QtWidgets.QDialog):
+    """Per-CORE sand property override dialog."""
+
+    def __init__(self, body: Body, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self._body = body
+        self.setWindowTitle(f"Kum Özellikleri – {body.name}")
+        self.setMinimumWidth(260)
+
+        layout = QtWidgets.QFormLayout(self)
+
+        base = MOLDS.get(body.mold_preset, MOLDS["green_sand"])
+
+        self._afs_spin = QtWidgets.QDoubleSpinBox()
+        self._afs_spin.setRange(0.0, 200.0)
+        self._afs_spin.setDecimals(1)
+        self._afs_spin.setSuffix(" AFS")
+        self._afs_spin.setValue(body.mold_afs_grain_size or base.afs_grain_size)
+        layout.addRow("AFS tane inceliği:", self._afs_spin)
+
+        self._moisture_spin = QtWidgets.QDoubleSpinBox()
+        self._moisture_spin.setRange(0.0, 30.0)
+        self._moisture_spin.setDecimals(1)
+        self._moisture_spin.setSuffix(" %")
+        self._moisture_spin.setValue(body.mold_moisture_percent or base.moisture_percent)
+        layout.addRow("Nem:", self._moisture_spin)
+
+        self._binder_spin = QtWidgets.QDoubleSpinBox()
+        self._binder_spin.setRange(0.0, 20.0)
+        self._binder_spin.setDecimals(1)
+        self._binder_spin.setSuffix(" %")
+        self._binder_spin.setValue(body.mold_binder_percent or base.binder_percent)
+        layout.addRow("Bağlayıcı:", self._binder_spin)
+
+        self._compact_spin = QtWidgets.QDoubleSpinBox()
+        self._compact_spin.setRange(0.0, 100.0)
+        self._compact_spin.setDecimals(1)
+        self._compact_spin.setSuffix(" %")
+        self._compact_spin.setValue(body.mold_compactability_percent or base.compactability_percent)
+        layout.addRow("Compactability:", self._compact_spin)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def _on_accept(self) -> None:
+        self._body.mold_afs_grain_size = float(self._afs_spin.value())
+        self._body.mold_moisture_percent = float(self._moisture_spin.value())
+        self._body.mold_binder_percent = float(self._binder_spin.value())
+        self._body.mold_compactability_percent = float(self._compact_spin.value())
+        self.accept()
+
 
 class BodyRowWidget(QtWidgets.QWidget):
-    """Single-line body row with inline, type-conditional feeder controls."""
+    """Single-line body row with inline, type-conditional feeder / mould controls."""
 
     body_type_changed = QtCore.pyqtSignal(Body, int)
     feeder_type_changed = QtCore.pyqtSignal(Body, str)
     feeder_m_changed = QtCore.pyqtSignal(Body, float)
+    mold_settings_changed = QtCore.pyqtSignal(Body)
 
     def __init__(
         self,
@@ -97,6 +166,26 @@ class BodyRowWidget(QtWidgets.QWidget):
         self._feeder_m_spin.valueChanged.connect(self._on_feeder_m_changed)
         layout.addWidget(self._feeder_m_spin)
 
+        # --- Mould-sand controls: compact, hidden unless CORE ---
+        self._sand_type_combo = QtWidgets.QComboBox()
+        self._sand_type_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self._sand_type_combo.setMaximumWidth(110)
+        self._sand_type_combo.setToolTip("Kum tipi")
+        for key, name in SAND_PRESET_NAMES.items():
+            self._sand_type_combo.addItem(name, key)
+        self._sand_type_combo.currentIndexChanged.connect(self._on_sand_type_changed)
+        layout.addWidget(self._sand_type_combo)
+
+        self._sand_prop_btn = QtWidgets.QPushButton("...")
+        self._sand_prop_btn.setMaximumWidth(32)
+        self._sand_prop_btn.setToolTip(
+            "Kum parametreleri (AFS tane, nem %, bağlayıcı %, compactability %)"
+        )
+        self._sand_prop_btn.clicked.connect(self._on_sand_properties)
+        layout.addWidget(self._sand_prop_btn)
+
         layout.addStretch()
 
     def body(self) -> Body:
@@ -112,20 +201,24 @@ class BodyRowWidget(QtWidgets.QWidget):
         self._block_updates = True
         try:
             self.set_body_type(self._body.body_type)
+
             idx = self._feeder_type_combo.findData(self._body.feeder_type or "")
-            if idx >= 0:
-                self._feeder_type_combo.setCurrentIndex(idx)
-            else:
-                self._feeder_type_combo.setCurrentIndex(0)
+            self._feeder_type_combo.setCurrentIndex(idx if idx >= 0 else 0)
             # stored in mm, shown in cm
             self._feeder_m_spin.setValue((self._body.feeder_m_mm or 0.0) / 10.0)
+
+            sidx = self._sand_type_combo.findData(self._body.mold_preset or "")
+            self._sand_type_combo.setCurrentIndex(sidx if sidx >= 0 else 0)
         finally:
             self._block_updates = False
 
     def _update_visibility(self, body_type: BodyType) -> None:
         is_riser = body_type == BodyType.RISER
+        is_core = body_type == BodyType.CORE
         self._feeder_type_combo.setVisible(is_riser)
         self._feeder_m_spin.setVisible(is_riser)
+        self._sand_type_combo.setVisible(is_core)
+        self._sand_prop_btn.setVisible(is_core)
 
     def _on_type_changed(self, index: int) -> None:
         if self._block_updates:
@@ -140,6 +233,9 @@ class BodyRowWidget(QtWidgets.QWidget):
             self._body.feeder_type = ""
             self._body.feeder_m_mm = 0.0
             self._sync_from_body()
+        if new_type != BodyType.CORE:
+            # Do not erase stored sand overrides; just hide the widgets.
+            pass
         self._update_visibility(new_type)
         self.body_type_changed.emit(self._body, int(new_type))
 
@@ -155,3 +251,15 @@ class BodyRowWidget(QtWidgets.QWidget):
             return
         self._body.feeder_m_mm = float(value) * 10.0
         self.feeder_m_changed.emit(self._body, self._body.feeder_m_mm)
+
+    def _on_sand_type_changed(self, index: int) -> None:
+        if self._block_updates:
+            return
+        key = self._sand_type_combo.itemData(index) or "green_sand"
+        self._body.mold_preset = key
+        self.mold_settings_changed.emit(self._body)
+
+    def _on_sand_properties(self) -> None:
+        dialog = MoldPropertiesDialog(self._body, self)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self.mold_settings_changed.emit(self._body)
