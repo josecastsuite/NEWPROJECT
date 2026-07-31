@@ -8,12 +8,13 @@ global gating graph so that local 3-D velocities and the global filling time
 remain consistent.
 """
 
+from __future__ import annotations
+
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 
-from core.gate_mesh import GateMesh, build_gate_mesh
 from core.gate_solver import GateFlowResult, solve_gate_flow
 from core.gating import _build_gating_topology
 from core.types import Body, BodyType, GatingNode
@@ -150,6 +151,10 @@ def solve_gate_flows(
         The same ``gating_nodes`` list with velocities/areas/flow rates
         overwritten for gates where a 3-D mesh solve was performed.
     """
+    # meshpy/tet is heavy and can crash on some Windows installs; load it only
+    # when the 3-D gate mesh solver is actually requested.
+    from core.gate_mesh import build_gate_mesh
+
     if not bodies or not gating_nodes:
         return {}, list(gating_nodes)
 

@@ -10,6 +10,8 @@ effective permeability is reduced according to the local velocity magnitude,
 capturing inertial losses in narrowings and bends.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -17,8 +19,6 @@ import numpy as np
 import trimesh
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
-
-from core.gate_mesh import GateMesh
 
 
 @dataclass

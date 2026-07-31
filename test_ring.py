@@ -45,7 +45,7 @@ params=CastingParameters(
     gravity_vector=(0.0,-1.0,0.0),
     ingate_velocity_m_s=1.80,
     velocity_section_key='SPRUE_THROAT',
-    enable_gate_mesh=True
+    enable_gate_mesh=False  # meshpy Windows kurulumuna bagli; True yapmadan once `diagnose_env.py` ile kontrol edin
 )
 result = analyze(
     bodies, grid, body_index, origin, dx,

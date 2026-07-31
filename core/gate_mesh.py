@@ -17,7 +17,6 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import trimesh
-from meshpy.tet import MeshInfo, Options, build
 
 from core.types import Body, BodyType
 
@@ -302,6 +301,9 @@ def build_gate_mesh(
 
     verts = clean.vertices.astype(float)
     faces = clean.faces.astype(np.int32)  # meshpy expects 0-based
+
+    # meshpy/TetGen is only needed when a 3-D gate mesh is actually built.
+    from meshpy.tet import MeshInfo, Options, build
 
     info = MeshInfo()
     info.set_points(verts.tolist())
