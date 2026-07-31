@@ -238,7 +238,7 @@ def _solve_thermal_cpp(
         _alloy_to_dict(alloy),
         _mold_to_dict(mold),
         float(feed_velocity_m_s),
-        np.asarray(gravity_vector, dtype=np.float64),
+        tuple(float(x) for x in gravity_vector),
     )
 
     T_fine = _upsample(T_c, fine_shape, order=1)
