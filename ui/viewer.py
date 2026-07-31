@@ -4,6 +4,7 @@ from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import pyvista as pv
+from PyQt6 import QtCore, QtGui, QtWidgets
 from pyvistaqt import QtInteractor
 
 from core.gating import (
@@ -14,7 +15,7 @@ from core.gating import (
 )
 from core.materials import get_alloy
 from core.sdf_analyzer import _trace_path_to_riser
-from core.types import AnalysisResult, Body, BodyType, HotSpot, RefinementRegion
+from core.types import BODY_TYPE_LABELS, AnalysisResult, Body, BodyType, HotSpot, RefinementRegion
 from ui.flow_animator import FlowAnimator
 
 
@@ -131,6 +132,79 @@ class Analyzer3DViewer(QtInteractor):
         self._flow_actor = None
         self._flow_node_actor = None
         self.flow_animator = FlowAnimator(self)
+        self._body_legend_frame = None
+        self._init_body_legend()
+
+    def _init_body_legend(self) -> None:
+        """Create the top-right overlay legend for current body types."""
+        frame = QtWidgets.QFrame(self)
+        frame.setObjectName("bodyLegendFrame")
+        frame.setStyleSheet(
+            "#bodyLegendFrame { background-color: rgba(24, 24, 27, 220); "
+            "border: 1px solid #00ffff; border-radius: 6px; padding: 4px; }"
+            "QLabel { color: #00ffff; font-weight: bold; font-size: 11px; }"
+        )
+        layout = QtWidgets.QVBoxLayout(frame)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+        frame.setLayout(layout)
+        frame.hide()
+        self._body_legend_frame = frame
+
+    def _update_body_legend(self, bodies: List[Body]) -> None:
+        """Populate the legend with only body types present in the current scene."""
+        if self._body_legend_frame is None:
+            return
+        layout = self._body_legend_frame.layout()
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        present: set = set()
+        for body in bodies:
+            if len(body.faces) > 0:
+                present.add(body.body_type)
+        if not present:
+            self._body_legend_frame.hide()
+            return
+
+        for bt in sorted(present, key=lambda x: int(x)):
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(6)
+            row.setContentsMargins(0, 0, 0, 0)
+            color = BODY_COLORS.get(bt, "#E0E0E0")
+            name = BODY_TYPE_LABELS.get(bt, str(bt))
+            swatch = QtWidgets.QLabel()
+            swatch.setFixedSize(14, 14)
+            swatch.setStyleSheet(
+                f"background-color: {color}; border-radius: 7px; border: 1px solid #00ffff;"
+            )
+            label = QtWidgets.QLabel(name)
+            row.addWidget(swatch)
+            row.addWidget(label)
+            row.addStretch()
+            container = QtWidgets.QWidget()
+            container.setLayout(row)
+            layout.addWidget(container)
+        self._body_legend_frame.adjustSize()
+        self._body_legend_frame.show()
+        self._position_body_legend()
+
+    def _position_body_legend(self) -> None:
+        if self._body_legend_frame is None:
+            return
+        w = self._body_legend_frame.width()
+        h = self._body_legend_frame.height()
+        x = max(0, self.width() - w - 12)
+        y = 12
+        self._body_legend_frame.move(x, y)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent):
+        super().resizeEvent(event)
+        self._position_body_legend()
 
     def clear_scene(self):
         self.flow_animator.stop()
@@ -186,6 +260,7 @@ class Analyzer3DViewer(QtInteractor):
             merged_f = np.vstack(part_faces)
             tri = np.c_[np.full(len(merged_f), 3, dtype=np.int64), merged_f].ravel()
             self._part_mesh_pv = pv.PolyData(merged_v, tri)
+        self._update_body_legend(bodies)
         if reset_camera:
             self.reset_camera()
 
