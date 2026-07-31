@@ -34,7 +34,8 @@ class GateFlowResult:
     pressure_drop_pa: float
     forchheimer_pressure_drop_pa: float
     total_pressure_drop_pa: float
-    max_velocity_m_s: float
+    section_velocity_m_s: float
+    peak_velocity_m_s: float
     max_pressure_pa: float
     min_pressure_pa: float
     reynolds: np.ndarray  # (n_cells,)
@@ -593,6 +594,13 @@ def solve_gate_flow(
     dp_darcy = float(p.max() - p.min())
     dp_forch = float(beta_1_m * rho_kg_m3 * (v_avg ** 2) * max(length_m, 1e-6))
 
+    # The velocity that should be reported at a gating node is the area-average
+    # velocity through the gate outlet, i.e. Q / A_outlet.  This is the physically
+    # meaningful section velocity the user expects.  The raw cell maximum is kept as
+    # a separate peak diagnostic for air-entrainment / local checks.
+    outlet_area = float(gate.boundary_areas[gate.outlet_faces].sum())
+    section_velocity_m_s = float(abs(outlet_flux) / (outlet_area + 1e-18))
+
     return GateFlowResult(
         pressures=p,
         velocities=v,
@@ -603,7 +611,8 @@ def solve_gate_flow(
         pressure_drop_pa=dp_darcy,
         forchheimer_pressure_drop_pa=dp_forch,
         total_pressure_drop_pa=dp_darcy + dp_forch,
-        max_velocity_m_s=float(v_mag.max()),
+        section_velocity_m_s=section_velocity_m_s,
+        peak_velocity_m_s=float(v_mag.max()),
         max_pressure_pa=float(p.max()),
         min_pressure_pa=float(p.min()),
         reynolds=re,

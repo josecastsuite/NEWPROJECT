@@ -136,7 +136,16 @@ def _section_flows_from_flow(
         # Map uppercase upstream key to the lower-case target range key.
         lo_hi_key = _map_node_velocity_to_section(up_section) or up_section.lower()
         lo, hi = velocity_targets.get(lo_hi_key, (0.0, 1.0))
-        a_min, a_max = 0.0, 1e9
+        # Target area range from Q = v A: A_min = Q / v_max, A_max = Q / v_min.
+        q_total_m3_s = total_q
+        if hi > 0.0 and q_total_m3_s > 0.0:
+            a_min = float(q_total_m3_s / hi) * 1e4
+        else:
+            a_min = 0.0
+        if lo > 0.0 and q_total_m3_s > 0.0:
+            a_max = float(q_total_m3_s / lo) * 1e4
+        else:
+            a_max = 1e9
         out[up_section] = SectionFlow(
             velocity_m_s=v_m_s,
             area_cm2=total_area_cm2,

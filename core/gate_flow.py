@@ -261,9 +261,25 @@ def solve_gate_flows(
             area_m2 = max(float(node.section_area_cm2 or 0.0) * 1e-4, 1e-18)
             node.flow_rate_m3_s = float(node_q)
             node.velocity_m_s = float(node_q / area_m2)
-            # The 3-D gate mesh gives the true maximum inside the body; expose
-            # it for labels/reports while keeping the mean contact velocity
-            # above for fill-time calculations.
-            node.max_velocity_m_s = float(result.max_velocity_m_s)
+            # The section velocity reported at a gating node is the physically
+            # consistent mean contact velocity (Q / A) for that branch.  The
+            # local 3-D mesh refines the *pressure drop* and captures the *peak*
+            # cell velocity for diagnostics, but using the raw mesh max for
+            # labels gave absurdly high values.
+            node.max_velocity_m_s = float(node.velocity_m_s)
+
+        # For the body-level summary, use the total outlet flux divided by the
+        # summed downstream contact areas.  This makes the 3-D mesh section
+        # velocity match the Q/A values shown in labels and reports.
+        downstream_area_m2 = 0.0
+        for node in gating_nodes:
+            if node.name is None or " → " not in node.name:
+                continue
+            up_name = node.name.split(" → ")[0]
+            if up_name != body.name:
+                continue
+            downstream_area_m2 += max(float(node.section_area_cm2 or 0.0) * 1e-4, 0.0)
+        if downstream_area_m2 > 1e-18:
+            result.section_velocity_m_s = float(abs(result.outlet_flux_m3_s) / downstream_area_m2)
 
     return results, list(gating_nodes)

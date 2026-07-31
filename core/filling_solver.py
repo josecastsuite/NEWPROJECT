@@ -3744,27 +3744,18 @@ def _aggregate_section_velocities(
     }
 
     def _section_for(up: str, down: str) -> Optional[str]:
-        for body in (down, up):
+        # Prefer the upstream section; e.g. SPRUE_THROAT→SPRUE belongs to
+        # SPRUE_THROAT and SPRUE→INGATE belongs to SPRUE_BASE.  Downstream
+        # is only used as a fallback (e.g. SOURCE→SPRUE_THROAT).
+        for body in (up, down):
             sec = _SECTION_KEY.get(body, body)
             if sec in section_velocities:
                 return sec
         return None
 
-    # If a 3-D gate solve was performed, each node inherits the body's true
-    # maximum velocity.  The mean contact velocity stays in velocity_m_s for
-    # fill-time estimates; max_velocity_m_s is used for reports/labels.
-    if gate_results:
-        for n in gating_nodes:
-            if n.name is None or " → " not in n.name:
-                continue
-            up_name, down_name = n.name.split(" → ", 1)
-            gate_body = (
-                down_name
-                if down_name in gate_results
-                else (up_name if up_name in gate_results else None)
-            )
-            if gate_body is not None:
-                n.max_velocity_m_s = float(gate_results[gate_body].max_velocity_m_s)
+    # The 3-D gate solve refines pressure drop and local peaks; the section
+    # velocity reported at each node is already the mean contact velocity
+    # (Q / A) for that branch, set in solve_gate_flows.
 
     for n in gating_nodes:
         parts = n.body_type.split("→")
@@ -5502,7 +5493,8 @@ def solve_filling_flow(
             )
             for name, r in gate_results.items():
                 gate_flow_results[name] = {
-                    "max_velocity_m_s": float(r.max_velocity_m_s),
+                    "section_velocity_m_s": float(r.section_velocity_m_s),
+                    "peak_velocity_m_s": float(r.peak_velocity_m_s),
                     "outlet_flux_m3_s": float(r.outlet_flux_m3_s),
                     "pressure_drop_pa": float(r.pressure_drop_pa),
                     "forchheimer_pressure_drop_pa": float(r.forchheimer_pressure_drop_pa),
@@ -5531,13 +5523,20 @@ def solve_filling_flow(
         for node in gating_nodes:
             if node.name is None or " → " not in node.name:
                 continue
-            downstream = node.name.split(" → ")[-1].strip()
+            parts = [p.strip() for p in node.name.split(" → ")]
+            downstream = parts[-1]
+            upstream = parts[0]
             if downstream in body_to_bidx:
-                mask = body_index == body_to_bidx[downstream]
+                target = downstream
             elif downstream.lower().startswith("par") or downstream.lower() == "part":
-                mask = (orig_grid > 0) & (orig_grid != BodyType.CORE)
+                # Metal leaving an ingate into the part; the upstream gate body
+                # is what should be coloured, not the whole cavity.
+                target = upstream if upstream in body_to_bidx else None
             else:
+                target = None
+            if target is None or body_to_bidx.get(target) is None:
                 continue
+            mask = body_index == body_to_bidx[target]
             v_label = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
             gating_vmag = np.where(mask, v_label, gating_vmag)
         if gating_vmag[fine_metal].any():
