@@ -1157,17 +1157,33 @@ class Analyzer3DViewer(QtInteractor):
             )
             self._section_actors.append(actor)
 
-        # Transparent cutting plane sized to the body bounds
+        # Transparent cutting plane sized to the body bounds.
+        # Sanitise the plane normal: a zero/NaN normal makes vtkPlaneSource
+        # raise "Bad plane coordinate system". Clamp it to a finite unit vector.
+        axis = np.asarray(axis, dtype=np.float64)
+        axis = np.nan_to_num(axis)
+        n = float(np.linalg.norm(axis))
+        if n <= 1e-12:
+            axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        else:
+            axis = axis / n
+        point = np.asarray(point, dtype=np.float64)
+        point = np.nan_to_num(point)
+
         bounds = body.mesh.bounds
         diag = float(np.linalg.norm(bounds[1] - bounds[0]))
-        if diag <= 0:
+        if diag <= 0 or not np.isfinite(diag):
             diag = 50.0
-        plane = pv.Plane(
-            center=point,
-            direction=axis,
-            i_size=diag,
-            j_size=diag,
-        )
+        try:
+            plane = pv.Plane(
+                center=point,
+                direction=axis,
+                i_size=diag,
+                j_size=diag,
+            )
+        except Exception as exc:
+            print(f"[section] Plane creation failed: {exc}")
+            return
         actor = self.add_mesh(
             plane,
             color="#00ffff",

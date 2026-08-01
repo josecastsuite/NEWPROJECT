@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <queue>
+#include <utility>
 #include <vector>
 
 namespace nb = nanobind;
@@ -101,12 +103,16 @@ public:
         }
         if (dt_ <= 0.0) dt_ = 1e-6;
         target_scale_ = dt_ / dx_;
+        // Take ownership of externally supplied target/distance arrays, or
+        // compute them internally from the gating geometry when omitted.
         if (target_velocity != nullptr) {
-            target_velocity_ = target_velocity;
+            target_velocity_owned_.assign(target_velocity, target_velocity + 3 * n_);
+            target_velocity_ = target_velocity_owned_.data();
             has_target_ = true;
         }
         if (inlet_distance != nullptr) {
-            inlet_distance_ = inlet_distance;
+            inlet_distance_owned_.assign(inlet_distance, inlet_distance + n_);
+            inlet_distance_ = inlet_distance_owned_.data();
             has_inlet_dist_ = true;
         }
 
@@ -133,6 +139,15 @@ public:
         for (size_t i = 0; i < n_; ++i) {
             if (inlet_mask[i]) flags_[i] = 2;
             if (outlet_mask[i]) flags_[i] = 3;
+        }
+
+        // If the caller did not supply a target velocity and/or inlet-distance
+        // field, build them here from a 26-neighbour geodesic distance field
+        // inside the cavity.  This lets Python call the solver with 12
+        // positional arguments while the LBM still receives a proper initial
+        // front and a directional body force.
+        if (!has_target_ || !has_inlet_dist_) {
+            build_geodesic_target();
         }
 
         // Compute a local outward normal for each outlet cell from its solid/boundary neighbours.
@@ -339,6 +354,135 @@ private:
     const double* inlet_distance_ = nullptr;
     bool has_inlet_dist_ = false;
     int current_step_ = 0;
+
+    std::vector<double> target_velocity_owned_;
+    std::vector<double> inlet_distance_owned_;
+
+    void build_geodesic_target() {
+        // 26-neighbour Dijkstra from inlet cells within the cavity.
+        std::vector<double> dist(n_, std::numeric_limits<double>::infinity());
+        using PQItem = std::pair<double, size_t>;
+        std::priority_queue<PQItem, std::vector<PQItem>, std::greater<PQItem>> pq;
+
+        auto linear_to_ijk = [&](size_t idx, int& x, int& y, int& z) {
+            x = static_cast<int>(idx / (ny_ * nz_));
+            size_t rem = idx % (ny_ * nz_);
+            y = static_cast<int>(rem / nz_);
+            z = static_cast<int>(rem % nz_);
+        };
+
+        for (size_t i = 0; i < n_; ++i) {
+            if (flags_[i] == 2) {
+                dist[i] = 0.0;
+                pq.emplace(0.0, i);
+            }
+        }
+
+        while (!pq.empty()) {
+            auto [d, i] = pq.top();
+            pq.pop();
+            if (d > dist[i] + 1e-12) continue;
+            int x, y, z;
+            linear_to_ijk(i, x, y, z);
+            for (int dz = -1; dz <= 1; ++dz) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0 && dz == 0) continue;
+                        int nx2 = x + dx, ny2 = y + dy, nz2 = z + dz;
+                        if (!in_cell(nx2, ny2, nz2, nx_, ny_, nz_)) continue;
+                        size_t j = cidx(nx2, ny2, nz2, ny_, nz_);
+                        if (flags_[j] == 1) continue; // solid
+                        double w = std::sqrt(static_cast<double>(dx * dx + dy * dy + dz * dz));
+                        double nd = d + w;
+                        if (nd + 1e-12 < dist[j]) {
+                            dist[j] = nd;
+                            pq.emplace(nd, j);
+                        }
+                    }
+                }
+            }
+        }
+
+        inlet_distance_owned_ = std::move(dist);
+        inlet_distance_ = inlet_distance_owned_.data();
+        has_inlet_dist_ = true;
+
+        // Derive a target velocity field from the geodesic-distance gradient.
+        // The gradient points away from the inlet (flow direction); normalise it
+        // and scale by the inflow velocity.
+        target_velocity_owned_.assign(3 * n_, 0.0);
+        for (size_t i = 0; i < n_; ++i) {
+            if (flags_[i] == 1) continue; // solid
+            int x, y, z;
+            linear_to_ijk(i, x, y, z);
+            double gx = 0.0, gy = 0.0, gz = 0.0;
+            bool has_x = false, has_y = false, has_z = false;
+
+            auto dist_at = [&](int xx, int yy, int zz) -> double {
+                if (!in_cell(xx, yy, zz, nx_, ny_, nz_)) return std::numeric_limits<double>::infinity();
+                size_t j = cidx(xx, yy, zz, ny_, nz_);
+                return (flags_[j] == 1) ? std::numeric_limits<double>::infinity() : inlet_distance_owned_[j];
+            };
+
+            double d0 = inlet_distance_owned_[i];
+            double d_xm = dist_at(x - 1, y, z);
+            double d_xp = dist_at(x + 1, y, z);
+            if (std::isfinite(d_xm) && std::isfinite(d_xp)) {
+                gx = (d_xp - d_xm) * 0.5;
+                has_x = true;
+            } else if (std::isfinite(d_xp) && std::isfinite(d0)) {
+                gx = d_xp - d0;
+                has_x = true;
+            } else if (std::isfinite(d_xm) && std::isfinite(d0)) {
+                gx = d0 - d_xm;
+                has_x = true;
+            }
+
+            double d_ym = dist_at(x, y - 1, z);
+            double d_yp = dist_at(x, y + 1, z);
+            if (std::isfinite(d_ym) && std::isfinite(d_yp)) {
+                gy = (d_yp - d_ym) * 0.5;
+                has_y = true;
+            } else if (std::isfinite(d_yp) && std::isfinite(d0)) {
+                gy = d_yp - d0;
+                has_y = true;
+            } else if (std::isfinite(d_ym) && std::isfinite(d0)) {
+                gy = d0 - d_ym;
+                has_y = true;
+            }
+
+            double d_zm = dist_at(x, y, z - 1);
+            double d_zp = dist_at(x, y, z + 1);
+            if (std::isfinite(d_zm) && std::isfinite(d_zp)) {
+                gz = (d_zp - d_zm) * 0.5;
+                has_z = true;
+            } else if (std::isfinite(d_zp) && std::isfinite(d0)) {
+                gz = d_zp - d0;
+                has_z = true;
+            } else if (std::isfinite(d_zm) && std::isfinite(d0)) {
+                gz = d0 - d_zm;
+                has_z = true;
+            }
+
+            if ((has_x || has_y || has_z) &&
+                std::isfinite(gx) && std::isfinite(gy) && std::isfinite(gz)) {
+                double mag = std::sqrt(gx * gx + gy * gy + gz * gz);
+                if (mag > 1e-12) {
+                    double s = inflow_velocity_ / mag;
+                    target_velocity_owned_[i] = gx * s;
+                    target_velocity_owned_[n_ + i] = gy * s;
+                    target_velocity_owned_[2 * n_ + i] = gz * s;
+                    continue;
+                }
+            }
+            // Fallback: use the (normalised) gravity vector.
+            target_velocity_owned_[i] = gx_ * inflow_velocity_;
+            target_velocity_owned_[n_ + i] = gy_ * inflow_velocity_;
+            target_velocity_owned_[2 * n_ + i] = gz_ * inflow_velocity_;
+        }
+        target_velocity_ = target_velocity_owned_.data();
+        has_target_ = true;
+    }
 
     void compute_macroscopic() {
         for (size_t idx = 0; idx < fluid_list_.size(); ++idx) {

@@ -5405,37 +5405,10 @@ def solve_filling_flow(
                 # C++ binding expects a plain Python list for the gravity vector.
                 lbm_g = [float(x) for x in g]
 
-                # Fast 26-neighbour geodesic field for the LBM initial condition.
-                geodesic_voxels = _geodesic_distance_field(vof_cavity, vof_inlet)
-                finite_mask = np.isfinite(geodesic_voxels) & vof_cavity
-                max_finite = (
-                    float(geodesic_voxels[finite_mask].max()) if finite_mask.any() else 0.0
-                )
-                dt_voxels = ndimage.distance_transform_edt(vof_cavity & ~vof_inlet)
-                geodesic_voxels = np.where(
-                    np.isfinite(geodesic_voxels),
-                    geodesic_voxels,
-                    max_finite + dt_voxels + 5.0,
-                )
-                dist_m = geodesic_voxels * vof_dx_m
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    grad_dist = np.gradient(dist_m, vof_dx_m)
-                    mag_d = np.sqrt(sum(g * g for g in grad_dist))
-                    mag_safe = np.where(mag_d > 1e-18, mag_d, 1.0)
-                    ux = grad_dist[0] / mag_safe * vof_inflow_v
-                    vy = grad_dist[1] / mag_safe * vof_inflow_v
-                    wz = grad_dist[2] / mag_safe * vof_inflow_v
-                lbm_target_velocity = np.ascontiguousarray(
-                    np.stack([ux, vy, wz], axis=0), dtype=np.float64
-                )
-                lbm_inlet_distance = np.ascontiguousarray(
-                    geodesic_voxels.astype(np.float64, copy=False)
-                )
-
-                # The compiled C++ LBM accepts target_velocity/inlet_distance as
-                # the 13th and 14th positional arguments.  Passing them as keyword
-                # arguments fails on the precompiled Windows .pyd, which exposes
-                # them as positional-only optional arguments.
+                # The compiled C++ LBM is called with exactly 12 positional
+                # arguments.  Older Windows .pyd builds expose 12 positional-only
+                # arguments; newer builds have default optional target_velocity /
+                # inlet_distance arrays, so 12 arguments is safe on both.
                 print(
                     f"[LBM] C++ D3Q19 solve starting: grid={vof_grid.shape}, "
                     f"dx={vof_dx_m:.4f} m, inflow={vof_inflow_v:.3f} m/s, t_max={t_max_vof:.3f} s",
@@ -5465,8 +5438,6 @@ def solve_filling_flow(
                     int(os.environ.get("JOSECAST_CPP_LBM_MAX_STEPS", "12000")),
                     float(os.environ.get("JOSECAST_CPP_LBM_CFL", "0.3")),
                     float(os.environ.get("JOSECAST_CPP_LBM_SMAG", "0.18")),
-                    lbm_target_velocity,
-                    lbm_inlet_distance,
                 )
                 vof_res = {
                     "fill_time": ft,
