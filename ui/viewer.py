@@ -162,6 +162,9 @@ class Analyzer3DViewer(QtInteractor):
         self._flow_arrow_actor = None
         self._flow_colorbar_actor = None
         self._mold_wall_actor = None
+        self._cold_shot_actor = None
+        self._cold_shot_scalar_bar_actor = None
+        self._last_fill_actor = None
         self.flow_animator = FlowAnimator(self)
         self._body_legend_actor = None
         self._bodies: List[Body] = []
@@ -254,6 +257,9 @@ class Analyzer3DViewer(QtInteractor):
         self._flow_arrow_actor = None
         self._flow_colorbar_actor = None
         self._mold_wall_actor = None
+        self._cold_shot_actor = None
+        self._cold_shot_scalar_bar_actor = None
+        self._last_fill_actor = None
         self._body_legend_actor = None
         self._bodies = []
         self._body_index = None
@@ -1054,6 +1060,76 @@ class Analyzer3DViewer(QtInteractor):
                 self.remove_actor(self._mold_wall_actor)
                 self._mold_wall_actor = None
             self._remove_scalar_bar("Kalıp şişmesi (%)")
+
+    def show_cold_shot_risk(self, result: Optional[AnalysisResult]):
+        """Heatmap of cold-shut (soğuk birleşme) risk on the part surface.
+
+        Risk values below 0.3 are made transparent.  Values between 0.3 and 1.0
+        are shown with a yellow-orange-red heatmap.  The latest-filled voxel is
+        marked with a red sphere so the operator sees where air/oxide is most
+        likely trapped.
+        """
+        if self._cold_shot_actor is not None:
+            self.remove_actor(self._cold_shot_actor)
+            self._cold_shot_actor = None
+        if self._last_fill_actor is not None:
+            self.remove_actor(self._last_fill_actor)
+            self._last_fill_actor = None
+        self._remove_scalar_bar("Soğuk birleşme riski")
+
+        if result is None or result.cold_shot_risk is None or result.cold_shot_risk.size == 0:
+            return
+
+        grid = self._make_grid(result, result.cold_shot_risk, "cold_shot_risk")
+        part = self._part_only(grid)
+        if part.n_cells == 0:
+            return
+
+        # Threshold: only show risk >= 0.3, per protocol.
+        cells = part.threshold(0.3, scalars="cold_shot_risk", all_scalars=True)
+        if cells.n_cells == 0:
+            return
+
+        vmax = float(np.percentile(cells["cold_shot_risk"], 99))
+        if vmax <= 0.3:
+            vmax = 1.0
+        clim = [0.3, vmax]
+
+        self._cold_shot_actor = self.add_mesh(
+            cells,
+            scalars="cold_shot_risk",
+            cmap="YlOrRd",
+            opacity=0.85,
+            clim=clim,
+            show_scalar_bar=True,
+            scalar_bar_args=_scalar_bar_args("Soğuk birleşme riski", (0.02, 0.02), clim=clim),
+            smooth_shading=True,
+        )
+
+        # Last-fill point marker: red sphere at the latest-filled voxel.
+        if result.last_fill_point_mm is not None and result.last_fill_point_mm.size == 3:
+            radius = max(float(result.dx_mm) * 2.0, 2.0)
+            sphere = pv.Sphere(radius=radius, center=result.last_fill_point_mm)
+            self._last_fill_actor = self.add_mesh(
+                sphere,
+                color="red",
+                opacity=0.9,
+                show_scalar_bar=False,
+            )
+
+        self._arrange_scalar_bars()
+
+    def toggle_cold_shot_risk(self, result: AnalysisResult, checked: bool):
+        if checked:
+            self.show_cold_shot_risk(result)
+        else:
+            if self._cold_shot_actor is not None:
+                self.remove_actor(self._cold_shot_actor)
+                self._cold_shot_actor = None
+            if self._last_fill_actor is not None:
+                self.remove_actor(self._last_fill_actor)
+                self._last_fill_actor = None
+            self._remove_scalar_bar("Soğuk birleşme riski")
 
     def toggle_feeding_paths(self, result: AnalysisResult, checked: bool):
         if checked:

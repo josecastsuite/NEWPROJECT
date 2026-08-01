@@ -469,6 +469,9 @@ class AnalysisResult:
     pore_size_fine_mask: np.ndarray = field(default_factory=lambda: np.array([]))
     # v10.3: per-voxel mold wall movement risk from unabsorbed graphite expansion
     mold_wall_movement: np.ndarray = field(default_factory=lambda: np.array([]))
+    # v10.4: per-voxel cold-shut (cold shot) risk and the last fill location
+    cold_shot_risk: np.ndarray = field(default_factory=lambda: np.array([]))
+    last_fill_point_mm: np.ndarray = field(default_factory=lambda: np.array([]))
     # v8.9: per-class display filters (top % of computed porosity to display)
     pore_size_noise_percent: float = 3.0
     pore_size_threshold_um: float = 0.0

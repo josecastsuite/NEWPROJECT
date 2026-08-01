@@ -609,6 +609,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mold_wall_toggle.toggled.connect(self.on_toggle_mold_wall_movement)
         vis_layout.addWidget(self.mold_wall_toggle)
 
+        self.cold_shot_toggle = QtWidgets.QCheckBox("Soğuk Birleşme Riski")
+        self.cold_shot_toggle.setToolTip("Düşük sıcaklık ve yavaş cephe hızından kaynaklanan soğuk birleşme riski")
+        self.cold_shot_toggle.setChecked(False)
+        self.cold_shot_toggle.toggled.connect(self.on_toggle_cold_shot_risk)
+        vis_layout.addWidget(self.cold_shot_toggle)
+
         anim_group = QtWidgets.QGroupBox("Akış & Katılaşma")
         anim_layout = QtWidgets.QVBoxLayout(anim_group)
 
@@ -1201,6 +1207,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.viewer.toggle_flow_velocity(self._analysis, True)
             if self.mold_wall_toggle.isChecked():
                 self.viewer.toggle_mold_wall_movement(self._analysis, True)
+            if self.cold_shot_toggle.isChecked():
+                self.viewer.toggle_cold_shot_risk(self._analysis, True)
             if self.path_toggle.isChecked():
                 self.viewer.show_feeding_paths(self._analysis)
             if self.local_toggle.isChecked():
@@ -1542,6 +1550,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_toggle_mold_wall_movement(self, checked: bool):
         if self._analysis:
             self.viewer.toggle_mold_wall_movement(self._analysis, checked)
+
+    def on_toggle_cold_shot_risk(self, checked: bool):
+        if self._analysis:
+            self.viewer.toggle_cold_shot_risk(self._analysis, checked)
 
     def _update_flow_controls(self):
         has_flow = bool(self._analysis and self._analysis.flow_result)

@@ -157,6 +157,12 @@ def main():
             print(f"    fill_time coverage: {filled}/{total} metal voxels ({100*filled/total:.2f}%)")
             print(f"    inlet cells (ft=0): {inlet_cells.sum()}, unfilled (ft>=sentinel): {unfilled.sum()}")
 
+    if result.cold_shot_risk is not None and result.cold_shot_risk.size:
+        risk = result.cold_shot_risk
+        print(f"  Cold shot risk: max={float(np.max(risk)):.4f}, "
+              f"cells>0.3={int(np.sum(risk > 0.3))}, cells>0.5={int(np.sum(risk > 0.5))}")
+        print(f"  Last fill point: {result.last_fill_point_mm}")
+
     print("Generating HTML report ...")
     html_path = os.path.join(args.out_dir, "test_report.html")
     _generate_html(result, html_path)

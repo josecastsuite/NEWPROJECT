@@ -738,6 +738,200 @@ def compute_pore_size(
     )
 
 
+def compute_cold_shot_risk(
+    part_mask: np.ndarray,
+    fill_time: Optional[np.ndarray],
+    velocity_magnitude: Optional[np.ndarray],
+    temperature: np.ndarray,
+    t_solid: np.ndarray,
+    M_mod: np.ndarray,
+    alloy: Alloy,
+    t_pour_c: float,
+    t_mold_c: float,
+    dx: float,
+    origin_mm: np.ndarray,
+    t_liq: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Estimate per-voxel cold-shut (soğuk birleşme) risk and the last fill point.
+
+    The risk is the product of four normalised factors:
+        temperature_factor    : how cold the metal is when the front reaches the cell
+        fill_delay_factor     : how late the cell fills relative to the last-filled cell
+        low_velocity_factor   : how far below the critical front velocity the flow is
+        thin_section_factor   : how thin the local section is (small modulus -> high risk)
+
+    Returns ``(cold_shot_risk, last_fill_point_mm)``.  ``last_fill_point_mm`` is
+    an empty array when no valid fill data exists.
+    """
+    if fill_time is None or fill_time.size == 0:
+        return (
+            np.zeros_like(part_mask, dtype=np.float64),
+            np.array([], dtype=np.float64),
+        )
+
+    part_mask = part_mask.astype(bool)
+    ft = np.asarray(fill_time, dtype=np.float64)
+    # Sentinel values in flow_result.fill_time mark unfilled cells.
+    valid_fill = part_mask & (ft < 1.0e6) & np.isfinite(ft) & (ft >= 0.0)
+
+    # fill_delay_factor: 0 at the first-filled cells, 1 at the last-filled cells.
+    fill_delay_factor = np.zeros_like(ft, dtype=np.float64)
+    if valid_fill.any():
+        t_max = float(np.max(ft[valid_fill]))
+        if t_max > 0.0:
+            fill_delay_factor[valid_fill] = ft[valid_fill] / t_max
+    fill_delay_factor = np.clip(fill_delay_factor, 0.0, 1.0)
+
+    # low_velocity_factor: 1 when the front is essentially stopped,
+    # 0 when it is above the material-specific critical velocity.
+    v_mag = (
+        np.asarray(velocity_magnitude, dtype=np.float64)
+        if velocity_magnitude is not None
+        else np.zeros_like(part_mask, dtype=np.float64)
+    )
+    v_threshold = float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.5))
+    if v_threshold <= 1e-9:
+        v_threshold = 0.5
+
+    # If the per-voxel Darcy velocity is not populated in the part, estimate the
+    # local front speed from the fill time progression: the front is fastest at
+    # the beginning of filling and slows as it reaches remote/late-fill regions.
+    # This is a conservative, geometry-aware proxy for the metal front velocity.
+    if not np.any((v_mag > 1e-9) & part_mask):
+        v_front = np.where(
+            part_mask,
+            v_threshold * (1.0 - fill_delay_factor),
+            0.0,
+        )
+        v_local = v_front
+    else:
+        v_local = v_mag
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        low_velocity_factor = np.where(
+            part_mask,
+            1.0 - np.clip(v_local / v_threshold, 0.0, 1.0),
+            0.0,
+        )
+    low_velocity_factor = np.clip(np.nan_to_num(low_velocity_factor, nan=0.0), 0.0, 1.0)
+
+    # temperature_factor: 0 when the metal reaching the cell is still hotter
+    # than T_liquidus + 30 °C, rising linearly to 1 at/below T_solidus.
+    t_liq_c = float(alloy.t_liquidus_c)
+    t_sol_c = float(alloy.t_solidus_c)
+    T_high = t_liq_c + 30.0
+    T_low = t_sol_c
+
+    # Prefer the actual per-voxel liquidus/solidus times from the thermal solver.
+    # They are already shifted by the local metal arrival time.  Cold shuts form
+    # at the surface of the advancing front, not at the bulk centre, so the
+    # surface temperature is evaluated at a subsurface depth equal to 25 % of
+    # the local modulus (≈ 12.5 % of the wall thickness).  The solidification
+    # time at that depth scales quadratically with the depth.
+    T_meet = np.full_like(ft, t_pour_c, dtype=np.float64)
+    if t_liq is not None and t_liq.size == ft.size and np.any(np.isfinite(t_liq)):
+        t_liq_arr = np.asarray(t_liq, dtype=np.float64)
+        t_sol_arr = np.asarray(t_solid, dtype=np.float64)
+        fin = (
+            part_mask
+            & np.isfinite(t_liq_arr)
+            & np.isfinite(t_sol_arr)
+            & (t_liq_arr > 1e-6)
+            & (t_sol_arr > t_liq_arr)
+        )
+
+        # Surface-near solidification times (t ∝ depth^2, depth = 0.25 * M_mod).
+        surface_scale = 0.25 * 0.25
+        t_liq_surf = np.where(fin, t_liq_arr * surface_scale, np.inf)
+        t_sol_surf = np.where(fin, t_sol_arr * surface_scale, np.inf)
+
+        # Time at which the surface reaches T_liquidus + 30 during the initial
+        # superheat removal (T_pour -> T_liquidus over [0, t_liq_surf]).
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t_super = np.where(
+                fin & (t_pour_c > t_liq_c) & (T_high < t_pour_c),
+                t_liq_surf * (t_pour_c - T_high) / (t_pour_c - t_liq_c),
+                0.0,
+            )
+            t_super = np.clip(t_super, 0.0, np.maximum(t_liq_surf, 0.0))
+
+        # segment 1: initial superheat removal (T_pour -> T_liquidus)
+        m1 = fin & (ft < t_liq_surf) & (t_liq_surf > 1e-9)
+        T_meet = np.where(
+            m1,
+            t_pour_c - (t_pour_c - t_liq_c) * (ft / np.maximum(t_liq_surf, 1e-9)),
+            T_meet,
+        )
+
+        # segment 2: solidifying through the mushy zone (T_liquidus -> T_solidus)
+        with np.errstate(invalid="ignore"):
+            denom_ts = np.where(fin, np.maximum(t_sol_surf - t_liq_surf, 1e-9), 1.0)
+        m2 = fin & (ft >= t_liq_surf) & (ft < t_sol_surf) & (t_liq_surf < t_sol_surf)
+        T_meet = np.where(
+            m2,
+            t_liq_c - (t_liq_c - t_sol_c) * ((ft - t_liq_surf) / denom_ts),
+            T_meet,
+        )
+
+        # segment 3: already below T_solidus at the surface when the front arrives
+        m3 = fin & (ft >= t_sol_surf)
+        T_meet = np.where(m3, t_sol_c, T_meet)
+    else:
+        # Fallback: Chvorinov-based local cooling rate using the local modulus.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cooling_rate = np.where(
+                part_mask & (t_solid > 1e-9),
+                (t_pour_c - t_sol_c) / t_solid,
+                1e-3,
+            )
+        T_meet = t_pour_c - ft * cooling_rate
+
+    T_meet = np.clip(T_meet, t_mold_c, t_pour_c)
+
+    if T_high <= T_low:
+        T_high = t_liq_c + 0.01
+        T_low = t_sol_c
+    denom = T_high - T_low
+    with np.errstate(divide="ignore", invalid="ignore"):
+        temperature_factor = np.where(
+            part_mask,
+            np.clip((T_high - T_meet) / denom, 0.0, 1.0),
+            0.0,
+        )
+    temperature_factor = np.clip(np.nan_to_num(temperature_factor, nan=0.0), 0.0, 1.0)
+
+    # thin_section_factor: smaller local modulus -> thinner section -> higher risk.
+    m_mod_safe = np.where(part_mask, np.asarray(M_mod, dtype=np.float64), np.inf)
+    finite_m = m_mod_safe[np.isfinite(m_mod_safe) & (m_mod_safe > 0.0)]
+    m_ref = float(np.percentile(finite_m, 10)) if finite_m.size > 0 else float(dx)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        thin_section_factor = np.clip(
+            m_ref / np.maximum(m_mod_safe, m_ref),
+            0.0,
+            1.0,
+        )
+    thin_section_factor = np.where(part_mask, thin_section_factor, 0.0)
+
+    cold_shot_risk = (
+        temperature_factor
+        * fill_delay_factor
+        * low_velocity_factor
+        * thin_section_factor
+    )
+    cold_shot_risk = np.clip(np.nan_to_num(cold_shot_risk, nan=0.0), 0.0, 1.0)
+
+    # last fill point: coordinate of the latest-filled part voxel.
+    last_fill_point_mm = np.array([], dtype=np.float64)
+    if valid_fill.any():
+        masked = np.where(valid_fill, ft, -1.0)
+        flat_idx = int(np.argmax(masked))
+        idx = np.unravel_index(flat_idx, ft.shape)
+        point = np.asarray(origin_mm, dtype=np.float64) + np.array(idx, dtype=np.float64) * float(dx)
+        last_fill_point_mm = point
+
+    return cold_shot_risk, last_fill_point_mm
+
+
 def directional_feed_efficiency(
     t_s: np.ndarray,
     feeder_mask: np.ndarray,
@@ -2813,6 +3007,22 @@ def analyze(
         mold=mold,
     )
 
+    # v10.4: per-voxel cold-shut (soğuk birleşme) risk and the last fill point.
+    cold_shot_risk, last_fill_point_mm = compute_cold_shot_risk(
+        part_mask,
+        fill_time_s,
+        velocity_magnitude,
+        temperature,
+        t_s,
+        M_mod,
+        alloy,
+        t_pour_c=alloy.t_pour_c,
+        t_mold_c=mold.t0_c,
+        dx=dx,
+        origin_mm=origin_mm,
+        t_liq=t_liq,
+    )
+
     # AŞAMA 9: Risk map aligned with the Carlson-Beckermann porosity volume.
     # The predicted pore volume percentage is already reduced by feeding
     # efficiency; convert it to a 0-1 risk field using the macro class limit
@@ -2936,6 +3146,8 @@ def analyze(
         pore_size_micro_mask=pore_micro_mask,
         pore_size_fine_mask=pore_fine_mask,
         mold_wall_movement=mold_wall_movement,
+        cold_shot_risk=cold_shot_risk,
+        last_fill_point_mm=last_fill_point_mm,
         pore_size_noise_percent=pore_macro_percent,
         pore_size_threshold_um=pore_macro_threshold_um,
         pore_size_macro_percent=pore_macro_percent,
