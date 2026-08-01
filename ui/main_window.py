@@ -784,6 +784,8 @@ class MainWindow(QtWidgets.QMainWindow):
         widget = BodyRowWidget(body, BODY_TYPE_NAMES)
 
         widget.body_type_changed.connect(self.on_body_type_changed)
+        widget.body_focused.connect(self.on_body_focused)
+        widget.body_unfocused.connect(self.on_body_unfocused)
         widget.feeder_type_changed.connect(self.on_body_feeder_type_changed)
         widget.feeder_m_changed.connect(self.on_body_feeder_m_changed)
         widget.mold_settings_changed.connect(self.on_body_mold_changed)
@@ -866,6 +868,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if widget is None:
             return
         self.viewer.show_bodies(self._bodies, selected_body=widget.body(), reset_camera=False)
+
+    def on_body_focused(self, body: Body):
+        """Highlight the body whose type dropdown is open."""
+        if self._bodies:
+            self.viewer.show_bodies(self._bodies, selected_body=body, reset_camera=False)
+
+    def on_body_unfocused(self):
+        """Clear the temporary body highlight when the dropdown closes."""
+        if self._bodies:
+            self.viewer.show_bodies(self._bodies, reset_camera=False)
 
     def on_body_feeder_type_changed(self, body: Body, feeder_type: str):
         self.aiLog(

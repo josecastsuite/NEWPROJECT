@@ -164,6 +164,21 @@ class MoldPropertiesDialog(QtWidgets.QDialog):
         self.accept()
 
 
+class BodyTypeComboBox(QtWidgets.QComboBox):
+    """QComboBox that reports when its popup is shown/hidden."""
+
+    popup_shown = QtCore.pyqtSignal()
+    popup_hidden = QtCore.pyqtSignal()
+
+    def showPopup(self):
+        super().showPopup()
+        self.popup_shown.emit()
+
+    def hidePopup(self):
+        super().hidePopup()
+        self.popup_hidden.emit()
+
+
 class BodyRowWidget(QtWidgets.QWidget):
     """Single-line body row with inline, type-conditional feeder / mould controls."""
 
@@ -171,6 +186,8 @@ class BodyRowWidget(QtWidgets.QWidget):
     feeder_type_changed = QtCore.pyqtSignal(Body, str)
     feeder_m_changed = QtCore.pyqtSignal(Body, float)
     mold_settings_changed = QtCore.pyqtSignal(Body)
+    body_focused = QtCore.pyqtSignal(Body)
+    body_unfocused = QtCore.pyqtSignal()
 
     def __init__(
         self,
@@ -214,7 +231,7 @@ class BodyRowWidget(QtWidgets.QWidget):
         )
         layout.addWidget(name_label)
 
-        self._type_combo = QtWidgets.QComboBox()
+        self._type_combo = BodyTypeComboBox()
         self._type_combo.setSizeAdjustPolicy(
             QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents
         )
@@ -226,6 +243,8 @@ class BodyRowWidget(QtWidgets.QWidget):
         for bt, label in self._body_type_names.items():
             self._type_combo.addItem(label, int(bt))
         self._type_combo.currentIndexChanged.connect(self._on_type_changed)
+        self._type_combo.popup_shown.connect(lambda: self.body_focused.emit(self._body))
+        self._type_combo.popup_hidden.connect(self.body_unfocused.emit)
         layout.addWidget(self._type_combo)
 
         # --- Feeder controls: compact, hidden unless RISER ---
