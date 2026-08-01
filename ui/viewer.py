@@ -1,6 +1,6 @@
 """PyVistaQt 3D viewer wrapper for JoseCast Analyzer v8.x."""
 
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyvista as pv
@@ -235,6 +235,7 @@ class Analyzer3DViewer(QtInteractor):
 
     def clear_scene(self):
         self.flow_animator.stop()
+        self._remove_all_scalar_bars()
         self.clear_actors()
         self.add_axes(line_width=2, color="#00ffff")
         self._body_actors.clear()
@@ -313,6 +314,21 @@ class Analyzer3DViewer(QtInteractor):
                 self.remove_scalar_bar(title)
             except Exception:
                 pass
+
+    def _remove_all_scalar_bars(self):
+        for title in list(self.scalar_bars.keys()):
+            self._remove_scalar_bar(title)
+
+    def _arrange_scalar_bars(self):
+        """Stack active scalar bars vertically at the bottom-left to avoid overlap."""
+        try:
+            y = 0.02
+            for _, actor in self.scalar_bars.items():
+                w, h = actor.GetPosition2()
+                actor.SetPosition(0.02, y)
+                y += h + 0.02
+        except Exception:
+            pass
 
     def _make_grid(self, result: AnalysisResult, scalars: np.ndarray, name: str) -> pv.ImageData:
         """Build a PyVista ImageData (voxel grid) with point-centered scalars and masks."""
@@ -460,9 +476,10 @@ class Analyzer3DViewer(QtInteractor):
             opacity=0.65,
             clim=[0.0, 1.0],
             show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Risk", (0.82, 0.02), clim=[0.0, 1.0]),
+            scalar_bar_args=_scalar_bar_args("Risk", (0.02, 0.02), clim=[0.0, 1.0]),
             smooth_shading=True,
         )
+        self._arrange_scalar_bars()
 
     def show_porosity_cloud(
         self,
@@ -620,8 +637,9 @@ class Analyzer3DViewer(QtInteractor):
             opacity=1.0,
             lighting=False,
             show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args(title, (0.82, 0.02), clim=[0.0, max(hi, 1.0)]),
+            scalar_bar_args=_scalar_bar_args(title, (0.02, 0.02), clim=[0.0, max(hi, 1.0)]),
         )
+        self._arrange_scalar_bars()
 
     def show_niyama_isosurfaces(self, result: Optional[AnalysisResult]):
         """Show Niyama isosurfaces (real surfaces) colored by Niyama value inside the part."""
@@ -652,18 +670,20 @@ class Analyzer3DViewer(QtInteractor):
             opacity=0.8,
             clim=[0.0, alloy.niyama_shrinkage * 2.0],
             show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Niyama", (0.82, 0.16), clim=[0.0, alloy.niyama_shrinkage * 2.0]),
+            scalar_bar_args=_scalar_bar_args("Niyama", (0.02, 0.02), clim=[0.0, alloy.niyama_shrinkage * 2.0]),
             smooth_shading=True,
         )
         self._niyama_actors.append(actor)
+        self._arrange_scalar_bars()
 
     def show_flow_velocity(self, result: Optional[AnalysisResult]):
-        """Paint the entire gating system with the real Darcy |v|.
+        """Paint the entire gating system with the physically correct velocity.
 
         Görsellik güzel ama en önemli şey hızların %100 doğru olması.
-        Renklendirme her hücredeki gerçek mutlak hız değerine
-        (|v| = sqrt(vx^2 + vy^2 + vz^2)) göre yapılır; LBM/VOF veya node
-        etiketleri bu alanın üzerine yazmaz.
+        Her gate gövdesi, 3-B gate mesh / Darcy-Forchheimer çözümünden gelen
+        kesit ortalama hızı (Q / A) ile boyanır. Böylece renk, o gövdenin
+        gerçek akış hızını yansıtır. Hücresel Darcy |v| = sqrt(vx^2+vy^2+vz^2)
+        sadece gate mesh verisi yoksa yedek olarak kullanılır.
         """
         if self._flow_actor is not None:
             self.remove_actor(self._flow_actor)
@@ -675,15 +695,9 @@ class Analyzer3DViewer(QtInteractor):
         vmag = fr.velocity_magnitude
         if vmag is None or vmag.size == 0:
             return
-        grid = self._make_grid(result, vmag, "velocity_magnitude")
-        gate = self._gate_only(grid)
-        if gate.n_cells == 0:
-            return
-        surf = self._smooth_surface(gate)
-        if surf.n_points == 0:
-            return
-        # Percentile clamping using only gate cells so a single peak cannot
-        # flatten the whole colour scale.
+
+        # Prefer the section-averaged velocity (Q/A) from the 3-D gate mesh.
+        # It is physically consistent and free of local Darcy/LBM spikes.
         gate_types = [
             BodyType.SPRUE_THROAT,
             BodyType.SPRUE,
@@ -695,15 +709,56 @@ class Analyzer3DViewer(QtInteractor):
             BodyType.FILTER,
         ]
         gate_mask = np.isin(result.grid, gate_types)
-        gate_vals = vmag[gate_mask & np.isfinite(vmag)]
+        body_vmag = np.zeros_like(vmag, dtype=np.float64)
+        body_velocities: Dict[str, float] = {}
+
+        if fr.gate_flow_results:
+            for body_name, gres in fr.gate_flow_results.items():
+                v = float(gres.get("section_velocity_m_s", 0.0))
+                if v > 1e-12:
+                    body_velocities[body_name] = v
+
+        # Fallback from the gating node network where a body lacks a mesh result.
+        for node in getattr(fr, "gating_nodes", []):
+            if "→" not in getattr(node, "name", ""):
+                continue
+            up, down = (p.strip() for p in node.name.split("→"))
+            v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
+            if v > 1e-12:
+                for bn in (up, down):
+                    if not bn:
+                        continue
+                    if bn not in body_velocities or v > body_velocities[bn]:
+                        body_velocities[bn] = v
+
+        if self._bodies is not None and self._body_index is not None:
+            for body in self._bodies:
+                v = body_velocities.get(body.name, 0.0)
+                if v > 1e-12:
+                    mask = (self._body_index == body.index) & gate_mask
+                    body_vmag[mask] = v
+
+        # Any gate cell still without a body-level value uses the local Darcy |v|.
+        body_vmag = np.where((body_vmag == 0) & gate_mask & (vmag > 0) & np.isfinite(vmag), vmag, body_vmag).astype(np.float32)
+
+        grid = self._make_grid(result, body_vmag, "velocity_magnitude")
+        gate = self._gate_only(grid)
+        if gate.n_cells == 0:
+            return
+        surf = self._smooth_surface(gate)
+        if surf.n_points == 0:
+            return
+
+        gate_vals = body_vmag[gate_mask & (body_vmag > 0) & np.isfinite(body_vmag)]
         if gate_vals.size > 0:
             p2 = float(np.percentile(gate_vals, 2.0))
             p98 = float(np.percentile(gate_vals, 98.0))
             if p98 <= p2:
-                p98 = p2 + 1e-9
+                p98 = p2 + max(0.1, 0.05 * abs(p2))
             clim = (p2, p98)
         else:
             clim = (0.0, 1.0)
+
         self._flow_actor = self.add_mesh(
             surf,
             scalars="velocity_magnitude",
@@ -711,9 +766,10 @@ class Analyzer3DViewer(QtInteractor):
             opacity=1.0,
             clim=clim,
             show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.45, 0.02), clim=clim),
+            scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.02, 0.02), clim=clim),
             smooth_shading=True,
         )
+        self._arrange_scalar_bars()
 
     def show_flow_node_labels(self, result: Optional[AnalysisResult]):
         """Add numeric velocity labels at the source inlet and each ingate-part entry."""
@@ -856,11 +912,12 @@ class Analyzer3DViewer(QtInteractor):
                 cmap=cmap,
                 opacity=0.95,
                 show_scalar_bar=first_bar,
-                scalar_bar_args=_scalar_bar_args(title, (0.82, 0.18), clim=slice_clim),
+                scalar_bar_args=_scalar_bar_args(title, (0.02, 0.02), clim=slice_clim),
                 clim=slice_clim,
             )
             self._slice_actors.append(actor)
             first_bar = False
+        self._arrange_scalar_bars()
 
     def show_local_regions(self, result: Optional[AnalysisResult], field: str = "risk"):
         for actor in self._local_actors:
