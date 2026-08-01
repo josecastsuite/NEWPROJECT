@@ -1,5 +1,6 @@
 """PyVistaQt 3D viewer wrapper for JoseCast Analyzer v8.x."""
 
+import heapq
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
@@ -81,6 +82,109 @@ BODY_OPACITY_POST = {
 }
 
 
+def _nearest_body_voxel(
+    body_index: np.ndarray,
+    body_idx: int,
+    origin_mm: np.ndarray,
+    dx_mm: float,
+    point_mm: np.ndarray,
+) -> Optional[Tuple[int, int, int]]:
+    """Return the body voxel closest to a 3-D point."""
+    p = np.asarray(point_mm, dtype=np.float64)
+    vox = np.round((p - origin_mm) / dx_mm - 0.5).astype(int)
+    shape = body_index.shape
+    if all(0 <= vox[i] < shape[i] for i in range(3)) and body_index[tuple(vox)] == body_idx:
+        return tuple(int(x) for x in vox)
+    # Fallback: search all body voxels for the nearest one.
+    coords = np.argwhere(body_index == body_idx)
+    if len(coords) == 0:
+        return None
+    dists = np.linalg.norm((coords + 0.5) * dx_mm + origin_mm - p, axis=1)
+    best = int(np.argmin(dists))
+    return tuple(int(x) for x in coords[best])
+
+
+def _voxel_path_through_body(
+    body_index: np.ndarray,
+    body_idx: int,
+    origin_mm: np.ndarray,
+    dx_mm: float,
+    start_mm: np.ndarray,
+    end_mm: np.ndarray,
+    step: int = 2,
+) -> Optional[np.ndarray]:
+    """Find a 26-neighbor A* path through one body's voxels.
+
+    The returned points are voxel centres plus the exact start/end points so the
+    polyline follows the real body interior instead of a straight chord.
+    """
+    start_v = _nearest_body_voxel(body_index, body_idx, origin_mm, dx_mm, start_mm)
+    end_v = _nearest_body_voxel(body_index, body_idx, origin_mm, dx_mm, end_mm)
+    if start_v is None or end_v is None:
+        return None
+    if start_v == end_v:
+        return np.vstack([start_mm, end_mm])
+
+    mask = body_index == body_idx
+    shape = mask.shape
+    # 26-neighbour offsets and costs
+    neigh = []
+    for iz in (-1, 0, 1):
+        for iy in (-1, 0, 1):
+            for ix in (-1, 0, 1):
+                if iz == 0 and iy == 0 and ix == 0:
+                    continue
+                d = (iz, iy, ix)
+                neigh.append((d, np.sqrt(iz * iz + iy * iy + ix * ix)))
+
+    def heuristic(a, b):
+        return float(np.linalg.norm(np.array(a) - np.array(b)))
+
+    open_set = [(heuristic(start_v, end_v), 0.0, start_v)]
+    g_score = {start_v: 0.0}
+    came_from = {}
+    closed = set()
+
+    while open_set:
+        _, g, cur = heapq.heappop(open_set)
+        if cur in closed:
+            continue
+        closed.add(cur)
+        if cur == end_v:
+            break
+        for off, cost in neigh:
+            nxt = (cur[0] + off[0], cur[1] + off[1], cur[2] + off[2])
+            if any(nxt[i] < 0 or nxt[i] >= shape[i] for i in range(3)):
+                continue
+            if not mask[nxt]:
+                continue
+            if nxt in closed:
+                continue
+            ng = g + cost
+            if nxt not in g_score or ng < g_score[nxt]:
+                g_score[nxt] = ng
+                came_from[nxt] = cur
+                heapq.heappush(open_set, (ng + heuristic(nxt, end_v), ng, nxt))
+
+    if end_v not in came_from and end_v != start_v:
+        return None
+
+    path_v = [end_v]
+    cur = end_v
+    while cur in came_from:
+        cur = came_from[cur]
+        path_v.append(cur)
+    path_v.reverse()
+
+    # Subsample to keep the polyline light but smooth.
+    path_v = path_v[::step]
+    if path_v[-1] != end_v:
+        path_v.append(end_v)
+
+    centres = (np.array(path_v, dtype=np.float64) + 0.5) * dx_mm + origin_mm
+    return np.vstack([np.asarray(start_mm, dtype=np.float64).reshape(1, -1), centres, np.asarray(end_mm, dtype=np.float64).reshape(1, -1)])
+
+
 def _scalar_bar_args(title: str, pos: Tuple[float, float], clim: Optional[Tuple[float, float]] = None) -> dict:
     """Build scalar-bar args that avoid label overlap for the value range."""
     fmt = "%.2f"
@@ -148,6 +252,11 @@ class Analyzer3DViewer(QtInteractor):
         self._flow_arrow_actor = None
         self.flow_animator = FlowAnimator(self)
         self._body_legend_actor = None
+        # voxel data needed to trace flow lines through body interiors
+        self._bodies: List[Body] = []
+        self._body_index: Optional[np.ndarray] = None
+        self._origin_mm: Optional[np.ndarray] = None
+        self._dx_mm: float = 0.0
 
     def _update_body_legend(self, bodies: List[Body]) -> None:
         """Add a top-right PyVista legend showing only body types in the scene."""
@@ -201,6 +310,19 @@ class Analyzer3DViewer(QtInteractor):
         text_prop.SetFontSize(11)
         text_prop.SetBold(0)
 
+    def set_gating_data(
+        self,
+        bodies: List[Body],
+        body_index: np.ndarray,
+        origin_mm: np.ndarray,
+        dx_mm: float,
+    ) -> None:
+        """Store voxel data so flow lines can be traced through body interiors."""
+        self._bodies = list(bodies)
+        self._body_index = np.asarray(body_index)
+        self._origin_mm = np.asarray(origin_mm)
+        self._dx_mm = float(dx_mm)
+
     def clear_scene(self):
         self.flow_animator.stop()
         self.clear_actors()
@@ -219,6 +341,10 @@ class Analyzer3DViewer(QtInteractor):
         self._flow_node_actor = None
         self._flow_arrow_actor = None
         self._body_legend_actor = None
+        self._bodies = []
+        self._body_index = None
+        self._origin_mm = None
+        self._dx_mm = 0.0
         self._clear_section_actors()
 
     def show_bodies(
@@ -647,6 +773,17 @@ class Analyzer3DViewer(QtInteractor):
         if not nodes:
             return
 
+        # Voxel data needed to trace flow lines through body interiors.
+        bodies = getattr(self, "_bodies", [])
+        body_index = getattr(self, "_body_index", None)
+        origin_mm = getattr(self, "_origin_mm", None)
+        dx_mm = float(getattr(self, "_dx_mm", 0.0) or 0.0)
+        body_idx_by_name = {
+            b.name: int(b.index)
+            for b in bodies
+            if getattr(b, "index", None) is not None
+        }
+
         # ---- one continuous colored line per ingate from inlet to ingate-part entry ----
         node_by_downstream: Dict[str, GatingNode] = {}
         for node in nodes:
@@ -656,7 +793,7 @@ class Analyzer3DViewer(QtInteractor):
             if down_name not in node_by_downstream:
                 node_by_downstream[down_name] = node
 
-        points: List[Tuple[float, float, float]] = []
+        points: List[np.ndarray] = []
         lines: List[int] = []
         cell_velocities: List[float] = []
         label_points: List[Tuple[float, float, float]] = []
@@ -685,15 +822,44 @@ class Analyzer3DViewer(QtInteractor):
             if len(path) < 2:
                 continue
 
-            start_idx = len(points)
-            point_index: Dict[int, int] = {}
-            for i, pnode in enumerate(path):
-                point_index[id(pnode)] = start_idx + i
-                points.append(pnode.centroid_mm)
+            # Build segment points through each body so the line follows the
+            # real gate interior instead of a straight chord cutting the part.
+            path_points: List[np.ndarray] = []
+            for i in range(len(path) - 1):
+                n0 = path[i]
+                n1 = path[i + 1]
+                body_name = n0.name.split("→")[1].strip()
+                segment = [np.asarray(n0.centroid_mm, dtype=np.float64)]
+                if (
+                    body_index is not None
+                    and body_name in body_idx_by_name
+                    and dx_mm > 0.0
+                    and origin_mm is not None
+                ):
+                    try:
+                        pts = _voxel_path_through_body(
+                            body_index,
+                            body_idx_by_name[body_name],
+                            origin_mm,
+                            dx_mm,
+                            np.asarray(n0.centroid_mm, dtype=np.float64),
+                            np.asarray(n1.centroid_mm, dtype=np.float64),
+                            step=2,
+                        )
+                        if pts is not None and len(pts) >= 2:
+                            segment = list(pts)
+                    except Exception:
+                        pass
+                if i == 0:
+                    path_points.extend(segment)
+                else:
+                    path_points.extend(segment[1:])
 
-            # One continuous polyline per ingate, coloured by the ingate velocity.
-            line_cells = [len(path)] + [point_index[id(p)] for p in path]
-            lines.extend(line_cells)
+            start_idx = len(points)
+            n_pts = len(path_points)
+            points.extend(path_points)
+            lines.extend([n_pts] + list(range(start_idx, start_idx + n_pts)))
+
             end_v = _node_velocity(node)
             cell_velocities.append(end_v)
 

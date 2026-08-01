@@ -967,6 +967,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.warning(self, "UYARI", msg)
 
             self.viewer.show_bodies(self._bodies)
+            self.viewer.set_gating_data(self._bodies, self._body_index, self._origin, self._dx)
             self.progress.setValue(100)
             self.status_label.setText(
                 f"Voxel grid hazır: {grid.shape} (dx={dx:.3f} mm)"
@@ -1055,6 +1056,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Post-analysis: all bodies are translucent so internal markers,
             # porosity, paths, hot-spots and flow/Niyama overlays are visible.
             self.viewer.show_bodies(self._bodies, reset_camera=True, analysis_mode=True)
+            self.viewer.set_gating_data(self._bodies, self._body_index, self._origin, self._dx)
             if self.risk_toggle.isChecked():
                 self.viewer.show_risk(self._analysis)
             if self.porosity_toggle.isChecked():
