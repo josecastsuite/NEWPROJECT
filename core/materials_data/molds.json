@@ -14,7 +14,8 @@
     "afs_grain_size": 50.0,
     "moisture_percent": 4.0,
     "binder_percent": 2.0,
-    "compactability_percent": 45.0
+    "compactability_percent": 45.0,
+    "mold_rigidity_factor": 0.5
   },
   "green_sand": {
     "key": "green_sand",
@@ -31,7 +32,8 @@
     "afs_grain_size": 50.0,
     "moisture_percent": 4.0,
     "binder_percent": 2.0,
-    "compactability_percent": 45.0
+    "compactability_percent": 45.0,
+    "mold_rigidity_factor": 0.35
   },
   "silica_sand": {
     "key": "silica_sand",
@@ -48,7 +50,8 @@
     "afs_grain_size": 55.0,
     "moisture_percent": 3.5,
     "binder_percent": 2.0,
-    "compactability_percent": 45.0
+    "compactability_percent": 45.0,
+    "mold_rigidity_factor": 0.5
   },
   "chromite_sand": {
     "key": "chromite_sand",
@@ -65,7 +68,8 @@
     "afs_grain_size": 45.0,
     "moisture_percent": 3.0,
     "binder_percent": 2.5,
-    "compactability_percent": 42.0
+    "compactability_percent": 42.0,
+    "mold_rigidity_factor": 0.6
   },
   "zircon_sand": {
     "key": "zircon_sand",
@@ -82,7 +86,8 @@
     "afs_grain_size": 65.0,
     "moisture_percent": 3.0,
     "binder_percent": 2.0,
-    "compactability_percent": 40.0
+    "compactability_percent": 40.0,
+    "mold_rigidity_factor": 0.65
   },
   "metal_mold": {
     "key": "metal_mold",
@@ -99,7 +104,8 @@
     "afs_grain_size": 50.0,
     "moisture_percent": 4.0,
     "binder_percent": 2.0,
-    "compactability_percent": 45.0
+    "compactability_percent": 45.0,
+    "mold_rigidity_factor": 1.0
   },
   "ceramic": {
     "key": "ceramic",
@@ -116,7 +122,8 @@
     "afs_grain_size": 50.0,
     "moisture_percent": 4.0,
     "binder_percent": 2.0,
-    "compactability_percent": 45.0
+    "compactability_percent": 45.0,
+    "mold_rigidity_factor": 0.5
   },
   "furan_resin_sand": {
     "key": "furan_resin_sand",
@@ -133,7 +140,8 @@
     "afs_grain_size": 55.0,
     "moisture_percent": 1.0,
     "binder_percent": 1.5,
-    "compactability_percent": 45.0
+    "compactability_percent": 45.0,
+    "mold_rigidity_factor": 0.5
   },
   "phenolic_resin_sand": {
     "key": "phenolic_resin_sand",
@@ -150,7 +158,8 @@
     "afs_grain_size": 50.0,
     "moisture_percent": 1.0,
     "binder_percent": 2.0,
-    "compactability_percent": 42.0
+    "compactability_percent": 42.0,
+    "mold_rigidity_factor": 0.5
   },
   "sodium_silicate_sand": {
     "key": "sodium_silicate_sand",
@@ -167,7 +176,8 @@
     "afs_grain_size": 50.0,
     "moisture_percent": 0.5,
     "binder_percent": 2.5,
-    "compactability_percent": 45.0
+    "compactability_percent": 45.0,
+    "mold_rigidity_factor": 0.5
   },
   "shell_mold": {
     "key": "shell_mold",
@@ -184,7 +194,8 @@
     "afs_grain_size": 50.0,
     "moisture_percent": 4.0,
     "binder_percent": 2.0,
-    "compactability_percent": 45.0
+    "compactability_percent": 45.0,
+    "mold_rigidity_factor": 0.95
   },
   "investment_ceramic": {
     "key": "investment_ceramic",
@@ -201,7 +212,8 @@
     "afs_grain_size": 50.0,
     "moisture_percent": 4.0,
     "binder_percent": 2.0,
-    "compactability_percent": 45.0
+    "compactability_percent": 45.0,
+    "mold_rigidity_factor": 0.9
   },
   "iron_mold": {
     "key": "iron_mold",
@@ -218,7 +230,8 @@
     "afs_grain_size": 50.0,
     "moisture_percent": 4.0,
     "binder_percent": 2.0,
-    "compactability_percent": 45.0
+    "compactability_percent": 45.0,
+    "mold_rigidity_factor": 1.0
   },
   "graphite_mold": {
     "key": "graphite_mold",
@@ -235,7 +248,8 @@
     "afs_grain_size": 50.0,
     "moisture_percent": 4.0,
     "binder_percent": 2.0,
-    "compactability_percent": 45.0
+    "compactability_percent": 45.0,
+    "mold_rigidity_factor": 0.5
   },
   "copper_chill": {
     "key": "copper_chill",
@@ -252,7 +266,8 @@
     "afs_grain_size": 50.0,
     "moisture_percent": 4.0,
     "binder_percent": 2.0,
-    "compactability_percent": 45.0
+    "compactability_percent": 45.0,
+    "mold_rigidity_factor": 1.0
   },
   "steel_chill": {
     "key": "steel_chill",
@@ -269,7 +284,8 @@
     "afs_grain_size": 50.0,
     "moisture_percent": 4.0,
     "binder_percent": 2.0,
-    "compactability_percent": 45.0
+    "compactability_percent": 45.0,
+    "mold_rigidity_factor": 1.0
   },
   "insulating_sleeve": {
     "key": "insulating_sleeve",
@@ -286,7 +302,8 @@
     "afs_grain_size": 50.0,
     "moisture_percent": 4.0,
     "binder_percent": 2.0,
-    "compactability_percent": 45.0
+    "compactability_percent": 45.0,
+    "mold_rigidity_factor": 0.3
   },
   "exothermic_sleeve": {
     "key": "exothermic_sleeve",
@@ -303,7 +320,8 @@
     "afs_grain_size": 50.0,
     "moisture_percent": 4.0,
     "binder_percent": 2.0,
-    "compactability_percent": 45.0
+    "compactability_percent": 45.0,
+    "mold_rigidity_factor": 0.5
   },
   "ceramic_foam_filter": {
     "key": "ceramic_foam_filter",
@@ -320,6 +338,7 @@
     "afs_grain_size": 50.0,
     "moisture_percent": 4.0,
     "binder_percent": 2.0,
-    "compactability_percent": 45.0
+    "compactability_percent": 45.0,
+    "mold_rigidity_factor": 0.5
   }
 }

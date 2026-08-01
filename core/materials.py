@@ -12,7 +12,7 @@ program keeps running.
 """
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -43,6 +43,7 @@ class MoldMaterial:
     moisture_percent: float = 4.0  # % moisture
     binder_percent: float = 2.0  # % bentonite / binder
     compactability_percent: float = 45.0  # % compactability
+    mold_rigidity_factor: float = 1.0  # 0 = weak green sand, 1 = rigid metal/shell mold
 
     @property
     def diffusivity_mm2_s(self) -> float:
@@ -103,6 +104,16 @@ class Alloy:
     yield_strength_pa: float = 2.5e8
     room_temp_yield_pa: float = 4.0e8
     hot_tear_threshold_strain: float = 0.015
+    # Material family for family-specific shrinkage / expansion models
+    material_family: str = "steel"
+    # Chemical composition (%) for cast-iron carbon equivalent: CE = C + (Si + P)/3
+    C_pct: float = 0.0
+    Si_pct: float = 0.0
+    P_pct: float = 0.0
+    carbon_equivalent: float = -1.0  # < 0 means auto-compute from C/Si/P
+    # Graphite expansion model (cast irons)
+    graphite_expansion_fraction: float = 0.0  # max volume expansion during eutectic
+    inoculation_factor: float = 1.0  # 0 = no inoculation, 1 = strong inoculation
     # Practical porosity acceptance limits [µm] and unavoidable gas/oxide baseline
     micro_pore_limit_um: float = 50.0
     macro_pore_limit_um: float = 500.0
@@ -139,6 +150,10 @@ class Alloy:
     def __post_init__(self):
         if self.density_g_cm3 == 0.0:
             self.density_g_cm3 = self.rho_g_cm3
+        if self.carbon_equivalent < 0.0 and (self.C_pct > 0.0 or self.Si_pct > 0.0 or self.P_pct > 0.0):
+            self.carbon_equivalent = self.C_pct + (self.Si_pct + self.P_pct) / 3.0
+        if self.carbon_equivalent < 0.0:
+            self.carbon_equivalent = 0.0
         if self.niyama_star_scale <= 0.0:
             self.niyama_star_scale = self._niyama_star_scale()
 
@@ -322,6 +337,50 @@ def get_mold(key: str) -> MoldMaterial:
     if key in MOLDS:
         return MOLDS[key]
     return MOLDS.get("sand", next(iter(MOLDS.values())))
+
+
+def make_effective_mold(
+    mold: MoldMaterial,
+    casting_params: Optional[object] = None,
+    body: Optional[object] = None,
+) -> MoldMaterial:
+    """Return a copy of ``mold`` with GUI / per-body overrides applied."""
+    # Use a per-CORE preset if the body provides one.
+    base = mold
+    overrides: Dict[str, float] = {}
+    if body is not None:
+        preset_key = getattr(body, "mold_preset", "")
+        if preset_key and preset_key in MOLDS:
+            base = MOLDS[preset_key]
+        afs = getattr(body, "mold_afs_grain_size", 0.0) or 0.0
+        moisture = getattr(body, "mold_moisture_percent", 0.0) or 0.0
+        binder = getattr(body, "mold_binder_percent", 0.0) or 0.0
+        compact = getattr(body, "mold_compactability_percent", 0.0) or 0.0
+        if afs:
+            overrides["afs_grain_size"] = afs
+        if moisture:
+            overrides["moisture_percent"] = moisture
+        if binder:
+            overrides["binder_percent"] = binder
+        if compact:
+            overrides["compactability_percent"] = compact
+
+    if casting_params is not None:
+        if getattr(casting_params, "mold_afs_grain_size", 0.0):
+            overrides["afs_grain_size"] = casting_params.mold_afs_grain_size
+        if getattr(casting_params, "mold_moisture_percent", 0.0):
+            overrides["moisture_percent"] = casting_params.mold_moisture_percent
+        if getattr(casting_params, "mold_binder_percent", 0.0):
+            overrides["binder_percent"] = casting_params.mold_binder_percent
+        if getattr(casting_params, "mold_compactability_percent", 0.0):
+            overrides["compactability_percent"] = casting_params.mold_compactability_percent
+        rigidity = getattr(casting_params, "mold_rigidity_factor", -1.0)
+        if rigidity >= 0.0:
+            overrides["mold_rigidity_factor"] = rigidity
+
+    if overrides:
+        return replace(base, **overrides)
+    return base
 
 
 # Backwards-compatible aliases

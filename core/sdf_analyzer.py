@@ -25,6 +25,7 @@ from core.materials import (
     chvorinov_c_from_properties,
     get_alloy,
     get_mold,
+    make_effective_mold,
 )
 from core.riser_designer import propose_risers
 from core.thermal_solver import _alloy_to_dict, _dscheil_dT, solve_3d_thermal
@@ -470,7 +471,8 @@ def _carlson_gp_pct(ny_star: np.ndarray, b0: float, key: str = "WCB") -> np.ndar
             -1.654 * np.log10(safe) + 3.052,
             43.05 * np.power(safe, -1.254),
         )
-    return np.clip(gp, 0.0, max(b0, 1e-9))
+    b0_safe = np.maximum(b0, 1e-9) if isinstance(b0, np.ndarray) else max(b0, 1e-9)
+    return np.clip(gp, 0.0, b0_safe)
 
 
 def compute_pore_size(
@@ -486,7 +488,9 @@ def compute_pore_size(
     fill_time: Optional[np.ndarray] = None,
     darcy_factor: Optional[np.ndarray] = None,
     velocity_magnitude: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    solid_fraction: Optional[np.ndarray] = None,
+    mold: Optional[MoldMaterial] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Estimate pore size from the Carlson-Beckermann dimensionless Niyama model.
 
     The engine Niyama field is converted to the dimensionless Ny* via the alloy
@@ -509,10 +513,66 @@ def compute_pore_size(
     mushy-zone resistance) directly scales the predicted pore volume in regions
     where liquid metal cannot be supplied fast enough.
 
+    ``solid_fraction`` and ``mold`` drive the fs-dependent graphite expansion
+    model for cast irons.  ``mold.mold_rigidity_factor`` determines how much of
+    the graphite expansion compensates shrinkage versus pushing the mold wall.
+
     Returns pore_size_um, pore_size_mm, macro_mask, micro_mask, fine_mask,
-    shrinkage_pore_size_um, pore_volume_pct.
+    shrinkage_pore_size_um, pore_volume_pct, mold_wall_movement_pct.
     """
     valid = part_mask & np.isfinite(niyama) & (niyama > 0.0)
+
+    # ---- fs-dependent shrinkage / graphite expansion (cast irons) ----
+    def _graphite_cumulative(fs: np.ndarray) -> np.ndarray:
+        """Cumulative graphite expansion fraction up to the current solid fraction.
+
+        The eutectic tent (peak = 1 at fs_center) is integrated so the total
+        expansion equals ``graphite_expansion_fraction`` once solidification has
+        passed the CE-dependent eutectic band (fs >= fs_end).  Cells inside the
+        band receive a partial, smooth expansion.
+        """
+        family = alloy.material_family
+        if family not in ("gray_iron", "ductile_iron", "white_iron"):
+            return np.zeros_like(fs)
+        ce = max(alloy.carbon_equivalent, 0.0)
+        if ce <= 0.0:
+            return np.zeros_like(fs)
+        fs_center = float(np.clip(0.7 - 0.12 * (ce - 4.3), 0.1, 0.9))
+        fs_half_width = 0.12
+        fs_start = fs_center - fs_half_width
+        fs_end = fs_center + fs_half_width
+        total_area = 0.5 * (fs_end - fs_start)
+        if total_area <= 0.0:
+            return np.zeros_like(fs)
+
+        left = (fs > fs_start) & (fs < fs_center)
+        right = (fs >= fs_center) & (fs < fs_end)
+        full = fs >= fs_end
+        denom_left = max(fs_center - fs_start, 1e-9)
+        denom_right = max(fs_end - fs_center, 1e-9)
+
+        left_area = np.where(left, 0.5 * (fs - fs_start) ** 2 / denom_left, 0.0)
+        mid_area = 0.5 * (fs_center - fs_start)
+        df = np.where(right, fs - fs_center, 0.0)
+        right_area = np.where(right, mid_area + df - 0.5 * df ** 2 / denom_right, 0.0)
+        area = left_area + right_area + np.where(full, total_area, 0.0)
+        return np.clip(area / total_area, 0.0, 1.0)
+
+    fs_input = (
+        solid_fraction
+        if solid_fraction is not None and solid_fraction.shape == niyama.shape
+        else np.zeros_like(niyama)
+    )
+    graphite_frac = _graphite_cumulative(fs_input)
+    rigidity = float(mold.mold_rigidity_factor) if mold is not None else 1.0
+    rigidity = np.clip(rigidity, 0.0, 1.0)
+    expansion = alloy.graphite_expansion_fraction * alloy.inoculation_factor * graphite_frac
+    compensated = expansion * rigidity
+    net_shrink = alloy.shrinkage_factor - compensated
+    b0_eff = np.where(valid, np.clip(net_shrink * 100.0, 0.0, None), alloy.shrinkage_factor * 100.0)
+    mold_wall_movement = np.where(
+        valid, np.clip(expansion * (1.0 - rigidity) * 100.0, 0.0, None), 0.0
+    )
 
     # Directional feeding: a feeder aligned with the solidification front and
     # located above the voxel (opposite to the user-defined gravity vector) is
@@ -524,17 +584,23 @@ def compute_pore_size(
 
     # Optional C++ accelerated porosity map.
     if USE_CPP_POROSITY and JOSECAST_CORE is not None:
-        v_in = (
-            velocity_magnitude.astype(np.float64, copy=False)
-            if velocity_magnitude is not None
-            else np.empty((0,), dtype=np.float64)
+        def _to_3d(arr: Optional[np.ndarray]) -> np.ndarray:
+            if arr is None:
+                return np.empty((0, 0, 0), dtype=np.float64)
+            if arr.ndim == 3:
+                return arr.astype(np.float64, copy=False)
+            if arr.size == 0:
+                return np.empty((0, 0, 0), dtype=np.float64)
+            return arr.astype(np.float64, copy=False)
+
+        v_in = _to_3d(velocity_magnitude)
+        d_in = _to_3d(darcy_factor)
+        fs_in = (
+            solid_fraction.astype(np.float64, copy=False)
+            if solid_fraction is not None and solid_fraction.ndim == 3 and solid_fraction.shape == niyama.shape
+            else np.empty((0, 0, 0), dtype=np.float64)
         )
-        d_in = (
-            darcy_factor.astype(np.float64, copy=False)
-            if darcy_factor is not None
-            else np.empty((0,), dtype=np.float64)
-        )
-        ps_um, ps_mm, macro, micro, fine, shrink, gp = JOSECAST_CORE.compute_porosity(
+        ps_um, ps_mm, macro, micro, fine, shrink, gp, mold_move = JOSECAST_CORE.compute_porosity(
             niyama.astype(np.float64, copy=False),
             M_mod.astype(np.float64, copy=False),
             feed_risk.astype(np.float64, copy=False),
@@ -544,6 +610,12 @@ def compute_pore_size(
             d_in,
             _alloy_to_dict(alloy),
             alloy.carlson_curve_key,
+            alloy.material_family,
+            fs_in,
+            alloy.carbon_equivalent,
+            float(mold.mold_rigidity_factor) if mold is not None else 1.0,
+            alloy.graphite_expansion_fraction,
+            alloy.inoculation_factor,
         )
         return (
             ps_um,
@@ -553,13 +625,14 @@ def compute_pore_size(
             fine.astype(bool),
             shrink,
             gp,
+            mold_move,
         )
 
     feed_factor = np.power(np.clip(feed_risk, 0.0, 1.0), alloy.feed_risk_exponent) * feed_eff
 
     # Carlson-Beckermann dimensionless Niyama -> shrinkage pore volume %.
     ny_star = niyama * alloy.niyama_star_scale
-    b0 = alloy.shrinkage_factor * 100.0  # total solidification shrinkage [%]
+    b0 = b0_eff  # per-voxel effective solidification shrinkage [%]
     gp_pct = _carlson_gp_pct(ny_star, b0, key=alloy.carlson_curve_key)
     # Apply feeding efficiency; keep zero for invalid (surface/boundary) voxels.
     # Where hydrostatic/Darcy balance says the pressure head cannot supply enough
@@ -661,6 +734,7 @@ def compute_pore_size(
         fine_mask,
         shrinkage_pore_size_um,
         gp_pct,
+        mold_wall_movement,
     )
 
 
@@ -2043,6 +2117,7 @@ def analyze(
             rho_kg_m3=casting_params.rho_liquid_kg_m3,
             viscosity_pa_s=casting_params.viscosity_pa_s,
         )
+        mold = make_effective_mold(mold, casting_params=casting_params)
         mold = replace(mold, t0_c=casting_params.t_mold_c)
     chvorinov_c = chvorinov_c_from_properties(alloy, mold)
     gravity_vector = (
@@ -2712,7 +2787,16 @@ def analyze(
         if flow_result_for_thermal is not None and flow_result_for_thermal.velocity_magnitude is not None
         else None
     )
-    pore_size_um, pore_size_mm, pore_macro_mask, pore_micro_mask, pore_fine_mask, pore_shrinkage_um, pore_volume_pct = compute_pore_size(
+    (
+        pore_size_um,
+        pore_size_mm,
+        pore_macro_mask,
+        pore_micro_mask,
+        pore_fine_mask,
+        pore_shrinkage_um,
+        pore_volume_pct,
+        mold_wall_movement,
+    ) = compute_pore_size(
         niyama,
         M_mod,
         feed_risk,
@@ -2725,6 +2809,8 @@ def analyze(
         fill_time=fill_time_s,
         darcy_factor=darcy_factor,
         velocity_magnitude=velocity_magnitude,
+        solid_fraction=solid_fraction,
+        mold=mold,
     )
 
     # AŞAMA 9: Risk map aligned with the Carlson-Beckermann porosity volume.
@@ -2849,6 +2935,7 @@ def analyze(
         pore_size_macro_mask=pore_macro_mask,
         pore_size_micro_mask=pore_micro_mask,
         pore_size_fine_mask=pore_fine_mask,
+        mold_wall_movement=mold_wall_movement,
         pore_size_noise_percent=pore_macro_percent,
         pore_size_threshold_um=pore_macro_threshold_um,
         pore_size_macro_percent=pore_macro_percent,

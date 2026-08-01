@@ -77,5 +77,11 @@ NB_MODULE(josecast_core, m) {
           nb::arg("niyama"), nb::arg("M_mod"), nb::arg("feed_risk"), nb::arg("feed_eff"),
           nb::arg("part_mask"), nb::arg("velocity_magnitude"), nb::arg("darcy_factor"),
           nb::arg("alloy"), nb::arg("carlson_curve_key") = std::string("WCB"),
+          nb::arg("material_family") = std::string(""),
+          nb::arg("solid_fraction") = nb::ndarray<nb::numpy, double>(),
+          nb::arg("carbon_equivalent") = -1.0,
+          nb::arg("mold_rigidity_factor") = -1.0,
+          nb::arg("graphite_expansion_fraction") = -1.0,
+          nb::arg("inoculation_factor") = -1.0,
           "Compute Carlson-Beckermann pore size and volume maps.");
 }

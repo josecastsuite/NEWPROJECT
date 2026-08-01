@@ -32,6 +32,12 @@ class CastingParameters:
     # v10.1: local 3-D gate mesh Darcy–Forchheimer solve.
     # Active by default; the meshpy/TetGen path is loaded lazily per gate body.
     enable_gate_mesh: bool = True
+    # v10.3: global mould-sand property overrides (0 = use preset defaults)
+    mold_afs_grain_size: float = 0.0
+    mold_moisture_percent: float = 0.0
+    mold_binder_percent: float = 0.0
+    mold_compactability_percent: float = 0.0
+    mold_rigidity_factor: float = -1.0  # <0 means derive from preset
 
     @property
     def superheat_c(self) -> float:
@@ -460,6 +466,8 @@ class AnalysisResult:
     pore_size_macro_mask: np.ndarray = field(default_factory=lambda: np.array([]))
     pore_size_micro_mask: np.ndarray = field(default_factory=lambda: np.array([]))
     pore_size_fine_mask: np.ndarray = field(default_factory=lambda: np.array([]))
+    # v10.3: per-voxel mold wall movement risk from unabsorbed graphite expansion
+    mold_wall_movement: np.ndarray = field(default_factory=lambda: np.array([]))
     # v8.9: per-class display filters (top % of computed porosity to display)
     pore_size_noise_percent: float = 3.0
     pore_size_threshold_um: float = 0.0

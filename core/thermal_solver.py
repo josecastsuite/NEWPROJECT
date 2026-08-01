@@ -146,6 +146,10 @@ def _alloy_to_dict(alloy: Alloy) -> dict:
         "niyama_star_scale": alloy.niyama_star_scale,
         "pore_size_um_per_porosity_pct": alloy.pore_size_um_per_porosity_pct,
         "pore_size_length_factor": alloy.pore_size_length_factor,
+        # Cast-iron graphite expansion model data
+        "carbon_equivalent": alloy.carbon_equivalent,
+        "graphite_expansion_fraction": alloy.graphite_expansion_fraction,
+        "inoculation_factor": alloy.inoculation_factor,
     }
 
 
@@ -155,6 +159,11 @@ def _mold_to_dict(mold: MoldMaterial) -> dict:
         "cp_j_kgk": mold.cp_j_kgk,
         "rho_kg_m3": mold.rho_kg_m3,
         "t0_c": mold.t0_c,
+        "mold_rigidity_factor": mold.mold_rigidity_factor,
+        "afs_grain_size": mold.afs_grain_size,
+        "moisture_percent": mold.moisture_percent,
+        "binder_percent": mold.binder_percent,
+        "compactability_percent": mold.compactability_percent,
     }
 
 

@@ -36,6 +36,12 @@ nb::tuple compute_porosity(
     nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> velocity_magnitude,
     nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> darcy_factor,
     std::map<std::string, double> alloy,
-    std::string carlson_curve_key);
+    std::string carlson_curve_key,
+    std::string material_family,
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> solid_fraction,
+    double carbon_equivalent,
+    double mold_rigidity_factor,
+    double graphite_expansion_fraction,
+    double inoculation_factor);
 
 } // namespace josecast

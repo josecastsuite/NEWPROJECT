@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <queue>
 #include <string>
 #include <vector>
 
@@ -122,6 +123,30 @@ nb::tuple solve_thermal(
     const double mold_rho = getd(mold, "rho_kg_m3", 1600.0);
     const double T0 = getd(mold, "t0_c", 25.0);
 
+    // Green-sand / chemically bonded sand property modifiers.
+    const double afs = getd(mold, "afs_grain_size", 50.0);
+    const double moisture = getd(mold, "moisture_percent", 4.0);
+    const double binder = getd(mold, "binder_percent", 2.0);
+    const double compactability = getd(mold, "compactability_percent", 45.0);
+    const bool is_sand_mold = (moisture > 0.0 || afs > 0.0);
+
+    // Empirical corrections: finer sand and more moisture/binder reduce k;
+    // moisture/binder increase effective heat capacity.
+    double k_bulk = mold_k;
+    double cp_bulk = mold_cp;
+    if (is_sand_mold) {
+        k_bulk *= std::max(0.3, 1.0 - 0.0015 * (afs - 50.0))
+                 * std::max(0.5, 1.0 - 0.015 * moisture)
+                 * std::max(0.5, 1.0 - 0.01 * binder)
+                 * std::max(0.5, 1.0 + 0.003 * (compactability - 45.0));
+        cp_bulk *= 1.0 + 0.025 * moisture + 0.005 * binder
+                   - 0.0002 * std::max(0.0, afs - 50.0)
+                   + 0.0003 * std::max(0.0, compactability - 45.0);
+    }
+    // Extra heat capacity in the first 3 mould layers due to water vapourisation.
+    double cp_surface = cp_bulk * (1.0 + 0.04 * std::max(0.0, moisture));
+    double k_surface = k_bulk * std::max(0.5, 1.0 - 0.005 * moisture);
+
     const double chill_k = 45.0;
     const double chill_cp = 460.0;
     const double chill_rho = 7850.0;
@@ -139,18 +164,59 @@ nb::tuple solve_thermal(
     const uint8_t *gating_ptr = is_gating.data();
     const uint8_t *chill_ptr = is_chill.data();
 
-    std::vector<double> T(n, T0), k(n, mold_k), rho(n, mold_rho);
+    std::vector<double> T(n, T0), k(n, k_bulk), rho(n, mold_rho), cp0(n, cp_bulk);
     std::vector<uint8_t> metal(n), gating(n), chill(n);
+    std::vector<int> mold_layer(n, -1);
+    std::queue<size_t> layer_q;
     for (size_t i = 0; i < n; ++i) {
         metal[i] = metal_ptr[i];
         gating[i] = gating_ptr[i];
         chill[i] = chill_ptr[i];
-        double cp0 = mold_cp, k0 = mold_k, r0 = mold_rho;
-        if (metal[i]) { cp0 = metal_cp; k0 = metal_k; r0 = metal_rho; }
-        if (chill[i]) { cp0 = chill_cp; k0 = chill_k; r0 = chill_rho; }
+        double cp_i = cp_bulk, k_i = k_bulk, r_i = mold_rho;
+        if (metal[i]) { cp_i = metal_cp; k_i = metal_k; r_i = metal_rho; }
+        if (chill[i]) { cp_i = chill_cp; k_i = chill_k; r_i = chill_rho; }
         T[i] = metal[i] ? Tp : T0;
-        k[i] = k0;
-        rho[i] = r0;
+        k[i] = k_i;
+        rho[i] = r_i;
+        cp0[i] = cp_i;
+        if (metal[i] || chill[i]) {
+            mold_layer[i] = 0;
+            layer_q.push(i);
+        }
+    }
+
+    // 6-neighbour BFS to identify the first 3 mould layers next to metal/chill.
+    if (is_sand_mold) {
+        auto linear_to_ijk = [&](size_t idx, int& x, int& y, int& z) {
+            z = static_cast<int>(idx % nz);
+            size_t r = idx / nz;
+            y = static_cast<int>(r % ny);
+            x = static_cast<int>(r / ny);
+        };
+        while (!layer_q.empty()) {
+            size_t i = layer_q.front(); layer_q.pop();
+            int x, y, z;
+            linear_to_ijk(i, x, y, z);
+            int d = mold_layer[i];
+            if (d >= 3) continue;
+            const int dxs[6] = {1, -1, 0, 0, 0, 0};
+            const int dys[6] = {0, 0, 1, -1, 0, 0};
+            const int dzs[6] = {0, 0, 0, 0, 1, -1};
+            for (int dir = 0; dir < 6; ++dir) {
+                int nx2 = x + dxs[dir], ny2 = y + dys[dir], nz2 = z + dzs[dir];
+                if (nx2 < 0 || nx2 >= nx || ny2 < 0 || ny2 >= ny || nz2 < 0 || nz2 >= nz) continue;
+                size_t j = cidx(nx2, ny2, nz2, ny, nz);
+                if (mold_layer[j] >= 0 || metal[j] || chill[j]) continue;
+                mold_layer[j] = d + 1;
+                layer_q.push(j);
+            }
+        }
+        for (size_t i = 0; i < n; ++i) {
+            if (mold_layer[i] > 0 && mold_layer[i] <= 3 && !metal[i] && !chill[i]) {
+                k[i] = k_surface;
+                cp0[i] = cp_surface;
+            }
+        }
     }
 
     // ---- fill time and velocity ----
@@ -325,8 +391,7 @@ nb::tuple solve_thermal(
         const double dT_mush = std::max(Tl - Ts, 1.0);
         const double df_cap = 1.0 / dT_mush;
         for (size_t i = 0; i < n; ++i) {
-            double cp = metal[i] ? metal_cp : mold_cp;
-            if (chill[i]) cp = chill_cp;
+            double cp = cp0[i];
             if (metal[i] && L > 0.0) {
                 double df = dscheil_dT(T_adv[i], Tl, Ts, k_part);
                 cp += L * std::max(0.0, std::min(df_cap, df));
@@ -479,7 +544,13 @@ nb::tuple compute_porosity(
     nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> velocity_magnitude,
     nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> darcy_factor,
     std::map<std::string, double> alloy,
-    std::string carlson_curve_key)
+    std::string carlson_curve_key,
+    std::string material_family,
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> solid_fraction,
+    double carbon_equivalent,
+    double mold_rigidity_factor,
+    double graphite_expansion_fraction,
+    double inoculation_factor)
 {
     int nx = static_cast<int>(niyama.shape(0));
     int ny = static_cast<int>(niyama.shape(1));
@@ -503,13 +574,70 @@ nb::tuple compute_porosity(
     const double pore_size_um_per_porosity_pct = getd(alloy, "pore_size_um_per_porosity_pct", 400.0);
     const double pore_size_length_factor = getd(alloy, "pore_size_length_factor", 1.0);
 
-    const double b0 = shrinkage_factor * 100.0;
+    // Cast-iron graphite expansion parameters (may be overridden by caller).
+    const double ce = (carbon_equivalent >= 0.0) ? carbon_equivalent : getd(alloy, "carbon_equivalent", 0.0);
+    const double rigidity = (mold_rigidity_factor >= 0.0) ? mold_rigidity_factor : getd(alloy, "mold_rigidity_factor", 1.0);
+    const double graphite_frac = (graphite_expansion_fraction >= 0.0) ? graphite_expansion_fraction : getd(alloy, "graphite_expansion_fraction", 0.0);
+    const double inoc = (inoculation_factor >= 0.0) ? inoculation_factor : getd(alloy, "inoculation_factor", 1.0);
+
+    const bool use_graphite = (material_family == "gray_iron" ||
+                               material_family == "ductile_iron" ||
+                               material_family == "white_iron") && ce > 0.0;
+
+    // Eutectic solid fraction band derived from carbon equivalent.  CE ≈ 4.3 is
+    // the eutectic composition; hypoeutectic iron reacts later (higher fs),
+    // hypereutectic earlier (lower fs).
+    const double fs_center = use_graphite ? std::max(0.1, std::min(0.9, 0.7 - 0.12 * (ce - 4.3))) : 0.0;
+    const double fs_half_width = 0.12;
+    const double fs_start = fs_center - fs_half_width;
+    const double fs_end = fs_center + fs_half_width;
+
+    // Cumulative graphite expansion fraction up to the current solid fraction.
+    // The eutectic tent (peak = 1 at fs_center) is integrated so that the total
+    // expansion equals graphite_expansion_fraction once solidification has
+    // passed the eutectic band (fs >= fs_end).  Cells inside the band receive a
+    // partial, smooth expansion.
+    const double total_area = 0.5 * (fs_end - fs_start);  // area under the unit tent
+    auto graphite_cumulative = [&](double fs) -> double {
+        if (!use_graphite || total_area <= 0.0) return 0.0;
+        if (fs <= fs_start) return 0.0;
+        if (fs >= fs_end) return 1.0;
+        double area = 0.0;
+        if (fs < fs_center) {
+            double dh = std::max(fs_center - fs_start, 1e-9);
+            area = 0.5 * (fs - fs_start) * (fs - fs_start) / dh;
+        } else {
+            double left_area = 0.5 * (fs_center - fs_start);
+            double dh = std::max(fs_end - fs_center, 1e-9);
+            double df = fs - fs_center;
+            area = left_area + df - 0.5 * df * df / dh;
+        }
+        return std::max(0.0, std::min(1.0, area / total_area));
+    };
+
+    auto effective_b0 = [&](double fs) -> double {
+        double b = shrinkage_factor * 100.0;
+        if (use_graphite) {
+            double expansion = graphite_frac * inoc * graphite_cumulative(fs);
+            double compensated = expansion * std::max(0.0, std::min(1.0, rigidity));
+            b = std::max(0.0, (shrinkage_factor - compensated) * 100.0);
+        }
+        return b;
+    };
+
+    auto mold_movement = [&](double fs) -> double {
+        if (!use_graphite) return 0.0;
+        double expansion = graphite_frac * inoc * graphite_cumulative(fs);
+        return std::max(0.0, expansion * (1.0 - std::max(0.0, std::min(1.0, rigidity))) * 100.0);
+    };
+
     const double sdas_um = dendrite_spacing_mm * 1000.0;
     const double gp_ref = macro_pore_limit_um / std::max(pore_size_um_per_porosity_pct, 1e-9);
 
     bool has_feed_eff = (feed_eff.size() == n);
     bool has_vel = (velocity_magnitude.size() == n);
     bool has_darcy = (darcy_factor.size() == n);
+    bool has_fs = (solid_fraction.size() == n);
 
     const double *ny_ptr = niyama.data();
     const double *M_ptr = M_mod.data();
@@ -518,6 +646,7 @@ nb::tuple compute_porosity(
     const uint8_t *part_ptr = part_mask.data();
     const double *vel_ptr = has_vel ? velocity_magnitude.data() : nullptr;
     const double *darcy_ptr = has_darcy ? darcy_factor.data() : nullptr;
+    const double *fs_ptr = has_fs ? solid_fraction.data() : nullptr;
 
     // find max modulus over the part for m_rel
     double m_max = 1.0;
@@ -525,7 +654,7 @@ nb::tuple compute_porosity(
         if (part_ptr[i] && std::isfinite(M_ptr[i]) && M_ptr[i] > m_max) m_max = M_ptr[i];
     }
 
-    std::vector<double> pore_size_um(n), pore_size_mm(n), shrinkage_um(n), gp_pct(n);
+    std::vector<double> pore_size_um(n), pore_size_mm(n), shrinkage_um(n), gp_pct(n), mold_movement_um(n);
     std::vector<uint8_t> macro_mask(n), micro_mask(n), fine_mask(n);
 
     for (size_t i = 0; i < n; ++i) {
@@ -538,13 +667,18 @@ nb::tuple compute_porosity(
         if (has_feed_eff) feed_e = std::max(0.05, std::min(1.0, fe_ptr[i]));
         double feed_factor = std::pow(feed_r, feed_risk_exponent) * feed_e;
 
+        double fs = (has_fs && std::isfinite(fs_ptr[i])) ? fs_ptr[i] : 0.0;
+        double b0_eff = effective_b0(fs);
+        double movement = mold_movement(fs);
+        mold_movement_um[i] = valid ? movement : 0.0;
+
         double ny_star = ny * niyama_star_scale;
-        double gp = valid ? carlson_gp(ny_star, b0, carlson_curve_key) : 0.0;
+        double gp = valid ? carlson_gp(ny_star, b0_eff, carlson_curve_key) : 0.0;
 
         double dfac = 1.0;
         if (has_darcy && darcy_ptr[i] > 1.0) dfac = darcy_ptr[i];
         double gpv = valid ? gp * feed_factor * dfac : 0.0;
-        gpv = std::max(0.0, std::min(b0, gpv));
+        gpv = std::max(0.0, std::min(b0_eff, gpv));
         gp_pct[i] = gpv;
 
         double max_d_um = std::max(2.0 * M_ptr[i] * 1000.0, sdas_um);
@@ -587,6 +721,7 @@ nb::tuple compute_porosity(
     auto *fine_out = new std::vector<uint8_t>(std::move(fine_mask));
     auto *shrink_out = new std::vector<double>(std::move(shrinkage_um));
     auto *gp_out = new std::vector<double>(std::move(gp_pct));
+    auto *mold_move_out = new std::vector<double>(std::move(mold_movement_um));
 
     std::initializer_list<size_t> shape{static_cast<size_t>(nx), static_cast<size_t>(ny), static_cast<size_t>(nz)};
 
@@ -601,7 +736,7 @@ nb::tuple compute_porosity(
             nb::capsule(v, [](void *p) noexcept { delete static_cast<std::vector<uint8_t> *>(p); }));
     };
 
-    return nb::make_tuple(mkd(ps_out), mkd(psmm_out), mku8(macro_out), mku8(micro_out), mku8(fine_out), mkd(shrink_out), mkd(gp_out));
+    return nb::make_tuple(mkd(ps_out), mkd(psmm_out), mku8(macro_out), mku8(micro_out), mku8(fine_out), mkd(shrink_out), mkd(gp_out), mkd(mold_move_out));
 }
 
 } // namespace josecast

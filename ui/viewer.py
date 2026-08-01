@@ -161,6 +161,7 @@ class Analyzer3DViewer(QtInteractor):
         self._flow_node_actor = None
         self._flow_arrow_actor = None
         self._flow_colorbar_actor = None
+        self._mold_wall_actor = None
         self.flow_animator = FlowAnimator(self)
         self._body_legend_actor = None
         self._bodies: List[Body] = []
@@ -252,6 +253,7 @@ class Analyzer3DViewer(QtInteractor):
         self._flow_node_actor = None
         self._flow_arrow_actor = None
         self._flow_colorbar_actor = None
+        self._mold_wall_actor = None
         self._body_legend_actor = None
         self._bodies = []
         self._body_index = None
@@ -950,6 +952,42 @@ class Analyzer3DViewer(QtInteractor):
             )
             self._local_actors.append(actor)
 
+    def show_mold_wall_movement(self, result: Optional[AnalysisResult]):
+        """Heatmap of regions where graphite expansion pushes the mould wall.
+
+        The movement percentage is positive where the graphite expansion force is
+        not fully absorbed by the mould rigidity (i.e. soft green-sand moulds).
+        """
+        if self._mold_wall_actor is not None:
+            self.remove_actor(self._mold_wall_actor)
+            self._mold_wall_actor = None
+        self._remove_scalar_bar("Kalıp şişmesi (%)")
+        if result is None or result.mold_wall_movement is None or result.mold_wall_movement.size == 0:
+            return
+
+        grid = self._make_grid(result, result.mold_wall_movement, "mold_wall_movement")
+        part = self._part_only(grid)
+        if part.n_cells == 0:
+            return
+        cells = part.threshold(0.05, scalars="mold_wall_movement", all_scalars=True)
+        if cells.n_cells == 0:
+            return
+        vmax = float(np.percentile(cells["mold_wall_movement"], 98))
+        if vmax <= 0.05:
+            vmax = 0.1
+        clim = [0.0, vmax]
+        self._mold_wall_actor = self.add_mesh(
+            cells,
+            scalars="mold_wall_movement",
+            cmap="hot",
+            opacity=0.75,
+            clim=clim,
+            show_scalar_bar=True,
+            scalar_bar_args=_scalar_bar_args("Kalıp şişmesi (%)", (0.02, 0.02), clim=clim),
+            smooth_shading=True,
+        )
+        self._arrange_scalar_bars()
+
     # ---------------- toggles ----------------
     def toggle_risk(self, result: AnalysisResult, checked: bool):
         if checked:
@@ -1007,6 +1045,15 @@ class Analyzer3DViewer(QtInteractor):
             self.flow_animator.set_result(result)
         else:
             self.flow_animator.stop()
+
+    def toggle_mold_wall_movement(self, result: AnalysisResult, checked: bool):
+        if checked:
+            self.show_mold_wall_movement(result)
+        else:
+            if self._mold_wall_actor is not None:
+                self.remove_actor(self._mold_wall_actor)
+                self._mold_wall_actor = None
+            self._remove_scalar_bar("Kalıp şişmesi (%)")
 
     def toggle_feeding_paths(self, result: AnalysisResult, checked: bool):
         if checked:

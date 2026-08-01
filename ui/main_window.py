@@ -24,7 +24,7 @@ from core import (
     get_mold,
     load_step,
 )
-from core.materials import chvorinov_c_from_properties
+from core.materials import chvorinov_c_from_properties, make_effective_mold
 from core.types import Body, BodyType, CastingParameters
 from ui.body_row_widget import BodyRowWidget, FEEDER_TYPE_NAMES
 from ui.section_dialog import SectionDialog
@@ -301,6 +301,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sand_type_combo.currentIndexChanged.connect(self._sync_casting_params_from_materials)
         _settings_labeled(self.sand_type_combo, "Kum tipi:")
 
+        # v10.3: global mould-sand property overrides
+        self.mold_afs_spin = QtWidgets.QDoubleSpinBox()
+        self.mold_afs_spin.setRange(0.0, 200.0)
+        self.mold_afs_spin.setDecimals(1)
+        self.mold_afs_spin.setSuffix(" AFS")
+        _settings_labeled(self.mold_afs_spin, "AFS tane inceliği:")
+
+        self.mold_moisture_spin = QtWidgets.QDoubleSpinBox()
+        self.mold_moisture_spin.setRange(0.0, 30.0)
+        self.mold_moisture_spin.setDecimals(1)
+        self.mold_moisture_spin.setSuffix(" %")
+        _settings_labeled(self.mold_moisture_spin, "Nem oranı:")
+
+        self.mold_binder_spin = QtWidgets.QDoubleSpinBox()
+        self.mold_binder_spin.setRange(0.0, 20.0)
+        self.mold_binder_spin.setDecimals(1)
+        self.mold_binder_spin.setSuffix(" %")
+        _settings_labeled(self.mold_binder_spin, "Bağlayıcı oranı:")
+
+        self.mold_compactability_spin = QtWidgets.QDoubleSpinBox()
+        self.mold_compactability_spin.setRange(0.0, 100.0)
+        self.mold_compactability_spin.setDecimals(1)
+        self.mold_compactability_spin.setSuffix(" %")
+        _settings_labeled(self.mold_compactability_spin, "Compactability:")
+
+        self.mold_rigidity_spin = QtWidgets.QDoubleSpinBox()
+        self.mold_rigidity_spin.setRange(-1.0, 1.0)
+        self.mold_rigidity_spin.setDecimals(2)
+        self.mold_rigidity_spin.setValue(-1.0)
+        self.mold_rigidity_spin.setSuffix(" (-1=auto)")
+        _settings_labeled(self.mold_rigidity_spin, "Kalıp rijitliği:")
+
         # Set defaults after combos exist; block signals to avoid partial sync.
         self.alloy_combo.blockSignals(True)
         self.mold_type_combo.blockSignals(True)
@@ -565,6 +597,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.flow_lines_toggle.toggled.connect(self.on_toggle_flow_velocity)
         vis_layout.addWidget(self.flow_lines_toggle)
 
+        self.mold_wall_toggle = QtWidgets.QCheckBox("Kalıp Şişmesi Riski")
+        self.mold_wall_toggle.setToolTip("Grafit genleşmesinin kalıp duvarını dışarı ittiği bölgeleri göster")
+        self.mold_wall_toggle.setChecked(False)
+        self.mold_wall_toggle.toggled.connect(self.on_toggle_mold_wall_movement)
+        vis_layout.addWidget(self.mold_wall_toggle)
+
         anim_group = QtWidgets.QGroupBox("Akış & Katılaşma")
         anim_layout = QtWidgets.QVBoxLayout(anim_group)
 
@@ -726,10 +764,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sand_type_combo.setVisible(is_sand)
         if hasattr(self.sand_type_combo, "_label"):
             self.sand_type_combo._label.setVisible(is_sand)
+        # v10.3: hide sand-property overrides when not a sand mould
+        for widget in (
+            self.mold_afs_spin,
+            self.mold_moisture_spin,
+            self.mold_binder_spin,
+            self.mold_compactability_spin,
+        ):
+            widget.setVisible(is_sand)
+            if hasattr(widget, "_label"):
+                widget._label.setVisible(is_sand)
 
     def _on_mold_type_changed(self):
         self._update_sand_type_visibility()
+        self._sync_mold_params_from_preset()
         self._sync_casting_params_from_materials()
+
+    def _sync_mold_params_from_preset(self):
+        """Set global mould-sand overrides from the selected preset."""
+        try:
+            mold = get_mold(self._current_mold_key())
+        except Exception:
+            return
+        self.mold_afs_spin.setValue(mold.afs_grain_size)
+        self.mold_moisture_spin.setValue(mold.moisture_percent)
+        self.mold_binder_spin.setValue(mold.binder_percent)
+        self.mold_compactability_spin.setValue(mold.compactability_percent)
+        self.mold_rigidity_spin.setValue(mold.mold_rigidity_factor)
 
     def _sync_casting_params_from_materials(self):
         """Set parameter defaults from the selected alloy and mould."""
@@ -756,6 +817,11 @@ class MainWindow(QtWidgets.QMainWindow):
             gravity_vector=self._gravity_vector_from_ui(),
             hotspot_min_size_mm=self.hs_min_size_spin.value(),
             hotspot_cluster_eps_mm=self.hs_cluster_eps_spin.value(),
+            mold_afs_grain_size=self.mold_afs_spin.value(),
+            mold_moisture_percent=self.mold_moisture_spin.value(),
+            mold_binder_percent=self.mold_binder_spin.value(),
+            mold_compactability_percent=self.mold_compactability_spin.value(),
+            mold_rigidity_factor=self.mold_rigidity_spin.value(),
         )
 
     def _gravity_vector_from_ui(self) -> Tuple[float, float, float]:
@@ -1037,7 +1103,7 @@ class MainWindow(QtWidgets.QMainWindow):
             casting_params = self._casting_params_from_ui()
 
             alloy = get_alloy(alloy_key)
-            mold = get_mold(mold_key)
+            mold = make_effective_mold(get_mold(mold_key), casting_params)
             chvorinov_c = chvorinov_c_from_properties(alloy, mold)
             self.aiLog(
                 f"Alaşım: {alloy.name} | Kalıp: {mold.name} | C={chvorinov_c:.4f} s/mm² | "
@@ -1101,6 +1167,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.viewer.show_niyama_isosurfaces(self._analysis)
             if self.flow_lines_toggle.isChecked():
                 self.viewer.toggle_flow_velocity(self._analysis, True)
+            if self.mold_wall_toggle.isChecked():
+                self.viewer.toggle_mold_wall_movement(self._analysis, True)
             if self.path_toggle.isChecked():
                 self.viewer.show_feeding_paths(self._analysis)
             if self.local_toggle.isChecked():
@@ -1438,6 +1506,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_toggle_flow_velocity(self, checked: bool):
         if self._analysis:
             self.viewer.toggle_flow_velocity(self._analysis, checked)
+
+    def on_toggle_mold_wall_movement(self, checked: bool):
+        if self._analysis:
+            self.viewer.toggle_mold_wall_movement(self._analysis, checked)
 
     def _update_flow_controls(self):
         has_flow = bool(self._analysis and self._analysis.flow_result)
