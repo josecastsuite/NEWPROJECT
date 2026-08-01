@@ -5265,7 +5265,7 @@ def solve_filling_flow(
         vy_f = _resample_to_grid(vy_c, origin_c, dx_c, orig_grid.shape, orig_origin, orig_dx)
         vz_f = _resample_to_grid(wz_c, origin_c, dx_c, orig_grid.shape, orig_origin, orig_dx)
 
-    fine_metal = orig_grid > 0
+    fine_metal = (orig_grid > 0) & (orig_grid != BodyType.CORE)
     velocity = np.stack(
         [
             np.where(fine_metal, vx_f, 0.0),
@@ -5549,30 +5549,13 @@ def solve_filling_flow(
             vof_res = None
 
     if vof_res is not None:
-        # Resample Taichi VOF fields to the original analysis grid.
+        # Use the LBM/VOF fill-time field for the transient animation, but keep
+        # the Darcy velocity field for per-point flow visualisation.
         fill_time_c = np.asarray(vof_res["fill_time"], dtype=np.float64)
         # Coarse cells that the LBM did not reach carry inf.  Trilinear
         # resampling of inf creates NaN on the fine grid, so replace them with a
         # finite sentinel before resampling and clamp later.
         fill_time_c = np.where(np.isfinite(fill_time_c), fill_time_c, 1e12)
-        velocity_c = vof_res["velocity"]
-        vel_comps_f = [
-            _resample_to_grid(
-                velocity_c[comp],
-                vof_origin,
-                vof_dx,
-                orig_grid.shape,
-                orig_origin,
-                orig_dx,
-                fill_value=0.0,
-                order=1,
-            )
-            for comp in range(3)
-        ]
-        velocity = np.stack(vel_comps_f, axis=0).astype(np.float32)
-        fine_metal = (orig_grid > 0) & (orig_grid != BodyType.CORE)
-        velocity = np.where(fine_metal, velocity, 0.0)
-        vmag_fine = np.linalg.norm(velocity, axis=0)
         fill_time_fine = _resample_to_grid(
             fill_time_c,
             vof_origin,
@@ -5708,42 +5691,6 @@ def solve_filling_flow(
                 }
         except Exception as exc:
             print(f"[GATE_MESH] {exc}", flush=True)
-
-    # Build a per-body velocity magnitude field from the gating-node values.
-    # Darcy face velocities can be numerically tiny in wide regions, but the
-    # node velocities are physically consistent; this makes Reynolds and
-    # turbulence-intensity maps visible in the report.
-    gating_vmag = vmag_fine.copy()
-    if gating_nodes and body_index is not None and bodies:
-        g_dir = np.asarray(g, dtype=np.float64)
-        g_norm = float(np.linalg.norm(g_dir))
-        if g_norm > 1e-12:
-            g_dir = g_dir / g_norm
-        else:
-            g_dir = np.array([0.0, -1.0, 0.0])
-        body_to_bidx = {b.name: i for i, b in enumerate(bodies)}
-        for node in gating_nodes:
-            if node.name is None or " → " not in node.name:
-                continue
-            parts = [p.strip() for p in node.name.split(" → ")]
-            downstream = parts[-1]
-            upstream = parts[0]
-            if downstream in body_to_bidx:
-                target = downstream
-            elif downstream.lower().startswith("par") or downstream.lower() == "part":
-                # Metal leaving an ingate into the part; the upstream gate body
-                # is what should be coloured, not the whole cavity.
-                target = upstream if upstream in body_to_bidx else None
-            else:
-                target = None
-            if target is None or body_to_bidx.get(target) is None:
-                continue
-            mask = body_index == body_to_bidx[target]
-            v_label = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
-            gating_vmag = np.where(mask, v_label, gating_vmag)
-        if gating_vmag[fine_metal].any():
-            vmag_fine = np.where(fine_metal, gating_vmag, 0.0)
-            velocity = (g_dir[:, None, None, None] * vmag_fine[None, ...]).astype(np.float32)
 
     # ------------------------------------------------------------------
     # Volume-aware graph-based fill time: gating vessels fill sequentially,

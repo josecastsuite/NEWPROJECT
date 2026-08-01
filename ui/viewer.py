@@ -4,6 +4,7 @@ import heapq
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
+import scipy.ndimage as ndi
 import pyvista as pv
 from pyvistaqt import QtInteractor
 
@@ -185,6 +186,118 @@ def _voxel_path_through_body(
     return np.vstack([np.asarray(start_mm, dtype=np.float64).reshape(1, -1), centres, np.asarray(end_mm, dtype=np.float64).reshape(1, -1)])
 
 
+def _points_inside_mask(
+    points: np.ndarray, mask: np.ndarray, origin_mm: np.ndarray, dx_mm: float
+) -> np.ndarray:
+    """Return a boolean array indicating which points map to True voxels."""
+    points = np.asarray(points, dtype=np.float64)
+    idx = np.round((points - origin_mm) / dx_mm - 0.5).astype(int)
+    shape = np.array(mask.shape)
+    valid = np.all((idx >= 0) & (idx < shape), axis=1)
+    inside = np.zeros(len(points), dtype=bool)
+    if valid.any():
+        inside[valid] = mask[idx[valid, 0], idx[valid, 1], idx[valid, 2]]
+    return inside
+
+
+def _smooth_path(
+    points: np.ndarray,
+    sigma: Optional[float] = None,
+    body_index: Optional[np.ndarray] = None,
+    body_idx: Optional[int] = None,
+    origin_mm: Optional[np.ndarray] = None,
+    dx_mm: float = 0.0,
+) -> np.ndarray:
+    """Gaussian 1-D smoothing along an ordered 3-D polyline.
+
+    Endpoints are preserved by replicating them before filtering; the curve is
+    therefore not shortened. If body data are supplied, points that drift
+    outside the body are snapped back to the nearest body voxel centre so the
+    displayed line never leaves the gate geometry.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    if len(points) < 3:
+        return points.copy()
+    if sigma is None:
+        sigma = max(1.0, min(2.0, len(points) * 0.05))
+    pad = max(2, int(3 * sigma))
+    padded = np.vstack([points[:1]] * pad + [points] + [points[-1:]] * pad)
+    smoothed = np.stack(
+        [ndi.gaussian_filter1d(padded[:, i], sigma, mode="nearest") for i in range(3)],
+        axis=1,
+    )
+    smoothed = smoothed[pad:-pad]
+    # Restore exact start/end positions (the contact centroids).
+    smoothed[0] = points[0]
+    smoothed[-1] = points[-1]
+
+    if (
+        body_index is not None
+        and body_idx is not None
+        and origin_mm is not None
+        and dx_mm > 0.0
+    ):
+        body_mask = body_index == body_idx
+        if body_mask.any():
+            # Allow a one-voxel tolerance, then snap any remaining outliers to
+            # the nearest body voxel centre.
+            tol_mask = ndi.binary_dilation(body_mask, iterations=1)
+            inside = _points_inside_mask(smoothed, tol_mask, origin_mm, dx_mm)
+            if not inside.all():
+                coords = np.argwhere(body_mask)
+                centres = (coords + 0.5) * dx_mm + origin_mm
+                for i in np.where(~inside)[0]:
+                    d2 = np.sum((centres - smoothed[i]) ** 2, axis=1)
+                    smoothed[i] = centres[np.argmin(d2)]
+    return smoothed
+
+
+def _filled_velocity_magnitude(velocity: np.ndarray, is_metal: np.ndarray) -> Optional[np.ndarray]:
+    """Compute |v| and fill empty voxels with the nearest metal cell's value.
+
+    This guarantees that trilinear interpolation near a body surface never falls
+    on a zero/empty cell even if the display point drifts slightly outside the
+    metal mask.
+    """
+    if velocity is None or is_metal is None:
+        return None
+    # Accept both (3, nz, ny, nx) and (..., 3) layouts.
+    if velocity.ndim == 4 and velocity.shape[0] == 3:
+        vmag = np.linalg.norm(velocity, axis=0)
+    elif velocity.ndim == 4 and velocity.shape[-1] == 3:
+        vmag = np.linalg.norm(velocity, axis=-1)
+    else:
+        return None
+    if vmag.shape != is_metal.shape:
+        return None
+    if not is_metal.any():
+        return vmag
+    # nearest metal voxel index for every voxel
+    _, nearest_idx = ndi.distance_transform_edt(is_metal, return_indices=True)
+    filled = vmag[tuple(nearest_idx)]
+    return filled
+
+
+def _sample_velocity_magnitude(
+    filled_vmag: np.ndarray,
+    origin_mm: np.ndarray,
+    dx_mm: float,
+    points: np.ndarray,
+) -> np.ndarray:
+    """Trilinear interpolation of |v| at arbitrary 3-D points (mm).
+
+    Coordinates are mapped to the voxel index frame: centre of voxel (i,j,k) is
+    origin + (i+0.5)*dx.  Points outside the array are handled by `mode='nearest'`.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim == 1:
+        points = points.reshape(1, -1)
+    coords = ((points - origin_mm) / dx_mm) - 0.5
+    sample_coords = np.array([coords[:, 0], coords[:, 1], coords[:, 2]])
+    vals = ndi.map_coordinates(filled_vmag, sample_coords, order=1, mode="nearest")
+    return np.asarray(vals, dtype=float)
+
+
 def _scalar_bar_args(title: str, pos: Tuple[float, float], clim: Optional[Tuple[float, float]] = None) -> dict:
     """Build scalar-bar args that avoid label overlap for the value range."""
     fmt = "%.2f"
@@ -201,7 +314,7 @@ def _scalar_bar_args(title: str, pos: Tuple[float, float], clim: Optional[Tuple[
     height = 0.08 * 1.5
     # Sağ kenarı sabit tutmak için sol kenarı sola kaydır.
     pos_x = max(0.0, pos[0] + 0.15 - width)
-    return {
+    args = {
         "color": "#00ffff",
         "title_font_size": 10,
         "label_font_size": 8,
@@ -214,6 +327,10 @@ def _scalar_bar_args(title: str, pos: Tuple[float, float], clim: Optional[Tuple[
         "height": height,
         "title": title,
     }
+    if clim is not None:
+        args["below_label"] = f"<{clim[0]:.2f}"
+        args["above_label"] = f">{clim[1]:.2f}"
+    return args
 
 
 class Analyzer3DViewer(QtInteractor):
@@ -250,6 +367,8 @@ class Analyzer3DViewer(QtInteractor):
         self._flow_actor = None
         self._flow_node_actor = None
         self._flow_arrow_actor = None
+        self._flow_lines_actor = None
+        self._flow_colorbar_actor = None
         self.flow_animator = FlowAnimator(self)
         self._body_legend_actor = None
         # voxel data needed to trace flow lines through body interiors
@@ -340,6 +459,8 @@ class Analyzer3DViewer(QtInteractor):
         self._flow_actor = None
         self._flow_node_actor = None
         self._flow_arrow_actor = None
+        self._flow_lines_actor = None
+        self._flow_colorbar_actor = None
         self._body_legend_actor = None
         self._bodies = []
         self._body_index = None
@@ -759,19 +880,39 @@ class Analyzer3DViewer(QtInteractor):
             smooth_shading=True,
         )
 
-    def show_flow_node_labels(self, result: Optional[AnalysisResult]):
-        """Add gating arrows and only ingate-inlet velocity labels."""
-        if self._flow_node_actor is not None:
-            self.remove_actor(self._flow_node_actor)
-            self._flow_node_actor = None
-        if self._flow_arrow_actor is not None:
-            self.remove_actor(self._flow_arrow_actor)
-            self._flow_arrow_actor = None
+    def show_flow_lines(self, result: Optional[AnalysisResult]):
+        """Draw smooth, body-following flow lines coloured by the true Darcy |v|.
+
+        Görsellik güzel ama en önemli şey hızların %100 doğru olması. Çizgiyi
+        pürüzsüzleştireceğim derken arkadaki gerçek Darcy hız verilerini
+        (flow_result.velocity) kaydırma veya bozma. Renklendirme her noktadaki
+        gerçek mutlak hız değerine (|v| = sqrt(vx^2 + vy^2 + vz^2)) göre yapılsın.
+        Meme girişindeki etiket hızı da o kesitteki gerçek akış hızını
+        yansıtmalı, uydurma veri istemiyorum. Matematik doğru çalışsın,
+        kodlamayı ona göre yap.
+        """
+        if self._flow_lines_actor is not None:
+            self.remove_actor(self._flow_lines_actor)
+            self._flow_lines_actor = None
+        self._remove_scalar_bar("Akış hızı (m/s)")
         if result is None or result.flow_result is None:
             return
-        nodes = result.flow_result.gating_nodes
+
+        fr = result.flow_result
+        nodes = fr.gating_nodes
         if not nodes:
             return
+
+        velocity = fr.velocity
+        if velocity is None:
+            return
+        filled_vmag = _filled_velocity_magnitude(velocity, result.is_metal)
+        if filled_vmag is None:
+            return
+
+        # The Darcy velocity field lives on the analysis grid.
+        origin_vel = np.asarray(result.origin_mm, dtype=np.float64)
+        dx_vel = float(result.dx_mm)
 
         # Voxel data needed to trace flow lines through body interiors.
         bodies = getattr(self, "_bodies", [])
@@ -784,7 +925,7 @@ class Analyzer3DViewer(QtInteractor):
             if getattr(b, "index", None) is not None
         }
 
-        # ---- one continuous colored line per ingate from inlet to ingate-part entry ----
+        # ---- one continuous coloured line per ingate from inlet to ingate-part entry ----
         node_by_downstream: Dict[str, GatingNode] = {}
         for node in nodes:
             if "→" not in node.name:
@@ -793,14 +934,9 @@ class Analyzer3DViewer(QtInteractor):
             if down_name not in node_by_downstream:
                 node_by_downstream[down_name] = node
 
-        points: List[np.ndarray] = []
-        lines: List[int] = []
-        cell_velocities: List[float] = []
-        label_points: List[Tuple[float, float, float]] = []
-        label_texts: List[str] = []
-
-        def _node_velocity(node: GatingNode) -> float:
-            return node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
+        all_points: List[np.ndarray] = []
+        all_lines: List[int] = []
+        all_scalars: List[float] = []
 
         for node in nodes:
             if "→" not in node.name or "→" not in node.body_type:
@@ -808,6 +944,7 @@ class Analyzer3DViewer(QtInteractor):
             down_type = node.body_type.split("→")[1].strip()
             if down_type != "PART":
                 continue
+
             # Trace from this ingate->part node back to the source.
             path: List[GatingNode] = [node]
             current_up = node.name.split("→")[0].strip()
@@ -822,8 +959,7 @@ class Analyzer3DViewer(QtInteractor):
             if len(path) < 2:
                 continue
 
-            # Build segment points through each body so the line follows the
-            # real gate interior instead of a straight chord cutting the part.
+            # Build a smooth, body-following polyline for this ingate.
             path_points: List[np.ndarray] = []
             for i in range(len(path) - 1):
                 n0 = path[i]
@@ -844,10 +980,17 @@ class Analyzer3DViewer(QtInteractor):
                             dx_mm,
                             np.asarray(n0.centroid_mm, dtype=np.float64),
                             np.asarray(n1.centroid_mm, dtype=np.float64),
-                            step=2,
+                            step=1,
                         )
                         if pts is not None and len(pts) >= 2:
-                            segment = list(pts)
+                            pts = _smooth_path(
+                                pts,
+                                body_index=body_index,
+                                body_idx=body_idx_by_name[body_name],
+                                origin_mm=origin_mm,
+                                dx_mm=dx_mm,
+                            )
+                            segment = [np.asarray(p, dtype=np.float64) for p in pts]
                     except Exception:
                         pass
                 if i == 0:
@@ -855,35 +998,72 @@ class Analyzer3DViewer(QtInteractor):
                 else:
                     path_points.extend(segment[1:])
 
-            start_idx = len(points)
+            if len(path_points) < 2:
+                continue
+
+            pts_arr = np.asarray(path_points, dtype=np.float64)
+            scalars = _sample_velocity_magnitude(filled_vmag, origin_vel, dx_vel, pts_arr)
+            scalars = np.clip(scalars, 0.0, None)
+
+            start_idx = len(all_points)
             n_pts = len(path_points)
-            points.extend(path_points)
-            lines.extend([n_pts] + list(range(start_idx, start_idx + n_pts)))
+            all_points.extend(path_points)
+            all_scalars.extend(scalars.tolist())
+            all_lines.extend([n_pts] + list(range(start_idx, start_idx + n_pts)))
 
-            end_v = _node_velocity(node)
-            cell_velocities.append(end_v)
+        if not all_points:
+            return
 
-            # label only at the ingate->part entry
-            if end_v > 1e-12:
+        scalars_arr = np.asarray(all_scalars, dtype=float)
+        if scalars_arr.size > 0:
+            p2 = float(np.percentile(scalars_arr, 2.0))
+            p98 = float(np.percentile(scalars_arr, 98.0))
+            if p98 <= p2:
+                p98 = p2 + 1e-9
+            clim = (p2, p98)
+        else:
+            clim = (0.0, 1.0)
+
+        poly = pv.PolyData(
+            np.asarray(all_points, dtype=np.float64),
+            lines=np.asarray(all_lines, dtype=np.int64),
+        )
+        poly.point_data["velocity_m_s"] = scalars_arr
+        poly.set_active_scalars("velocity_m_s", preference="point")
+
+        self._flow_lines_actor = self.add_mesh(
+            poly,
+            scalars="velocity_m_s",
+            cmap="turbo",
+            line_width=5,
+            opacity=0.95,
+            clim=clim,
+            show_scalar_bar=True,
+            scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.02, 0.02), clim=clim),
+            lighting=False,
+        )
+
+    def show_flow_node_labels(self, result: Optional[AnalysisResult]):
+        """Add numeric velocity labels only at each ingate-part entry."""
+        if self._flow_node_actor is not None:
+            self.remove_actor(self._flow_node_actor)
+            self._flow_node_actor = None
+        if result is None or result.flow_result is None:
+            return
+
+        nodes = result.flow_result.gating_nodes
+        label_points: List[Tuple[float, float, float]] = []
+        label_texts: List[str] = []
+
+        for node in nodes:
+            if "→" not in node.name or "→" not in node.body_type:
+                continue
+            if node.body_type.split("→")[1].strip() != "PART":
+                continue
+            v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
+            if v > 1e-12:
                 label_points.append(node.centroid_mm)
-                label_texts.append(f"{end_v:.2f} m/s")
-
-        if points:
-            poly = pv.PolyData(
-                np.asarray(points, dtype=np.float64),
-                lines=np.asarray(lines, dtype=np.int64),
-            )
-            poly.cell_data["velocity_m_s"] = np.asarray(cell_velocities, dtype=float)
-            self._flow_arrow_actor = self.add_mesh(
-                poly,
-                scalars="velocity_m_s",
-                cmap="turbo",
-                line_width=5,
-                opacity=0.95,
-                show_scalar_bar=True,
-                scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.02, 0.02)),
-                lighting=False,
-            )
+                label_texts.append(f"{v:.2f} m/s")
 
         if label_points:
             label_points = np.asarray(label_points, dtype=np.float64)
@@ -1082,6 +1262,15 @@ class Analyzer3DViewer(QtInteractor):
                 self._flow_actor = None
             self._remove_scalar_bar("Akış hızı (m/s)")
 
+    def toggle_flow_lines(self, result: AnalysisResult, checked: bool):
+        if checked:
+            self.show_flow_lines(result)
+        else:
+            if self._flow_lines_actor is not None:
+                self.remove_actor(self._flow_lines_actor)
+                self._flow_lines_actor = None
+            self._remove_scalar_bar("Akış hızı (m/s)")
+
     def toggle_flow_node_labels(self, result: AnalysisResult, checked: bool):
         if checked:
             self.show_flow_node_labels(result)
@@ -1089,9 +1278,6 @@ class Analyzer3DViewer(QtInteractor):
             if self._flow_node_actor is not None:
                 self.remove_actor(self._flow_node_actor)
                 self._flow_node_actor = None
-            if self._flow_arrow_actor is not None:
-                self.remove_actor(self._flow_arrow_actor)
-                self._flow_arrow_actor = None
 
     def toggle_flow_animation(self, result: AnalysisResult, checked: bool):
         if checked:

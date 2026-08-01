@@ -546,8 +546,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.niyama_toggle.toggled.connect(self.on_toggle_niyama)
         vis_layout.addWidget(self.niyama_toggle)
 
+        self.flow_lines_toggle = QtWidgets.QCheckBox("Akış Çizgileri")
+        self.flow_lines_toggle.setToolTip("Meme başına bir renkli akış çizgisi ve renk skalası göster")
+        self.flow_lines_toggle.setChecked(True)
+        self.flow_lines_toggle.toggled.connect(self.on_toggle_flow_lines)
+        vis_layout.addWidget(self.flow_lines_toggle)
+
         self.flow_node_toggle = QtWidgets.QCheckBox("Düğüm Hızları")
-        self.flow_node_toggle.setToolTip("Her gating elemanında nokta + hız değeri göster")
+        self.flow_node_toggle.setToolTip("Sadece meme girişinde hız değeri göster")
         self.flow_node_toggle.setChecked(True)
         self.flow_node_toggle.toggled.connect(self.on_toggle_flow_node_labels)
         vis_layout.addWidget(self.flow_node_toggle)
@@ -1064,6 +1070,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
             if self.niyama_toggle.isChecked():
                 self.viewer.show_niyama_isosurfaces(self._analysis)
+            if self.flow_lines_toggle.isChecked():
+                self.viewer.show_flow_lines(self._analysis)
             if self.flow_node_toggle.isChecked():
                 self.viewer.show_flow_node_labels(self._analysis)
             if self.path_toggle.isChecked():
@@ -1399,6 +1407,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_toggle_niyama(self, checked: bool):
         if self._analysis:
             self.viewer.toggle_niyama(self._analysis, checked)
+
+    def on_toggle_flow_lines(self, checked: bool):
+        if self._analysis:
+            self.viewer.toggle_flow_lines(self._analysis, checked)
 
     def on_toggle_flow_node_labels(self, checked: bool):
         if self._analysis:
