@@ -165,6 +165,7 @@ class Analyzer3DViewer(QtInteractor):
         self._cold_shot_actor = None
         self._cold_shot_scalar_bar_actor = None
         self._last_fill_actor = None
+        self._erosion_actor = None
         self.flow_animator = FlowAnimator(self)
         self._body_legend_actor = None
         self._bodies: List[Body] = []
@@ -260,6 +261,7 @@ class Analyzer3DViewer(QtInteractor):
         self._cold_shot_actor = None
         self._cold_shot_scalar_bar_actor = None
         self._last_fill_actor = None
+        self._erosion_actor = None
         self._body_legend_actor = None
         self._bodies = []
         self._body_index = None
@@ -1130,6 +1132,50 @@ class Analyzer3DViewer(QtInteractor):
                 self.remove_actor(self._last_fill_actor)
                 self._last_fill_actor = None
             self._remove_scalar_bar("Soğuk birleşme riski")
+
+    def show_erosion_risk(self, result: Optional[AnalysisResult]):
+        """Heatmap of mold-sand erosion risk driven by local metal velocity."""
+        if self._erosion_actor is not None:
+            self.remove_actor(self._erosion_actor)
+            self._erosion_actor = None
+        self._remove_scalar_bar("Kalıp erozyonu riski")
+
+        if result is None or result.erosion_risk is None or result.erosion_risk.size == 0:
+            return
+
+        grid = self._make_grid(result, result.erosion_risk, "erosion_risk")
+        metal = self._metal_only(grid)
+        if metal.n_cells == 0:
+            return
+
+        cells = metal.threshold(1e-6, scalars="erosion_risk", all_scalars=True)
+        if cells.n_cells == 0:
+            return
+
+        vmax = float(np.percentile(cells["erosion_risk"], 99))
+        vmax = max(vmax, 0.3)
+        clim = [0.0, vmax]
+
+        self._erosion_actor = self.add_mesh(
+            cells,
+            scalars="erosion_risk",
+            cmap="YlOrRd",
+            opacity=0.85,
+            clim=clim,
+            show_scalar_bar=True,
+            scalar_bar_args=_scalar_bar_args("Kalıp erozyonu riski", (0.02, 0.02), clim=clim),
+            smooth_shading=True,
+        )
+        self._arrange_scalar_bars()
+
+    def toggle_erosion_risk(self, result: AnalysisResult, checked: bool):
+        if checked:
+            self.show_erosion_risk(result)
+        else:
+            if self._erosion_actor is not None:
+                self.remove_actor(self._erosion_actor)
+                self._erosion_actor = None
+            self._remove_scalar_bar("Kalıp erozyonu riski")
 
     def toggle_feeding_paths(self, result: AnalysisResult, checked: bool):
         if checked:

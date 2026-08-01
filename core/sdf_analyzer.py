@@ -932,6 +932,34 @@ def compute_cold_shot_risk(
     return cold_shot_risk, last_fill_point_mm
 
 
+def compute_erosion_risk(
+    velocity_magnitude: Optional[np.ndarray],
+    is_metal: np.ndarray,
+    alloy,
+    mold,
+) -> np.ndarray:
+    """Per-voxel mold-sand erosion risk driven by local metal velocity.
+
+    Erosion becomes significant when the local metal speed exceeds the
+    material-specific threshold (based on Campbell's critical entrainment
+    velocity) and is amplified for low-rigidity green-sand molds.  Risk is
+    clipped to [0, 1] and zero outside the metal domain.
+    """
+    if velocity_magnitude is None or velocity_magnitude.size == 0:
+        return np.zeros_like(is_metal, dtype=np.float64)
+    v = np.asarray(velocity_magnitude, dtype=np.float64)
+    v_thresh = float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.5))
+    # Low-rigidity molds (green sand) erode at lower velocities.
+    rigidity = float(getattr(mold, "mold_rigidity_factor", 1.0))
+    v_thresh = v_thresh * max(0.3, rigidity)
+    v_max = v_thresh * 3.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        risk = (v - v_thresh) / max(v_max - v_thresh, 1e-9)
+    risk = np.clip(np.nan_to_num(risk, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 1.0)
+    risk = np.where(is_metal, risk, 0.0)
+    return risk
+
+
 def directional_feed_efficiency(
     t_s: np.ndarray,
     feeder_mask: np.ndarray,
@@ -3023,6 +3051,14 @@ def analyze(
         t_liq=t_liq,
     )
 
+    # v10.5: per-voxel mold-sand erosion risk from local metal velocity.
+    erosion_risk = compute_erosion_risk(
+        velocity_magnitude,
+        is_metal,
+        alloy,
+        mold,
+    )
+
     # AŞAMA 9: Risk map aligned with the Carlson-Beckermann porosity volume.
     # The predicted pore volume percentage is already reduced by feeding
     # efficiency; convert it to a 0-1 risk field using the macro class limit
@@ -3148,6 +3184,7 @@ def analyze(
         mold_wall_movement=mold_wall_movement,
         cold_shot_risk=cold_shot_risk,
         last_fill_point_mm=last_fill_point_mm,
+        erosion_risk=erosion_risk,
         pore_size_noise_percent=pore_macro_percent,
         pore_size_threshold_um=pore_macro_threshold_um,
         pore_size_macro_percent=pore_macro_percent,

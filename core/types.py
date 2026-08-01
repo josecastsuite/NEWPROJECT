@@ -472,6 +472,8 @@ class AnalysisResult:
     # v10.4: per-voxel cold-shut (cold shot) risk and the last fill location
     cold_shot_risk: np.ndarray = field(default_factory=lambda: np.array([]))
     last_fill_point_mm: np.ndarray = field(default_factory=lambda: np.array([]))
+    # v10.5: per-voxel mold-sand erosion risk from high metal velocity
+    erosion_risk: np.ndarray = field(default_factory=lambda: np.array([]))
     # v8.9: per-class display filters (top % of computed porosity to display)
     pore_size_noise_percent: float = 3.0
     pore_size_threshold_um: float = 0.0

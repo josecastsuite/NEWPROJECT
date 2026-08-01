@@ -8,7 +8,6 @@ import math
 import numpy as np
 import trimesh
 from scipy import ndimage
-from scipy.sparse import coo_matrix, csgraph
 from scipy.spatial import ConvexHull
 
 from core.gating_calculator import (
@@ -26,7 +25,6 @@ from core.gating_engine import (
     calculate_gating_design,
 )
 from core.materials import get_alloy, get_mold, chvorinov_c_from_properties
-from core.sdf_analyzer import COST_26, NEIGH_26
 from core.types import (
     BODY_FEEDER_TYPES,
     BODY_METAL_TYPES,
@@ -1014,102 +1012,73 @@ def _mean_thickness(mask: np.ndarray, dx: float) -> float:
     return float(edt[mask].mean()) * 2.0
 
 
-def _distance_to_sprue_26(channel_mask: np.ndarray, sprue_mask: np.ndarray, dx: float) -> np.ndarray:
-    """26-neighbor Dijkstra distance from every channel voxel to the sprue."""
-    dist = np.full(channel_mask.shape, np.inf, dtype=np.float64)
-    if not (channel_mask & sprue_mask).any():
-        return dist
-
-    idx = np.full(channel_mask.shape, -1, dtype=np.int64)
-    vox = np.argwhere(channel_mask)
-    n = int(vox.shape[0])
-    idx[tuple(vox.T)] = np.arange(n)
-
-    rows, cols, vals = [], [], []
-    for (di, dj, dk), c in zip(NEIGH_26, COST_26):
-        ni = vox[:, 0] + di
-        nj = vox[:, 1] + dj
-        nk = vox[:, 2] + dk
-        mask = (
-            (ni >= 0)
-            & (ni < channel_mask.shape[0])
-            & (nj >= 0)
-            & (nj < channel_mask.shape[1])
-            & (nk >= 0)
-            & (nk < channel_mask.shape[2])
-        )
-        if not mask.any():
-            continue
-        neighbor_idx = idx[ni[mask], nj[mask], nk[mask]]
-        source_idx = np.arange(n)[mask]
-        valid = neighbor_idx >= 0
-        if not valid.any():
-            continue
-        rows.append(source_idx[valid])
-        cols.append(neighbor_idx[valid])
-        vals.append(np.full(valid.sum(), c * dx, dtype=np.float32))
-
-    sprue_flat = np.where(sprue_mask[tuple(vox.T)])[0]
-    rows.append(np.full(len(sprue_flat), n, dtype=np.int64))
-    cols.append(sprue_flat.astype(np.int64))
-    vals.append(np.zeros(len(sprue_flat), dtype=np.float32))
-
-    graph = coo_matrix(
-        (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
-        shape=(n + 1, n + 1),
-    ).tocsr()
-    flat_dist = csgraph.dijkstra(graph, directed=False, indices=n, return_predecessors=False)
-    dist[tuple(vox.T)] = flat_dist[:n].astype(np.float64)
-    return dist
-
-
-def _count_elbows_along_path(
-    dist: np.ndarray,
-    channel_mask: np.ndarray,
-    start: Tuple[int, int, int],
+def _count_elbows_from_gating_nodes(
+    gating_nodes,
     angle_threshold_deg: float = 60.0,
 ) -> int:
-    """Trace from start toward decreasing dist and count sharp direction changes."""
-    shape = dist.shape
-    current = start
-    if not channel_mask[current]:
-        return 0
-    path = [current]
-    visited = {current}
-    for _ in range(1000):
-        i, j, k = current
-        if dist[i, j, k] <= 0:
-            break
-        best = None
-        best_d = dist[i, j, k]
-        for di, dj, dk in _neighbor_offsets_6():
-            ni, nj, nk = i + di, j + dj, k + dk
-            if not (0 <= ni < shape[0] and 0 <= nj < shape[1] and 0 <= nk < shape[2]):
-                continue
-            if not channel_mask[ni, nj, nk]:
-                continue
-            d = dist[ni, nj, nk]
-            if d < best_d:
-                best_d = d
-                best = (ni, nj, nk)
-        if best is None or best in visited:
-            break
-        visited.add(best)
-        path.append(best)
-        current = best
+    """Count sharp direction changes along the gating tree using node centroids.
 
-    if len(path) < 3:
+    Replaces the heavy 26-neighbour Dijkstra + gradient-descent path trace that
+    was freezing on large gating systems.  Each ``GatingNode`` already carries
+    the 3-D centroid of its connecting section, so the elbow count is derived
+    from the angles between consecutive node-to-node vectors.
+    """
+    if not gating_nodes:
         return 0
-    elbows = 0
-    cos_thresh = np.cos(np.deg2rad(angle_threshold_deg))
-    for a in range(1, len(path) - 1):
-        v1 = np.array(path[a]) - np.array(path[a - 1])
-        v2 = np.array(path[a + 1]) - np.array(path[a])
-        n1 = v1 / (np.linalg.norm(v1) + 1e-12)
-        n2 = v2 / (np.linalg.norm(v2) + 1e-12)
-        if np.dot(n1, n2) < cos_thresh:
-            elbows += 1
-    return elbows
+
+    # Build an adjacency map keyed by the upstream body name.
+    children: Dict[str, List] = {}
+    roots = []
+    for node in gating_nodes:
+        name = node.name
+        if "->" not in name:
+            continue
+        up, down = [s.strip() for s in name.split("->", 1)]
+        if up == "Kaynak":
+            roots.append(node)
+        children.setdefault(up, []).append(node)
+
+    if not roots:
+        return 0
+
+    cos_thresh = math.cos(math.radians(angle_threshold_deg))
+
+    def _walk(node, prev_centroid):
+        # Gather centroid path from this node downstream to every leaf.
+        paths = []
+        centroid = np.array(node.centroid_mm, dtype=np.float64)
+        path = [prev_centroid, centroid] if prev_centroid is not None else [centroid]
+        _, down = [s.strip() for s in node.name.split("->", 1)]
+        kids = children.get(down, [])
+        if not kids:
+            return [path]
+        for kid in kids:
+            for sub in _walk(kid, centroid):
+                paths.append(path + sub[1:])
+        return paths
+
+    counts = []
+    for root in roots:
+        # The source node's centroid is the upstream (pouring) point.
+        for path in _walk(root, None):
+            if len(path) < 3:
+                continue
+            elbows = 0
+            for i in range(1, len(path) - 1):
+                v1 = np.array(path[i]) - np.array(path[i - 1])
+                v2 = np.array(path[i + 1]) - np.array(path[i])
+                n1 = float(np.linalg.norm(v1))
+                n2 = float(np.linalg.norm(v2))
+                if n1 < 1e-12 or n2 < 1e-12:
+                    continue
+                cosang = float(np.dot(v1, v2)) / (n1 * n2)
+                if cosang < cos_thresh:
+                    elbows += 1
+            counts.append(elbows)
+
+    if not counts:
+        return 0
+    return int(round(float(np.median(counts))))
 
 
 # Campbell-style velocity ranges for pressurized / unpressurized / semi-pressurized
@@ -1439,25 +1408,14 @@ def analyze_gating(
     H_eff_m = effective_head(h_avg_mm / 1000.0, part_mass_kg)
     H_eff_m = float(np.clip(H_eff_m, 0.02, 0.60))
 
-    channel_mask = np.isin(
-        grid,
-        [BodyType.INGATE, BodyType.RUNNER, BodyType.DISTRIBUTOR, BodyType.CURUFLUK, BodyType.SPRUE, BodyType.SPRUE_THROAT, BodyType.FILTER, BodyType.POURING_BASIN],
-    )
-    sprue_mask = sprue & channel_mask
-    elbow_count = 0
-    head_loss_m = 0.0
-    if channel_mask.any() and sprue_mask.any():
-        source_vox = np.argwhere(ingate) if has_ingate else np.argwhere(runner & channel_mask)
-        if len(source_vox) > 0:
-            dist_to_sprue = _distance_to_sprue_26(channel_mask, sprue_mask, dx)
-            sample = source_vox[np.linspace(0, len(source_vox) - 1, min(20, len(source_vox))).astype(int)]
-            counts = []
-            for v in sample:
-                counts.append(_count_elbows_along_path(dist_to_sprue, channel_mask, tuple(v)))
-            elbow_count = int(round(np.median(counts))) if counts else 0
-            v_loss_m_s = math.sqrt(2.0 * 9.81 * H_eff_m)
-            h_loss_per_elbow_m = alloy.elbow_loss_k * (v_loss_m_s ** 2) / (2.0 * 9.81)
-            head_loss_m = h_loss_per_elbow_m * elbow_count
+    # Elbow/head-loss estimate from the discrete gating tree.  This avoids the
+    # 26-neighbor Dijkstra over the channel voxel mask that was hanging at 28%.
+    flow_result = getattr(result, "flow_result", None)
+    gating_nodes = getattr(flow_result, "gating_nodes", []) if flow_result else []
+    elbow_count = _count_elbows_from_gating_nodes(gating_nodes, angle_threshold_deg=60.0)
+    v_loss_m_s = math.sqrt(2.0 * 9.81 * H_eff_m)
+    h_loss_per_elbow_m = alloy.elbow_loss_k * (v_loss_m_s ** 2) / (2.0 * 9.81)
+    head_loss_m = h_loss_per_elbow_m * elbow_count
     # Engine will subtract head_loss from its own effective-head calculation.
     # We keep the raw H_eff_m for the local loss estimate and update H_eff_m
     # from the engine result afterwards.
