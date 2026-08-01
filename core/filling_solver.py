@@ -4811,6 +4811,7 @@ def _gating_node_velocities(
             section_area_cm2=float(area_m2 * 1e4),
             centroid_mm=tuple(float(x) for x in centroid),
             flow_rate_m3_s=float(flow_rate_m3_s),
+            max_velocity_m_s=v,
         )
 
     nodes: List[GatingNode] = []

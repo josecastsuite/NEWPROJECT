@@ -14,7 +14,7 @@ from core.gating import (
 )
 from core.materials import get_alloy
 from core.sdf_analyzer import _trace_path_to_riser
-from core.types import BODY_TYPE_LABELS, AnalysisResult, Body, BodyType, HotSpot, RefinementRegion
+from core.types import BODY_TYPE_LABELS, AnalysisResult, Body, BodyType, GatingNode, HotSpot, RefinementRegion
 from ui.flow_animator import FlowAnimator
 
 
@@ -145,6 +145,7 @@ class Analyzer3DViewer(QtInteractor):
         self._section_picker = None
         self._flow_actor = None
         self._flow_node_actor = None
+        self._flow_arrow_actor = None
         self.flow_animator = FlowAnimator(self)
         self._body_legend_actor = None
 
@@ -216,6 +217,7 @@ class Analyzer3DViewer(QtInteractor):
         self._local_actors.clear()
         self._flow_actor = None
         self._flow_node_actor = None
+        self._flow_arrow_actor = None
         self._body_legend_actor = None
         self._clear_section_actors()
 
@@ -632,29 +634,97 @@ class Analyzer3DViewer(QtInteractor):
         )
 
     def show_flow_node_labels(self, result: Optional[AnalysisResult]):
-        """Add a 3-D point + label at each gating contact (node) velocity."""
+        """Add gating arrows and only ingate-inlet velocity labels."""
         if self._flow_node_actor is not None:
             self.remove_actor(self._flow_node_actor)
             self._flow_node_actor = None
+        if self._flow_arrow_actor is not None:
+            self.remove_actor(self._flow_arrow_actor)
+            self._flow_arrow_actor = None
         if result is None or result.flow_result is None:
             return
         nodes = result.flow_result.gating_nodes
         if not nodes:
             return
-        points = []
-        labels = []
+
+        # ---- arrows along the gating graph ----
+        node_by_downstream: Dict[str, GatingNode] = {}
         for node in nodes:
+            if "→" not in node.name:
+                continue
+            down_name = node.name.split("→")[1].strip()
+            if down_name not in node_by_downstream:
+                node_by_downstream[down_name] = node
+
+        starts: List[np.ndarray] = []
+        directions: List[np.ndarray] = []
+        velocities: List[float] = []
+        for node in nodes:
+            if "→" not in node.name:
+                continue
+            up_name, _down_name = [s.strip() for s in node.name.split("→")]
+            pred = node_by_downstream.get(up_name)
+            if pred is None:
+                continue
             v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
             if v <= 1e-12:
                 continue
-            points.append(node.centroid_mm)
-            labels.append(f"{node.name}\n{v:.2f} m/s")
-        if not points:
+            start = np.asarray(pred.centroid_mm, dtype=float)
+            end = np.asarray(node.centroid_mm, dtype=float)
+            diff = end - start
+            dist = float(np.linalg.norm(diff))
+            if dist < 1e-6:
+                continue
+            # arrow length proportional to velocity (mm per m/s), clamped by distance
+            scale = 30.0
+            length = max(5.0, min(dist * 0.85, v * scale))
+            unit = diff / dist
+            starts.append(start)
+            directions.append(unit * length)
+            velocities.append(v)
+
+        if starts:
+            starts_arr = np.asarray(starts, dtype=np.float64)
+            dirs_arr = np.asarray(directions, dtype=np.float64)
+            pdata = pv.PolyData(starts_arr)
+            pdata["velocity_m_s"] = np.asarray(velocities, dtype=float)
+            pdata["vectors"] = dirs_arr
+            arrows = pdata.glyph(
+                orient="vectors",
+                scale="vectors",
+                factor=1.0,
+                geom=pv.Arrow(),
+            )
+            self._flow_arrow_actor = self.add_mesh(
+                arrows,
+                scalars="velocity_m_s",
+                cmap="turbo",
+                opacity=0.9,
+                show_scalar_bar=True,
+                scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.02, 0.02)),
+                lighting=False,
+            )
+
+        # ---- labels only at ingate inlets ----
+        label_points: List[Tuple[float, float, float]] = []
+        label_texts: List[str] = []
+        for node in nodes:
+            if "→" not in node.name or "→" not in node.body_type:
+                continue
+            down_type = node.body_type.split("→")[1].strip()
+            if down_type != "INGATE":
+                continue
+            v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
+            if v <= 1e-12:
+                continue
+            label_points.append(node.centroid_mm)
+            label_texts.append(f"{v:.2f} m/s")
+        if not label_points:
             return
-        points = np.asarray(points, dtype=np.float64)
+        label_points = np.asarray(label_points, dtype=np.float64)
         self._flow_node_actor = self.add_point_labels(
-            points,
-            labels,
+            label_points,
+            label_texts,
             font_size=10,
             text_color="white",
             point_color="red",
@@ -854,6 +924,9 @@ class Analyzer3DViewer(QtInteractor):
             if self._flow_node_actor is not None:
                 self.remove_actor(self._flow_node_actor)
                 self._flow_node_actor = None
+            if self._flow_arrow_actor is not None:
+                self.remove_actor(self._flow_arrow_actor)
+                self._flow_arrow_actor = None
 
     def toggle_flow_animation(self, result: AnalysisResult, checked: bool):
         if checked:

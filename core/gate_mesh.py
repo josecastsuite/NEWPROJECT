@@ -331,8 +331,8 @@ def _tet_mesh_gmsh(
 
     gmsh.initialize()
     try:
-        gmsh.option.setNumber("General.Terminal", 1)
-        gmsh.option.setNumber("General.Verbosity", 1)
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.option.setNumber("General.Verbosity", 0)
         gmsh.option.setNumber("Mesh.Optimize", 1)
         # Delaunay tetrahedralisation; disable automatic curvature-based
         # refinement so the already-decimated surface is respected.
