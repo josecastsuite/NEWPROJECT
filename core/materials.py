@@ -12,7 +12,7 @@ program keeps running.
 """
 import json
 import math
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -339,6 +339,14 @@ def get_mold(key: str) -> MoldMaterial:
     return MOLDS.get("sand", next(iter(MOLDS.values())))
 
 
+def save_molds(path: Optional[Path] = None) -> None:
+    """Persist the current in-memory ``MOLDS`` dictionary back to JSON."""
+    target = path or _json_path("molds.json")
+    data = {key: asdict(mold) for key, mold in MOLDS.items()}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def make_effective_mold(
     mold: MoldMaterial,
     casting_params: Optional[object] = None,
@@ -356,6 +364,7 @@ def make_effective_mold(
         moisture = getattr(body, "mold_moisture_percent", 0.0) or 0.0
         binder = getattr(body, "mold_binder_percent", 0.0) or 0.0
         compact = getattr(body, "mold_compactability_percent", 0.0) or 0.0
+        rigidity = getattr(body, "mold_rigidity_factor", 0.0) or 0.0
         if afs:
             overrides["afs_grain_size"] = afs
         if moisture:
@@ -364,6 +373,8 @@ def make_effective_mold(
             overrides["binder_percent"] = binder
         if compact:
             overrides["compactability_percent"] = compact
+        if rigidity > 0.0:
+            overrides["mold_rigidity_factor"] = rigidity
 
     if casting_params is not None:
         if getattr(casting_params, "mold_afs_grain_size", 0.0):

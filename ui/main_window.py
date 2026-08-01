@@ -27,6 +27,7 @@ from core import (
 from core.materials import chvorinov_c_from_properties, make_effective_mold
 from core.types import Body, BodyType, CastingParameters
 from ui.body_row_widget import BodyRowWidget, FEEDER_TYPE_NAMES
+from ui.mold_properties_dialog import MoldPropertiesDialog
 from ui.section_dialog import SectionDialog
 from ui.viewer import Analyzer3DViewer
 
@@ -298,8 +299,13 @@ class MainWindow(QtWidgets.QMainWindow):
         for key, mold in MOLDS.items():
             if getattr(mold, "is_sand", True) and key != "sand":
                 self.sand_type_combo.addItem(mold.name, key)
-        self.sand_type_combo.currentIndexChanged.connect(self._sync_casting_params_from_materials)
+        self.sand_type_combo.currentIndexChanged.connect(self._on_sand_type_changed)
         _settings_labeled(self.sand_type_combo, "Kum tipi:")
+
+        self.mold_props_btn = QtWidgets.QPushButton("Kum Parametrelerini Düzenle")
+        self.mold_props_btn.setToolTip("Seçili kum tipinin AFS, nem, bağlayıcı, compactability ve rijitlik değerlerini düzenle ve JSON kütüphanesine kaydet")
+        self.mold_props_btn.clicked.connect(self._on_mold_properties)
+        _settings_labeled(self.mold_props_btn, "Kum parametreleri:")
 
         # v10.3: global mould-sand property overrides
         self.mold_afs_spin = QtWidgets.QDoubleSpinBox()
@@ -766,10 +772,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sand_type_combo._label.setVisible(is_sand)
         # v10.3: hide sand-property overrides when not a sand mould
         for widget in (
+            self.sand_type_combo,
+            self.mold_props_btn,
             self.mold_afs_spin,
             self.mold_moisture_spin,
             self.mold_binder_spin,
             self.mold_compactability_spin,
+            self.mold_rigidity_spin,
         ):
             widget.setVisible(is_sand)
             if hasattr(widget, "_label"):
@@ -779,6 +788,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_sand_type_visibility()
         self._sync_mold_params_from_preset()
         self._sync_casting_params_from_materials()
+
+    def _on_sand_type_changed(self):
+        self._sync_mold_params_from_preset()
+        self._sync_casting_params_from_materials()
+
+    def _on_mold_properties(self):
+        """Open the reusable sand-property dialog for the selected sand preset."""
+        preset = self._current_mold_key()
+        try:
+            if get_mold(preset).mold_type != "sand":
+                preset = self.sand_type_combo.currentData() or "green_sand"
+        except Exception:
+            preset = "green_sand"
+        dialog = MoldPropertiesDialog(
+            parent=self,
+            body=None,
+            preset_key=preset,
+            title="Kum Parametreleri",
+        )
+        dialog.saved.connect(self._sync_mold_params_from_preset)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self._sync_mold_params_from_preset()
+            self._sync_casting_params_from_materials()
 
     def _sync_mold_params_from_preset(self):
         """Set global mould-sand overrides from the selected preset."""

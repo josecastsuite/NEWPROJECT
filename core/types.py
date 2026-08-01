@@ -146,6 +146,7 @@ class Body:
     mold_moisture_percent: float = 0.0      # % moisture
     mold_binder_percent: float = 0.0       # % bentonite/binder
     mold_compactability_percent: float = 0.0  # % compactability
+    mold_rigidity_factor: float = 0.0       # 0=soft green sand, 1=rigid; 0=use preset default
 
 
 @dataclass

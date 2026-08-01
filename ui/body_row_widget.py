@@ -18,6 +18,7 @@ from PyQt6 import QtCore, QtWidgets
 
 from core.materials import MOLDS
 from core.types import Body, BodyType
+from ui.mold_properties_dialog import MoldPropertiesDialog
 
 
 FEEDER_TYPE_NAMES = {
@@ -36,132 +37,6 @@ SAND_PRESET_NAMES = {
     "chromite_sand": "Kromit Kum",
     "zircon_sand": "Zirkon Kum",
 }
-
-
-class MoldPropertiesDialog(QtWidgets.QDialog):
-    """Per-CORE sand property override dialog with app-styled dark UI."""
-
-    def __init__(self, body: Body, parent: Optional[QtWidgets.QWidget] = None):
-        super().__init__(parent)
-        self._body = body
-        self.setWindowTitle(f"Kum Özellikleri – {body.name}")
-        self.setMinimumWidth(300)
-
-        self.setStyleSheet(
-            """
-            QDialog { background-color: #18181b; }
-            QLabel { color: #00ffff; font-weight: 800; font-size: 13px; }
-            QGroupBox {
-                color: #00ffff;
-                font-weight: bold;
-                font-size: 13px;
-                border: 1px solid #3f3f46;
-                border-radius: 8px;
-                margin-top: 14px;
-                padding-top: 12px;
-                padding-left: 10px;
-                padding-right: 10px;
-                padding-bottom: 10px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                subcontrol-position: top left;
-                left: 10px;
-                color: #00ffff;
-                font-weight: bold;
-            }
-            QDoubleSpinBox {
-                background: #27272a;
-                color: #00ffff;
-                border: 1px solid #52525b;
-                border-radius: 5px;
-                padding: 5px;
-                min-height: 22px;
-                font-weight: bold;
-            }
-            QPushButton {
-                background: #27272a;
-                color: #00ffff;
-                border: 1px solid #00ffff;
-                border-radius: 6px;
-                padding: 8px 14px;
-                font-weight: bold;
-                font-size: 12px;
-            }
-            QPushButton:hover { background: #3f3f46; }
-            """
-        )
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setSpacing(8)
-        layout.setContentsMargins(12, 12, 12, 12)
-
-        header = QtWidgets.QLabel(
-            f"<b>{body.name}</b> için kum parametrelerini ayarlayın."
-        )
-        header.setStyleSheet("color: #00ffff; font-size: 13px; font-weight: bold;")
-        layout.addWidget(header)
-
-        info = QtWidgets.QLabel(
-            "Varsayılan değerler seçili kum presetinden gelir; isteğe göre değiştirebilirsiniz."
-        )
-        info.setWordWrap(True)
-        info.setStyleSheet("color: #00ffff; font-size: 11px; font-weight: normal;")
-        layout.addWidget(info)
-
-        group = QtWidgets.QGroupBox("Kum Parametreleri")
-        form = QtWidgets.QFormLayout(group)
-        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
-        form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
-
-        base = MOLDS.get(body.mold_preset, MOLDS["green_sand"])
-
-        self._afs_spin = QtWidgets.QDoubleSpinBox()
-        self._afs_spin.setRange(0.0, 200.0)
-        self._afs_spin.setDecimals(1)
-        self._afs_spin.setSuffix(" AFS")
-        self._afs_spin.setValue(body.mold_afs_grain_size or base.afs_grain_size)
-        form.addRow("AFS Tane İnceliği:", self._afs_spin)
-
-        self._moisture_spin = QtWidgets.QDoubleSpinBox()
-        self._moisture_spin.setRange(0.0, 30.0)
-        self._moisture_spin.setDecimals(1)
-        self._moisture_spin.setSuffix(" %")
-        self._moisture_spin.setValue(body.mold_moisture_percent or base.moisture_percent)
-        form.addRow("Nem Oranı:", self._moisture_spin)
-
-        self._binder_spin = QtWidgets.QDoubleSpinBox()
-        self._binder_spin.setRange(0.0, 20.0)
-        self._binder_spin.setDecimals(1)
-        self._binder_spin.setSuffix(" %")
-        self._binder_spin.setValue(body.mold_binder_percent or base.binder_percent)
-        form.addRow("Bağlayıcı Oranı:", self._binder_spin)
-
-        self._compact_spin = QtWidgets.QDoubleSpinBox()
-        self._compact_spin.setRange(0.0, 100.0)
-        self._compact_spin.setDecimals(1)
-        self._compact_spin.setSuffix(" %")
-        self._compact_spin.setValue(body.mold_compactability_percent or base.compactability_percent)
-        form.addRow("Compactability Oranı:", self._compact_spin)
-
-        layout.addWidget(group)
-
-        btn_layout = QtWidgets.QHBoxLayout()
-        btn_layout.addStretch()
-        self._cancel_btn = QtWidgets.QPushButton("İptal")
-        self._cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(self._cancel_btn)
-        self._save_btn = QtWidgets.QPushButton("Kaydet")
-        self._save_btn.clicked.connect(self._on_accept)
-        btn_layout.addWidget(self._save_btn)
-        layout.addLayout(btn_layout)
-
-    def _on_accept(self) -> None:
-        self._body.mold_afs_grain_size = float(self._afs_spin.value())
-        self._body.mold_moisture_percent = float(self._moisture_spin.value())
-        self._body.mold_binder_percent = float(self._binder_spin.value())
-        self._body.mold_compactability_percent = float(self._compact_spin.value())
-        self.accept()
 
 
 class BodyTypeComboBox(QtWidgets.QComboBox):
@@ -392,6 +267,11 @@ class BodyRowWidget(QtWidgets.QWidget):
         self.mold_settings_changed.emit(self._body)
 
     def _on_sand_properties(self) -> None:
-        dialog = MoldPropertiesDialog(self._body, self)
+        dialog = MoldPropertiesDialog(
+            parent=self,
+            body=self._body,
+            preset_key=self._body.mold_preset or "green_sand",
+            title=f"Kum Parametreleri – {self._body.name}",
+        )
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             self.mold_settings_changed.emit(self._body)
