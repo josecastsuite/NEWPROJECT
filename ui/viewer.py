@@ -1,10 +1,8 @@
 """PyVistaQt 3D viewer wrapper for JoseCast Analyzer v8.x."""
 
-import heapq
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
-import scipy.ndimage as ndi
 import pyvista as pv
 from pyvistaqt import QtInteractor
 
@@ -16,7 +14,7 @@ from core.gating import (
 )
 from core.materials import get_alloy
 from core.sdf_analyzer import _trace_path_to_riser
-from core.types import BODY_TYPE_LABELS, AnalysisResult, Body, BodyType, GatingNode, HotSpot, RefinementRegion
+from core.types import BODY_TYPE_LABELS, AnalysisResult, Body, BodyType, HotSpot, RefinementRegion
 from ui.flow_animator import FlowAnimator
 
 
@@ -81,221 +79,6 @@ BODY_OPACITY_POST = {
     BodyType.DISTRIBUTOR: 0.35,
     BodyType.CURUFLUK: 0.35,
 }
-
-
-def _nearest_body_voxel(
-    body_index: np.ndarray,
-    body_idx: int,
-    origin_mm: np.ndarray,
-    dx_mm: float,
-    point_mm: np.ndarray,
-) -> Optional[Tuple[int, int, int]]:
-    """Return the body voxel closest to a 3-D point."""
-    p = np.asarray(point_mm, dtype=np.float64)
-    vox = np.round((p - origin_mm) / dx_mm - 0.5).astype(int)
-    shape = body_index.shape
-    if all(0 <= vox[i] < shape[i] for i in range(3)) and body_index[tuple(vox)] == body_idx:
-        return tuple(int(x) for x in vox)
-    # Fallback: search all body voxels for the nearest one.
-    coords = np.argwhere(body_index == body_idx)
-    if len(coords) == 0:
-        return None
-    dists = np.linalg.norm((coords + 0.5) * dx_mm + origin_mm - p, axis=1)
-    best = int(np.argmin(dists))
-    return tuple(int(x) for x in coords[best])
-
-
-def _voxel_path_through_body(
-    body_index: np.ndarray,
-    body_idx: int,
-    origin_mm: np.ndarray,
-    dx_mm: float,
-    start_mm: np.ndarray,
-    end_mm: np.ndarray,
-    step: int = 2,
-) -> Optional[np.ndarray]:
-    """Find a 26-neighbor A* path through one body's voxels.
-
-    The returned points are voxel centres plus the exact start/end points so the
-    polyline follows the real body interior instead of a straight chord.
-    """
-    start_v = _nearest_body_voxel(body_index, body_idx, origin_mm, dx_mm, start_mm)
-    end_v = _nearest_body_voxel(body_index, body_idx, origin_mm, dx_mm, end_mm)
-    if start_v is None or end_v is None:
-        return None
-    if start_v == end_v:
-        return np.vstack([start_mm, end_mm])
-
-    mask = body_index == body_idx
-    shape = mask.shape
-    # 26-neighbour offsets and costs
-    neigh = []
-    for iz in (-1, 0, 1):
-        for iy in (-1, 0, 1):
-            for ix in (-1, 0, 1):
-                if iz == 0 and iy == 0 and ix == 0:
-                    continue
-                d = (iz, iy, ix)
-                neigh.append((d, np.sqrt(iz * iz + iy * iy + ix * ix)))
-
-    def heuristic(a, b):
-        return float(np.linalg.norm(np.array(a) - np.array(b)))
-
-    open_set = [(heuristic(start_v, end_v), 0.0, start_v)]
-    g_score = {start_v: 0.0}
-    came_from = {}
-    closed = set()
-
-    while open_set:
-        _, g, cur = heapq.heappop(open_set)
-        if cur in closed:
-            continue
-        closed.add(cur)
-        if cur == end_v:
-            break
-        for off, cost in neigh:
-            nxt = (cur[0] + off[0], cur[1] + off[1], cur[2] + off[2])
-            if any(nxt[i] < 0 or nxt[i] >= shape[i] for i in range(3)):
-                continue
-            if not mask[nxt]:
-                continue
-            if nxt in closed:
-                continue
-            ng = g + cost
-            if nxt not in g_score or ng < g_score[nxt]:
-                g_score[nxt] = ng
-                came_from[nxt] = cur
-                heapq.heappush(open_set, (ng + heuristic(nxt, end_v), ng, nxt))
-
-    if end_v not in came_from and end_v != start_v:
-        return None
-
-    path_v = [end_v]
-    cur = end_v
-    while cur in came_from:
-        cur = came_from[cur]
-        path_v.append(cur)
-    path_v.reverse()
-
-    # Subsample to keep the polyline light but smooth.
-    path_v = path_v[::step]
-    if path_v[-1] != end_v:
-        path_v.append(end_v)
-
-    centres = (np.array(path_v, dtype=np.float64) + 0.5) * dx_mm + origin_mm
-    return np.vstack([np.asarray(start_mm, dtype=np.float64).reshape(1, -1), centres, np.asarray(end_mm, dtype=np.float64).reshape(1, -1)])
-
-
-def _points_inside_mask(
-    points: np.ndarray, mask: np.ndarray, origin_mm: np.ndarray, dx_mm: float
-) -> np.ndarray:
-    """Return a boolean array indicating which points map to True voxels."""
-    points = np.asarray(points, dtype=np.float64)
-    idx = np.round((points - origin_mm) / dx_mm - 0.5).astype(int)
-    shape = np.array(mask.shape)
-    valid = np.all((idx >= 0) & (idx < shape), axis=1)
-    inside = np.zeros(len(points), dtype=bool)
-    if valid.any():
-        inside[valid] = mask[idx[valid, 0], idx[valid, 1], idx[valid, 2]]
-    return inside
-
-
-def _smooth_path(
-    points: np.ndarray,
-    sigma: Optional[float] = None,
-    body_index: Optional[np.ndarray] = None,
-    body_idx: Optional[int] = None,
-    origin_mm: Optional[np.ndarray] = None,
-    dx_mm: float = 0.0,
-) -> np.ndarray:
-    """Gaussian 1-D smoothing along an ordered 3-D polyline.
-
-    Endpoints are preserved by replicating them before filtering; the curve is
-    therefore not shortened. If body data are supplied, points that drift
-    outside the body are snapped back to the nearest body voxel centre so the
-    displayed line never leaves the gate geometry.
-    """
-    points = np.asarray(points, dtype=np.float64)
-    if len(points) < 3:
-        return points.copy()
-    if sigma is None:
-        sigma = max(1.0, min(2.0, len(points) * 0.05))
-    pad = max(2, int(3 * sigma))
-    padded = np.vstack([points[:1]] * pad + [points] + [points[-1:]] * pad)
-    smoothed = np.stack(
-        [ndi.gaussian_filter1d(padded[:, i], sigma, mode="nearest") for i in range(3)],
-        axis=1,
-    )
-    smoothed = smoothed[pad:-pad]
-    # Restore exact start/end positions (the contact centroids).
-    smoothed[0] = points[0]
-    smoothed[-1] = points[-1]
-
-    if (
-        body_index is not None
-        and body_idx is not None
-        and origin_mm is not None
-        and dx_mm > 0.0
-    ):
-        body_mask = body_index == body_idx
-        if body_mask.any():
-            # Allow a one-voxel tolerance, then snap any remaining outliers to
-            # the nearest body voxel centre.
-            tol_mask = ndi.binary_dilation(body_mask, iterations=1)
-            inside = _points_inside_mask(smoothed, tol_mask, origin_mm, dx_mm)
-            if not inside.all():
-                coords = np.argwhere(body_mask)
-                centres = (coords + 0.5) * dx_mm + origin_mm
-                for i in np.where(~inside)[0]:
-                    d2 = np.sum((centres - smoothed[i]) ** 2, axis=1)
-                    smoothed[i] = centres[np.argmin(d2)]
-    return smoothed
-
-
-def _filled_velocity_magnitude(velocity: np.ndarray, is_metal: np.ndarray) -> Optional[np.ndarray]:
-    """Compute |v| and fill empty voxels with the nearest metal cell's value.
-
-    This guarantees that trilinear interpolation near a body surface never falls
-    on a zero/empty cell even if the display point drifts slightly outside the
-    metal mask.
-    """
-    if velocity is None or is_metal is None:
-        return None
-    # Accept both (3, nz, ny, nx) and (..., 3) layouts.
-    if velocity.ndim == 4 and velocity.shape[0] == 3:
-        vmag = np.linalg.norm(velocity, axis=0)
-    elif velocity.ndim == 4 and velocity.shape[-1] == 3:
-        vmag = np.linalg.norm(velocity, axis=-1)
-    else:
-        return None
-    if vmag.shape != is_metal.shape:
-        return None
-    if not is_metal.any():
-        return vmag
-    # nearest metal voxel index for every voxel
-    _, nearest_idx = ndi.distance_transform_edt(is_metal, return_indices=True)
-    filled = vmag[tuple(nearest_idx)]
-    return filled
-
-
-def _sample_velocity_magnitude(
-    filled_vmag: np.ndarray,
-    origin_mm: np.ndarray,
-    dx_mm: float,
-    points: np.ndarray,
-) -> np.ndarray:
-    """Trilinear interpolation of |v| at arbitrary 3-D points (mm).
-
-    Coordinates are mapped to the voxel index frame: centre of voxel (i,j,k) is
-    origin + (i+0.5)*dx.  Points outside the array are handled by `mode='nearest'`.
-    """
-    points = np.asarray(points, dtype=np.float64)
-    if points.ndim == 1:
-        points = points.reshape(1, -1)
-    coords = ((points - origin_mm) / dx_mm) - 0.5
-    sample_coords = np.array([coords[:, 0], coords[:, 1], coords[:, 2]])
-    vals = ndi.map_coordinates(filled_vmag, sample_coords, order=1, mode="nearest")
-    return np.asarray(vals, dtype=float)
 
 
 def _scalar_bar_args(title: str, pos: Tuple[float, float], clim: Optional[Tuple[float, float]] = None) -> dict:
@@ -367,11 +150,9 @@ class Analyzer3DViewer(QtInteractor):
         self._flow_actor = None
         self._flow_node_actor = None
         self._flow_arrow_actor = None
-        self._flow_lines_actor = None
         self._flow_colorbar_actor = None
         self.flow_animator = FlowAnimator(self)
         self._body_legend_actor = None
-        # voxel data needed to trace flow lines through body interiors
         self._bodies: List[Body] = []
         self._body_index: Optional[np.ndarray] = None
         self._origin_mm: Optional[np.ndarray] = None
@@ -459,7 +240,6 @@ class Analyzer3DViewer(QtInteractor):
         self._flow_actor = None
         self._flow_node_actor = None
         self._flow_arrow_actor = None
-        self._flow_lines_actor = None
         self._flow_colorbar_actor = None
         self._body_legend_actor = None
         self._bodies = []
@@ -525,7 +305,7 @@ class Analyzer3DViewer(QtInteractor):
                 pass
 
     def _make_grid(self, result: AnalysisResult, scalars: np.ndarray, name: str) -> pv.ImageData:
-        """Build a PyVista ImageData (voxel grid) with point-centered scalars and a metal mask."""
+        """Build a PyVista ImageData (voxel grid) with point-centered scalars and masks."""
         grid = pv.ImageData()
         grid.dimensions = np.array(result.grid.shape) + 1
         grid.origin = result.origin_mm
@@ -533,12 +313,30 @@ class Analyzer3DViewer(QtInteractor):
         grid.cell_data[name] = np.asarray(scalars).ravel(order="F")
         grid.cell_data["is_metal"] = result.is_metal.ravel(order="F").astype(np.float64)
         grid.cell_data["part"] = (result.grid == BodyType.PART).ravel(order="F").astype(np.float64)
+        gate_mask = np.isin(
+            result.grid,
+            [
+                BodyType.SPRUE_THROAT,
+                BodyType.SPRUE,
+                BodyType.RUNNER,
+                BodyType.DISTRIBUTOR,
+                BodyType.INGATE,
+                BodyType.POURING_BASIN,
+                BodyType.COOLING_SPRUE,
+                BodyType.FILTER,
+            ],
+        )
+        grid.cell_data["is_gate"] = gate_mask.ravel(order="F").astype(np.float64)
         # Contour / slice filters require point data; convert and keep both scalars.
         return grid.cell_data_to_point_data()
 
     def _metal_only(self, grid: pv.ImageData) -> pv.UnstructuredGrid:
         """Return only fully-metal cells from a grid."""
         return grid.threshold([1.0, 1.0], scalars="is_metal", all_scalars=True)
+
+    def _gate_only(self, grid: pv.ImageData) -> pv.UnstructuredGrid:
+        """Return only gating-system cells (sprue/runner/distributor/ingate)."""
+        return grid.threshold([1.0, 1.0], scalars="is_gate", all_scalars=True)
 
     def _part_only(self, grid: pv.ImageData) -> pv.UnstructuredGrid:
         """Return only part cells; porosity/Niyama belong to the casting, not risers/gating."""
@@ -850,7 +648,13 @@ class Analyzer3DViewer(QtInteractor):
         self._niyama_actors.append(actor)
 
     def show_flow_velocity(self, result: Optional[AnalysisResult]):
-        """Overlay the 3-D Darcy flow-velocity magnitude on the metal surfaces."""
+        """Paint the entire gating system with the real Darcy |v|.
+
+        Görsellik güzel ama en önemli şey hızların %100 doğru olması.
+        Renklendirme her hücredeki gerçek mutlak hız değerine
+        (|v| = sqrt(vx^2 + vy^2 + vz^2)) göre yapılır; LBM/VOF veya node
+        etiketleri bu alanın üzerine yazmaz.
+        """
         if self._flow_actor is not None:
             self.remove_actor(self._flow_actor)
             self._flow_actor = None
@@ -862,185 +666,43 @@ class Analyzer3DViewer(QtInteractor):
         if vmag is None or vmag.size == 0:
             return
         grid = self._make_grid(result, vmag, "velocity_magnitude")
-        metal = self._metal_only(grid)
-        if metal.n_cells == 0:
+        gate = self._gate_only(grid)
+        if gate.n_cells == 0:
             return
-        surf = self._smooth_surface(metal)
+        surf = self._smooth_surface(gate)
         if surf.n_points == 0:
             return
-        vmax = float(np.nanmax(vmag)) if np.isfinite(vmag).any() else 1.0
-        self._flow_actor = self.add_mesh(
-            surf,
-            scalars="velocity_magnitude",
-            cmap="turbo",
-            opacity=1.0,
-            clim=[0.0, max(vmax, 1e-3)],
-            show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.64, 0.02), clim=[0.0, max(vmax, 1e-3)]),
-            smooth_shading=True,
-        )
-
-    def show_flow_lines(self, result: Optional[AnalysisResult]):
-        """Draw smooth, body-following flow lines coloured by the true Darcy |v|.
-
-        Görsellik güzel ama en önemli şey hızların %100 doğru olması. Çizgiyi
-        pürüzsüzleştireceğim derken arkadaki gerçek Darcy hız verilerini
-        (flow_result.velocity) kaydırma veya bozma. Renklendirme her noktadaki
-        gerçek mutlak hız değerine (|v| = sqrt(vx^2 + vy^2 + vz^2)) göre yapılsın.
-        Meme girişindeki etiket hızı da o kesitteki gerçek akış hızını
-        yansıtmalı, uydurma veri istemiyorum. Matematik doğru çalışsın,
-        kodlamayı ona göre yap.
-        """
-        if self._flow_lines_actor is not None:
-            self.remove_actor(self._flow_lines_actor)
-            self._flow_lines_actor = None
-        self._remove_scalar_bar("Akış hızı (m/s)")
-        if result is None or result.flow_result is None:
-            return
-
-        fr = result.flow_result
-        nodes = fr.gating_nodes
-        if not nodes:
-            return
-
-        velocity = fr.velocity
-        if velocity is None:
-            return
-        filled_vmag = _filled_velocity_magnitude(velocity, result.is_metal)
-        if filled_vmag is None:
-            return
-
-        # The Darcy velocity field lives on the analysis grid.
-        origin_vel = np.asarray(result.origin_mm, dtype=np.float64)
-        dx_vel = float(result.dx_mm)
-
-        # Voxel data needed to trace flow lines through body interiors.
-        bodies = getattr(self, "_bodies", [])
-        body_index = getattr(self, "_body_index", None)
-        origin_mm = getattr(self, "_origin_mm", None)
-        dx_mm = float(getattr(self, "_dx_mm", 0.0) or 0.0)
-        body_idx_by_name = {
-            b.name: int(b.index)
-            for b in bodies
-            if getattr(b, "index", None) is not None
-        }
-
-        # ---- one continuous coloured line per ingate from inlet to ingate-part entry ----
-        node_by_downstream: Dict[str, GatingNode] = {}
-        for node in nodes:
-            if "→" not in node.name:
-                continue
-            down_name = node.name.split("→")[1].strip()
-            if down_name not in node_by_downstream:
-                node_by_downstream[down_name] = node
-
-        all_points: List[np.ndarray] = []
-        all_lines: List[int] = []
-        all_scalars: List[float] = []
-
-        for node in nodes:
-            if "→" not in node.name or "→" not in node.body_type:
-                continue
-            down_type = node.body_type.split("→")[1].strip()
-            if down_type != "PART":
-                continue
-
-            # Trace from this ingate->part node back to the source.
-            path: List[GatingNode] = [node]
-            current_up = node.name.split("→")[0].strip()
-            while current_up in node_by_downstream:
-                pred = node_by_downstream[current_up]
-                path.append(pred)
-                current_up = pred.name.split("→")[0].strip()
-                if current_up == "Kaynak" or pred.body_type.split("→")[0].strip() == "SOURCE":
-                    break
-            path.reverse()
-
-            if len(path) < 2:
-                continue
-
-            # Build a smooth, body-following polyline for this ingate.
-            path_points: List[np.ndarray] = []
-            for i in range(len(path) - 1):
-                n0 = path[i]
-                n1 = path[i + 1]
-                body_name = n0.name.split("→")[1].strip()
-                segment = [np.asarray(n0.centroid_mm, dtype=np.float64)]
-                if (
-                    body_index is not None
-                    and body_name in body_idx_by_name
-                    and dx_mm > 0.0
-                    and origin_mm is not None
-                ):
-                    try:
-                        pts = _voxel_path_through_body(
-                            body_index,
-                            body_idx_by_name[body_name],
-                            origin_mm,
-                            dx_mm,
-                            np.asarray(n0.centroid_mm, dtype=np.float64),
-                            np.asarray(n1.centroid_mm, dtype=np.float64),
-                            step=1,
-                        )
-                        if pts is not None and len(pts) >= 2:
-                            pts = _smooth_path(
-                                pts,
-                                body_index=body_index,
-                                body_idx=body_idx_by_name[body_name],
-                                origin_mm=origin_mm,
-                                dx_mm=dx_mm,
-                            )
-                            segment = [np.asarray(p, dtype=np.float64) for p in pts]
-                    except Exception:
-                        pass
-                if i == 0:
-                    path_points.extend(segment)
-                else:
-                    path_points.extend(segment[1:])
-
-            if len(path_points) < 2:
-                continue
-
-            pts_arr = np.asarray(path_points, dtype=np.float64)
-            scalars = _sample_velocity_magnitude(filled_vmag, origin_vel, dx_vel, pts_arr)
-            scalars = np.clip(scalars, 0.0, None)
-
-            start_idx = len(all_points)
-            n_pts = len(path_points)
-            all_points.extend(path_points)
-            all_scalars.extend(scalars.tolist())
-            all_lines.extend([n_pts] + list(range(start_idx, start_idx + n_pts)))
-
-        if not all_points:
-            return
-
-        scalars_arr = np.asarray(all_scalars, dtype=float)
-        if scalars_arr.size > 0:
-            p2 = float(np.percentile(scalars_arr, 2.0))
-            p98 = float(np.percentile(scalars_arr, 98.0))
+        # Percentile clamping using only gate cells so a single peak cannot
+        # flatten the whole colour scale.
+        gate_types = [
+            BodyType.SPRUE_THROAT,
+            BodyType.SPRUE,
+            BodyType.RUNNER,
+            BodyType.DISTRIBUTOR,
+            BodyType.INGATE,
+            BodyType.POURING_BASIN,
+            BodyType.COOLING_SPRUE,
+            BodyType.FILTER,
+        ]
+        gate_mask = np.isin(result.grid, gate_types)
+        gate_vals = vmag[gate_mask & np.isfinite(vmag)]
+        if gate_vals.size > 0:
+            p2 = float(np.percentile(gate_vals, 2.0))
+            p98 = float(np.percentile(gate_vals, 98.0))
             if p98 <= p2:
                 p98 = p2 + 1e-9
             clim = (p2, p98)
         else:
             clim = (0.0, 1.0)
-
-        poly = pv.PolyData(
-            np.asarray(all_points, dtype=np.float64),
-            lines=np.asarray(all_lines, dtype=np.int64),
-        )
-        poly.point_data["velocity_m_s"] = scalars_arr
-        poly.set_active_scalars("velocity_m_s", preference="point")
-
-        self._flow_lines_actor = self.add_mesh(
-            poly,
-            scalars="velocity_m_s",
+        self._flow_actor = self.add_mesh(
+            surf,
+            scalars="velocity_magnitude",
             cmap="turbo",
-            line_width=5,
-            opacity=0.95,
+            opacity=1.0,
             clim=clim,
             show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.02, 0.02), clim=clim),
-            lighting=False,
+            scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.45, 0.02), clim=clim),
+            smooth_shading=True,
         )
 
     def show_flow_node_labels(self, result: Optional[AnalysisResult]):
@@ -1260,15 +922,6 @@ class Analyzer3DViewer(QtInteractor):
             if self._flow_actor is not None:
                 self.remove_actor(self._flow_actor)
                 self._flow_actor = None
-            self._remove_scalar_bar("Akış hızı (m/s)")
-
-    def toggle_flow_lines(self, result: AnalysisResult, checked: bool):
-        if checked:
-            self.show_flow_lines(result)
-        else:
-            if self._flow_lines_actor is not None:
-                self.remove_actor(self._flow_lines_actor)
-                self._flow_lines_actor = None
             self._remove_scalar_bar("Akış hızı (m/s)")
 
     def toggle_flow_node_labels(self, result: AnalysisResult, checked: bool):
