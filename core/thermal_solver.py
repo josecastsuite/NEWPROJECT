@@ -422,11 +422,17 @@ def solve_3d_thermal(
     is_metal_fine = np.isin(grid, [int(t) for t in BODY_METAL_TYPES])
 
     if USE_CPP_THERMAL and JOSECAST_CORE is not None:
-        return _solve_thermal_cpp(
-            grid, is_metal_fine, alloy, mold, dx, max_time_s,
-            downsample, fill_time_s, velocity_m_s, gravity_vector,
-            feed_velocity_m_s,
-        )
+        try:
+            return _solve_thermal_cpp(
+                grid, is_metal_fine, alloy, mold, dx, max_time_s,
+                downsample, fill_time_s, velocity_m_s, gravity_vector,
+                feed_velocity_m_s,
+            )
+        except Exception as exc:
+            print(
+                f"[Thermal] C++ imza/argüman hatası, Python fallback kullanılıyor: {exc}",
+                file=sys.stderr,
+            )
 
     if downsample > 1:
         grid_c = _downsample_grid(grid, downsample)

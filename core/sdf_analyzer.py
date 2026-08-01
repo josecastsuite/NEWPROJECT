@@ -600,33 +600,39 @@ def compute_pore_size(
             if solid_fraction is not None and solid_fraction.ndim == 3 and solid_fraction.shape == niyama.shape
             else np.empty((0, 0, 0), dtype=np.float64)
         )
-        ps_um, ps_mm, macro, micro, fine, shrink, gp, mold_move = JOSECAST_CORE.compute_porosity(
-            niyama.astype(np.float64, copy=False),
-            M_mod.astype(np.float64, copy=False),
-            feed_risk.astype(np.float64, copy=False),
-            feed_eff.astype(np.float64, copy=False),
-            part_mask.astype(np.uint8, copy=False),
-            v_in,
-            d_in,
-            _alloy_to_dict(alloy),
-            alloy.carlson_curve_key,
-            alloy.material_family,
-            fs_in,
-            alloy.carbon_equivalent,
-            float(mold.mold_rigidity_factor) if mold is not None else 1.0,
-            alloy.graphite_expansion_fraction,
-            alloy.inoculation_factor,
-        )
-        return (
-            ps_um,
-            ps_mm,
-            macro.astype(bool),
-            micro.astype(bool),
-            fine.astype(bool),
-            shrink,
-            gp,
-            mold_move,
-        )
+        try:
+            ps_um, ps_mm, macro, micro, fine, shrink, gp, mold_move = JOSECAST_CORE.compute_porosity(
+                niyama.astype(np.float64, copy=False),
+                M_mod.astype(np.float64, copy=False),
+                feed_risk.astype(np.float64, copy=False),
+                feed_eff.astype(np.float64, copy=False),
+                part_mask.astype(np.uint8, copy=False),
+                v_in,
+                d_in,
+                _alloy_to_dict(alloy),
+                alloy.carlson_curve_key,
+                alloy.material_family,
+                fs_in,
+                alloy.carbon_equivalent,
+                float(mold.mold_rigidity_factor) if mold is not None else 1.0,
+                alloy.graphite_expansion_fraction,
+                alloy.inoculation_factor,
+            )
+            return (
+                ps_um,
+                ps_mm,
+                macro.astype(bool),
+                micro.astype(bool),
+                fine.astype(bool),
+                shrink,
+                gp,
+                mold_move,
+            )
+        except Exception as exc:
+            print(
+                f"[Porosity] C++ imza/argüman hatası, Python fallback kullanılıyor: {exc}",
+                file=sys.stderr,
+            )
 
     feed_factor = np.power(np.clip(feed_risk, 0.0, 1.0), alloy.feed_risk_exponent) * feed_eff
 
