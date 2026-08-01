@@ -691,14 +691,13 @@ class Analyzer3DViewer(QtInteractor):
                 point_index[id(pnode)] = start_idx + i
                 points.append(pnode.centroid_mm)
 
-            for i in range(len(path) - 1):
-                p0 = point_index[id(path[i])]
-                p1 = point_index[id(path[i + 1])]
-                lines.extend([2, p0, p1])
-                cell_velocities.append(_node_velocity(path[i + 1]))
+            # One continuous polyline per ingate, coloured by the ingate velocity.
+            line_cells = [len(path)] + [point_index[id(p)] for p in path]
+            lines.extend(line_cells)
+            end_v = _node_velocity(node)
+            cell_velocities.append(end_v)
 
             # label only at the ingate->part entry
-            end_v = _node_velocity(node)
             if end_v > 1e-12:
                 label_points.append(node.centroid_mm)
                 label_texts.append(f"{end_v:.2f} m/s")

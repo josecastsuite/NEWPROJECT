@@ -4795,6 +4795,8 @@ def _gating_node_velocities(
     # Propagate Q and compute velocities.
     Q_in: Dict[int, float] = {cid: 0.0 for cid in comp_meta if cid != part_id}
     Q_in[source_id] = float(Q_user)
+    # (up_id, down_id, GatingNode) used for post-processing to unify throat areas
+    node_entries: List[Tuple[int, int, GatingNode]] = []
 
     def _node_name(up_id: int, down_id: int) -> str:
         return f"{comp_meta[up_id][1]} → {comp_meta[down_id][1]}"
@@ -4879,6 +4881,7 @@ def _gating_node_velocities(
             )
             node = _make_node(cid, down_id, A, Q_branch, c["centroid_mm"], flow_rate_m3_s=Q_branch)
             nodes.append(node)
+            node_entries.append((cid, down_id, node))
             if down_id != part_id:
                 Q_in[down_id] += Q_branch
 
@@ -4887,6 +4890,34 @@ def _gating_node_velocities(
             "Düğüm hızları çözülemedi: hesaplanan düğüm listesi boş. "
             "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
         )
+
+    # Her gövde için kendisine bağlı tüm kenarlardaki en küçük (darboğaz) alanı
+    # bul.  Böylece DISTRIBUTOR→INGATE ve INGATE→PART aynı memenin dar
+    # kesitinden hesaplanır, parça yüzeyi genişlemesinde oluşan saçma düşük hızlar
+    # ortadan kalkar.
+    body_min_area_m2: Dict[int, float] = {}
+    for up_id, down_id, node in node_entries:
+        if node.body_type.startswith("SOURCE"):
+            continue
+        area_m2 = float(node.section_area_cm2) * 1e-4
+        if area_m2 <= 1e-18:
+            continue
+        # Parçaya akan kenar için gövde yukarıdaki elemandır, diğer tüm
+        # kenarlarda gövde aşağıdaki elemandır.
+        body = up_id if down_id == part_id else down_id
+        if body not in body_min_area_m2 or area_m2 < body_min_area_m2[body]:
+            body_min_area_m2[body] = area_m2
+
+    for up_id, down_id, node in node_entries:
+        if node.body_type.startswith("SOURCE"):
+            continue
+        q = float(node.flow_rate_m3_s)
+        body = up_id if down_id == part_id else down_id
+        a = body_min_area_m2.get(body, float(node.section_area_cm2) * 1e-4)
+        if a > 1e-18 and q > 1e-18:
+            node.section_area_cm2 = float(a * 1e4)
+            node.velocity_m_s = float(q / a)
+            node.max_velocity_m_s = node.velocity_m_s
 
     # Sort so the report follows the BFS fill path (source first).
     up_name_to_cid = {name: cid for cid, (_, name) in comp_meta.items()}
