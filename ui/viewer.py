@@ -92,17 +92,30 @@ def _scalar_bar_args(title: str, pos: Tuple[float, float], clim: Optional[Tuple[
             fmt = "%.1f"
         elif vmax < 1.0:
             fmt = "%.3f"
-    # Renk skalasını 1.5x uzatmak için boyutları ve sağa yaslı konumu güncelle.
-    width = 0.15 * 1.5
+    # Estimate text lengths so the bar is wide enough for the title and the
+    # numeric labels without overlap.
+    label_chars = 0
+    if clim is not None:
+        spec = fmt[1:]  # e.g. ".2f"
+        label_chars = max(len(f"{clim[0]:{spec}}"), len(f"{clim[1]:{spec}}"))
+    title_chars = len(title)
+    # Keep height fixed, make width dynamic based on title and desired labels.
     height = 0.08 * 1.5
-    # Sağ kenarı sabit tutmak için sol kenarı sola kaydır.
-    pos_x = max(0.0, pos[0] + 0.15 - width)
+    n_labels = 2
+    for n in (5, 4, 3, 2):
+        needed = title_chars * 0.013 + 0.04 + n * (max(label_chars, 1) * 0.011 + 0.008)
+        if needed <= 0.80:
+            n_labels = n
+            break
+    width = min(0.80, max(0.20, needed))
+    # Center the bar horizontally near the requested bottom position.
+    pos_x = max(0.0, 0.5 - width / 2.0)
     args = {
         "color": "#00ffff",
         "title_font_size": 10,
         "label_font_size": 8,
         "fmt": fmt,
-        "n_labels": 5,
+        "n_labels": n_labels,
         "vertical": False,
         "position_x": pos_x,
         "position_y": pos[1],
@@ -110,9 +123,6 @@ def _scalar_bar_args(title: str, pos: Tuple[float, float], clim: Optional[Tuple[
         "height": height,
         "title": title,
     }
-    if clim is not None:
-        args["below_label"] = f"<{clim[0]:.2f}"
-        args["above_label"] = f">{clim[1]:.2f}"
     return args
 
 
@@ -706,7 +716,7 @@ class Analyzer3DViewer(QtInteractor):
         )
 
     def show_flow_node_labels(self, result: Optional[AnalysisResult]):
-        """Add numeric velocity labels only at each ingate-part entry."""
+        """Add numeric velocity labels at the source inlet and each ingate-part entry."""
         if self._flow_node_actor is not None:
             self.remove_actor(self._flow_node_actor)
             self._flow_node_actor = None
@@ -717,10 +727,15 @@ class Analyzer3DViewer(QtInteractor):
         label_points: List[Tuple[float, float, float]] = []
         label_texts: List[str] = []
 
+        has_source = any("→" in n.body_type and n.body_type.split("→")[0].strip() == "SOURCE" for n in nodes)
+
         for node in nodes:
             if "→" not in node.name or "→" not in node.body_type:
                 continue
-            if node.body_type.split("→")[1].strip() != "PART":
+            up_type, down_type = (p.strip() for p in node.body_type.split("→"))
+            is_ingate_entry = down_type == "PART"
+            is_inlet = up_type == "SOURCE" or (not has_source and up_type == "SPRUE_THROAT")
+            if not (is_ingate_entry or is_inlet):
                 continue
             v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
             if v > 1e-12:
@@ -918,19 +933,15 @@ class Analyzer3DViewer(QtInteractor):
     def toggle_flow_velocity(self, result: AnalysisResult, checked: bool):
         if checked:
             self.show_flow_velocity(result)
+            self.show_flow_node_labels(result)
         else:
             if self._flow_actor is not None:
                 self.remove_actor(self._flow_actor)
                 self._flow_actor = None
-            self._remove_scalar_bar("Akış hızı (m/s)")
-
-    def toggle_flow_node_labels(self, result: AnalysisResult, checked: bool):
-        if checked:
-            self.show_flow_node_labels(result)
-        else:
             if self._flow_node_actor is not None:
                 self.remove_actor(self._flow_node_actor)
                 self._flow_node_actor = None
+            self._remove_scalar_bar("Akış hızı (m/s)")
 
     def toggle_flow_animation(self, result: AnalysisResult, checked: bool):
         if checked:
