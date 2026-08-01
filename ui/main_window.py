@@ -274,9 +274,23 @@ class MainWindow(QtWidgets.QMainWindow):
         _settings_labeled(self.alloy_combo, "Alaşım:")
 
         self.mold_type_combo = QtWidgets.QComboBox()
-        self.mold_type_combo.addItem("Kum Kalıp", "sand")
-        self.mold_type_combo.addItem("Metal Kalıp", "metal_mold")
-        self.mold_type_combo.addItem("Seramik Kalıp", "ceramic")
+        mold_category_names = {
+            "sand": "Kum Kalıp",
+            "metal": "Metal Kalıp",
+            "ceramic": "Seramik Kalıp",
+            "shell": "Shell Kalıp",
+            "investment": "Investment (Mum Yitirme)",
+            "graphite": "Grafit Kalıp",
+            "chill": "Soğutucu / Cep",
+            "filter": "Seramik Filtre",
+            "exothermic": "Egzotermik Yalancı",
+            "insulating": "Isı Yalıtkan Yalancı",
+        }
+        mold_category_order = ["sand", "metal", "ceramic", "shell", "investment", "graphite", "chill", "filter", "exothermic", "insulating"]
+        for cat in mold_category_order:
+            key = next((k for k, v in MOLDS.items() if v.mold_type == cat), None)
+            if key:
+                self.mold_type_combo.addItem(mold_category_names.get(cat, cat.capitalize()), key)
         self.mold_type_combo.currentIndexChanged.connect(self._on_mold_type_changed)
         _settings_labeled(self.mold_type_combo, "Kalıp tipi:")
 
@@ -292,11 +306,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mold_type_combo.blockSignals(True)
         self.sand_type_combo.blockSignals(True)
         self.alloy_combo.setCurrentIndex(list(ALLOYS.keys()).index("42CrMo4"))
-        self.mold_type_combo.setCurrentIndex(0)
-        sand_items = [self.sand_type_combo.itemData(i) for i in range(self.sand_type_combo.count())]
-        self.sand_type_combo.setCurrentIndex(
-            sand_items.index("green_sand") if "green_sand" in sand_items else 0
-        )
+        mold_default_idx = self.mold_type_combo.findData("sand")
+        self.mold_type_combo.setCurrentIndex(mold_default_idx if mold_default_idx >= 0 else 0)
+        sand_default_idx = self.sand_type_combo.findData("green_sand")
+        self.sand_type_combo.setCurrentIndex(sand_default_idx if sand_default_idx >= 0 else 0)
         self.alloy_combo.blockSignals(False)
         self.mold_type_combo.blockSignals(False)
         self.sand_type_combo.blockSignals(False)
@@ -693,13 +706,23 @@ class MainWindow(QtWidgets.QMainWindow):
         main_vbox.addWidget(terminal_group, stretch=0)
 
     def _current_mold_key(self) -> str:
-        mtype = self.mold_type_combo.currentData()
-        if mtype == "sand":
-            return self.sand_type_combo.currentData() or "green_sand"
-        return mtype or "green_sand"
+        mtype_key = self.mold_type_combo.currentData()
+        if mtype_key:
+            try:
+                if get_mold(mtype_key).mold_type == "sand":
+                    return self.sand_type_combo.currentData() or mtype_key
+            except Exception:
+                pass
+        return mtype_key or "sand"
 
     def _update_sand_type_visibility(self):
-        is_sand = self.mold_type_combo.currentData() == "sand"
+        mtype_key = self.mold_type_combo.currentData()
+        is_sand = False
+        if mtype_key:
+            try:
+                is_sand = get_mold(mtype_key).mold_type == "sand"
+            except Exception:
+                pass
         self.sand_type_combo.setVisible(is_sand)
         if hasattr(self.sand_type_combo, "_label"):
             self.sand_type_combo._label.setVisible(is_sand)

@@ -1,7 +1,20 @@
-"""Alloy and mould material database for JoseCast v7.2."""
+"""Alloy and mould material database for JoseCast v8.0.
 
+The actual material data lives in JSON files under ``data/materials/``:
+
+* ``data/materials/alloys.json`` – cast alloy physical properties.
+* ``data/materials/molds.json``  – mould / chill / sleeve properties.
+
+This module loads those JSON files at import time and exposes the same
+``ALLOYS``/``MOLDS`` dictionaries and helper functions as before.  If the JSON
+files are missing or malformed, a small built-in fallback is used so the
+program keeps running.
+"""
+import json
+import math
 from dataclasses import dataclass
-from typing import Dict
+from pathlib import Path
+from typing import Dict, Optional
 
 import numpy as np
 
@@ -9,25 +22,26 @@ import numpy as np
 @dataclass
 class MoldMaterial:
     """Mould / chill material for Chvorinov and heat transfer."""
+
     key: str
     name: str
     # Thermal properties (SI)
-    k_w_mk: float           # thermal conductivity (W/m·K)
-    rho_kg_m3: float        # density (kg/m³)
-    cp_j_kgk: float         # specific heat (J/kg·K)
-    t0_c: float             # initial mould temp (°C)
+    k_w_mk: float  # thermal conductivity (W/m·K)
+    rho_kg_m3: float  # density (kg/m³)
+    cp_j_kgk: float  # specific heat (J/kg·K)
+    t0_c: float  # initial mould temp (°C)
     # Chvorinov constant in s/mm² (empirical)
     chvorinov_c: float
     # Darcy / flow
     particle_size_mm: float = 0.25  # representative sand grain size
     permeability_proxy: float = 1.0
-    # Mold type category (sand, metal, ceramic, ...)
+    # Mold type category (sand, metal, ceramic, shell, investment, chill, ...)
     mold_type: str = "sand"
     is_sand: bool = True
     # Green-sand properties for particle-based permeability / air-leakage model
-    afs_grain_size: float = 50.0      # AFS grain fineness number (GFN)
-    moisture_percent: float = 4.0     # % moisture
-    binder_percent: float = 2.0         # % bentonite / binder
+    afs_grain_size: float = 50.0  # AFS grain fineness number (GFN)
+    moisture_percent: float = 4.0  # % moisture
+    binder_percent: float = 2.0  # % bentonite / binder
     compactability_percent: float = 45.0  # % compactability
 
     @property
@@ -39,6 +53,7 @@ class MoldMaterial:
 @dataclass
 class Alloy:
     """Cast alloy physical data."""
+
     key: str
     name: str
     # Metal properties
@@ -129,9 +144,9 @@ class Alloy:
 
     def _niyama_star_scale(self) -> float:
         """Solve the Carlson curve so N=niyama_macro gives the macro size proxy."""
-        import math
-
-        target_gp = self.macro_pore_limit_um / max(self.pore_size_um_per_porosity_pct, 1e-9)
+        target_gp = self.macro_pore_limit_um / max(
+            self.pore_size_um_per_porosity_pct, 1e-9
+        )
 
         def gp_for_scale(s: float) -> float:
             ny = self.niyama_macro * s
@@ -179,223 +194,134 @@ class Alloy:
         return (self.k_w_mk / (self.rho_kg_m3 * self.cp_j_kgk)) * 1e6
 
 
-MOLDS: Dict[str, MoldMaterial] = {
-    "sand": MoldMaterial(
-        key="sand",
-        name="Kum Kalıp",
-        k_w_mk=0.58,
-        rho_kg_m3=1600.0,
-        cp_j_kgk=1170.0,
-        t0_c=25.0,
-        chvorinov_c=2.8,
-        particle_size_mm=0.25,
-        permeability_proxy=1.0,
-        mold_type="sand",
-        is_sand=True,
-    ),
-    "green_sand": MoldMaterial(
-        key="green_sand",
-        name="Yeşil Kum",
-        k_w_mk=0.58,
-        rho_kg_m3=1600.0,
-        cp_j_kgk=1170.0,
-        t0_c=25.0,
-        chvorinov_c=2.8,
-        particle_size_mm=0.25,
-        permeability_proxy=1.0,
-        mold_type="sand",
-        is_sand=True,
-        afs_grain_size=50.0,
-        moisture_percent=4.0,
-        binder_percent=2.0,
-        compactability_percent=45.0,
-    ),
-    "silica_sand": MoldMaterial(
-        key="silica_sand",
-        name="Silis Kum",
-        k_w_mk=0.58,
-        rho_kg_m3=1600.0,
-        cp_j_kgk=1170.0,
-        t0_c=25.0,
-        chvorinov_c=2.8,
-        particle_size_mm=0.25,
-        permeability_proxy=1.0,
-        mold_type="sand",
-        is_sand=True,
-        afs_grain_size=55.0,
-        moisture_percent=3.5,
-        binder_percent=2.0,
-        compactability_percent=45.0,
-    ),
-    "chromite_sand": MoldMaterial(
-        key="chromite_sand",
-        name="Kromit Kum",
-        k_w_mk=0.50,
-        rho_kg_m3=2900.0,
-        cp_j_kgk=800.0,
-        t0_c=25.0,
-        chvorinov_c=2.5,
-        particle_size_mm=0.30,
-        permeability_proxy=0.9,
-        mold_type="sand",
-        is_sand=True,
-        afs_grain_size=45.0,
-        moisture_percent=3.0,
-        binder_percent=2.5,
-        compactability_percent=42.0,
-    ),
-    "zircon_sand": MoldMaterial(
-        key="zircon_sand",
-        name="Zirkon Kum",
-        k_w_mk=0.80,
-        rho_kg_m3=2600.0,
-        cp_j_kgk=800.0,
-        t0_c=25.0,
-        chvorinov_c=2.0,
-        particle_size_mm=0.18,
-        permeability_proxy=1.2,
-        mold_type="sand",
-        is_sand=True,
-        afs_grain_size=65.0,
-        moisture_percent=3.0,
-        binder_percent=2.0,
-        compactability_percent=40.0,
-    ),
-    "metal_mold": MoldMaterial(
-        key="metal_mold",
-        name="Metal Kalıp",
-        k_w_mk=45.0,
-        rho_kg_m3=7850.0,
-        cp_j_kgk=460.0,
-        t0_c=25.0,
-        chvorinov_c=0.8,
-        particle_size_mm=0.05,
-        permeability_proxy=0.05,
-        mold_type="metal",
-        is_sand=False,
-    ),
-    "ceramic": MoldMaterial(
-        key="ceramic",
-        name="Seramik Kalıp",
-        k_w_mk=1.2,
-        rho_kg_m3=2000.0,
-        cp_j_kgk=1000.0,
-        t0_c=25.0,
-        chvorinov_c=2.2,
-        particle_size_mm=0.15,
-        permeability_proxy=0.7,
-        mold_type="ceramic",
-        is_sand=False,
-    ),
-}
+# ---------------------------------------------------------------------------
+# JSON loading
+# ---------------------------------------------------------------------------
+
+ALLOYS: Dict[str, Alloy] = {}
+MOLDS: Dict[str, MoldMaterial] = {}
 
 
-ALLOYS: Dict[str, Alloy] = {
-    "AlSi7": Alloy(
-        key="AlSi7",
-        name="AlSi7 (Alüminyum)",
-        rho_g_cm3=2.66,
-        rho_kg_m3=2660.0,
-        latent_heat_j_kg=3.97e5,
-        t_liquidus_c=615.0,
-        t_solidus_c=577.0,
-        t_pour_c=700.0,
-        k_w_mk=150.0,
-        cp_j_kgk=900.0,
-        partition_coefficient=0.12,
-        viscosity_pa_s=0.0012,
-        particle_size_mm=0.30,
-        shrinkage_factor=0.07,
-        dendrite_spacing_mm=0.08,
-        feed_k1=3.5,
-        feed_k2=0.0,
-        niyama_macro=0.775,
-        niyama_shrinkage=1.5,
-        carlson_curve_key="A356",
-        critical_entrainment_velocity_m_s=0.5,
-        young_modulus_pa=7.0e10,
-        thermal_expansion_cinv=2.3e-5,
-        yield_strength_pa=1.5e8,
-        room_temp_yield_pa=2.5e8,
-    ),
-    "GGG40": Alloy(
-        key="GGG40",
-        name="GGG40 (Dökme Demir)",
-        rho_g_cm3=7.1,
-        rho_kg_m3=7100.0,
-        latent_heat_j_kg=2.3e5,
-        t_liquidus_c=1200.0,
-        t_solidus_c=1150.0,
-        t_pour_c=1350.0,
-        k_w_mk=36.0,
-        cp_j_kgk=520.0,
-        partition_coefficient=0.35,
-        viscosity_pa_s=0.006,
-        particle_size_mm=0.30,
-        shrinkage_factor=0.02,
-        dendrite_spacing_mm=0.15,
-        feed_k1=4.5,
-        feed_k2=0.0,
-        niyama_macro=0.775,
-        niyama_shrinkage=1.5,
-        carlson_curve_key="WCB",
-        critical_entrainment_velocity_m_s=0.6,
-    ),
-    "42CrMo4": Alloy(
-        key="42CrMo4",
-        name="42CrMo4 (Çelik)",
-        rho_g_cm3=7.85,
-        rho_kg_m3=7850.0,
-        latent_heat_j_kg=2.7e5,
-        t_liquidus_c=1510.0,
-        t_solidus_c=1410.0,
-        t_pour_c=1600.0,
-        k_w_mk=45.0,
-        cp_j_kgk=460.0,
-        partition_coefficient=0.20,
-        viscosity_pa_s=0.005,
-        particle_size_mm=0.25,
-        shrinkage_factor=0.03,
-        dendrite_spacing_mm=0.12,
-        feed_k1=6.0,
-        feed_k2=0.0,
-        niyama_macro=0.775,
-        niyama_shrinkage=1.5,
-        carlson_curve_key="WCB",
-        critical_entrainment_velocity_m_s=1.0,
-    ),
-    "bronze": Alloy(
-        key="bronze",
-        name="Bronz",
-        rho_g_cm3=8.8,
-        rho_kg_m3=8800.0,
-        latent_heat_j_kg=2.1e5,
-        t_liquidus_c=1000.0,
-        t_solidus_c=950.0,
-        t_pour_c=1150.0,
-        k_w_mk=60.0,
-        cp_j_kgk=380.0,
-        partition_coefficient=0.25,
-        viscosity_pa_s=0.004,
-        particle_size_mm=0.30,
-        shrinkage_factor=0.06,
-        dendrite_spacing_mm=0.10,
-        feed_k1=4.0,
-        feed_k2=0.0,
-        niyama_macro=0.775,
-        niyama_shrinkage=1.5,
-        carlson_curve_key="WCB",
-        critical_entrainment_velocity_m_s=0.5,
-    ),
-}
+def _json_path(name: str) -> Path:
+    return Path(__file__).resolve().parent / "materials_data" / name
+
+
+def _load_json_dict(path: Path) -> Optional[dict]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _default_alloys() -> Dict[str, Alloy]:
+    """Minimal fallback if alloys.json is missing."""
+    return {
+        "42CrMo4": Alloy(
+            key="42CrMo4",
+            name="42CrMo4 (Çelik)",
+            rho_g_cm3=7.85,
+            rho_kg_m3=7850.0,
+            latent_heat_j_kg=2.7e5,
+            t_liquidus_c=1510.0,
+            t_solidus_c=1410.0,
+            t_pour_c=1600.0,
+            k_w_mk=45.0,
+            cp_j_kgk=460.0,
+            viscosity_pa_s=0.005,
+            shrinkage_factor=0.03,
+            critical_entrainment_velocity_m_s=1.0,
+        ),
+        "AlSi7": Alloy(
+            key="AlSi7",
+            name="AlSi7 (Alüminyum)",
+            rho_g_cm3=2.66,
+            rho_kg_m3=2660.0,
+            latent_heat_j_kg=3.97e5,
+            t_liquidus_c=615.0,
+            t_solidus_c=577.0,
+            t_pour_c=700.0,
+            k_w_mk=150.0,
+            cp_j_kgk=900.0,
+            viscosity_pa_s=0.0012,
+            shrinkage_factor=0.07,
+            dendrite_spacing_mm=0.08,
+            feed_k1=3.5,
+            carlson_curve_key="A356",
+            critical_entrainment_velocity_m_s=0.5,
+            young_modulus_pa=7.0e10,
+            thermal_expansion_cinv=2.3e-5,
+            yield_strength_pa=1.5e8,
+            room_temp_yield_pa=2.5e8,
+        ),
+    }
+
+
+def _default_molds() -> Dict[str, MoldMaterial]:
+    """Minimal fallback if molds.json is missing."""
+    return {
+        "sand": MoldMaterial(
+            key="sand",
+            name="Kum Kalıp",
+            k_w_mk=0.58,
+            rho_kg_m3=1600.0,
+            cp_j_kgk=1170.0,
+            t0_c=25.0,
+            chvorinov_c=2.8,
+        ),
+        "metal_mold": MoldMaterial(
+            key="metal_mold",
+            name="Metal Kalıp",
+            k_w_mk=45.0,
+            rho_kg_m3=7850.0,
+            cp_j_kgk=460.0,
+            t0_c=25.0,
+            chvorinov_c=0.8,
+            mold_type="metal",
+            is_sand=False,
+        ),
+    }
+
+
+def _load_materials() -> None:
+    """Populate ALLOYS and MOLDS from JSON, with a tiny fallback."""
+    ALLOYS.clear()
+    MOLDS.clear()
+
+    alloys_raw = _load_json_dict(_json_path("alloys.json"))
+    if alloys_raw:
+        for k, v in alloys_raw.items():
+            try:
+                ALLOYS[k] = Alloy(**v)
+            except Exception as exc:
+                print(f"[MATERIALS] skipping invalid alloy {k}: {exc}")
+    if not ALLOYS:
+        ALLOYS.update(_default_alloys())
+
+    molds_raw = _load_json_dict(_json_path("molds.json"))
+    if molds_raw:
+        for k, v in molds_raw.items():
+            try:
+                MOLDS[k] = MoldMaterial(**v)
+            except Exception as exc:
+                print(f"[MATERIALS] skipping invalid mold {k}: {exc}")
+    if not MOLDS:
+        MOLDS.update(_default_molds())
+
+
+_load_materials()
 
 
 def get_alloy(key: str) -> Alloy:
-    return ALLOYS.get(key, ALLOYS["42CrMo4"])
+    if key in ALLOYS:
+        return ALLOYS[key]
+    return ALLOYS.get("42CrMo4", next(iter(ALLOYS.values())))
 
 
 def get_mold(key: str) -> MoldMaterial:
-    return MOLDS.get(key, MOLDS["sand"])
+    if key in MOLDS:
+        return MOLDS[key]
+    return MOLDS.get("sand", next(iter(MOLDS.values())))
 
 
 # Backwards-compatible aliases
