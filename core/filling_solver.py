@@ -74,84 +74,6 @@ def _downsample_grid(
     return grid_c.astype(grid.dtype), origin_c, dx_c
 
 
-def _geodesic_distance_field(
-    cavity_mask: np.ndarray, inlet_mask: np.ndarray
-) -> np.ndarray:
-    """26-neighbour geodesic distance from ``inlet_mask`` within ``cavity_mask``.
-
-    Uses vectorised sparse-graph construction so 120 000-cell LBM grids do not
-    hang in Python list append loops.
-    """
-    shape = cavity_mask.shape
-    node_id = np.full(shape, -1, dtype=np.int64)
-    n_nodes = int(cavity_mask.sum())
-    if n_nodes == 0:
-        return np.full(shape, np.inf, dtype=np.float64)
-    node_id[cavity_mask] = np.arange(n_nodes, dtype=np.int64)
-    nz, ny, nx = shape
-
-    src_list: List[np.ndarray] = []
-    dst_list: List[np.ndarray] = []
-    w_list: List[np.ndarray] = []
-    # 13 unique neighbour offsets; csr_graph below is undirected.
-    for dz in (-1, 0, 1):
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dz == 0 and dy == 0 and dx == 0:
-                    continue
-                if not (
-                    dz > 0 or (dz == 0 and dy > 0) or (dz == 0 and dy == 0 and dx > 0)
-                ):
-                    continue
-                if dz >= 0:
-                    sz = slice(0, nz - dz)
-                    dz_s = slice(dz, nz)
-                else:
-                    sz = slice(-dz, nz)
-                    dz_s = slice(0, nz + dz)
-                if dy >= 0:
-                    sy = slice(0, ny - dy)
-                    dy_s = slice(dy, ny)
-                else:
-                    sy = slice(-dy, ny)
-                    dy_s = slice(0, ny + dy)
-                if dx >= 0:
-                    sx = slice(0, nx - dx)
-                    dx_s = slice(dx, nx)
-                else:
-                    sx = slice(-dx, nx)
-                    dx_s = slice(0, nx + dx)
-                src = node_id[sz, sy, sx]
-                dst = node_id[dz_s, dy_s, dx_s]
-                valid = (src >= 0) & (dst >= 0)
-                if not valid.any():
-                    continue
-                src_list.append(src[valid])
-                dst_list.append(dst[valid])
-                weight = float(np.linalg.norm([dz, dy, dx]))
-                w_list.append(np.full(valid.sum(), weight, dtype=np.float64))
-
-    if src_list:
-        rows = np.concatenate(src_list)
-        cols = np.concatenate(dst_list)
-        data = np.concatenate(w_list)
-    else:
-        rows = cols = data = np.empty(0, dtype=np.float64)
-    graph = csr_matrix((data, (rows, cols)), shape=(n_nodes, n_nodes))
-
-    inlet_nodes = node_id[inlet_mask]
-    inlet_nodes = inlet_nodes[inlet_nodes >= 0]
-    geodesic = np.full(shape, np.inf, dtype=np.float64)
-    if inlet_nodes.size > 0:
-        dists = csgraph.dijkstra(
-            graph, indices=inlet_nodes, directed=False, return_predecessors=False
-        )
-        min_dist = np.min(dists, axis=0)
-        min_dist = np.where(np.isfinite(min_dist), min_dist, np.inf)
-        geodesic[cavity_mask] = min_dist
-    return geodesic
-
-
 def _recommend_filter(
     gating_nodes: List[Any], Q_m3_s: float, alloy: Any
 ) -> Optional[str]:
@@ -2900,132 +2822,6 @@ def _compute_fill_time_graph(
     return fill
 
 
-def _geodesic_gating_time(
-    grid: np.ndarray,
-    body_index: np.ndarray,
-    bodies: List[Body],
-    gating_nodes: List[GatingNode],
-    source_mask: np.ndarray,
-    dx_mm: float,
-) -> np.ndarray:
-    """Geodesic arrival time (seconds) from the source through the gating system.
-
-    Each connected gating body is treated as a conduit with a local front speed
-    derived from the gating-node velocities.  The shortest-path distance within
-    the metal mask, divided by the local speed, gives a realistic time for the
-    metal front to travel from the source through sprues, runners and ingates.
-    """
-    shape = grid.shape
-    T = np.full(shape, np.inf, dtype=np.float64)
-    gating_types = {
-        int(BodyType.SPRUE),
-        int(BodyType.SPRUE_THROAT),
-        int(BodyType.POURING_BASIN),
-        int(BodyType.RUNNER),
-        int(BodyType.DISTRIBUTOR),
-        int(BodyType.INGATE),
-    }
-    gating_mask = (
-        np.isin(grid, list(gating_types))
-        & (body_index >= 0)
-        & (grid != int(BodyType.CORE))
-    )
-    if not gating_mask.any():
-        return T
-
-    n_bodies = len(bodies)
-    name_to_bidx = {b.name: i for i, b in enumerate(bodies)}
-    q_sum = np.zeros(n_bodies, dtype=np.float64)
-    a_sum = np.zeros(n_bodies, dtype=np.float64)
-    for node in gating_nodes:
-        if "→" not in node.name or "→" not in node.body_type:
-            continue
-        up_name, _ = [s.strip() for s in node.name.split("→")]
-        up_bidx = name_to_bidx.get(up_name)
-        if up_bidx is None:
-            continue
-        q = float(node.flow_rate_m3_s)
-        v = float(
-            node.max_velocity_m_s
-            if node.max_velocity_m_s > 1e-12
-            else node.velocity_m_s
-        )
-        if v <= 1e-18:
-            continue
-        q_sum[up_bidx] += q
-        a_sum[up_bidx] += q / v
-
-    body_speed = np.zeros(n_bodies, dtype=np.float64)
-    valid = a_sum > 1e-18
-    if valid.any():
-        body_speed[valid] = q_sum[valid] / a_sum[valid]
-    avg_speed = float(np.mean(body_speed[body_speed > 1e-18])) if np.any(body_speed > 1e-18) else 1.5
-    body_speed = np.where(body_speed > 1e-18, body_speed, avg_speed)
-
-    cell_bidx = body_index[gating_mask]
-    cell_speed = body_speed[cell_bidx]
-    speed_grid = np.zeros(shape, dtype=np.float64)
-    speed_grid[gating_mask] = cell_speed
-
-    idx = np.full(shape, -1, dtype=np.int64)
-    idx[gating_mask] = np.arange(int(gating_mask.sum()))
-    N = int(gating_mask.sum())
-
-    source_indices = idx[source_mask & gating_mask]
-    if source_indices.size == 0:
-        # Use the top-most (against gravity) gating cells as fallback seed.
-        return T
-
-    rows: List[np.ndarray] = []
-    cols: List[np.ndarray] = []
-    weights: List[np.ndarray] = []
-    dx_m = float(dx_mm) / 1000.0
-
-    # x-faces
-    valid_x = (idx[:-1, :, :] >= 0) & (idx[1:, :, :] >= 0)
-    r = idx[:-1, :, :][valid_x]
-    c = idx[1:, :, :][valid_x]
-    v_face = 0.5 * (speed_grid[:-1, :, :][valid_x] + speed_grid[1:, :, :][valid_x])
-    w = dx_m / np.maximum(v_face, 1e-6)
-    rows.extend([r, c])
-    cols.extend([c, r])
-    weights.extend([w, w])
-
-    # y-faces
-    valid_y = (idx[:, :-1, :] >= 0) & (idx[:, 1:, :] >= 0)
-    r = idx[:, :-1, :][valid_y]
-    c = idx[:, 1:, :][valid_y]
-    v_face = 0.5 * (speed_grid[:, :-1, :][valid_y] + speed_grid[:, 1:, :][valid_y])
-    w = dx_m / np.maximum(v_face, 1e-6)
-    rows.extend([r, c])
-    cols.extend([c, r])
-    weights.extend([w, w])
-
-    # z-faces
-    valid_z = (idx[:, :, :-1] >= 0) & (idx[:, :, 1:] >= 0)
-    r = idx[:, :, :-1][valid_z]
-    c = idx[:, :, 1:][valid_z]
-    v_face = 0.5 * (speed_grid[:, :, :-1][valid_z] + speed_grid[:, :, 1:][valid_z])
-    w = dx_m / np.maximum(v_face, 1e-6)
-    rows.extend([r, c])
-    cols.extend([c, r])
-    weights.extend([w, w])
-
-    if not rows:
-        return T
-
-    rows_a = np.concatenate(rows)
-    cols_a = np.concatenate(cols)
-    weights_a = np.concatenate(weights)
-    graph = csr_matrix((weights_a, (rows_a, cols_a)), shape=(N, N))
-    dist = csgraph.dijkstra(graph, directed=False, indices=source_indices, return_predecessors=False)
-    if dist.ndim == 1:
-        dist = dist.reshape(1, -1)
-    min_dist = np.min(dist, axis=0)
-    T[gating_mask] = min_dist
-    return T
-
-
 def _gating_volume_time(
     grid: np.ndarray,
     body_index: np.ndarray,
@@ -5395,6 +5191,32 @@ def solve_filling_flow(
 
             vof_outlet = _select_vent_cells(vof_grid, vof_cavity, g)
 
+            # Fast Euclidean distance to the nearest inlet and a unit-gradient
+            # target-velocity field.  Passing these to the C++ LBM lets it skip
+            # its internal 26-neighbour Dijkstra pre-computation, which was the
+            # source of the long pause before the solver started.
+            lbm_inlet_distance = ndimage.distance_transform_edt(
+                ~vof_inlet
+            ).astype(np.float64)
+            lbm_inlet_distance[~vof_cavity] = 1e9
+            grad_x, grad_y, grad_z = np.gradient(lbm_inlet_distance)
+            norm = np.sqrt(grad_x * grad_x + grad_y * grad_y + grad_z * grad_z)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                target_x = np.where(
+                    norm > 1e-12, (grad_x / norm) * vof_inflow_v, 0.0
+                )
+                target_y = np.where(
+                    norm > 1e-12, (grad_y / norm) * vof_inflow_v, 0.0
+                )
+                target_z = np.where(
+                    norm > 1e-12, (grad_z / norm) * vof_inflow_v, 0.0
+                )
+            lbm_target_velocity = np.zeros((3,) + vof_grid.shape, dtype=np.float64)
+            lbm_target_velocity[0] = target_x
+            lbm_target_velocity[1] = target_y
+            lbm_target_velocity[2] = target_z
+            lbm_target_velocity[:, ~vof_cavity] = 0.0
+
             if use_cpp_lbm:
                 from core.cpp_bridge import JOSECAST_CORE
 
@@ -5405,10 +5227,9 @@ def solve_filling_flow(
                 # C++ binding expects a plain Python list for the gravity vector.
                 lbm_g = [float(x) for x in g]
 
-                # The compiled C++ LBM is called with exactly 12 positional
-                # arguments.  Older Windows .pyd builds expose 12 positional-only
-                # arguments; newer builds have default optional target_velocity /
-                # inlet_distance arrays, so 12 arguments is safe on both.
+                # 12 required positional arguments + 2 optional named arrays.
+                # Passing inlet_distance / target_velocity prevents the C++ LBM
+                # from running its own 26-neighbour Dijkstra at start-up.
                 print(
                     f"[LBM] C++ D3Q19 solve starting: grid={vof_grid.shape}, "
                     f"dx={vof_dx_m:.4f} m, inflow={vof_inflow_v:.3f} m/s, t_max={t_max_vof:.3f} s",
@@ -5438,6 +5259,8 @@ def solve_filling_flow(
                     int(os.environ.get("JOSECAST_CPP_LBM_MAX_STEPS", "12000")),
                     float(os.environ.get("JOSECAST_CPP_LBM_CFL", "0.3")),
                     float(os.environ.get("JOSECAST_CPP_LBM_SMAG", "0.18")),
+                    target_velocity=lbm_target_velocity,
+                    inlet_distance=lbm_inlet_distance,
                 )
                 vof_res = {
                     "fill_time": ft,
