@@ -647,7 +647,7 @@ class Analyzer3DViewer(QtInteractor):
         if not nodes:
             return
 
-        # ---- arrows along the gating graph ----
+        # ---- one continuous colored line per ingate from inlet to ingate-part entry ----
         node_by_downstream: Dict[str, GatingNode] = {}
         for node in nodes:
             if "→" not in node.name:
@@ -656,84 +656,84 @@ class Analyzer3DViewer(QtInteractor):
             if down_name not in node_by_downstream:
                 node_by_downstream[down_name] = node
 
-        starts: List[np.ndarray] = []
-        directions: List[np.ndarray] = []
-        velocities: List[float] = []
-        for node in nodes:
-            if "→" not in node.name:
-                continue
-            up_name, _down_name = [s.strip() for s in node.name.split("→")]
-            pred = node_by_downstream.get(up_name)
-            if pred is None:
-                continue
-            v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
-            if v <= 1e-12:
-                continue
-            start = np.asarray(pred.centroid_mm, dtype=float)
-            end = np.asarray(node.centroid_mm, dtype=float)
-            diff = end - start
-            dist = float(np.linalg.norm(diff))
-            if dist < 1e-6:
-                continue
-            # arrow length proportional to velocity (mm per m/s), clamped by distance
-            scale = 30.0
-            length = max(5.0, min(dist * 0.85, v * scale))
-            unit = diff / dist
-            starts.append(start)
-            directions.append(unit * length)
-            velocities.append(v)
+        points: List[Tuple[float, float, float]] = []
+        lines: List[int] = []
+        cell_velocities: List[float] = []
+        label_points: List[Tuple[float, float, float]] = []
+        label_texts: List[str] = []
 
-        if starts:
-            starts_arr = np.asarray(starts, dtype=np.float64)
-            dirs_arr = np.asarray(directions, dtype=np.float64)
-            pdata = pv.PolyData(starts_arr)
-            pdata["velocity_m_s"] = np.asarray(velocities, dtype=float)
-            pdata["vectors"] = dirs_arr
-            arrows = pdata.glyph(
-                orient="vectors",
-                scale="vectors",
-                factor=1.0,
-                geom=pv.Arrow(),
+        def _node_velocity(node: GatingNode) -> float:
+            return node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
+
+        for node in nodes:
+            if "→" not in node.name or "→" not in node.body_type:
+                continue
+            down_type = node.body_type.split("→")[1].strip()
+            if down_type != "PART":
+                continue
+            # Trace from this ingate->part node back to the source.
+            path: List[GatingNode] = [node]
+            current_up = node.name.split("→")[0].strip()
+            while current_up in node_by_downstream:
+                pred = node_by_downstream[current_up]
+                path.append(pred)
+                current_up = pred.name.split("→")[0].strip()
+                if current_up == "Kaynak" or pred.body_type.split("→")[0].strip() == "SOURCE":
+                    break
+            path.reverse()
+
+            if len(path) < 2:
+                continue
+
+            start_idx = len(points)
+            point_index: Dict[int, int] = {}
+            for i, pnode in enumerate(path):
+                point_index[id(pnode)] = start_idx + i
+                points.append(pnode.centroid_mm)
+
+            for i in range(len(path) - 1):
+                p0 = point_index[id(path[i])]
+                p1 = point_index[id(path[i + 1])]
+                lines.extend([2, p0, p1])
+                cell_velocities.append(_node_velocity(path[i + 1]))
+
+            # label only at the ingate->part entry
+            end_v = _node_velocity(node)
+            if end_v > 1e-12:
+                label_points.append(node.centroid_mm)
+                label_texts.append(f"{end_v:.2f} m/s")
+
+        if points:
+            poly = pv.PolyData(
+                np.asarray(points, dtype=np.float64),
+                lines=np.asarray(lines, dtype=np.int64),
             )
+            poly.cell_data["velocity_m_s"] = np.asarray(cell_velocities, dtype=float)
             self._flow_arrow_actor = self.add_mesh(
-                arrows,
+                poly,
                 scalars="velocity_m_s",
                 cmap="turbo",
-                opacity=0.9,
+                line_width=5,
+                opacity=0.95,
                 show_scalar_bar=True,
                 scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.02, 0.02)),
                 lighting=False,
             )
 
-        # ---- labels only at ingate inlets ----
-        label_points: List[Tuple[float, float, float]] = []
-        label_texts: List[str] = []
-        for node in nodes:
-            if "→" not in node.name or "→" not in node.body_type:
-                continue
-            down_type = node.body_type.split("→")[1].strip()
-            if down_type != "INGATE":
-                continue
-            v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
-            if v <= 1e-12:
-                continue
-            label_points.append(node.centroid_mm)
-            label_texts.append(f"{v:.2f} m/s")
-        if not label_points:
-            return
-        label_points = np.asarray(label_points, dtype=np.float64)
-        self._flow_node_actor = self.add_point_labels(
-            label_points,
-            label_texts,
-            font_size=10,
-            text_color="white",
-            point_color="red",
-            point_size=12,
-            shape=None,
-            always_visible=True,
-            shadow=False,
-            name="flow_node_labels",
-        )
+        if label_points:
+            label_points = np.asarray(label_points, dtype=np.float64)
+            self._flow_node_actor = self.add_point_labels(
+                label_points,
+                label_texts,
+                font_size=10,
+                text_color="white",
+                point_color="red",
+                point_size=12,
+                shape=None,
+                always_visible=True,
+                shadow=False,
+                name="flow_node_labels",
+            )
 
     def show_feeding_paths(self, result: Optional[AnalysisResult]):
         for actor in self._path_actors:
