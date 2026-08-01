@@ -170,13 +170,23 @@ class BodyTypeComboBox(QtWidgets.QComboBox):
     popup_shown = QtCore.pyqtSignal()
     popup_hidden = QtCore.pyqtSignal()
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._show_emitted = False
+
     def showPopup(self):
         super().showPopup()
-        self.popup_shown.emit()
+        if not self._show_emitted:
+            self._show_emitted = True
+            # Defer the signal so showPopup returns and the popup is fully
+            # rendered before the viewer is rebuilt.
+            QtCore.QTimer.singleShot(0, self.popup_shown.emit)
 
     def hidePopup(self):
         super().hidePopup()
-        self.popup_hidden.emit()
+        if self._show_emitted:
+            self._show_emitted = False
+            QtCore.QTimer.singleShot(0, self.popup_hidden.emit)
 
 
 class BodyRowWidget(QtWidgets.QWidget):

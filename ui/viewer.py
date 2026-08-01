@@ -281,7 +281,9 @@ class Analyzer3DViewer(QtInteractor):
                 continue
             faces = np.c_[np.full(len(body.faces), 3, dtype=np.int64), body.faces].ravel()
             mesh = pv.PolyData(body.vertices, faces)
-            is_selected = selected_body is not None and body is selected_body
+            is_selected = selected_body is not None and (
+                body is selected_body or body.name == selected_body.name
+            )
             color = "#ff0000" if is_selected else BODY_COLORS.get(body.body_type, "#F5F5F5")
             opacity = 1.0 if is_selected else opacity_map.get(body.body_type, 1.0)
             if selected_body is not None and not is_selected and not analysis_mode:

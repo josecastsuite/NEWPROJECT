@@ -806,6 +806,8 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self._bodies = load_step(path)
             self.aiLog(f"STEP yüklendi: {os.path.basename(path)}", "ok")
+            self._body_rows.clear()
+            self._body_items.clear()
             self.body_list.clear()
             for body in self._bodies:
                 self._add_body_row(body)
@@ -822,8 +824,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.voxelize_btn.setEnabled(True)
             self.analyze_btn.setEnabled(False)
             self._analysis = None
-            self._body_rows.clear()
-            self._body_items.clear()
 
             self._clear_checklist()
             self.rec_text.clear()
@@ -854,7 +854,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if new_type != BodyType.RISER:
             body.feeder_type = ""
             body.feeder_m_mm = 0.0
-        self.viewer.show_bodies(self._bodies)
+        self.viewer.show_bodies(self._bodies, reset_camera=False)
 
     def on_body_row_selected(self, row: int):
         """Highlight the selected body in the 3D viewer (red) for easier identification."""
