@@ -44,7 +44,7 @@ class FlowAnimator(QtCore.QObject):
     PHI_SIGMA = 1.5  # voxels; spatial smoothing for a smooth clip_scalar surface
     DECIMATE_TARGET = 0.5  # reduce triangle count per frame for GPU/CPU relief
     PORE_RISE_SPEED_M_S = 0.05  # buoyant pore drift against gravity
-    CLIP_UPSAMPLE = 3  # up-sample the animation grid before clip_scalar for smooth surfaces
+    CLIP_UPSAMPLE = 1  # contour interpolates sub-voxel surfaces; upsample disabled for speed
 
     def __init__(self, viewer, config_path=None):
         super().__init__(parent=None)
@@ -709,50 +709,64 @@ class FlowAnimator(QtCore.QObject):
         temperature: Optional[np.ndarray] = None,
         scalars: Optional[str] = None,
     ) -> pv.PolyData:
-        """Clip an up-sampled version of the base image for a smooth boundary.
+        """Extract the phi=0.5 isosurface for the filled metal region.
 
-        The voxel grid is up-sampled by CLIP_UPSAMPLE with trilinear
-        interpolation before clip_scalar, so the liquid front and part surface
-        get sub-voxel triangles.  Small features remain because the low-res phi
-        still decides which cells are filled.
+        ``vtkFlyingEdges3D`` interpolates inside voxels, so the boundary is
+        smooth and sub-voxel accurate without expensive up-sampling.  If
+        ``CLIP_UPSAMPLE > 1`` the grid is optionally zoomed for finer triangles.
         """
         base = self._base_image
         shape = tuple(base.dimensions)
         phi_3d = phi.reshape(shape, order="F")
-        phi_zoom = ndimage.zoom(
-            phi_3d, self.CLIP_UPSAMPLE, order=3, mode="constant", cval=0.0
-        )
-        phi_zoom = np.clip(phi_zoom, 0.0, 1.0)
-        new_shape = phi_zoom.shape
-        spacing = tuple(s / self.CLIP_UPSAMPLE for s in base.spacing)
-        clip_img = pv.ImageData(
-            dimensions=new_shape, spacing=spacing, origin=base.origin
-        )
-        clip_img.point_data["phi"] = phi_zoom.ravel(order="F")
+        if self.CLIP_UPSAMPLE > 1:
+            phi_zoom = ndimage.zoom(
+                phi_3d, self.CLIP_UPSAMPLE, order=3, mode="constant", cval=0.0
+            )
+            phi_zoom = np.clip(phi_zoom, 0.0, 1.0)
+            spacing = tuple(s / self.CLIP_UPSAMPLE for s in base.spacing)
+            clip_img = pv.ImageData(
+                dimensions=phi_zoom.shape, spacing=spacing, origin=base.origin
+            )
+            clip_img.point_data["phi"] = phi_zoom.ravel(order="F")
+            if temperature is not None:
+                temp_zoom = ndimage.zoom(
+                    temperature.reshape(shape, order="F"),
+                    self.CLIP_UPSAMPLE,
+                    order=1,
+                    mode="constant",
+                    cval=self._t_mold,
+                )
+                clip_img.point_data["temperature"] = temp_zoom.ravel(order="F")
+            if (
+                scalars is not None
+                and scalars != "phi"
+                and scalars in base.point_data
+            ):
+                s_zoom = ndimage.zoom(
+                    np.asarray(base.point_data[scalars]).reshape(shape, order="F"),
+                    self.CLIP_UPSAMPLE,
+                    order=1,
+                    mode="constant",
+                    cval=0.0,
+                )
+                clip_img.point_data[scalars] = s_zoom.ravel(order="F")
+        else:
+            clip_img = base
+            clip_img.point_data["phi"] = phi.ravel(order="F")
+            if temperature is not None:
+                clip_img.point_data["temperature"] = temperature.ravel(order="F")
+
+        surf = clip_img.contour(isosurfaces=[0.5], scalars="phi")
+        if surf.n_faces == 0:
+            return pv.PolyData()
         if temperature is not None:
-            temp_3d = temperature.reshape(shape, order="F")
-            temp_zoom = ndimage.zoom(
-                temp_3d,
-                self.CLIP_UPSAMPLE,
-                order=1,
-                mode="constant",
-                cval=self._t_mold,
-            )
-            clip_img.point_data["temperature"] = temp_zoom.ravel(order="F")
-        if scalars is not None and scalars != "phi" and scalars in base.point_data:
-            s_3d = np.asarray(base.point_data[scalars]).reshape(shape, order="F")
-            s_zoom = ndimage.zoom(
-                s_3d,
-                self.CLIP_UPSAMPLE,
-                order=1,
-                mode="constant",
-                cval=0.0,
-            )
-            clip_img.point_data[scalars] = s_zoom.ravel(order="F")
-        return (
-            clip_img.clip_scalar(scalars="phi", value=0.5, invert=False)
-            .extract_surface(algorithm="dataset_surface")
-        )
+            try:
+                surf = surf.compute_normals(
+                    auto_orient_normals=True, flip_normals=False
+                )
+            except Exception:
+                pass
+        return surf
 
     def _sample_scalar_at_points(
         self, points: np.ndarray, field: np.ndarray, order: int = 1
