@@ -5049,6 +5049,9 @@ def solve_filling_flow(
     # velocities are known.  Placeholder is created here so the variable exists;
     # the actual computation follows ``_gating_node_velocities``.
     fill_time_fine = np.full(orig_grid.shape, 0.0, dtype=np.float64)
+    air_entrapment_fine = np.full(orig_grid.shape, 0.0, dtype=np.float64)
+    trapped_air_volume_m3 = 0.0
+    air_entrapment_centroid_mm = np.array([], dtype=np.float64)
 
     if (
         vmag.shape == orig_grid.shape
@@ -5398,6 +5401,42 @@ def solve_filling_flow(
                 if np.isfinite(max_fill_t) and max_fill_t > 0.0:
                     fill_time_s = max_fill_t
 
+        # Resample binary air-entrapment mask from the LBM VOF grid.
+        air_entrapment_c = np.asarray(vof_res.get("air_entrapment", np.zeros_like(fill_time_c)), dtype=np.float64)
+        air_entrapment_c = np.where(np.isfinite(air_entrapment_c), air_entrapment_c, 0.0)
+        air_entrapment_fine = _resample_to_grid(
+            air_entrapment_c,
+            vof_origin,
+            vof_dx,
+            orig_grid.shape,
+            orig_origin,
+            orig_dx,
+            fill_value=0.0,
+            order=0,
+        )
+        air_entrapment_fine = np.where(fine_metal, np.clip(air_entrapment_fine, 0.0, 1.0), 0.0)
+        trapped_air_volume_m3 = float(air_entrapment_fine.sum() * (orig_dx / 1000.0) ** 3)
+        # Largest trapped pocket centroid for UI marker.
+        if air_entrapment_fine.max() > 1e-12:
+            try:
+                labeled, _ = ndimage.label(air_entrapment_fine > 0.5, structure=np.ones((3, 3, 3), dtype=np.int32))
+                if labeled.max() > 0:
+                    volumes = ndimage.sum(
+                        air_entrapment_fine,
+                        labeled,
+                        np.arange(1, labeled.max() + 1),
+                    )
+                    largest_label = int(np.argmax(volumes)) + 1
+                    centroid_voxel = ndimage.center_of_mass(
+                        air_entrapment_fine,
+                        labeled,
+                        largest_label,
+                    )
+                    air_entrapment_centroid_mm = np.asarray(centroid_voxel, dtype=np.float64)[[2, 1, 0]]
+                    air_entrapment_centroid_mm = air_entrapment_centroid_mm * orig_dx + orig_origin + 0.5 * orig_dx
+            except Exception:
+                pass
+
     # Post-process 3-D flow turbulence metrics (Re, turbulent intensity).
     orig_dx_m = orig_dx / 1000.0
     if fine_metal.any():
@@ -5613,4 +5652,7 @@ def solve_filling_flow(
         turbulence_intensity=turb_intensity.astype(np.float32),
         filter_recommendation=filter_recommendation,
         gate_flow_results=gate_flow_results,
+        air_entrapment=air_entrapment_fine.astype(np.float32),
+        trapped_air_volume_m3=trapped_air_volume_m3,
+        air_entrapment_centroid_mm=air_entrapment_centroid_mm,
     )

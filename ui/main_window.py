@@ -621,6 +621,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.erosion_toggle.toggled.connect(self.on_toggle_erosion_risk)
         vis_layout.addWidget(self.erosion_toggle)
 
+        self.air_entrapment_toggle = QtWidgets.QCheckBox("Hava Sıkışması")
+        self.air_entrapment_toggle.setToolTip("LBM/VOF serbest yüzey çözücüsünün bulduğu kapanmış hava ceplerini göster")
+        self.air_entrapment_toggle.setChecked(False)
+        self.air_entrapment_toggle.toggled.connect(self.on_toggle_air_entrapment)
+        vis_layout.addWidget(self.air_entrapment_toggle)
+
         anim_group = QtWidgets.QGroupBox("Akış & Katılaşma")
         anim_layout = QtWidgets.QVBoxLayout(anim_group)
 
@@ -1217,6 +1223,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.viewer.toggle_cold_shot_risk(self._analysis, True)
             if self.erosion_toggle.isChecked():
                 self.viewer.toggle_erosion_risk(self._analysis, True)
+            if self.air_entrapment_toggle.isChecked():
+                self.viewer.toggle_air_entrapment(self._analysis, True)
             if self.path_toggle.isChecked():
                 self.viewer.show_feeding_paths(self._analysis)
             if self.local_toggle.isChecked():
@@ -1566,6 +1574,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_toggle_erosion_risk(self, checked: bool):
         if self._analysis:
             self.viewer.toggle_erosion_risk(self._analysis, checked)
+
+    def on_toggle_air_entrapment(self, checked: bool):
+        if self._analysis:
+            self.viewer.toggle_air_entrapment(self._analysis, checked)
 
     def _update_flow_controls(self):
         has_flow = bool(self._analysis and self._analysis.flow_result)

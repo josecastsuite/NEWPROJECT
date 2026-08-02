@@ -63,6 +63,12 @@ if fr.gate_flow_results:
     for body_name, summary in fr.gate_flow_results.items():
         print(' ', body_name, summary)
 
+if result.air_entrapment is not None and result.air_entrapment.size:
+    ae = result.air_entrapment
+    print('air_entrapment', 'max', float(np.max(ae)), 'cells>0.3', int(np.sum(ae > 0.3)),
+          'trapped_volume_m3', result.trapped_air_volume_m3,
+          'centroid', result.air_entrapment_centroid_mm)
+
 anim = FlowAnimator(MockViewer())
 t0=time.time()
 anim.set_result(result)

@@ -163,6 +163,13 @@ def main():
               f"cells>0.3={int(np.sum(risk > 0.3))}, cells>0.5={int(np.sum(risk > 0.5))}")
         print(f"  Last fill point: {result.last_fill_point_mm}")
 
+    if result.air_entrapment is not None and result.air_entrapment.size:
+        ae = result.air_entrapment
+        print(f"  Air entrapment: max={float(np.max(ae)):.4f}, "
+              f"cells>0.3={int(np.sum(ae > 0.3))}, "
+              f"trapped_volume_m3={result.trapped_air_volume_m3:.6e}, "
+              f"centroid={result.air_entrapment_centroid_mm}")
+
     print("Generating HTML report ...")
     html_path = os.path.join(args.out_dir, "test_report.html")
     _generate_html(result, html_path)

@@ -166,6 +166,8 @@ class Analyzer3DViewer(QtInteractor):
         self._cold_shot_scalar_bar_actor = None
         self._last_fill_actor = None
         self._erosion_actor = None
+        self._air_entrapment_actor = None
+        self._air_entrapment_marker_actor = None
         self.flow_animator = FlowAnimator(self)
         self._body_legend_actor = None
         self._bodies: List[Body] = []
@@ -262,6 +264,8 @@ class Analyzer3DViewer(QtInteractor):
         self._cold_shot_scalar_bar_actor = None
         self._last_fill_actor = None
         self._erosion_actor = None
+        self._air_entrapment_actor = None
+        self._air_entrapment_marker_actor = None
         self._body_legend_actor = None
         self._bodies = []
         self._body_index = None
@@ -1176,6 +1180,70 @@ class Analyzer3DViewer(QtInteractor):
                 self.remove_actor(self._erosion_actor)
                 self._erosion_actor = None
             self._remove_scalar_bar("Kalıp erozyonu riski")
+
+    def show_air_entrapment(self, result: Optional[AnalysisResult]):
+        """Heatmap of trapped-air pockets detected by the LBM/VOF free-surface solver."""
+        if self._air_entrapment_actor is not None:
+            self.remove_actor(self._air_entrapment_actor)
+            self._air_entrapment_actor = None
+        if self._air_entrapment_marker_actor is not None:
+            self.remove_actor(self._air_entrapment_marker_actor)
+            self._air_entrapment_marker_actor = None
+        self._remove_scalar_bar("Hava sıkışması")
+
+        if result is None or result.air_entrapment is None or result.air_entrapment.size == 0:
+            return
+
+        grid = self._make_grid(result, result.air_entrapment, "air_entrapment")
+        part = self._part_only(grid)
+        if part.n_cells == 0:
+            part = self._metal_only(grid)
+        if part.n_cells == 0:
+            return
+
+        cells = part.threshold(0.3, scalars="air_entrapment", all_scalars=True)
+        if cells.n_cells == 0:
+            return
+
+        vmax = max(float(np.percentile(cells["air_entrapment"], 99)), 0.5)
+        if vmax <= 0.3:
+            vmax = 1.0
+        clim = [0.3, vmax]
+
+        self._air_entrapment_actor = self.add_mesh(
+            cells,
+            scalars="air_entrapment",
+            cmap="cool",
+            opacity=0.85,
+            clim=clim,
+            show_scalar_bar=True,
+            scalar_bar_args=_scalar_bar_args("Hava sıkışması", (0.02, 0.02), clim=clim),
+            smooth_shading=True,
+        )
+
+        if result.air_entrapment_centroid_mm is not None and result.air_entrapment_centroid_mm.size == 3:
+            radius = max(float(result.dx_mm) * 2.0, 2.0)
+            sphere = pv.Sphere(radius=radius, center=result.air_entrapment_centroid_mm)
+            self._air_entrapment_marker_actor = self.add_mesh(
+                sphere,
+                color="cyan",
+                opacity=0.9,
+                show_scalar_bar=False,
+            )
+
+        self._arrange_scalar_bars()
+
+    def toggle_air_entrapment(self, result: AnalysisResult, checked: bool):
+        if checked:
+            self.show_air_entrapment(result)
+        else:
+            if self._air_entrapment_actor is not None:
+                self.remove_actor(self._air_entrapment_actor)
+                self._air_entrapment_actor = None
+            if self._air_entrapment_marker_actor is not None:
+                self.remove_actor(self._air_entrapment_marker_actor)
+                self._air_entrapment_marker_actor = None
+            self._remove_scalar_bar("Hava sıkışması")
 
     def toggle_feeding_paths(self, result: AnalysisResult, checked: bool):
         if checked:

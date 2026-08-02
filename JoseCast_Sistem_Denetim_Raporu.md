@@ -720,3 +720,99 @@ class AnalysisResult:
 - **UI entegrasyonu:** `Soğuk Birleşme`, `Kalıp Şişmesi` ve `Kalıp Erozyonu` katmanları bağımsız checkbox'lara bağlıdır; soğuk birleşme katmanı 0.3 eşik değeri altını gizler, son dolum noktasına kırmızı küre koyar.
 
 **Yeni, denetimden geçmiş arşiv:** Güncel `NEWPROJECT.zip` oturum mesajındaki en son ek linkidir.
+
+---
+
+## EK A: Hava Sıkışması (Air Entrapment) Modülü — 2026-07-19
+
+Bu eklemede kullanıcı talebi üzerine LBM/VOF serbest-yüzey çözücüsünün zaten ürettiği `trap` (hava sıkışması) maskesinin sonuçlara ve arayüze entegrasyonu anlatılmaktadır.
+
+### A.1 C++ LBM Çıktısı
+
+`cpp/src/lbm_solver.cpp` içinde `solve_lbm_filling` zaten 10 elemanlı tuple döndürüyor; 5. eleman `trap`, 6. eleman toplam hacim:
+
+```cpp
+std::vector<double> ft, vmag, vel, phi, trap;
+solver.get_fill_time(&ft);
+solver.get_velocity_magnitude(&vmag);
+solver.get_velocity(&vel);
+solver.get_phi(&phi);
+solver.get_entrapment(&trap);
+...
+return nb::make_tuple(
+    arr_ft, arr_vmag, arr_vel, arr_phi, arr_trap,
+    solver.total_entrapped_volume(),
+    ...
+);
+```
+
+`detect_entrapment()` fonksiyonu 26-komşu birleşik bulma (union-find) ile kalıp boşluklarındaki hava hücrelerinin dışarı (outlet) ile bağlantılı olup olmadığını kontrol eder; bağlantısı kalmayan hava cepleri `trapped_time_` ile işaretlenir.
+
+### A.2 Python Veri Yapısı (`core/types.py`)
+
+```python
+@dataclass
+class FillingResult:
+    ...
+    air_entrapment: Optional[np.ndarray] = None
+    trapped_air_volume_m3: float = 0.0
+    air_entrapment_centroid_mm: np.ndarray = field(default_factory=lambda: np.array([]))
+
+@dataclass
+class AnalysisResult:
+    ...
+    air_entrapment: np.ndarray = field(default_factory=lambda: np.array([]))
+    trapped_air_volume_m3: float = 0.0
+    air_entrapment_centroid_mm: np.ndarray = field(default_factory=lambda: np.array([]))
+```
+
+### A.3 Hacim ve Merkez Hesabı (`core/filling_solver.py`)
+
+`vof_res["air_entrapment"]` (coarse LBM grid) `order=0` (nearest) ile fine grid'e örneklenir, sadece metal hücrelerinde tutulur, hacim binary mask toplamından hesaplanır ve en büyük hava cep merkezi `ndimage.label` + `ndimage.center_of_mass` ile bulunur:
+
+```python
+air_entrapment_c = np.asarray(vof_res.get("air_entrapment", ...), dtype=np.float64)
+air_entrapment_fine = _resample_to_grid(
+    air_entrapment_c, vof_origin, vof_dx,
+    orig_grid.shape, orig_origin, orig_dx,
+    fill_value=0.0, order=0,
+)
+air_entrapment_fine = np.where(fine_metal, np.clip(air_entrapment_fine, 0.0, 1.0), 0.0)
+trapped_air_volume_m3 = float(air_entrapment_fine.sum() * (orig_dx / 1000.0) ** 3)
+
+if air_entrapment_fine.max() > 1e-12:
+    labeled, _ = ndimage.label(air_entrapment_fine > 0.5, structure=np.ones((3,3,3)))
+    ...
+    air_entrapment_centroid_mm = centroid_voxel * orig_dx + orig_origin + 0.5 * orig_dx
+```
+
+### A.4 Arayüz (`ui/viewer.py`)
+
+Bağımsız "Hava Sıkışması" checkbox'ı eklendi. `0.3` eşiğinin altı şeffaf, üstü `cool` renk haritasıyla gösterilir; en büyük hava cep merkezine cyan küre konur:
+
+```python
+cells = part.threshold(0.3, scalars="air_entrapment", all_scalars=True)
+self._air_entrapment_actor = self.add_mesh(
+    cells, scalars="air_entrapment", cmap="cool",
+    opacity=0.85, clim=[0.3, vmax], ...
+)
+if result.air_entrapment_centroid_mm is not None and result.air_entrapment_centroid_mm.size == 3:
+    sphere = pv.Sphere(radius=..., center=result.air_entrapment_centroid_mm)
+    self._air_entrapment_marker_actor = self.add_mesh(sphere, color="cyan", opacity=0.9)
+```
+
+### A.5 Test Çıktısı (`Model_Knuckle_Dusuk.STEP`)
+
+```text
+Air entrapment: max=1.0000, cells>0.3=1486,
+  trapped_volume_m3=2.519780e-05,
+  centroid=[ 54.62206666 307.16147757 919.65759905]
+```
+
+`trapped_volume_m3 = 2.52e-5 m³ ≈ 25.2 cm³`. Bu değer, analizin `Model_Knuckle_Dusuk` geometrisinde gerçekten kapanmış hava hacmi ürettiğini gösterir.
+
+### A.6 Matematiksel Doğruluk ve "Inspire Cast" Karşılaştırması
+
+- **Hacim korunumu:** LBM/VOF implementasyonu `phi` alanıyla sıvı/hava arayüzünü izler; `total_entrapped_volume()` hücre hacimleri toplamıyla hesaplanır. Matematiksel olarak süreklilik denklemi `∂φ/∂t + ∇·(u φ) = 0` çerçevesindedir.
+- **Kapalı boşluk tespiti:** 26-komşu union-find, havalandırma/çıkış olmayan hava hücrelerini objektif olarak işaretler; bu, VOF-tabanlı döküm simülasyonlarında (Inspire Cast, MAGMA, FLOW-3D) kullanılan standart yöntemdir.
+- **Açık söylem:** "Inspire Cast'i matematiksel olarak geçtik" iddiası **doğrudan karşılaştırılamaz** çünkü Inspire Cast'in hava sıkışması modülünün per-voxel detaylarını, hücre sayısını ve benchmark verisini bilmiyoruz. JoseCast'te hava sıkışması modeli aynı fiziksel temele (VOF + kapalı cep tespiti) dayanır, açık API'si ve hücre-seviyesi çıktıları vardır, ancak **kesin üstünlük iddiası için bağımsız bir benchmark ve doğrulama verisi gerekir.**

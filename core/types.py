@@ -309,6 +309,10 @@ class FillingResult:
     filter_recommendation: Optional[str] = None
     # Local 3-D Darcy–Forchheimer gate-mesh summaries, keyed by Body.name.
     gate_flow_results: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    # Air entrapment from LBM/VOF free-surface solver (1 = trapped air pocket).
+    air_entrapment: Optional[np.ndarray] = None
+    trapped_air_volume_m3: float = 0.0
+    air_entrapment_centroid_mm: np.ndarray = field(default_factory=lambda: np.array([]))
 
 
 @dataclass
@@ -474,6 +478,10 @@ class AnalysisResult:
     last_fill_point_mm: np.ndarray = field(default_factory=lambda: np.array([]))
     # v10.5: per-voxel mold-sand erosion risk from high metal velocity
     erosion_risk: np.ndarray = field(default_factory=lambda: np.array([]))
+    # v10.6: per-voxel air entrapment from LBM free-surface solver
+    air_entrapment: np.ndarray = field(default_factory=lambda: np.array([]))
+    trapped_air_volume_m3: float = 0.0
+    air_entrapment_centroid_mm: np.ndarray = field(default_factory=lambda: np.array([]))
     # v8.9: per-class display filters (top % of computed porosity to display)
     pore_size_noise_percent: float = 3.0
     pore_size_threshold_um: float = 0.0
