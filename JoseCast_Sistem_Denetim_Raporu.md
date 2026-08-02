@@ -3,7 +3,7 @@
 **Tarih:** 2026-07-19  
 **Dal:** `devin/1784480540-p0-p1-fixes`  
 **HEAD commit:** `c42e1fd` — *Fix missing sys import in C++ fallback error printers*  
-**ZIP:** https://app.devin.ai/attachments/de56325b-670c-4e54-afe5-7dc2d9e1a16f/NEWPROJECT.zip
+**ZIP:** https://app.devin.ai/attachments/ca49a442-05f0-4c84-bf1e-d2ff142c16f9/NEWPROJECT.zip
 
 ---
 
@@ -719,4 +719,4 @@ class AnalysisResult:
 - **Fiziksel doğruluk:** LBM doldurma süresi `~0.86 s`, coverage `%100`, ince cidar/dar boğaz bölgelerinde `cold_shot_risk > 0` üretilmiştir.
 - **UI entegrasyonu:** `Soğuk Birleşme`, `Kalıp Şişmesi` ve `Kalıp Erozyonu` katmanları bağımsız checkbox'lara bağlıdır; soğuk birleşme katmanı 0.3 eşik değeri altını gizler, son dolum noktasına kırmızı küre koyar.
 
-**Yeni, denetimden geçmiş arşiv:** https://app.devin.ai/attachments/de56325b-670c-4e54-afe5-7dc2d9e1a16f/NEWPROJECT.zip
+**Yeni, denetimden geçmiş arşiv:** https://app.devin.ai/attachments/ca49a442-05f0-4c84-bf1e-d2ff142c16f9/NEWPROJECT.zip
