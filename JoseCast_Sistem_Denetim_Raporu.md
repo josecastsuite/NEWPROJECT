@@ -2,7 +2,7 @@
 
 **Tarih:** 2026-07-19  
 **Dal:** `devin/1784480540-p0-p1-fixes`  
-**HEAD commit:** `a7c8d07` — *Update report with final zip URL*  
+**Dal durumu:** En son commit PR'da `devin/1784480540-p0-p1-fixes` dalında görülebilir.
 **ZIP:** Güncel `NEWPROJECT.zip` dosyası oturum mesajında sunulan en son ek URL'sidir.
 
 ---
