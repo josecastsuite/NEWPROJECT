@@ -5415,11 +5415,41 @@ def solve_filling_flow(
             order=0,
         )
         air_entrapment_fine = np.where(fine_metal, np.clip(air_entrapment_fine, 0.0, 1.0), 0.0)
+
+        # Mold-permeability correction: in sand molds air can vent through the
+        # mold pores, especially if the trapped pocket is close to the surface.
+        # In metal/ceramic/shell molds the air has no escape path, so the C++
+        # binary trap value is kept as-is.  This makes air entrapment strongly
+        # depend on mold type, as it should.
+        if mold is not None and getattr(mold, "is_sand", True):
+            # Sand molds vent air through their pores; metal/ceramic/shell
+            # molds do not.  Scale the binary C++ trap mask by an escape
+            # factor that grows with sand permeability and is largest near
+            # the casting surface (where the trapped air has the shortest
+            # path through the mold).  In metal/ceramic this branch is skipped,
+            # so the full binary trap value is retained.
+            perm_eff = float(np.clip(getattr(mold, "permeability_proxy", 1.0), 0.0, 1.0))
+            if perm_eff > 1e-9:
+                dist_to_surface_mm = ndimage.distance_transform_edt(fine_metal, sampling=orig_dx)
+                # High-permeability sand vents deeper pockets faster.
+                vent_depth_mm = 2.0 + 20.0 * perm_eff
+                # Even internal pockets lose a small fraction of air through
+                # the sand over the filling time; surface pockets vent most.
+                base_escape = 0.1 + 0.25 * perm_eff
+                escape_factor = base_escape + (perm_eff - base_escape) * np.exp(
+                    -dist_to_surface_mm / max(vent_depth_mm, 1e-3)
+                )
+                air_entrapment_fine = np.where(
+                    fine_metal,
+                    np.clip(air_entrapment_fine * (1.0 - escape_factor), 0.0, 1.0),
+                    0.0,
+                )
+
         trapped_air_volume_m3 = float(air_entrapment_fine.sum() * (orig_dx / 1000.0) ** 3)
         # Largest trapped pocket centroid for UI marker.
         if air_entrapment_fine.max() > 1e-12:
             try:
-                labeled, _ = ndimage.label(air_entrapment_fine > 0.5, structure=np.ones((3, 3, 3), dtype=np.int32))
+                labeled, _ = ndimage.label(air_entrapment_fine > 0.3, structure=np.ones((3, 3, 3), dtype=np.int32))
                 if labeled.max() > 0:
                     volumes = ndimage.sum(
                         air_entrapment_fine,
