@@ -18,6 +18,7 @@ already elapsed, so the thermal solver is coupled to the flow solution.
 from typing import Optional, Tuple
 
 import os
+import sys
 
 import numpy as np
 from scipy import ndimage, sparse
