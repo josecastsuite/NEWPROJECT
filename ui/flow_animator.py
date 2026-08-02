@@ -310,12 +310,14 @@ class FlowAnimator(QtCore.QObject):
 
     def _build_animation_grid(self, metal: np.ndarray) -> bool:
         """Crop, downsample, and precompute the frame meshes."""
-        # Crop to the metal bounding box with a small pad.
+        # Crop to the exact metal bounding box; the ImageData padding below
+        # supplies the zero boundary so the clip/contour surface lands on the
+        # actual voxel faces rather than a full cell outside/inside.
         idx = np.nonzero(metal)
         if len(idx[0]) == 0:
             return False
 
-        pad = 1
+        pad = 0
         bbox = [
             max(0, int(idx[0].min()) - pad),
             min(self._shape[0], int(idx[0].max()) + 1 + pad),
@@ -397,13 +399,14 @@ class FlowAnimator(QtCore.QObject):
             [bbox[0], bbox[2], bbox[4]], dtype=np.float64
         ) * self._dx
 
-        # Wrap the cropped/downsampled animation grid with a one-cell void
-        # border.  This guarantees the marching-cubes isosurface has a zero
-        # background on every side, so the liquid metal surface closes cleanly
-        # and small thin sections are not clipped by the dataset boundary.
+        # Wrap the cell-centred cropped grid with a one-cell void boundary and
+        # shift the origin by half a spacing.  Point i=1 then sits at the
+        # original cell centre, point i=0 is the exterior padding, and the
+        # clip/contour surface lands on the true voxel faces instead of half a
+        # cell inside or outside the part mesh.
         border = 1
         shape_p = tuple(s + 2 * border for s in shape)
-        origin_p = origin_c - np.asarray(spacing, dtype=np.float64) * border
+        origin_p = origin_c - np.asarray(spacing, dtype=np.float64) * 0.5
 
         def _pad(field, fill):
             return np.pad(
@@ -516,9 +519,15 @@ class FlowAnimator(QtCore.QObject):
         # Non-metal cells keep phi = 0 because they are outside the casting.
         dt = np.where(metal, t - ft, -self._sentinel)
         phi = 0.5 * (1.0 + erf(dt / (np.sqrt(2.0) * sigma_t)))
-        phi = ndimage.gaussian_filter(
-            phi, sigma=self.PHI_SIGMA, mode="constant", cval=0.0
+        # Smooth only the interior data.  Treating the exterior padding as zero
+        # erodes the metal boundary, so the filter uses 'nearest' on the inner
+        # cells (replicating the outer metal values) and the zero padding is
+        # restored afterwards.  This keeps small sections and surface edges.
+        interior = phi[1:-1, 1:-1, 1:-1]
+        interior = ndimage.gaussian_filter(
+            interior, sigma=self.PHI_SIGMA, mode="nearest"
         )
+        phi[1:-1, 1:-1, 1:-1] = interior
         return phi.astype(np.float32).ravel(order="F")
 
     def _build_solid_base(self) -> None:
@@ -1141,7 +1150,10 @@ class FlowAnimator(QtCore.QObject):
                 T = self._compute_temperature(t).astype(np.float32).ravel(order="F")
                 self._base_image.point_data["temperature"] = T
                 self._base_image.point_data["phi"] = phi
-                surface = self._base_image.contour(isosurfaces=[0.5], scalars="phi")
+                surface = (
+                    self._base_image.clip_scalar(scalars="phi", value=0.5, invert=False)
+                    .extract_surface(algorithm="dataset_surface")
+                )
                 if surface.n_points == 0:
                     if self._frame_actor is not None:
                         try:
@@ -1247,24 +1259,35 @@ class FlowAnimator(QtCore.QObject):
                 )
                 active_pore = shifted > 0.5
 
-            pore_smooth = ndimage.gaussian_filter(
-                active_pore.astype(np.float64), sigma=self.PHI_SIGMA, mode="constant", cval=0.0
-            ).astype(np.float32)
+            # Smooth the pore and metal fields on the interior cells only,
+            # replicating the outer metal boundary instead of treating the zero
+            # padding as void, so the solidified surface does not shrink away.
+            pore_int = active_pore[1:-1, 1:-1, 1:-1].astype(np.float64)
+            pore_int = ndimage.gaussian_filter(
+                pore_int, sigma=self.PHI_SIGMA, mode="nearest"
+            )
+            pore_smooth = np.zeros_like(active_pore, dtype=np.float64)
+            pore_smooth[1:-1, 1:-1, 1:-1] = pore_int
+            pore_smooth = pore_smooth.astype(np.float32)
 
             # Metal level-set: keep the full casting geometry (including solid
             # feeders) so the surface never disappears.  The riser liquid fraction
             # is used only for the active feed-path overlay and pore suppression.
             metal_field = metal.astype(np.float64)
             metal_field = np.where(active_pore, 0.0, metal_field)
-            phi_t = ndimage.gaussian_filter(
-                metal_field,
-                sigma=self.PHI_SIGMA,
-                mode="constant",
-                cval=0.0,
-            ).astype(np.float32)
+            metal_int = metal_field[1:-1, 1:-1, 1:-1]
+            metal_int = ndimage.gaussian_filter(
+                metal_int, sigma=self.PHI_SIGMA, mode="nearest"
+            )
+            phi_t = np.zeros_like(metal_field, dtype=np.float64)
+            phi_t[1:-1, 1:-1, 1:-1] = metal_int
+            phi_t = phi_t.astype(np.float32)
             self._base_image.point_data["phi"] = phi_t.ravel(order="F")
 
-            surface = self._base_image.contour(isosurfaces=[0.5], scalars="phi")
+            surface = (
+                self._base_image.clip_scalar(scalars="phi", value=0.5, invert=False)
+                .extract_surface(algorithm="dataset_surface")
+            )
             if surface.n_points == 0:
                 if self._frame_actor is not None:
                     try:
@@ -1299,7 +1322,10 @@ class FlowAnimator(QtCore.QObject):
             # Rendered in bright purple (#800080) with 0.9 opacity so deep cavities
             # remain visible even behind the metal surface.
             self._base_image.point_data["pore_phi"] = pore_smooth.ravel(order="F")
-            pore_surface = self._base_image.contour(isosurfaces=[0.5], scalars="pore_phi")
+            pore_surface = (
+                self._base_image.clip_scalar(scalars="pore_phi", value=0.5, invert=False)
+                .extract_surface(algorithm="dataset_surface")
+            )
             if pore_surface.n_points == 0:
                 if self._pore_actor is not None:
                     try:
