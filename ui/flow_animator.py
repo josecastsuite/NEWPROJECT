@@ -397,18 +397,38 @@ class FlowAnimator(QtCore.QObject):
             [bbox[0], bbox[2], bbox[4]], dtype=np.float64
         ) * self._dx
 
-        self._fill_time_d = fill_d
-        self._solid_time_d = solid_d
-        self._metal_d = metal_d
-        self._pore_mask_d = pore_d
-        self._grid_d = grid_d
-        self._dist_to_riser_d = dist_d
+        # Wrap the cropped/downsampled animation grid with a one-cell void
+        # border.  This guarantees the marching-cubes isosurface has a zero
+        # background on every side, so the liquid metal surface closes cleanly
+        # and small thin sections are not clipped by the dataset boundary.
+        border = 1
+        shape_p = tuple(s + 2 * border for s in shape)
+        origin_p = origin_c - np.asarray(spacing, dtype=np.float64) * border
+
+        def _pad(field, fill):
+            return np.pad(
+                field, pad_width=border, mode="constant", constant_values=fill
+            )
+
+        fill_p = _pad(fill_d, self._sentinel)
+        solid_p = _pad(solid_d, self._sentinel)
+        metal_p = _pad(metal_d, False)
+        pore_p = _pad(pore_d, False)
+        grid_p = _pad(grid_d, int(BodyType.EMPTY))
+        dist_p = _pad(dist_d, np.inf)
+
+        self._fill_time_d = fill_p
+        self._solid_time_d = solid_p
+        self._metal_d = metal_p
+        self._pore_mask_d = pore_p
+        self._grid_d = grid_p
+        self._dist_to_riser_d = dist_p
 
         img = pv.ImageData(
-            dimensions=shape, spacing=spacing, origin=origin_c
+            dimensions=shape_p, spacing=spacing, origin=origin_p
         )
-        img.point_data["fill_time"] = fill_d.ravel(order="F")
-        img.point_data["solid_time"] = solid_d.ravel(order="F")
+        img.point_data["fill_time"] = fill_p.ravel(order="F")
+        img.point_data["solid_time"] = solid_p.ravel(order="F")
         self._base_image = img
 
         self._build_frames()

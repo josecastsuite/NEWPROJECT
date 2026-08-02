@@ -126,8 +126,8 @@ def _recommend_filter(
 def _flow_refined_grid(
     bodies: List[Body],
     casting_params,
-    desired_dx_mm: float = 1.75,
-    max_cells: int = 6_000_000,
+    desired_dx_mm: float = 1.0,
+    max_cells: int = 12_000_000,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float]]:
     """Re-voxelise the casting bodies for the Darcy flow solve.
 
@@ -4795,7 +4795,7 @@ def solve_filling_flow(
     alloy,
     bodies=None,
     body_index: Optional[np.ndarray] = None,
-    max_solver_cells: int = 6_000_000,
+    max_solver_cells: int = 12_000_000,
     progress_callback=None,
     design_velocity_m_s: float = 0.0,
     design_section_key: str = "SPRUE_THROAT",
@@ -4858,7 +4858,7 @@ def solve_filling_flow(
     # capture gate cross-sections (≤ ~1.8 mm) while staying within the solver
     # cavity budget.  Otherwise fall back to the supplied analysis grid.
     ref_grid, ref_origin, ref_dx = _flow_refined_grid(
-        bodies, casting_params, desired_dx_mm=1.75, max_cells=max_solver_cells
+        bodies, casting_params, desired_dx_mm=1.0, max_cells=max_solver_cells
     )
     if ref_grid is not None and ref_dx < dx * 0.95:
         grid, origin, dx = ref_grid, ref_origin, ref_dx
@@ -5115,7 +5115,7 @@ def solve_filling_flow(
     if not use_cpp_vof:
         vof_max_cells = 500_000
     # LBM is lighter per step but still benefits from a coarse grid for first runs.
-    lbm_max_cells = int(os.environ.get("JOSECAST_CPP_LBM_MAX_CELLS", "60000"))
+    lbm_max_cells = int(os.environ.get("JOSECAST_CPP_LBM_MAX_CELLS", "120000"))
 
     vof_res = None
     inflow_v = 0.0
