@@ -279,15 +279,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "sand": "Kum Kalıp",
             "metal": "Metal Kalıp",
             "ceramic": "Seramik Kalıp",
-            "shell": "Shell Kalıp",
-            "investment": "Investment (Mum Yitirme)",
-            "graphite": "Grafit Kalıp",
-            "chill": "Soğutucu / Cep",
-            "filter": "Seramik Filtre",
-            "exothermic": "Egzotermik Yalancı",
-            "insulating": "Isı Yalıtkan Yalancı",
         }
-        mold_category_order = ["sand", "metal", "ceramic", "shell", "investment", "graphite", "chill", "filter", "exothermic", "insulating"]
+        mold_category_order = ["sand", "metal", "ceramic"]
         for cat in mold_category_order:
             key = next((k for k, v in MOLDS.items() if v.mold_type == cat), None)
             if key:
