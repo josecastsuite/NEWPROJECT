@@ -41,9 +41,10 @@ class FlowAnimator(QtCore.QObject):
     MAX_ANIM_CELLS = 120_000
     MAX_FRAMES = 1350
     MIN_FILL_FRAMES = 1200  # most frames are allocated to the filling phase
-    PHI_SIGMA = 1.2  # voxels; controls how liquid surface is smoothed
+    PHI_SIGMA = 1.5  # voxels; spatial smoothing for a smooth clip_scalar surface
     DECIMATE_TARGET = 0.5  # reduce triangle count per frame for GPU/CPU relief
     PORE_RISE_SPEED_M_S = 0.05  # buoyant pore drift against gravity
+    CLIP_UPSAMPLE = 3  # up-sample the animation grid before clip_scalar for smooth surfaces
 
     def __init__(self, viewer, config_path=None):
         super().__init__(parent=None)
@@ -54,7 +55,9 @@ class FlowAnimator(QtCore.QObject):
         self.MAX_ANIM_CELLS = cfg.max_anim_cells
         self.MAX_FRAMES = cfg.max_frames
         self.MIN_FILL_FRAMES = cfg.min_fill_frames
-        self.PHI_SIGMA = cfg.phi_sigma
+        # A modest spatial gradient is needed for a smooth clip_scalar boundary.
+        # The phase-2 pore/metal smoothing is capped separately to avoid blurring.
+        self.PHI_SIGMA = max(0.0, min(cfg.phi_sigma, 2.0))
         self.DECIMATE_TARGET = cfg.decimate_target
         self.MAX_STREAMLINES = cfg.max_streamlines
         self.MAX_STEPS = cfg.max_steps
@@ -519,13 +522,13 @@ class FlowAnimator(QtCore.QObject):
         # Non-metal cells keep phi = 0 because they are outside the casting.
         dt = np.where(metal, t - ft, -self._sentinel)
         phi = 0.5 * (1.0 + erf(dt / (np.sqrt(2.0) * sigma_t)))
-        # Smooth only the interior data.  Treating the exterior padding as zero
-        # erodes the metal boundary, so the filter uses 'nearest' on the inner
-        # cells (replicating the outer metal values) and the zero padding is
-        # restored afterwards.  This keeps small sections and surface edges.
+        # Smooth the interior data with a zero-valued exterior boundary.  This
+        # creates a sub-voxel gradient at the metal/front surface so the
+        # clip_scalar surface is smooth and one-cell-thick sections are not
+        # lost.  A modest sigma keeps small features above the 0.5 clip value.
         interior = phi[1:-1, 1:-1, 1:-1]
         interior = ndimage.gaussian_filter(
-            interior, sigma=self.PHI_SIGMA, mode="nearest"
+            interior, sigma=self.PHI_SIGMA, mode="constant", cval=0.0
         )
         phi[1:-1, 1:-1, 1:-1] = interior
         return phi.astype(np.float32).ravel(order="F")
@@ -572,8 +575,9 @@ class FlowAnimator(QtCore.QObject):
     def _finalize_surface(
         self, surface: pv.PolyData, active_scalars: str = "velocity_magnitude"
     ) -> pv.PolyData:
-        """Smooth, decimate and normalise a surface mesh."""
-        surface = self._windowed_sinc_smooth(surface)
+        """Decimate and normalise a surface mesh."""
+        # The sub-voxel smoothness comes from _clip_smooth; additional mesh
+        # smoothing here re-introduces blocky artifacts and shrinks thin sections.
         try:
             surface = surface.compute_normals(
                 auto_orient_normals=True, flip_normals=False
@@ -643,17 +647,33 @@ class FlowAnimator(QtCore.QObject):
             color[mask] = field[z[mask], y[mask], x[mask]]
         return color
 
-    def _windowed_sinc_smooth(self, mesh: pv.PolyData) -> pv.PolyData:
-        """Apply a VTK windowed-sinc filter for fluid-like smooth surfaces."""
+    def _subdivide_and_smooth(self, mesh: pv.PolyData) -> pv.PolyData:
+        """Triangulate, subdivide once, and mildly smooth the fill surface.
+
+        This is the allowed 'illusion': the liquid boundary becomes visually
+        smooth (sub-voxel triangles) while the low-resolution voxel grid still
+        decides which cells are filled, so one-cell-thick sections are not
+        erased.
+        """
         try:
             import vtk
 
+            tri = mesh.triangulate()
+            if tri.n_points == 0:
+                return mesh
+            sub = vtk.vtkLoopSubdivisionFilter()
+            sub.SetInputData(tri)
+            sub.SetNumberOfSubdivisions(1)
+            sub.Update()
+            sub_out = pv.PolyData(sub.GetOutput())
+            if sub_out.n_points == 0:
+                return mesh
             smooth = vtk.vtkWindowedSincPolyDataFilter()
-            smooth.SetInputData(mesh)
-            smooth.SetNumberOfIterations(20)
-            smooth.SetPassBand(0.1)
+            smooth.SetInputData(sub_out)
+            smooth.SetNumberOfIterations(5)
+            smooth.SetPassBand(0.9)
             smooth.SetFeatureAngle(120.0)
-            smooth.BoundarySmoothingOn()
+            smooth.BoundarySmoothingOff()
             smooth.FeatureEdgeSmoothingOff()
             smooth.NonManifoldSmoothingOff()
             smooth.NormalizeCoordinatesOn()
@@ -662,6 +682,77 @@ class FlowAnimator(QtCore.QObject):
             return out if out.n_points > 0 else mesh
         except Exception:
             return mesh
+
+    def _windowed_sinc_smooth(self, mesh: pv.PolyData) -> pv.PolyData:
+        """Fallback conservative VTK windowed-sinc filter."""
+        try:
+            import vtk
+
+            smooth = vtk.vtkWindowedSincPolyDataFilter()
+            smooth.SetInputData(mesh)
+            smooth.SetNumberOfIterations(5)
+            smooth.SetPassBand(0.9)
+            smooth.SetFeatureAngle(120.0)
+            smooth.BoundarySmoothingOff()
+            smooth.FeatureEdgeSmoothingOff()
+            smooth.NonManifoldSmoothingOff()
+            smooth.NormalizeCoordinatesOn()
+            smooth.Update()
+            out = pv.PolyData(smooth.GetOutput())
+            return out if out.n_points > 0 else mesh
+        except Exception:
+            return mesh
+
+    def _clip_smooth(
+        self,
+        phi: np.ndarray,
+        temperature: Optional[np.ndarray] = None,
+        scalars: Optional[str] = None,
+    ) -> pv.PolyData:
+        """Clip an up-sampled version of the base image for a smooth boundary.
+
+        The voxel grid is up-sampled by CLIP_UPSAMPLE with trilinear
+        interpolation before clip_scalar, so the liquid front and part surface
+        get sub-voxel triangles.  Small features remain because the low-res phi
+        still decides which cells are filled.
+        """
+        base = self._base_image
+        shape = tuple(base.dimensions)
+        phi_3d = phi.reshape(shape, order="F")
+        phi_zoom = ndimage.zoom(
+            phi_3d, self.CLIP_UPSAMPLE, order=3, mode="constant", cval=0.0
+        )
+        phi_zoom = np.clip(phi_zoom, 0.0, 1.0)
+        new_shape = phi_zoom.shape
+        spacing = tuple(s / self.CLIP_UPSAMPLE for s in base.spacing)
+        clip_img = pv.ImageData(
+            dimensions=new_shape, spacing=spacing, origin=base.origin
+        )
+        clip_img.point_data["phi"] = phi_zoom.ravel(order="F")
+        if temperature is not None:
+            temp_3d = temperature.reshape(shape, order="F")
+            temp_zoom = ndimage.zoom(
+                temp_3d,
+                self.CLIP_UPSAMPLE,
+                order=1,
+                mode="constant",
+                cval=self._t_mold,
+            )
+            clip_img.point_data["temperature"] = temp_zoom.ravel(order="F")
+        if scalars is not None and scalars != "phi" and scalars in base.point_data:
+            s_3d = np.asarray(base.point_data[scalars]).reshape(shape, order="F")
+            s_zoom = ndimage.zoom(
+                s_3d,
+                self.CLIP_UPSAMPLE,
+                order=1,
+                mode="constant",
+                cval=0.0,
+            )
+            clip_img.point_data[scalars] = s_zoom.ravel(order="F")
+        return (
+            clip_img.clip_scalar(scalars="phi", value=0.5, invert=False)
+            .extract_surface(algorithm="dataset_surface")
+        )
 
     def _sample_scalar_at_points(
         self, points: np.ndarray, field: np.ndarray, order: int = 1
@@ -1150,10 +1241,7 @@ class FlowAnimator(QtCore.QObject):
                 T = self._compute_temperature(t).astype(np.float32).ravel(order="F")
                 self._base_image.point_data["temperature"] = T
                 self._base_image.point_data["phi"] = phi
-                surface = (
-                    self._base_image.clip_scalar(scalars="phi", value=0.5, invert=False)
-                    .extract_surface(algorithm="dataset_surface")
-                )
+                surface = self._clip_smooth(phi, temperature=T)
                 if surface.n_points == 0:
                     if self._frame_actor is not None:
                         try:
@@ -1180,6 +1268,7 @@ class FlowAnimator(QtCore.QObject):
                             scalars="temperature",
                             show_scalar_bar=True,
                             scalar_bar_args={"title": "Sıcaklık (°C)"},
+                            smooth_shading=True,
                             name="flow_frame",
                         )
                         self._frame_actor_scalar = "temperature"
@@ -1264,7 +1353,7 @@ class FlowAnimator(QtCore.QObject):
             # padding as void, so the solidified surface does not shrink away.
             pore_int = active_pore[1:-1, 1:-1, 1:-1].astype(np.float64)
             pore_int = ndimage.gaussian_filter(
-                pore_int, sigma=self.PHI_SIGMA, mode="nearest"
+                pore_int, sigma=min(self.PHI_SIGMA, 0.25), mode="nearest"
             )
             pore_smooth = np.zeros_like(active_pore, dtype=np.float64)
             pore_smooth[1:-1, 1:-1, 1:-1] = pore_int
@@ -1277,17 +1366,14 @@ class FlowAnimator(QtCore.QObject):
             metal_field = np.where(active_pore, 0.0, metal_field)
             metal_int = metal_field[1:-1, 1:-1, 1:-1]
             metal_int = ndimage.gaussian_filter(
-                metal_int, sigma=self.PHI_SIGMA, mode="nearest"
+                metal_int, sigma=min(self.PHI_SIGMA, 0.25), mode="nearest"
             )
             phi_t = np.zeros_like(metal_field, dtype=np.float64)
             phi_t[1:-1, 1:-1, 1:-1] = metal_int
             phi_t = phi_t.astype(np.float32)
             self._base_image.point_data["phi"] = phi_t.ravel(order="F")
 
-            surface = (
-                self._base_image.clip_scalar(scalars="phi", value=0.5, invert=False)
-                .extract_surface(algorithm="dataset_surface")
-            )
+            surface = self._clip_smooth(phi_t, temperature=T)
             if surface.n_points == 0:
                 if self._frame_actor is not None:
                     try:
@@ -1312,6 +1398,7 @@ class FlowAnimator(QtCore.QObject):
                         scalars="temperature",
                         show_scalar_bar=True,
                         scalar_bar_args={"title": "Sıcaklık (°C)"},
+                        smooth_shading=True,
                         name="flow_frame",
                     )
                     self._frame_actor_scalar = "temperature"
@@ -1322,9 +1409,8 @@ class FlowAnimator(QtCore.QObject):
             # Rendered in bright purple (#800080) with 0.9 opacity so deep cavities
             # remain visible even behind the metal surface.
             self._base_image.point_data["pore_phi"] = pore_smooth.ravel(order="F")
-            pore_surface = (
-                self._base_image.clip_scalar(scalars="pore_phi", value=0.5, invert=False)
-                .extract_surface(algorithm="dataset_surface")
+            pore_surface = self._clip_smooth(
+                pore_smooth.ravel(order="F"), scalars="pore_phi"
             )
             if pore_surface.n_points == 0:
                 if self._pore_actor is not None:
@@ -1342,6 +1428,7 @@ class FlowAnimator(QtCore.QObject):
                         color="#800080",
                         opacity=0.9,
                         show_scalar_bar=False,
+                        smooth_shading=True,
                         name="pore_actor",
                     )
                 else:

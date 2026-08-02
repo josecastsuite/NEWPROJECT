@@ -18,7 +18,7 @@ class AnimationConfig:
     max_anim_cells: int = 300_000
     max_frames: int = 1350
     min_fill_frames: int = 1200
-    phi_sigma: float = 0.6
+    phi_sigma: float = 1.5  # spatial smoothing for a smooth liquid boundary
     decimate_target: float = 0.0
     max_streamlines: int = 20
     max_steps: int = 2000
