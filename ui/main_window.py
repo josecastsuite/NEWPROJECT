@@ -110,10 +110,10 @@ class MainWindow(QtWidgets.QMainWindow):
         """Apply the #5 light blue-gray theme requested by the user."""
         self.setStyle(QtWidgets.QStyleFactory.create("Fusion"))
         palette = QtGui.QPalette()
-        palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor("#F1F5F9"))
+        palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor("#E2E8F0"))
         palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("#1E293B"))
-        palette.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor("#FFFFFF"))
-        palette.setColor(QtGui.QPalette.ColorRole.AlternateBase, QtGui.QColor("#F8FAFC"))
+        palette.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor("#F8FAFC"))
+        palette.setColor(QtGui.QPalette.ColorRole.AlternateBase, QtGui.QColor("#F1F5F9"))
         palette.setColor(QtGui.QPalette.ColorRole.ToolTipBase, QtGui.QColor("#FFFFFF"))
         palette.setColor(QtGui.QPalette.ColorRole.ToolTipText, QtGui.QColor("#1E293B"))
         palette.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor("#334155"))
@@ -126,14 +126,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.setStyleSheet(
             """
-            QMainWindow { background: #F1F5F9; }
-            QSplitter, QScrollArea, QScrollArea > QWidget { background: #F1F5F9; }
+            QMainWindow { background: #E2E8F0; }
+            QSplitter, QScrollArea, QScrollArea > QWidget { background: #E2E8F0; }
             QGroupBox {
                 background: #FFFFFF;
-                color: #1E293B;
+                color: #334155;
                 font-weight: 600;
                 font-size: 12px;
-                border: 1px solid #E2E8F0;
+                border: 1px solid #94A3B8;
                 border-radius: 10px;
                 margin-top: 14px;
                 padding-top: 18px;
@@ -147,7 +147,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 left: 12px;
                 top: -2px;
                 color: #1E293B;
-                font-weight: 600;
+                font-weight: 700;
                 background: transparent;
             }
             QPushButton {
@@ -158,46 +158,46 @@ class MainWindow(QtWidgets.QMainWindow):
             QPushButton:disabled { background: #CBD5E1; color: #64748B; }
             QPushButton:pressed { background: #1D4ED8; }
             QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
-                background: #FFFFFF; color: #1E293B; border: 1px solid #CBD5E1;
+                background: #F8FAFC; color: #1E293B; border: 1px solid #94A3B8;
                 border-radius: 6px; padding: 5px; min-height: 22px;
             }
             QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus {
-                border: 1px solid #3B82F6;
+                border: 1.5px solid #3B82F6;
             }
             QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QLineEdit:disabled {
-                background: #F1F5F9; color: #94A3B8; border: 1px solid #E2E8F0;
+                background: #E2E8F0; color: #94A3B8; border: 1px solid #CBD5E1;
             }
             QProgressBar {
-                background: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 6px;
+                background: #F8FAFC; border: 1px solid #94A3B8; border-radius: 6px;
                 text-align: center; color: #1E293B; font-weight: 600;
             }
             QProgressBar::chunk { background: #3B82F6; border-radius: 5px; }
             QLabel { color: #334155; font-weight: 500; font-size: 12px; }
             QListWidget {
-                background: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 8px;
+                background: #FFFFFF; border: 1px solid #94A3B8; border-radius: 8px;
                 color: #334155; padding: 4px;
             }
             QListWidget::item { padding: 4px; border-radius: 4px; }
             QListWidget::item:selected { background: #DBEAFE; color: #1E293B; }
             QTextEdit {
-                background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px;
+                background: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 8px;
                 color: #334155; font-family: 'Consolas', monospace; font-size: 12px;
             }
             QCheckBox { color: #334155; spacing: 8px; font-weight: 500; font-size: 12px; }
             QCheckBox::indicator {
                 width: 16px; height: 16px;
-                border: 1px solid #CBD5E1; border-radius: 4px;
-                background: #FFFFFF;
+                border: 1px solid #94A3B8; border-radius: 4px;
+                background: #F8FAFC;
             }
             QCheckBox::indicator:checked { background: #3B82F6; border: 1px solid #3B82F6; }
             QScrollArea { border: none; background: transparent; }
-            QScrollBar:vertical { background: #F1F5F9; width: 10px; border-radius: 5px; }
-            QScrollBar::handle:vertical { background: #CBD5E1; border-radius: 5px; }
-            QScrollBar::handle:vertical:hover { background: #94A3B8; }
-            QSlider::groove:horizontal { height: 6px; background: #E2E8F0; border-radius: 3px; }
+            QScrollBar:vertical { background: #E2E8F0; width: 10px; border-radius: 5px; }
+            QScrollBar::handle:vertical { background: #94A3B8; border-radius: 5px; }
+            QScrollBar::handle:vertical:hover { background: #64748B; }
+            QSlider::groove:horizontal { height: 6px; background: #CBD5E1; border-radius: 3px; }
             QSlider::sub-page:horizontal { background: #3B82F6; border-radius: 3px; }
-            QSlider::handle:horizontal { background: #FFFFFF; border: 1px solid #CBD5E1; width: 14px; height: 14px; border-radius: 7px; }
-            QToolTip { background: #FFFFFF; color: #1E293B; border: 1px solid #E2E8F0; padding: 4px; border-radius: 4px; }
+            QSlider::handle:horizontal { background: #FFFFFF; border: 1px solid #94A3B8; width: 14px; height: 14px; border-radius: 7px; }
+            QToolTip { background: #FFFFFF; color: #1E293B; border: 1px solid #CBD5E1; padding: 4px; border-radius: 4px; }
             """
         )
 
