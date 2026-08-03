@@ -103,8 +103,8 @@ class BodyRowWidget(QtWidgets.QWidget):
         )
         name_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         name_label.setStyleSheet(
-            "background-color: #27272a; color: #00ffff; border: 1px solid #52525b; "
-            "border-radius: 4px; padding: 3px; font-size: 11px; font-weight: bold; "
+            "background-color: #F1F5F9; color: #334155; border: 1px solid #CBD5E1; "
+            "border-radius: 4px; padding: 3px; font-size: 11px; font-weight: 600; "
             "min-height: 20px;"
         )
         name_label.setMaximumWidth(70)
@@ -180,8 +180,8 @@ class BodyRowWidget(QtWidgets.QWidget):
             "Kum parametrelerini düzenle (AFS tane, nem %, bağlayıcı %, compactability %)"
         )
         self._sand_prop_btn.setStyleSheet(
-            "background-color: #27272a; color: #00ffff; border: 1px solid #00ffff; "
-            "border-radius: 4px; padding: 2px; font-size: 11px; font-weight: bold; "
+            "background-color: #3B82F6; color: #FFFFFF; border: none; "
+            "border-radius: 4px; padding: 2px; font-size: 11px; font-weight: 600; "
             "text-align: center;"
         )
         self._sand_prop_btn.setSizePolicy(

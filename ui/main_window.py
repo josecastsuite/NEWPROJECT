@@ -63,13 +63,13 @@ class CheckListItem(QtWidgets.QWidget):
     def __init__(self, text: str, ok: bool, parent=None):
         super().__init__(parent)
         layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(4, 2, 4, 2)
-        layout.setSpacing(6)
-        icon = "✓" if ok else "✗"
-        color = "#00ff88" if ok else "#ff4444"
+        layout.setContentsMargins(4, 3, 4, 3)
+        layout.setSpacing(8)
+        icon = "●" if ok else "●"
+        icon_color = "#3B82F6" if ok else "#EF4444"
         self.label = QtWidgets.QLabel(
-            f'<span style="color:{color};font-weight:bold;font-size:14px">{icon}</span> '
-            f'<span style="color:#00ffff;font-weight:bold;">{_escape_html(text)}</span>'
+            f'<span style="color:{icon_color};font-weight:bold;font-size:12px">{icon}</span> '
+            f'<span style="color:#334155;font-weight:500;">{_escape_html(text)}</span>'
         )
         self.label.setWordWrap(True)
         self.label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.MinimumExpanding)
@@ -98,7 +98,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
         self._build_ui()
-        self._apply_dark_theme()
+        self._apply_light_theme()
         self._sync_casting_params_from_materials()
         self.aiLog(
             "JOSECAST TITAN ENGINE v8.0 BOOTING... [2040-READY]",
@@ -106,79 +106,98 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.aiLog("Siyah AI terminal hazır. Gelecekte LLM bağlantı noktası.", "ok")
 
-    def _apply_dark_theme(self):
+    def _apply_light_theme(self):
+        """Apply the #5 light blue-gray theme requested by the user."""
         self.setStyle(QtWidgets.QStyleFactory.create("Fusion"))
         palette = QtGui.QPalette()
-        palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor("#18181b"))
-        palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("#00ffff"))
-        palette.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor("#09090b"))
-        palette.setColor(QtGui.QPalette.ColorRole.AlternateBase, QtGui.QColor("#27272a"))
-        palette.setColor(QtGui.QPalette.ColorRole.ToolTipBase, QtGui.QColor("#18181b"))
-        palette.setColor(QtGui.QPalette.ColorRole.ToolTipText, QtGui.QColor("#00ffff"))
-        palette.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor("#00ffff"))
-        palette.setColor(QtGui.QPalette.ColorRole.Button, QtGui.QColor("#3f3f46"))
-        palette.setColor(QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor("#000000"))
-        palette.setColor(QtGui.QPalette.ColorRole.BrightText, QtGui.QColor("#ff4444"))
-        palette.setColor(QtGui.QPalette.ColorRole.Highlight, QtGui.QColor("#00ff88"))
-        palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#000000"))
+        palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor("#F1F5F9"))
+        palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("#1E293B"))
+        palette.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor("#FFFFFF"))
+        palette.setColor(QtGui.QPalette.ColorRole.AlternateBase, QtGui.QColor("#F8FAFC"))
+        palette.setColor(QtGui.QPalette.ColorRole.ToolTipBase, QtGui.QColor("#FFFFFF"))
+        palette.setColor(QtGui.QPalette.ColorRole.ToolTipText, QtGui.QColor("#1E293B"))
+        palette.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor("#334155"))
+        palette.setColor(QtGui.QPalette.ColorRole.Button, QtGui.QColor("#3B82F6"))
+        palette.setColor(QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor("#FFFFFF"))
+        palette.setColor(QtGui.QPalette.ColorRole.BrightText, QtGui.QColor("#EF4444"))
+        palette.setColor(QtGui.QPalette.ColorRole.Highlight, QtGui.QColor("#3B82F6"))
+        palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#FFFFFF"))
         self.setPalette(palette)
-        
+
         self.setStyleSheet(
             """
-            QMainWindow { background: #18181b; }
+            QMainWindow { background: #F1F5F9; }
+            QSplitter, QScrollArea, QScrollArea > QWidget { background: #F1F5F9; }
             QGroupBox {
-                color: #00ffff;
-                font-weight: bold;
+                background: #FFFFFF;
+                color: #1E293B;
+                font-weight: 600;
                 font-size: 12px;
-                border: 1px solid #3f3f46;
-                border-radius: 8px;
-                margin-top: 18px; 
-                padding-top: 18px; 
-                padding-left: 8px;
-                padding-right: 8px;
-                padding-bottom: 8px;
+                border: 1px solid #E2E8F0;
+                border-radius: 10px;
+                margin-top: 14px;
+                padding-top: 18px;
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-bottom: 12px;
             }
             QGroupBox::title {
-                subcontrol-origin: margin; 
+                subcontrol-origin: margin;
                 subcontrol-position: top left;
-                left: 12px; 
-                top: 0px;
-                color: #00ff88; 
-                font-weight: bold;
+                left: 12px;
+                top: -2px;
+                color: #1E293B;
+                font-weight: 600;
+                background: transparent;
             }
             QPushButton {
-                background: #00ff88; color: #000000; border: none;
-                border-radius: 6px; padding: 10px 16px; font-weight: bold; font-size: 12px;
+                background: #3B82F6; color: #FFFFFF; border: none;
+                border-radius: 8px; padding: 8px 16px; font-weight: 600; font-size: 12px;
             }
-            QPushButton:hover { background: #00cc6a; }
-            QPushButton:disabled { background: #27272a; color: #55aa88; }
+            QPushButton:hover { background: #2563EB; }
+            QPushButton:disabled { background: #CBD5E1; color: #64748B; }
+            QPushButton:pressed { background: #1D4ED8; }
             QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
-                background: #27272a; color: #00ffff; border: 1px solid #52525b;
-                border-radius: 5px; padding: 5px; min-height: 20px; font-weight: bold;
+                background: #FFFFFF; color: #1E293B; border: 1px solid #CBD5E1;
+                border-radius: 6px; padding: 5px; min-height: 22px;
+            }
+            QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus {
+                border: 1px solid #3B82F6;
             }
             QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QLineEdit:disabled {
-                background: #18181b; color: #55aa88; border: 1px solid #3f3f46;
+                background: #F1F5F9; color: #94A3B8; border: 1px solid #E2E8F0;
             }
             QProgressBar {
-                background: #27272a; border: 1px solid #52525b; border-radius: 5px;
-                text-align: center; color: #00ffff; font-weight: bold;
+                background: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 6px;
+                text-align: center; color: #1E293B; font-weight: 600;
             }
-            QProgressBar::chunk { background: #00ff88; border-radius: 4px; }
-            QLabel { color: #00ffff; font-weight: 800; font-size: 13px; }
+            QProgressBar::chunk { background: #3B82F6; border-radius: 5px; }
+            QLabel { color: #334155; font-weight: 500; font-size: 12px; }
             QListWidget {
-                background: #09090b; border: 1px solid #3f3f46; border-radius: 6px;
-                color: #00ffff; font-weight: bold;
+                background: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 8px;
+                color: #334155; padding: 4px;
             }
+            QListWidget::item { padding: 4px; border-radius: 4px; }
+            QListWidget::item:selected { background: #DBEAFE; color: #1E293B; }
             QTextEdit {
-                background: #000000; border: 2px solid #00ff88; border-radius: 6px;
-                color: #00ff88; font-weight: 800; font-size: 12px;
+                background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px;
+                color: #334155; font-family: 'Consolas', monospace; font-size: 12px;
             }
-            QCheckBox { color: #00ffff; spacing: 6px; font-weight: bold; font-size: 12px; }
-            QCheckBox::indicator { width: 16px; height: 16px; }
-            QCheckBox::indicator:checked { background: #00ff88; border: 1px solid #00ff88; }
+            QCheckBox { color: #334155; spacing: 8px; font-weight: 500; font-size: 12px; }
+            QCheckBox::indicator {
+                width: 16px; height: 16px;
+                border: 1px solid #CBD5E1; border-radius: 4px;
+                background: #FFFFFF;
+            }
+            QCheckBox::indicator:checked { background: #3B82F6; border: 1px solid #3B82F6; }
             QScrollArea { border: none; background: transparent; }
-            QScrollBar:vertical { background: #27272a; width: 10px; }
-            QScrollBar::handle:vertical { background: #00ff88; border-radius: 5px; }
+            QScrollBar:vertical { background: #F1F5F9; width: 10px; border-radius: 5px; }
+            QScrollBar::handle:vertical { background: #CBD5E1; border-radius: 5px; }
+            QScrollBar::handle:vertical:hover { background: #94A3B8; }
+            QSlider::groove:horizontal { height: 6px; background: #E2E8F0; border-radius: 3px; }
+            QSlider::sub-page:horizontal { background: #3B82F6; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #FFFFFF; border: 1px solid #CBD5E1; width: 14px; height: 14px; border-radius: 7px; }
+            QToolTip { background: #FFFFFF; color: #1E293B; border: 1px solid #E2E8F0; padding: 4px; border-radius: 4px; }
             """
         )
 
@@ -187,8 +206,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         
         main_vbox = QtWidgets.QVBoxLayout(central)
-        main_vbox.setContentsMargins(8, 8, 8, 8)
-        main_vbox.setSpacing(6)
+        main_vbox.setContentsMargins(12, 12, 12, 12)
+        main_vbox.setSpacing(10)
 
         # ---------------- TOP AREA (Splitter) ----------------
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
@@ -202,8 +221,8 @@ class MainWindow(QtWidgets.QMainWindow):
         left_scroll.setWidget(left_panel)
         left_layout = QtWidgets.QVBoxLayout(left_panel)
         left_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
-        left_layout.setSpacing(10)
-        left_layout.setContentsMargins(8, 8, 8, 8)
+        left_layout.setSpacing(8)
+        left_layout.setContentsMargins(10, 10, 10, 10)
 
         # File & body group
         file_group = QtWidgets.QGroupBox("1. STEP ve Body")
@@ -529,8 +548,8 @@ class MainWindow(QtWidgets.QMainWindow):
         right_scroll.setWidget(right_panel)
         right_layout = QtWidgets.QVBoxLayout(right_panel)
         right_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
-        right_layout.setSpacing(10)
-        right_layout.setContentsMargins(4, 4, 4, 4)
+        right_layout.setSpacing(8)
+        right_layout.setContentsMargins(10, 10, 10, 10)
 
         check_group = QtWidgets.QGroupBox("Kontrol Listesi")
         check_inner = QtWidgets.QVBoxLayout(check_group)
@@ -740,26 +759,18 @@ class MainWindow(QtWidgets.QMainWindow):
         main_vbox.addWidget(splitter, stretch=1)
 
         # ---------------- BOTTOM AREA: AI TERMINAL ----------------
-        terminal_group = QtWidgets.QGroupBox("AI ASİSTAN (Yapay Zeka)")
-        terminal_group.setStyleSheet("QGroupBox { color: #00ff88; font-weight: bold; border: 2px solid #00ff88; }")
+        terminal_group = QtWidgets.QGroupBox("AI Asistan")
         terminal_layout = QtWidgets.QVBoxLayout(terminal_group)
-        
+
         self.ai_terminal = QtWidgets.QTextEdit()
         self.ai_terminal.setReadOnly(True)
         self.ai_terminal.setMaximumHeight(90)
-        self.ai_terminal.setStyleSheet(
-            "QTextEdit { background-color: #000000; color: #00ffff; "
-            "font-family: 'Consolas', monospace; font-weight: 800; border: none;}"
-        )
         terminal_layout.addWidget(self.ai_terminal)
-        
+
         self.ai_input = QtWidgets.QLineEdit()
-        self.ai_input.setPlaceholderText("> Komut girişi yapın...")
-        self.ai_input.setStyleSheet(
-            "QLineEdit { background-color: #18181b; color: #00ff88; border: 1px solid #00ff88; font-weight: 800;}"
-        )
+        self.ai_input.setPlaceholderText("> Komut girin...")
         terminal_layout.addWidget(self.ai_input)
-        
+
         main_vbox.addWidget(terminal_group, stretch=0)
 
     def _current_mold_key(self) -> str:
@@ -893,13 +904,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.gravity_custom.clear()
 
     def aiLog(self, msg: str, type_: str = "info"):
-        """Print a line to the black AI terminal."""
+        """Print a line to the AI terminal."""
         color = {
-            "crit": "#ff4444",
-            "ok": "#00ff88",
-            "info": "#00ffff",
-            "warn": "#ffaa00",
-        }.get(type_, "#00ffff")
+            "crit": "#EF4444",
+            "ok": "#10B981",
+            "info": "#3B82F6",
+            "warn": "#F59E0B",
+        }.get(type_, "#3B82F6")
         line = (
             f'<span style="color:{color};margin:2px 0;font-family:Consolas,monospace;"'
             f'>&gt; {_escape_html(msg)}</span>'
@@ -1328,7 +1339,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"{n_hidden} adet hot spot yeterli besleyici/çıkıcı ile çözüldü; "
                 "sadece çözülmemişler listeleniyor."
             )
-            note.setStyleSheet("color: green;")
+            note.setStyleSheet("color: #3B82F6; font-weight: 500;")
             self.checklist_layout.addWidget(note)
 
         for rr in self._analysis.riser_results:
@@ -1502,7 +1513,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_recommendations(self):
         if self._analysis and self._analysis.recommendations:
-            html = "<ul style='margin:0;padding-left:16px;color:#00ffff;'>"
+            html = "<ul style='margin:0;padding-left:16px;color:#334155;'>"
             for r in self._analysis.recommendations:
                 html += f"<li style='margin:4px 0'><b>{_escape_html(r)}</b></li>"
             html += "</ul>"

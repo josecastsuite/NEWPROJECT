@@ -111,7 +111,7 @@ def _scalar_bar_args(title: str, pos: Tuple[float, float], clim: Optional[Tuple[
     # Center the bar horizontally near the requested bottom position.
     pos_x = max(0.0, 0.5 - width / 2.0)
     args = {
-        "color": "#00ffff",
+        "color": "#334155",
         "title_font_size": 10,
         "label_font_size": 8,
         "fmt": fmt,
@@ -131,8 +131,8 @@ class Analyzer3DViewer(QtInteractor):
 
     def __init__(self, parent=None, off_screen: bool = False):
         super().__init__(parent=parent, off_screen=off_screen)
-        self.set_background("#050505", top="#0a0a1a")
-        self.add_axes(line_width=2, color="#00ffff")
+        self.set_background("#F8FAFC", top="#E2E8F0")
+        self.add_axes(line_width=2, color="#64748B")
         try:
             self.add_light(pv.Light(light_type="headlight"))
         except Exception:
@@ -206,8 +206,8 @@ class Analyzer3DViewer(QtInteractor):
         self._body_legend_actor = self.add_legend(
             labels=entries,
             loc="upper right",
-            bcolor=(0.08, 0.08, 0.10),
-            background_opacity=0.85,
+            bcolor=(0.97, 0.98, 0.99),
+            background_opacity=0.90,
             face="circle",
             size=(width, height),
             name="body_legend",
@@ -226,6 +226,7 @@ class Analyzer3DViewer(QtInteractor):
         text_prop = self._body_legend_actor.GetEntryTextProperty()
         text_prop.SetFontSize(11)
         text_prop.SetBold(0)
+        text_prop.SetColor(0.20, 0.26, 0.33)
 
     def set_gating_data(
         self,
@@ -244,7 +245,7 @@ class Analyzer3DViewer(QtInteractor):
         self.flow_animator.stop()
         self._remove_all_scalar_bars()
         self.clear_actors()
-        self.add_axes(line_width=2, color="#00ffff")
+        self.add_axes(line_width=2, color="#64748B")
         self._body_actors.clear()
         self._part_mesh_pv = None
         self._hotspot_actors.clear()
@@ -427,12 +428,12 @@ class Analyzer3DViewer(QtInteractor):
                 phi_resolution=24,
             )
             if is_feeder or hs.solved:
-                # Solved / feeder-backed hot spot: blue/green sphere.
-                color = "#00aaff" if is_feeder else "#00ff88"
+                # Solved / feeder-backed hot spot: blue sphere.
+                color = "#2563EB" if is_feeder else "#3B82F6"
                 status = "Besleyici Tarafından Çözüldü (Safe)" if is_feeder else "Çözüldü (Safe)"
             else:
                 # Unfed or hydraulic/thermal feeding failed -> dangerous.
-                color = "#ff0000"
+                color = "#EF4444"
                 status = "TEHLİKE: ÇÖZÜLMEDİ!"
             actor = self.add_mesh(
                 sphere,
@@ -457,10 +458,10 @@ class Analyzer3DViewer(QtInteractor):
                 self._hotspot_label_actor = self.add_point_labels(
                     np.array(centers),
                     labels,
-                    text_color="#ffffff",
+                    text_color="#334155",
                     font_size=11,
                     shape="rounded_rect",
-                    background_color="black",
+                    background_color="#F1F5F9",
                     background_opacity=1.0,
                     show_points=False,
                     always_visible=True,
@@ -820,10 +821,12 @@ class Analyzer3DViewer(QtInteractor):
                 label_points,
                 label_texts,
                 font_size=10,
-                text_color="white",
-                point_color="red",
+                text_color="#334155",
+                point_color="#EF4444",
                 point_size=12,
-                shape=None,
+                shape="rounded_rect",
+                background_color="#F1F5F9",
+                background_opacity=0.85,
                 always_visible=True,
                 shadow=False,
                 name="flow_node_labels",
@@ -861,8 +864,8 @@ class Analyzer3DViewer(QtInteractor):
                 tube = poly.tube(radius=radius)
             except Exception:
                 tube = poly
-            # Cyan tubes are visible against red/yellow risk surfaces.
-            color = "#00ff88" if hs.feed_ok else "#00ffff"
+            # Blue/gray tubes are visible against risk surfaces.
+            color = "#3B82F6" if hs.feed_ok else "#64748B"
             actor = self.add_mesh(
                 tube,
                 color=color,
@@ -1423,7 +1426,7 @@ class Analyzer3DViewer(QtInteractor):
             return
         actor = self.add_mesh(
             plane,
-            color="#00ffff",
+            color="#3B82F6",
             opacity=0.15,
             pickable=False,
         )

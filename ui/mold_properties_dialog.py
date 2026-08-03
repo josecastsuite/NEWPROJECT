@@ -36,13 +36,14 @@ class MoldPropertiesDialog(QtWidgets.QDialog):
 
         self.setStyleSheet(
             """
-            QDialog { background-color: #18181b; }
-            QLabel { color: #00ffff; font-weight: 800; font-size: 13px; }
+            QDialog { background-color: #F8FAFC; }
+            QLabel { color: #334155; font-weight: 600; font-size: 12px; }
             QGroupBox {
-                color: #00ffff;
-                font-weight: bold;
-                font-size: 13px;
-                border: 1px solid #3f3f46;
+                color: #1E293B;
+                font-weight: 600;
+                font-size: 12px;
+                background: #FFFFFF;
+                border: 1px solid #E2E8F0;
                 border-radius: 8px;
                 margin-top: 14px;
                 padding-top: 12px;
@@ -54,28 +55,30 @@ class MoldPropertiesDialog(QtWidgets.QDialog):
                 subcontrol-origin: margin;
                 subcontrol-position: top left;
                 left: 10px;
-                color: #00ffff;
-                font-weight: bold;
+                color: #1E293B;
+                font-weight: 600;
+                background: transparent;
             }
             QDoubleSpinBox, QComboBox {
-                background: #27272a;
-                color: #00ffff;
-                border: 1px solid #52525b;
+                background: #FFFFFF;
+                color: #1E293B;
+                border: 1px solid #CBD5E1;
                 border-radius: 5px;
                 padding: 5px;
                 min-height: 22px;
-                font-weight: bold;
             }
+            QDoubleSpinBox:focus, QComboBox:focus { border: 1px solid #3B82F6; }
             QPushButton {
-                background: #27272a;
-                color: #00ffff;
-                border: 1px solid #00ffff;
+                background: #3B82F6;
+                color: #FFFFFF;
+                border: none;
                 border-radius: 6px;
                 padding: 8px 14px;
-                font-weight: bold;
+                font-weight: 600;
                 font-size: 12px;
             }
-            QPushButton:hover { background: #3f3f46; }
+            QPushButton:hover { background: #2563EB; }
+            QPushButton:disabled { background: #CBD5E1; color: #64748B; }
             """
         )
 
@@ -86,7 +89,7 @@ class MoldPropertiesDialog(QtWidgets.QDialog):
         header = QtWidgets.QLabel(
             body.name if body else "Kalıp kumu parametrelerini seçin ve düzenleyin."
         )
-        header.setStyleSheet("color: #00ffff; font-size: 13px; font-weight: bold;")
+        header.setStyleSheet("color: #1E293B; font-size: 13px; font-weight: 600;")
         layout.addWidget(header)
 
         info = QtWidgets.QLabel(
@@ -94,7 +97,7 @@ class MoldPropertiesDialog(QtWidgets.QDialog):
             "Kaydet butonu değişiklikleri JSON kütüphanesine yazar."
         )
         info.setWordWrap(True)
-        info.setStyleSheet("color: #00ffff; font-size: 11px; font-weight: normal;")
+        info.setStyleSheet("color: #64748B; font-size: 11px; font-weight: normal;")
         layout.addWidget(info)
 
         preset_layout = QtWidgets.QHBoxLayout()
