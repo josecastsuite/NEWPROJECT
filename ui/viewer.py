@@ -211,15 +211,16 @@ class Analyzer3DViewer(QtInteractor):
         text_color = (0.20, 0.26, 0.33)
         win_w, win_h = self.window_size
 
-        # Keep a constant legend width so adding/removing entries does not shift
-        # the left edge; only the right edge is anchored to the viewport.
-        max_chars = max(len(lbl) for lbl in BODY_LEGEND_LABELS.values())
+        # Tight, right-anchored legend box. Width follows the current entries so
+        # there is no empty space; the panel only resizes when the content grows.
+        max_chars = max(len(label) for label, _ in entries)
         char_w = 7
-        bullet_diameter = font_size + 4
-        bullet_to_label_gap = 8
-        box_w = max(120, max_chars * char_w + bullet_diameter + bullet_to_label_gap + 40)
-        line_h = 24
-        box_h = line_h * len(entries) + 10
+        bullet_diameter = font_size + 2  # thin black outline
+        bullet_to_label_gap = 6
+        pad = 10
+        line_h = 22
+        box_w = max(120, max_chars * char_w + bullet_diameter + bullet_to_label_gap + 2 * pad)
+        box_h = line_h * len(entries) + 2 * pad
         margin = 10
         x0 = int(win_w - box_w - margin)
         y0 = int(win_h - margin)
@@ -240,16 +241,16 @@ class Analyzer3DViewer(QtInteractor):
         bg.SetTextScaleModeToNone()
         self._body_legend_actors.append(bg)
 
-        bullet_x = int(x0 + bullet_diameter // 2 + 4)
+        bullet_x = int(x0 + pad + bullet_diameter // 2)
         label_x = int(bullet_x + bullet_diameter // 2 + bullet_to_label_gap)
         for i, (label, color) in enumerate(entries):
-            cy = int(y0 - 5 - line_h // 2 - i * line_h)
+            cy = int(y0 - pad - line_h // 2 - i * line_h)
 
             # Black outline bullet (larger)
             black_actor = self.add_text(
                 "\u2022",
                 position=(bullet_x, cy),
-                font_size=font_size + 4,
+                font_size=font_size + 2,
                 color="black",
             )
             black_prop = black_actor.GetTextProperty()
