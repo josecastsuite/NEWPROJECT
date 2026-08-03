@@ -940,7 +940,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.body_list.addItem(item)
         self.body_list.setItemWidget(item, widget)
-        item.setSizeHint(widget.sizeHint())
+        item.setSizeHint(
+            QtCore.QSize(
+                widget.sizeHint().width(),
+                max(widget.sizeHint().height(), widget.minimumSizeHint().height()) + 6,
+            )
+        )
 
     def on_load_step(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(

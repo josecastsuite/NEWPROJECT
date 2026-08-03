@@ -87,15 +87,16 @@ class BodyRowWidget(QtWidgets.QWidget):
 
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Fixed,
+            QtWidgets.QSizePolicy.Policy.Minimum,
         )
         self._build_ui()
         self._sync_from_body()
 
     def _build_ui(self) -> None:
         layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(1, 1, 1, 1)
-        layout.setSpacing(3)
+        layout.setContentsMargins(3, 3, 3, 3)
+        layout.setSpacing(4)
+        self.setMinimumHeight(32)
 
         name_label = QtWidgets.QLabel(self._body.name)
         name_label.setToolTip(
@@ -105,14 +106,14 @@ class BodyRowWidget(QtWidgets.QWidget):
         name_label.setStyleSheet(
             "background-color: #F1F5F9; color: #334155; border: 1px solid #CBD5E1; "
             "border-radius: 4px; padding: 3px; font-size: 11px; font-weight: 600; "
-            "min-height: 20px;"
+            "min-height: 24px;"
         )
         name_label.setMaximumWidth(70)
-        name_label.setMinimumHeight(26)
-        name_label.setMaximumHeight(28)
+        name_label.setMinimumHeight(24)
+        name_label.setMaximumHeight(32)
         name_label.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Maximum,
-            QtWidgets.QSizePolicy.Policy.Fixed,
+            QtWidgets.QSizePolicy.Policy.Preferred,
         )
         layout.addWidget(name_label)
 
@@ -121,9 +122,10 @@ class BodyRowWidget(QtWidgets.QWidget):
             QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents
         )
         self._type_combo.setMinimumWidth(80)
+        self._type_combo.setMinimumHeight(24)
         self._type_combo.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Fixed,
+            QtWidgets.QSizePolicy.Policy.Preferred,
         )
         for bt, label in self._body_type_names.items():
             self._type_combo.addItem(label, int(bt))
@@ -138,9 +140,10 @@ class BodyRowWidget(QtWidgets.QWidget):
             QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents
         )
         self._feeder_type_combo.setMinimumWidth(80)
+        self._feeder_type_combo.setMinimumHeight(24)
         self._feeder_type_combo.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Fixed,
+            QtWidgets.QSizePolicy.Policy.Preferred,
         )
         self._feeder_type_combo.setToolTip("Besleyici tipi")
         for key, name in FEEDER_TYPE_NAMES.items():
@@ -156,6 +159,7 @@ class BodyRowWidget(QtWidgets.QWidget):
         self._feeder_m_spin.setToolTip("Opsiyonel besleyici modülü (cm); 0 = otomatik")
         self._feeder_m_spin.setMinimumWidth(60)
         self._feeder_m_spin.setMaximumWidth(95)
+        self._feeder_m_spin.setMinimumHeight(24)
         self._feeder_m_spin.valueChanged.connect(self._on_feeder_m_changed)
         layout.addWidget(self._feeder_m_spin)
 
@@ -165,9 +169,10 @@ class BodyRowWidget(QtWidgets.QWidget):
             QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents
         )
         self._sand_type_combo.setMinimumWidth(80)
+        self._sand_type_combo.setMinimumHeight(24)
         self._sand_type_combo.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Fixed,
+            QtWidgets.QSizePolicy.Policy.Preferred,
         )
         self._sand_type_combo.setToolTip("Kum tipi")
         for key, name in SAND_PRESET_NAMES.items():
@@ -190,8 +195,8 @@ class BodyRowWidget(QtWidgets.QWidget):
         )
         self._sand_prop_btn.setMinimumWidth(80)
         self._sand_prop_btn.setMaximumWidth(95)
-        self._sand_prop_btn.setMinimumHeight(26)
-        self._sand_prop_btn.setMaximumHeight(28)
+        self._sand_prop_btn.setMinimumHeight(24)
+        self._sand_prop_btn.setMaximumHeight(32)
         self._sand_prop_btn.clicked.connect(self._on_sand_properties)
         layout.addWidget(self._sand_prop_btn)
 
