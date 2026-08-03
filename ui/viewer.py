@@ -224,13 +224,14 @@ class Analyzer3DViewer(QtInteractor):
             entries.append([label, color, "circle"])
 
         n = len(entries)
-        # Fixed per-entry height keeps the bullet size constant regardless of n.
-        # Text size is set independently on each text actor so it can be smaller
-        # while the bullet stays slightly larger and aligned with the label.
-        line_height = 0.060
+        # Fixed per-entry height aligns the bullet with the 12px text.
+        # Text actors are locked to 12px so the font size never changes when the
+        # left panel / window is resized.
+        font_size = 12
+        line_height = 0.038
         height = min(0.55, max(line_height, line_height * n))
         max_chars = max(len(entry[0]) for entry in entries)
-        width = min(0.35, max(0.15, max_chars * 0.016 + 0.03))
+        width = min(0.35, max(0.12, max_chars * 0.014 + 0.025))
 
         legend = self.add_legend(
             labels=entries,
@@ -252,7 +253,6 @@ class Analyzer3DViewer(QtInteractor):
         legend.SetPadding(4)
 
         text_color = [0.20, 0.26, 0.33]
-        font_size = 10
         for i, (label, color, _) in enumerate(entries):
             symbol = self._make_legend_symbol(color)
             legend.SetEntry(i, symbol, label, text_color)
