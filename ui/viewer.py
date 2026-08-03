@@ -207,7 +207,7 @@ class Analyzer3DViewer(QtInteractor):
             label = BODY_LEGEND_LABELS.get(bt, str(bt))
             entries.append([label, color])
 
-        font_size = 12
+        font_size = 10
         text_color = (0.20, 0.26, 0.33)
         win_w, win_h = self.window_size
 
