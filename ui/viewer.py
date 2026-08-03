@@ -176,7 +176,12 @@ class Analyzer3DViewer(QtInteractor):
         self._dx_mm: float = 0.0
 
     def _update_body_legend(self, bodies: List[Body]) -> None:
-        """Add a top-right PyVista legend showing only body types in the scene."""
+        """Add a top-right legend with fixed, bold font size that never shrinks.
+
+        The body-type bullet keeps its original color while the label text is
+        always a dark, bold, constant size so adding more entries does not scale
+        the font down.
+        """
         if self._body_legend_actor is not None:
             try:
                 self.remove_actor(self._body_legend_actor)
@@ -198,12 +203,12 @@ class Analyzer3DViewer(QtInteractor):
             entries.append([label, color, "circle"])
 
         n = len(entries)
-        line_height = 0.035
-        height = min(0.45, max(0.06, line_height * n))
+        line_height = 0.045
+        height = min(0.55, max(0.08, line_height * n + 0.015))
         max_chars = max(len(entry[0]) for entry in entries)
-        width = min(0.30, max(0.12, max_chars * 0.011))
+        width = min(0.35, max(0.14, max_chars * 0.015 + 0.03))
 
-        self._body_legend_actor = self.add_legend(
+        legend = self.add_legend(
             labels=entries,
             loc="upper right",
             bcolor=(0.97, 0.98, 0.99),
@@ -211,22 +216,45 @@ class Analyzer3DViewer(QtInteractor):
             face="circle",
             size=(width, height),
             name="body_legend",
+            font_family="arial",
         )
 
-        # PyVista's default loc math treats the vertical size as the right margin,
-        # so override the viewport position explicitly to keep the legend inside
-        # the viewer area and away from the right scrollbar/panel.
         right_margin = 0.08
         top_margin = 0.05
         x = 1.0 - width - right_margin
         y = 1.0 - height - top_margin
-        self._body_legend_actor.SetPosition(x, y)
-        self._body_legend_actor.SetPosition2(width, height)
-        self._body_legend_actor.SetPadding(2)
-        text_prop = self._body_legend_actor.GetEntryTextProperty()
-        text_prop.SetFontSize(11)
-        text_prop.SetBold(0)
-        text_prop.SetColor(0.20, 0.26, 0.33)
+        legend.SetPosition(x, y)
+        legend.SetPosition2(width, height)
+        legend.SetPadding(4)
+
+        text_color = [0.20, 0.26, 0.33]
+        for i, (label, color, _) in enumerate(entries):
+            symbol = legend.GetEntrySymbol(i)
+            if symbol is not None:
+                # Color the bullet with the body-type color while leaving text dark.
+                try:
+                    poly = pv.wrap(symbol)
+                    rgb = np.asarray(pv.Color(color).int_rgb, dtype=np.uint8)
+                    n_cells = poly.n_cells
+                    scalars = pv._vtk.vtkUnsignedCharArray()
+                    scalars.SetName("colors")
+                    scalars.SetNumberOfComponents(3)
+                    scalars.SetNumberOfTuples(n_cells)
+                    for ci in range(n_cells):
+                        scalars.SetTuple3(ci, int(rgb[0]), int(rgb[1]), int(rgb[2]))
+                    poly.GetCellData().SetScalars(scalars)
+                except Exception:
+                    pass
+            legend.SetEntry(i, symbol, label, text_color)
+
+        text_prop = pv._vtk.vtkTextProperty()
+        text_prop.SetFontFamilyToArial()
+        text_prop.SetFontSize(13)
+        text_prop.SetBold(1)
+        text_prop.SetColor(*text_color)
+        legend.SetEntryTextProperty(text_prop)
+
+        self._body_legend_actor = legend
 
     def set_gating_data(
         self,
