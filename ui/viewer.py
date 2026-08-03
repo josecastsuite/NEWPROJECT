@@ -175,12 +175,33 @@ class Analyzer3DViewer(QtInteractor):
         self._origin_mm: Optional[np.ndarray] = None
         self._dx_mm: float = 0.0
 
+    def _make_legend_symbol(self, color: str) -> pv.PolyData:
+        """Create a circular legend bullet with a black outline and body-type fill."""
+        fill = pv.Disc(inner=0, outer=0.43, c_res=32)
+        ring = pv.Disc(inner=0.43, outer=0.5, c_res=32)
+        symbol = fill.merge(ring)
+
+        rgb = np.asarray(pv.Color(color).int_rgb, dtype=np.uint8)
+        black = np.asarray([0, 0, 0], dtype=np.uint8)
+        n_fill = fill.n_cells
+        n_ring = ring.n_cells
+        scalars = pv._vtk.vtkUnsignedCharArray()
+        scalars.SetName("colors")
+        scalars.SetNumberOfComponents(3)
+        scalars.SetNumberOfTuples(n_fill + n_ring)
+        for ci in range(n_fill):
+            scalars.SetTuple3(ci, int(rgb[0]), int(rgb[1]), int(rgb[2]))
+        for ci in range(n_fill, n_fill + n_ring):
+            scalars.SetTuple3(ci, int(black[0]), int(black[1]), int(black[2]))
+        symbol.GetCellData().SetScalars(scalars)
+        return symbol
+
     def _update_body_legend(self, bodies: List[Body]) -> None:
         """Add a top-right legend with fixed, bold font size that never shrinks.
 
-        The body-type bullet keeps its original color while the label text is
-        always a dark, bold, constant size so adding more entries does not scale
-        the font down.
+        Each bullet keeps its body-type color and has a black outline so even
+        white or light-colored entries remain visible. The text is dark, bold and
+        its size does not change as more entries are added.
         """
         if self._body_legend_actor is not None:
             try:
@@ -203,10 +224,11 @@ class Analyzer3DViewer(QtInteractor):
             entries.append([label, color, "circle"])
 
         n = len(entries)
-        line_height = 0.045
-        height = min(0.55, max(0.08, line_height * n + 0.015))
+        # Fixed per-entry height keeps text/bullet size constant regardless of n.
+        line_height = 0.075
+        height = min(0.55, max(line_height, line_height * n))
         max_chars = max(len(entry[0]) for entry in entries)
-        width = min(0.35, max(0.14, max_chars * 0.015 + 0.03))
+        width = min(0.35, max(0.16, max_chars * 0.018 + 0.03))
 
         legend = self.add_legend(
             labels=entries,
@@ -229,22 +251,7 @@ class Analyzer3DViewer(QtInteractor):
 
         text_color = [0.20, 0.26, 0.33]
         for i, (label, color, _) in enumerate(entries):
-            symbol = legend.GetEntrySymbol(i)
-            if symbol is not None:
-                # Color the bullet with the body-type color while leaving text dark.
-                try:
-                    poly = pv.wrap(symbol)
-                    rgb = np.asarray(pv.Color(color).int_rgb, dtype=np.uint8)
-                    n_cells = poly.n_cells
-                    scalars = pv._vtk.vtkUnsignedCharArray()
-                    scalars.SetName("colors")
-                    scalars.SetNumberOfComponents(3)
-                    scalars.SetNumberOfTuples(n_cells)
-                    for ci in range(n_cells):
-                        scalars.SetTuple3(ci, int(rgb[0]), int(rgb[1]), int(rgb[2]))
-                    poly.GetCellData().SetScalars(scalars)
-                except Exception:
-                    pass
+            symbol = self._make_legend_symbol(color)
             legend.SetEntry(i, symbol, label, text_color)
 
         text_prop = pv._vtk.vtkTextProperty()
