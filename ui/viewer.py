@@ -1,6 +1,6 @@
 """PyVistaQt 3D viewer wrapper for JoseCast Analyzer v8.x."""
 
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyvista as pv
@@ -169,46 +169,30 @@ class Analyzer3DViewer(QtInteractor):
         self._air_entrapment_actor = None
         self._air_entrapment_marker_actor = None
         self.flow_animator = FlowAnimator(self)
-        self._body_legend_actor = None
+        self._body_legend_actors: List[Any] = []
         self._bodies: List[Body] = []
         self._body_index: Optional[np.ndarray] = None
         self._origin_mm: Optional[np.ndarray] = None
         self._dx_mm: float = 0.0
 
-    def _make_legend_symbol(self, color: str) -> pv.PolyData:
-        """Create a circular legend bullet with a black outline and body-type fill."""
-        fill = pv.Disc(inner=0, outer=0.43, c_res=32)
-        ring = pv.Disc(inner=0.43, outer=0.5, c_res=32)
-        symbol = fill.merge(ring)
-
-        rgb = np.asarray(pv.Color(color).int_rgb, dtype=np.uint8)
-        black = np.asarray([0, 0, 0], dtype=np.uint8)
-        n_fill = fill.n_cells
-        n_ring = ring.n_cells
-        scalars = pv._vtk.vtkUnsignedCharArray()
-        scalars.SetName("colors")
-        scalars.SetNumberOfComponents(3)
-        scalars.SetNumberOfTuples(n_fill + n_ring)
-        for ci in range(n_fill):
-            scalars.SetTuple3(ci, int(rgb[0]), int(rgb[1]), int(rgb[2]))
-        for ci in range(n_fill, n_fill + n_ring):
-            scalars.SetTuple3(ci, int(black[0]), int(black[1]), int(black[2]))
-        symbol.GetCellData().SetScalars(scalars)
-        return symbol
-
-    def _update_body_legend(self, bodies: List[Body]) -> None:
-        """Add a top-right legend with fixed, bold font size that never shrinks.
-
-        Each bullet keeps its body-type color and has a black outline so even
-        white or light-colored entries remain visible. The text is dark, bold and
-        its size does not change as more entries are added.
-        """
-        if self._body_legend_actor is not None:
+    def _remove_body_legend(self) -> None:
+        """Remove all custom body-legend 2D text actors."""
+        for actor in self._body_legend_actors:
             try:
-                self.remove_actor(self._body_legend_actor)
+                self.remove_actor(actor)
             except Exception:
                 pass
-            self._body_legend_actor = None
+        self._body_legend_actors = []
+
+    def _update_body_legend(self, bodies: List[Body]) -> None:
+        """Add a top-right legend with fixed, bold 12px text and aligned bullets.
+
+        Each bullet is a colored Unicode disc with a black outline drawn with
+        two overlaid text actors. This guarantees the bullet and label share
+        the same vertical center and the font size never scales when the window
+        or left panel is resized.
+        """
+        self._remove_body_legend()
 
         present = sorted(
             {body.body_type for body in bodies if len(body.faces) > 0},
@@ -221,63 +205,86 @@ class Analyzer3DViewer(QtInteractor):
         for bt in present:
             color = BODY_COLORS.get(bt, "#F5F5F5")
             label = BODY_LEGEND_LABELS.get(bt, str(bt))
-            entries.append([label, color, "circle"])
+            entries.append([label, color])
 
-        n = len(entries)
-        # Fixed per-entry height aligns the bullet with the 12px text.
-        # Text actors are locked to 12px so the font size never changes when the
-        # left panel / window is resized.
         font_size = 12
-        line_height = 0.038
-        height = min(0.55, max(line_height, line_height * n))
-        max_chars = max(len(entry[0]) for entry in entries)
-        width = min(0.35, max(0.12, max_chars * 0.014 + 0.025))
+        text_color = (0.20, 0.26, 0.33)
+        win_w, win_h = self.window_size
 
-        legend = self.add_legend(
-            labels=entries,
-            loc="upper right",
-            bcolor=(0.97, 0.98, 0.99),
-            background_opacity=0.90,
-            face="circle",
-            size=(width, height),
-            name="body_legend",
-            font_family="arial",
+        max_chars = max(len(label) for label, _ in entries)
+        # add_text uses integer pixel coordinates with origin at the lower-left.
+        char_w = 7
+        box_w = max(100, max_chars * char_w + 50)
+        line_h = 20
+        box_h = line_h * len(entries) + 8
+        margin = 10
+        x0 = int(win_w - box_w - margin)
+        y0 = int(win_h - margin)
+
+        # Background box
+        rows = max(1, len(entries))
+        cols = max(1, box_w // char_w)
+        bg_text = (" " * cols + "\n") * rows
+        bg = self.add_text(
+            bg_text,
+            position=(x0, y0 - box_h),
+            font_size=font_size,
+            color="black",
         )
+        bg_prop = bg.GetTextProperty()
+        bg_prop.SetBackgroundColor(0.97, 0.98, 0.99)
+        bg_prop.SetBackgroundOpacity(0.90)
+        bg.SetTextScaleModeToNone()
+        self._body_legend_actors.append(bg)
 
-        right_margin = 0.08
-        top_margin = 0.05
-        x = 1.0 - width - right_margin
-        y = 1.0 - height - top_margin
-        legend.SetPosition(x, y)
-        legend.SetPosition2(width, height)
-        legend.SetPadding(4)
+        bullet_offset = 12
+        for i, (label, color) in enumerate(entries):
+            cy = int(y0 - 4 - line_h // 2 - i * line_h)
+            bullet_x = int(x0 + line_h // 2)
+            label_x = int(bullet_x + bullet_offset)
 
-        text_color = [0.20, 0.26, 0.33]
-        for i, (label, color, _) in enumerate(entries):
-            symbol = self._make_legend_symbol(color)
-            legend.SetEntry(i, symbol, label, text_color)
+            # Black outline bullet (larger)
+            black_actor = self.add_text(
+                "\u2022",
+                position=(bullet_x, cy),
+                font_size=font_size + 4,
+                color="black",
+            )
+            black_prop = black_actor.GetTextProperty()
+            black_prop.SetJustificationToCentered()
+            black_prop.SetVerticalJustificationToCentered()
+            black_prop.SetBold(1)
+            black_actor.SetTextScaleModeToNone()
+            self._body_legend_actors.append(black_actor)
 
-        text_prop = pv._vtk.vtkTextProperty()
-        text_prop.SetFontFamilyToArial()
-        text_prop.SetFontSize(font_size)
-        text_prop.SetBold(1)
-        text_prop.SetColor(*text_color)
-        legend.SetEntryTextProperty(text_prop)
+            # Colored fill bullet
+            rgb = pv.Color(color).float_rgb
+            color_actor = self.add_text(
+                "\u2022",
+                position=(bullet_x, cy),
+                font_size=font_size,
+                color=rgb,
+            )
+            color_prop = color_actor.GetTextProperty()
+            color_prop.SetJustificationToCentered()
+            color_prop.SetVerticalJustificationToCentered()
+            color_prop.SetBold(1)
+            color_actor.SetTextScaleModeToNone()
+            self._body_legend_actors.append(color_actor)
 
-        # Lock the text size so adding entries does not rescale the font.
-        collection = pv._vtk.vtkPropCollection()
-        legend.GetActors2D(collection)
-        collection.InitTraversal()
-        for _ in range(collection.GetNumberOfItems()):
-            actor = collection.GetNextItemAsObject()
-            if isinstance(actor, pv._vtk.vtkTextActor):
-                actor.SetTextScaleModeToNone()
-                actor.GetTextProperty().SetFontFamilyToArial()
-                actor.GetTextProperty().SetFontSize(font_size)
-                actor.GetTextProperty().SetBold(1)
-                actor.GetTextProperty().SetColor(*text_color)
-
-        self._body_legend_actor = legend
+            # Label
+            label_actor = self.add_text(
+                label,
+                position=(label_x, cy),
+                font_size=font_size,
+                color=text_color,
+            )
+            label_prop = label_actor.GetTextProperty()
+            label_prop.SetJustificationToLeft()
+            label_prop.SetVerticalJustificationToCentered()
+            label_prop.SetBold(1)
+            label_actor.SetTextScaleModeToNone()
+            self._body_legend_actors.append(label_actor)
 
     def set_gating_data(
         self,
@@ -318,7 +325,7 @@ class Analyzer3DViewer(QtInteractor):
         self._erosion_actor = None
         self._air_entrapment_actor = None
         self._air_entrapment_marker_actor = None
-        self._body_legend_actor = None
+        self._body_legend_actors = []
         self._bodies = []
         self._body_index = None
         self._origin_mm = None
