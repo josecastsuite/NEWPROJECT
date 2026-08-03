@@ -249,7 +249,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.res_spin = QtWidgets.QSpinBox()
         self.res_spin.setRange(160, MAX_RES)
-        self.res_spin.setValue(625)
+        self.res_spin.setValue(400)
         self.res_spin.setSingleStep(80)
         _settings_labeled(self.res_spin, "Max çözünürlük:", "160 = hızlı, 2040 = Titan mod (yavaş, yerel refine).")
 
@@ -518,6 +518,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ---------------- CENTER 3D VIEWER ----------------
         self.viewer = Analyzer3DViewer()
+        self.viewer.flow_animator.frameChanged.connect(self._on_flow_frame_changed)
+        self.viewer.flow_animator.stateChanged.connect(self._on_flow_state_changed)
 
         # ---------------- RIGHT PANEL (scrollable) ----------------
         right_scroll = QtWidgets.QScrollArea()
@@ -1625,6 +1627,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_flow_speed_changed(self, value: float):
         if self.viewer.flow_animator is not None:
             self.viewer.flow_animator.set_speed_multiplier(value)
+
+    def _on_flow_frame_changed(self, frame: int, t: float, t_max: float):
+        if t_max > 0.0:
+            ratio = t / t_max
+            self.flow_time_slider.blockSignals(True)
+            self.flow_time_slider.setValue(int(round(ratio * 1000)))
+            self.flow_time_slider.blockSignals(False)
+            self.flow_time_label.setText(f"t: {t:.3f} s / {t_max:.3f} s")
+        n_frames = self.viewer.flow_animator.frame_count()
+        if n_frames > 0:
+            self.flow_particle_label.setText(f"{frame + 1}/{n_frames} kare")
+
+    def _on_flow_state_changed(self, is_playing: bool):
+        self.flow_play_btn.setText("⏸ Duraklat" if is_playing else "▶ Oynat")
 
     def on_flow_surface_toggled(self, checked: bool):
         if self.viewer.flow_animator is not None:

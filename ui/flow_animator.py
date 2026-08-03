@@ -33,6 +33,9 @@ from ui.flow_velocity_graph import FlowVelocityGraph
 class FlowAnimator(QtCore.QObject):
     """Animate metal filling and solidification as a sequence of 3-D frames."""
 
+    frameChanged = QtCore.pyqtSignal(int, float, float)
+    stateChanged = QtCore.pyqtSignal(bool)
+
     TIMER_INTERVAL = 0.10  # base interval between live frames (s) - slow cinematic
     MAX_STREAMLINES = 20
     MAX_STEPS = 2000
@@ -130,6 +133,8 @@ class FlowAnimator(QtCore.QObject):
         self._sdf_d: Optional[np.ndarray] = None
         self._feeder_actor = None
         self._gravity: np.ndarray = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+        self._source_section_key: str = "SPRUE_THROAT"
+        self._source_mask_d: Optional[np.ndarray] = None
 
     def set_result(self, result: Optional[AnalysisResult]) -> None:
         """Attach a completed analysis result and build the animation frames."""
@@ -256,6 +261,8 @@ class FlowAnimator(QtCore.QObject):
         self._gating_labels = None
         self._gating_radius = None
         self._gravity = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+        self._source_section_key = "SPRUE_THROAT"
+        self._source_mask_d = None
         self._frame_actor = None
         self._frame_actor_scalar = ""
         self._streamline_actor = None
@@ -268,6 +275,46 @@ class FlowAnimator(QtCore.QObject):
         if finite.any():
             return float(np.max(arr[finite]))
         return -np.inf
+
+    def _section_body_type(self, key: str) -> BodyType:
+        type_map = {
+            "SPRUE": BodyType.SPRUE,
+            "SPRUE_BASE": BodyType.SPRUE,
+            "SPRUE_THROAT": BodyType.SPRUE_THROAT,
+            "POURING_BASIN": BodyType.POURING_BASIN,
+            "RUNNER": BodyType.RUNNER,
+            "DISTRIBUTOR": BodyType.DISTRIBUTOR,
+            "CURUFLUK": BodyType.CURUFLUK,
+            "INGATE": BodyType.INGATE,
+            "FILTER": BodyType.FILTER,
+        }
+        return type_map.get((key or "SPRUE_THROAT").upper(), BodyType.SPRUE_THROAT)
+
+    def _build_source_mask(
+        self,
+        grid: np.ndarray,
+        metal: np.ndarray,
+        spacing: Tuple[float, float, float],
+        origin: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        """Return a mask of the upstream (top) face cells of the selected inlet body."""
+        body_type = self._section_body_type(self._source_section_key)
+        body_mask = (grid == int(body_type)) & metal
+        if not body_mask.any():
+            return None
+
+        idx = np.argwhere(body_mask)
+        spacing = np.asarray(spacing, dtype=np.float64)
+        coords = idx * spacing + origin + 0.5 * spacing
+        # Upstream is opposite to gravity, so project onto -gravity.
+        up = -self._gravity
+        proj = coords @ up
+        max_proj = float(proj.max())
+        tol = 0.5 * float(np.min(spacing))
+
+        mask = np.zeros(grid.shape, dtype=bool)
+        mask[body_mask] = proj >= max_proj - tol
+        return mask
 
     def _load_temperature_bounds(self, result: AnalysisResult) -> None:
         cp = getattr(result, "casting_params", None)
@@ -282,6 +329,9 @@ class FlowAnimator(QtCore.QObject):
             g = np.asarray(cp.gravity_vector, dtype=np.float64)
             norm = float(np.linalg.norm(g)) + 1e-9
             self._gravity = g / norm
+            self._source_section_key = (
+                getattr(cp, "velocity_section_key", None) or "SPRUE_THROAT"
+            )
         else:
             self._t_pour = float(alloy.t_pour_c)
             self._t_mold = float(mold.t0_c)
@@ -443,6 +493,9 @@ class FlowAnimator(QtCore.QObject):
         self._dist_to_riser_d = dist_d
         self._sdf_d = sdf_d
 
+        # Source mask for the user-selected inlet (upstream face of the section).
+        self._source_mask_d = self._build_source_mask(grid_d, metal_d, spacing, origin_c)
+
         # Precompute a fat gating mask and per-component radius for the boundary
         # inflation step.  Voxelised runners often lose their outermost wall
         # cells, so we add a one-voxel shell around the gating mask and store the
@@ -480,7 +533,9 @@ class FlowAnimator(QtCore.QObject):
         # upstream gate/runner cells that feed them.  This fixes the LBM front
         # occasionally jumping into the part through a narrow gate before the
         # gate itself is fully registered as filled.
-        self._enforce_monotonic_fill_time()
+        # The source mask now comes from the user-selected inlet so t=0 starts
+        # exactly at the pour point (sprue throat / selected entry section).
+        self._enforce_monotonic_fill_time(source_mask=self._source_mask_d)
         fill_d = self._fill_time_d
 
         img = pv.ImageData(
@@ -494,7 +549,9 @@ class FlowAnimator(QtCore.QObject):
         self._build_frames()
         return bool(self._phase1_phi) or (self._phase2_mesh is not None)
 
-    def _enforce_monotonic_fill_time(self) -> None:
+    def _enforce_monotonic_fill_time(
+        self, source_mask: Optional[np.ndarray] = None
+    ) -> None:
         """Correct the LBM fill-time field so a voxel cannot fill before any
         upstream voxel on a path from the source.
 
@@ -504,6 +561,10 @@ class FlowAnimator(QtCore.QObject):
         method runs a 26-neighbour minimax Dijkstra from the inlet cells and
         replaces each cell's fill time with the smallest bottleneck along any
         path, guaranteeing a monotone front.
+
+        If ``source_mask`` is supplied, the cells it marks become the unique
+        t=0 source so the animation starts exactly at the user-selected inlet
+        (sprue throat / pour basin / etc.).
         """
         ft = self._fill_time_d
         metal = self._metal_d
@@ -513,17 +574,32 @@ class FlowAnimator(QtCore.QObject):
         finite = metal & np.isfinite(ft) & (ft < self._sentinel - 1.0)
         if not finite.any():
             return
-        t_min = float(ft[finite].min())
-        source = finite & (ft <= t_min + 1e-12)
+
+        if source_mask is not None and source_mask.any():
+            source = finite & source_mask
+            if not source.any():
+                source = finite & (ft <= float(ft[finite].min()) + 1e-12)
+            else:
+                # The selected inlet is the unique t=0 source.  Clamp every
+                # other cell to a small positive time so the first frame only
+                # shows the inlet and not stray downstream voxels.
+                ft[source] = 0.0
+                non_source = finite & ~source
+                if non_source.any():
+                    ft[non_source] = np.maximum(ft[non_source], 1e-6)
+        else:
+            t_min = float(ft[finite].min())
+            source = finite & (ft <= t_min + 1e-12)
+
         if not source.any():
             return
 
         dist = np.full(shape, np.inf, dtype=np.float64)
-        dist[source] = ft[source]
+        dist[source] = 0.0
         final = np.zeros(shape, dtype=bool)
         heap = []
         for (sx, sy, sz) in zip(*np.where(source)):
-            heapq.heappush(heap, (dist[sx, sy, sz], int(sx), int(sy), int(sz)))
+            heapq.heappush(heap, (0.0, int(sx), int(sy), int(sz)))
 
         while heap:
             d, x, y, z = heapq.heappop(heap)
@@ -698,7 +774,9 @@ class FlowAnimator(QtCore.QObject):
         phi_3d = phi.reshape(shape, order="F")
         gating_mask = self._gating_mask_fat
 
-        sigma_t = max(0.05 * self._max_fill_time, 0.005)
+        # Tight temporal window so the first frame only inflates around the
+        # selected inlet; the spatial radius below then fills the cross-section.
+        sigma_t = max(0.001 * self._max_fill_time, 0.005)
         # Fill gating cells that are inside the smooth interface window.
         gating_seed = gating_mask & metal & (self._fill_time_d <= t + sigma_t)
         if not gating_seed.any():
@@ -1312,12 +1390,14 @@ class FlowAnimator(QtCore.QObject):
         if self._current_frame >= len(self._frame_times) - 1:
             self._current_frame = 0
         self._is_running = True
+        self.stateChanged.emit(True)
         self._timer.start(self._interval_ms())
 
     def pause(self) -> None:
         if self._is_running:
             self._is_running = False
             self._timer.stop()
+            self.stateChanged.emit(False)
 
     def stop(self) -> None:
         self.pause()
@@ -1678,6 +1758,7 @@ class FlowAnimator(QtCore.QObject):
                 self._marker_actor = None
 
         self._viewer.render()
+        self.frameChanged.emit(self._current_frame, self._current_time, self._max_time)
 
     def _riser_liquid_fraction(
         self, t: float, ft: np.ndarray, st: np.ndarray
