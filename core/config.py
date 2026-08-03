@@ -67,9 +67,9 @@ class FlowConfig:
     """High-resolution flow-solver settings."""
 
     desired_dx_mm: float = 0.8  # voxel pitch for the LBM/pressure solve
-    max_solver_cells: int = 2_000_000  # cavity-cell budget for the pressure grid
+    max_solver_cells: int = 30_000_000  # cavity-cell budget for the pressure grid
     lbm_max_cells: int = 300_000  # cavity-cell budget for the C++ LBM grid
-    target_dim: int = 400  # default voxel grid target dimension (~1.0 mm for 500 mm model)
+    target_dim: int = 625  # default voxel grid target dimension (~0.8 mm for 500 mm model)
 
 
 def _default_config_path() -> Path:
