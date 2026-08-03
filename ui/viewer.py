@@ -310,6 +310,10 @@ class Analyzer3DViewer(QtInteractor):
                 show_edges=False,
                 smooth_shading=True,
                 pickable=False,
+                ambient=0.55,
+                diffuse=0.45,
+                specular=0.05,
+                specular_power=1,
             )
             self._body_actors.append(actor)
             if body.body_type == BodyType.PART:
