@@ -1,102 +1,65 @@
-"""Enhanced 2-D flow velocity graphs for the Darcy flow result.
+"""Flow-velocity profile dialog for JoseCast Analyzer.
 
-The dialog now contains three panels and a metric selector:
-
-1. Akış metriği - Dolum zamanı:  Darcy ön cephe metriğinin (hız, Reynolds,
-   Froude veya hidrolik çap) dolum süresi boyunca değişimi.  Çizgi renkli,
-   10.-90. yüzdelik bant şeffaf renkli ve gating düğümlerinin ulaşma
-   zamanları nokta olarak işaretlenmiş.
-
-2. Akış yolu profili:  Döküm ağzından (sprue) her meme girişine kadar gating
-   düğümleri boyunca seçili metrik profili.  Her nokta gerçek kesit ortalaması
-   (Q/A) üzerinden Reynolds/Froude ile renklendirilir; yarıçap/hidrolik çap
-   etkisi görünür.
-
-3. Kesit geometrisi:  Her gating düğümünde kesit alanı (cm²) ve hidrolik çap
-   (mm) çift y-eksenli olarak çizilir; dar bölgeler (radyus etkisi) net görülür.
-
-Tüm metrikler gerçek Darcy vektör alanından (`flow_result.velocity`) veya
-Q/A süreklilik hesabından gelir; ayrıca kesit yarıçapı, hidrolik çap ve
-malzeme yoğunluğu/viskozitesi ile Reynolds/Froude hesaplanır.
+The graph is built directly from the Darcy solver's gating-node list, so every
+plotted point is a real throat/contact section with a known Q, A and v.
+Section changes (runner narrowing, gate expansion, multiple runners drawn as one
+body, etc.) therefore immediately move the velocity/Re/Froude curves.
 """
-import math
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from scipy import ndimage
-
-from PyQt6 import QtCore, QtWidgets
-from matplotlib import cm
+from PyQt6 import QtWidgets
+import matplotlib
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
-from matplotlib.collections import LineCollection
-from matplotlib.colors import Normalize, to_hex
+from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 
 from core.materials import get_alloy
 from core.types import AnalysisResult, GatingNode
 
 
+_DEFAULT_TARGET_V = (0.25, 1.0)  # m/s
+
+
 class FlowVelocityGraph(QtWidgets.QDialog):
-    """Popup dialog showing Darcy velocity / Re / Fr / hydraulic diameter vs fill time
-    and flow-path profile, plus a cross-section geometry trace."""
+    """Popup showing the Darcy flow profile along the gating system."""
 
-    def __init__(self, result: AnalysisResult, parent: Optional[QtWidgets.QWidget] = None):
+    def __init__(
+        self,
+        result: AnalysisResult,
+        parent: Optional[QtWidgets.QWidget] = None,
+    ):
         super().__init__(parent)
-        self.setWindowTitle("Akış Hızı - Reynolds - Froude - Geometri")
-        self.setMinimumSize(1200, 1050)
-        self._setup_matplotlib_style()
-
         self._result = result
+        self.setWindowTitle("Akış Hızı Profili")
+        self.setMinimumSize(1100, 950)
+
         self._rho, self._mu, self._g = self._material_and_gravity(result)
+        self._target_v = self._target_velocity(result)
+        self._branches, self._branch_names = self._build_branches(result)
 
-        layout = QtWidgets.QVBoxLayout(self)
-
-        # Controls
-        controls = QtWidgets.QHBoxLayout()
-        controls.addWidget(QtWidgets.QLabel("Renkli metrik:"))
-        self._metric_combo = QtWidgets.QComboBox()
-        self._metric_combo.addItem("Hız |v| (m/s)", "velocity")
-        self._metric_combo.addItem("Reynolds (türbülans)", "reynolds")
-        self._metric_combo.addItem("Froude (dalga/çalkantı)", "froude")
-        self._metric_combo.addItem("Hidrolik Çap Dh (mm)", "diameter")
-        self._metric_combo.setCurrentIndex(0)
-        self._metric_combo.currentIndexChanged.connect(self._on_metric_changed)
-        controls.addWidget(self._metric_combo)
-
-        self._radius_check = QtWidgets.QCheckBox("Kesit yarıçapı etkisini göster")
-        self._radius_check.setChecked(True)
-        self._radius_check.stateChanged.connect(self._on_metric_changed)
-        controls.addWidget(self._radius_check)
-
-        self._smooth_check = QtWidgets.QCheckBox("26-komşu medyan ile düğüm örnekle")
-        self._smooth_check.setChecked(True)
-        self._smooth_check.stateChanged.connect(self._on_metric_changed)
-        controls.addStretch()
-        layout.addLayout(controls)
-
-        self.figure = Figure(figsize=(12, 10.5), dpi=100, tight_layout=True)
-        self.canvas = FigureCanvasQTAgg(self.figure)
-        layout.addWidget(self.canvas)
-        self.toolbar = NavigationToolbar2QT(self.canvas, self)
-        layout.addWidget(self.toolbar)
-
+        self._setup_matplotlib_style()
+        self._setup_ui()
         self._plot()
 
+    # ------------------------------------------------------------------
+    # UI setup
+    # ------------------------------------------------------------------
     def _setup_matplotlib_style(self) -> None:
         import matplotlib as mpl
 
         rc = {
-            "figure.facecolor": "#1a1a2e",
-            "axes.facecolor": "#16213e",
-            "axes.edgecolor": "#e0e0e0",
-            "axes.labelcolor": "#e0e0e0",
-            "xtick.color": "#e0e0e0",
-            "ytick.color": "#e0e0e0",
-            "text.color": "#e0e0e0",
-            "grid.color": "#0f3460",
-            "grid.alpha": 0.35,
+            "figure.facecolor": "#F8FAFC",
+            "axes.facecolor": "#FFFFFF",
+            "axes.edgecolor": "#334155",
+            "axes.labelcolor": "#334155",
+            "xtick.color": "#334155",
+            "ytick.color": "#334155",
+            "text.color": "#334155",
+            "grid.color": "#E2E8F0",
+            "grid.alpha": 0.6,
             "axes.grid": True,
-            "axes.titlesize": 12,
+            "axes.titlesize": 11,
             "axes.labelsize": 10,
             "xtick.labelsize": 9,
             "ytick.labelsize": 9,
@@ -108,33 +71,65 @@ class FlowVelocityGraph(QtWidgets.QDialog):
             except Exception:
                 pass
 
-    def _style_axes(self, ax) -> None:
-        ax.set_facecolor("#16213e")
-        ax.tick_params(colors="#e0e0e0")
-        for spine in ax.spines.values():
-            spine.set_color("#e0e0e0")
-        ax.xaxis.label.set_color("#e0e0e0")
-        ax.yaxis.label.set_color("#e0e0e0")
-        ax.title.set_color("#e0e0e0")
-        ax.grid(True, alpha=0.35, color="#0f3460")
+    def _setup_ui(self) -> None:
+        self.setStyleSheet("background-color: #F8FAFC;")
+        layout = QtWidgets.QVBoxLayout(self)
 
+        controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(QtWidgets.QLabel("Renk metriği:"))
+        self._metric_combo = QtWidgets.QComboBox()
+        self._metric_combo.addItem("Hız |v| (m/s)", "velocity")
+        self._metric_combo.addItem("Reynolds (Re)", "reynolds")
+        self._metric_combo.addItem("Froude (Fr)", "froude")
+        self._metric_combo.addItem("Hidrolik Çap Dh (mm)", "diameter")
+        self._metric_combo.setCurrentIndex(0)
+        self._metric_combo.currentIndexChanged.connect(self._plot)
+        controls.addWidget(self._metric_combo)
+
+        controls.addWidget(QtWidgets.QLabel("Kol:"))
+        self._branch_combo = QtWidgets.QComboBox()
+        self._branch_combo.addItem("Tüm kollar")
+        for name in self._branch_names:
+            self._branch_combo.addItem(name)
+        self._branch_combo.currentIndexChanged.connect(self._plot)
+        controls.addWidget(self._branch_combo)
+
+        self._target_check = QtWidgets.QCheckBox("Hedef hız bandı")
+        self._target_check.setChecked(True)
+        self._target_check.stateChanged.connect(self._plot)
+        controls.addWidget(self._target_check)
+
+        self._label_check = QtWidgets.QCheckBox("Düğüm etiketleri")
+        self._label_check.setChecked(True)
+        self._label_check.stateChanged.connect(self._plot)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        self.figure = Figure(figsize=(11, 11), dpi=100, layout="constrained")
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        layout.addWidget(self.canvas)
+        self.toolbar = NavigationToolbar2QT(self.canvas, self)
+        layout.addWidget(self.toolbar)
+
+    # ------------------------------------------------------------------
+    # Data helpers
+    # ------------------------------------------------------------------
     @staticmethod
     def _material_and_gravity(result: AnalysisResult) -> Tuple[float, float, float]:
         rho = 7000.0
         mu = 0.006
         g = 9.81
-        cp = result.casting_params
+        cp = getattr(result, "casting_params", None)
         if cp is not None:
             rho = float(cp.rho_liquid_kg_m3) if cp.rho_liquid_kg_m3 > 0 else rho
             mu = float(cp.viscosity_pa_s) if cp.viscosity_pa_s > 0 else mu
-            if hasattr(cp, "gravity_vector") and cp.gravity_vector:
+            gv = getattr(cp, "gravity_vector", None)
+            if gv:
                 try:
-                    gv = np.asarray(cp.gravity_vector, dtype=np.float64)
-                    g = float(np.linalg.norm(gv))
-                    if g <= 0:
-                        g = 9.81
+                    gv = np.asarray(gv, dtype=np.float64)
+                    g = float(np.linalg.norm(gv)) or 9.81
                 except Exception:
-                    g = 9.81
+                    pass
         else:
             try:
                 alloy = get_alloy(result.alloy_key)
@@ -144,644 +139,367 @@ class FlowVelocityGraph(QtWidgets.QDialog):
                 pass
         return rho, mu, g
 
-    def _on_metric_changed(self, *_) -> None:
-        self._plot()
+    def _target_velocity(self, result: AnalysisResult) -> Tuple[float, float]:
+        gr = getattr(result, "gate_result", None)
+        if gr is not None:
+            vmin = float(getattr(gr, "target_v_min_m_s", 0.0) or 0.0)
+            vmax = float(getattr(gr, "target_v_max_m_s", 0.0) or 0.0)
+            if vmin > 0 and vmax > vmin:
+                return vmin, vmax
+        return _DEFAULT_TARGET_V
 
-    def _metric_label(self, metric: str) -> str:
+    def _build_branches(
+        self, result: AnalysisResult
+    ) -> Tuple[List[List[GatingNode]], List[str]]:
+        """Return every source -> ingate path as a list of GatingNodes."""
+        flow = getattr(result, "flow_result", None)
+        nodes = getattr(flow, "gating_nodes", None) or []
+        if not nodes:
+            return [], []
+
+        # down_name -> node is unique in a tree.
+        down_to_node: Dict[str, GatingNode] = {}
+        source_node: Optional[GatingNode] = None
+        for n in nodes:
+            try:
+                up, down = n.name.split(" → ", 1)
+            except ValueError:
+                continue
+            if up == "Kaynak":
+                source_node = n
+            down_to_node[down] = n
+
+        if source_node is None:
+            # Fallback: first node is treated as source.
+            source_node = nodes[0]
+
+        up_names = {n.name.split(" → ", 1)[0] for n in nodes if " → " in n.name}
+        leaves = [n for n in nodes if n is not source_node and n.name.split(" → ", 1)[1] not in up_names]
+
+        branches: List[List[GatingNode]] = []
+        for leaf in leaves:
+            path = [leaf]
+            while True:
+                up = path[0].name.split(" → ", 1)[0]
+                if up == "Kaynak" or up not in down_to_node:
+                    break
+                path.insert(0, down_to_node[up])
+            branches.append(path)
+
+        # If no leaf found (unusual), show the whole chain as one branch.
+        if not branches:
+            branches = [[source_node] + [n for n in nodes if n is not source_node]]
+
+        names = [self._branch_name(b, i) for i, b in enumerate(branches)]
+        return branches, names
+
+    @staticmethod
+    def _branch_name(path: List[GatingNode], index: int) -> str:
+        """Return a human name for the branch (prefer the ingate name)."""
+        if not path:
+            return f"Kol {index + 1}"
+        up, down = path[-1].name.split(" → ", 1)
+        if down in ("Parça", "PART", "part"):
+            return up
+        return down
+
+    def _node_metrics(self, node: GatingNode) -> Dict[str, float]:
+        v = float(node.velocity_m_s)
+        a_cm2 = float(node.section_area_cm2)
+        a_m2 = a_cm2 * 1e-4
+        if a_m2 > 1e-18:
+            dh_m = 2.0 * np.sqrt(a_m2 / np.pi)
+        else:
+            dh_m = 0.0
+        re = self._rho * v * dh_m / self._mu if dh_m > 0 and self._mu > 0 else 0.0
+        fr = v / np.sqrt(self._g * dh_m) if dh_m > 0 and v > 0 else 0.0
         return {
+            "velocity": v,
+            "area_cm2": a_cm2,
+            "area_m2": a_m2,
+            "dh_mm": dh_m * 1000.0,
+            "reynolds": re,
+            "froude": fr,
+            "flow_rate_m3_s": float(getattr(node, "flow_rate_m3_s", 0.0)),
+        }
+
+    def _metric_for_node(self, node: GatingNode, metric: str) -> float:
+        m = self._node_metrics(node)
+        return float(m.get(metric, 0.0))
+
+    # ------------------------------------------------------------------
+    # Plotting
+    # ------------------------------------------------------------------
+    def _style_ax(self, ax) -> None:
+        ax.set_facecolor("#FFFFFF")
+        ax.tick_params(colors="#334155")
+        for spine in ax.spines.values():
+            spine.set_color("#CBD5E1")
+        ax.xaxis.label.set_color("#334155")
+        ax.yaxis.label.set_color("#334155")
+        ax.title.set_color("#334155")
+        ax.grid(True, alpha=0.6, color="#E2E8F0")
+
+    def _plot(self, *_) -> None:
+        self.figure.clear()
+        if not self._branches:
+            ax = self.figure.add_subplot(111)
+            self._style_ax(ax)
+            ax.text(
+                0.5,
+                0.5,
+                "Akış düğümü verisi yok;\nanaliz sonucu gating düğümleri içermiyor.",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                fontsize=12,
+                color="#64748B",
+            )
+            self.canvas.draw()
+            return
+
+        metric = self._metric_combo.currentData()
+        selected_branch = self._branch_combo.currentIndex() - 1
+
+        # ------------------------------------------------------------------
+        # 1. Build per-branch 1D data along the real gating network.
+        # ------------------------------------------------------------------
+        branch_data: List[Dict] = []
+        metric_values: List[float] = []
+        for path in self._branches:
+            s = [0.0]
+            for i in range(1, len(path)):
+                c0 = np.asarray(path[i - 1].centroid_mm, dtype=np.float64)
+                c1 = np.asarray(path[i].centroid_mm, dtype=np.float64)
+                s.append(s[-1] + float(np.linalg.norm(c1 - c0)))
+            metrics = [self._metric_for_node(n, metric) for n in path]
+            vels = [self._metric_for_node(n, "velocity") for n in path]
+            metric_values.extend(metrics)
+            branch_data.append(
+                {
+                    "path": path,
+                    "s": np.asarray(s, dtype=np.float64),
+                    "metrics": np.asarray(metrics, dtype=np.float64),
+                    "vels": np.asarray(vels, dtype=np.float64),
+                }
+            )
+
+        all_s = np.concatenate([b["s"] for b in branch_data])
+        all_v = np.concatenate([b["vels"] for b in branch_data])
+        all_re = np.concatenate(
+            [np.asarray([self._metric_for_node(n, "reynolds") for n in b["path"]]) for b in branch_data]
+        )
+        all_fr = np.concatenate(
+            [np.asarray([self._metric_for_node(n, "froude") for n in b["path"]]) for b in branch_data]
+        )
+        all_area = np.concatenate(
+            [np.asarray([self._metric_for_node(n, "area_cm2") for n in b["path"]]) for b in branch_data]
+        )
+        all_dh = np.concatenate(
+            [np.asarray([self._metric_for_node(n, "dh_mm") for n in b["path"]]) for b in branch_data]
+        )
+
+        x_max = float(np.nanmax(all_s)) * 1.05 if all_s.size else 1.0
+
+        # ------------------------------------------------------------------
+        # 2. Colormap for the top velocity profile.
+        # ------------------------------------------------------------------
+        if metric_values:
+            vmax_m = float(np.nanpercentile(metric_values, 98.0))
+            vmin_m = float(np.nanpercentile(metric_values, 2.0))
+            if vmax_m <= vmin_m:
+                vmax_m = vmin_m + 1e-6
+        else:
+            vmin_m, vmax_m = 0.0, 1.0
+        norm = Normalize(vmin=vmin_m, vmax=vmax_m)
+        cmap = {
+            "velocity": matplotlib.colormaps["turbo"],
+            "reynolds": matplotlib.colormaps["coolwarm"],
+            "froude": matplotlib.colormaps["plasma"],
+            "diameter": matplotlib.colormaps["viridis"],
+        }.get(metric, matplotlib.colormaps["turbo"])
+
+        def _branch_visible(idx: int) -> bool:
+            return selected_branch < 0 or selected_branch == idx
+
+        metric_label = {
             "velocity": "|v| (m/s)",
             "reynolds": "Re",
             "froude": "Fr",
             "diameter": "Dh (mm)",
         }.get(metric, metric)
 
-    def _cmap_for_metric(self, metric: str):
-        return {
-            "velocity": cm.get_cmap("turbo"),
-            "reynolds": cm.get_cmap("coolwarm"),
-            "froude": cm.get_cmap("plasma"),
-            "diameter": cm.get_cmap("viridis"),
-        }.get(metric, cm.get_cmap("turbo"))
+        # ------------------------------------------------------------------
+        # 3. Create axes and set common x-range.
+        # ------------------------------------------------------------------
+        gs = self.figure.add_gridspec(4, 1, height_ratios=[1.2, 1, 1, 1], hspace=0.18)
+        ax_v = self.figure.add_subplot(gs[0, 0])
+        ax_re = self.figure.add_subplot(gs[1, 0])
+        ax_fr = self.figure.add_subplot(gs[2, 0])
+        ax_area = self.figure.add_subplot(gs[3, 0])
+        ax_dh = ax_area.twinx()
 
-    def _sample_neighbor_median(
-        self,
-        field: np.ndarray,
-        ijk: np.ndarray,
-        radius: int = 1,
-        order: int = 1,
-    ) -> float:
-        """Sample `field` at a 3x3x3 neighborhood around ijk and return the median.
+        for ax in (ax_v, ax_re, ax_fr, ax_area):
+            self._style_ax(ax)
+        ax_dh.tick_params(colors="#334155")
+        ax_dh.yaxis.label.set_color("#334155")
 
-        Coordinates are in array-index order [x_idx, y_idx, z_idx] because the
-        voxel grid is stored with axes (x, y, z).
-        """
-        offsets = np.array(
-            [[i, j, k] for i in range(-radius, radius + 1)
-             for j in range(-radius, radius + 1)
-             for k in range(-radius, radius + 1)],
-            dtype=np.float64,
-        ).T  # shape (3, 27)
-        coords = ijk[:, None] + offsets
-        vals = ndimage.map_coordinates(
-            field,
-            coords,
-            order=order,
-            mode="nearest",
-            cval=np.nan,
-        )
-        vals = np.asarray(vals, dtype=np.float64)
-        finite = np.isfinite(vals)
-        if finite.any():
-            return float(np.median(vals[finite]))
-        return float(np.nan)
+        for ax in (ax_v, ax_re, ax_fr, ax_area):
+            ax.set_xlim(0.0, x_max)
+            ax.tick_params(labelbottom=(ax is ax_area))
 
-    def _compute_per_voxel_metrics(
-        self,
-        result: AnalysisResult,
-        ft: np.ndarray,
-        vm: np.ndarray,
-        grid: np.ndarray,
-    ) -> Dict[str, np.ndarray]:
-        metal = grid > 0
-        valid = metal & np.isfinite(ft) & np.isfinite(vm) & (vm > 0.0)
+        # ------------------------------------------------------------------
+        # 4. Top: velocity profile coloured by the chosen metric.
+        # ------------------------------------------------------------------
+        n_branches = max(len(branch_data), 1)
+        branch_cmap = matplotlib.colormaps["tab10"]
 
-        # Hydraulic diameter: D_h = 2 * distance_to_surface (in metres).
-        dx_m = float(result.dx_mm) / 1000.0
-        if result.sdf is not None and result.sdf.size == grid.size:
-            sdf_m = np.asarray(result.sdf, dtype=np.float64) / 1000.0
-            dh_m = 2.0 * np.maximum(sdf_m, dx_m * 0.5)
-        else:
-            dt = ndimage.distance_transform_edt(metal, sampling=dx_m)
-            dh_m = 2.0 * np.maximum(dt, dx_m * 0.5)
+        def _branch_color(idx: int):
+            return branch_cmap((idx % 10) / 9.0)
 
-        re = np.where(
-            valid & (dh_m > 0),
-            self._rho * vm * dh_m / self._mu,
-            0.0,
-        )
-        fr = np.where(
-            valid & (dh_m > 0),
-            vm / np.sqrt(self._g * dh_m),
-            0.0,
-        )
-
-        return {
-            "velocity": np.where(valid, vm, 0.0),
-            "reynolds": re,
-            "froude": fr,
-            "diameter": np.where(valid, dh_m * 1000.0, 0.0),  # mm
-            "valid": valid,
-            "dh_m": dh_m,
-        }
-
-    def _compute_node_metrics(self, gn: GatingNode) -> Dict[str, float]:
-        """Compute accurate section-based Re/Fr/Dh for a gating node."""
-        v = float(gn.velocity_m_s) if gn.velocity_m_s > 1e-12 else 0.0
-        area_cm2 = float(gn.section_area_cm2)
-        area_m2 = area_cm2 * 1e-4
-        if area_m2 > 0:
-            dh_m = 2.0 * math.sqrt(area_m2 / math.pi)
-        else:
-            dh_m = 1e-3
-        re = self._rho * v * dh_m / self._mu if dh_m > 0 else 0.0
-        fr = v / math.sqrt(self._g * dh_m) if dh_m > 0 else 0.0
-        return {
-            "velocity": v,
-            "reynolds": re,
-            "froude": fr,
-            "diameter": dh_m * 1000.0,
-            "area_cm2": area_cm2,
-        }
-
-    def _sample_node_arrival_time(
-        self,
-        result: AnalysisResult,
-        gn: GatingNode,
-        ft: np.ndarray,
-        grid: np.ndarray,
-    ) -> float:
-        origin = np.asarray(result.origin_mm, dtype=np.float64)
-        dx = float(result.dx_mm)
-        pos = np.asarray(gn.centroid_mm, dtype=np.float64)
-        ijk = (pos - origin) / dx
-        try:
-            grid_sample = self._sample_neighbor_median(
-                grid.astype(np.float64), ijk, radius=1, order=0
+        annotated: set = set()
+        for i, b in enumerate(branch_data):
+            # Alternate label placement per branch to avoid overlap.
+            label_dy = 10 if i % 2 == 0 else -15
+            if not _branch_visible(i):
+                continue
+            s = b["s"]
+            v = b["vels"]
+            m = b["metrics"]
+            color = _branch_color(i)
+            label = self._branch_names[i]
+            ax_v.plot(s, v, "-", color=color, linewidth=2.5, zorder=3, label=label)
+            ax_v.scatter(
+                s,
+                v,
+                c=m,
+                cmap=cmap,
+                norm=norm,
+                s=60,
+                zorder=4,
+                edgecolors="#334155",
+                linewidths=0.5,
             )
-            if grid_sample > 0.5:
-                t_arrival = self._sample_neighbor_median(ft, ijk, radius=1, order=1)
-                if np.isfinite(t_arrival) and t_arrival >= 0.0:
-                    return float(t_arrival)
-        except Exception:
-            pass
-        return float(np.nan)
+            if self._label_check.isChecked():
+                for node, si, vi in zip(b["path"], s, v):
+                    try:
+                        up, down = node.name.split(" → ", 1)
+                    except ValueError:
+                        continue
+                    label = down
+                    if label in ("Parça", "PART", "part", "Kaynak", "SOURCE"):
+                        continue
+                    if label in annotated:
+                        continue
+                    annotated.add(label)
+                    ax_v.annotate(
+                        label,
+                        (si, vi),
+                        textcoords="offset points",
+                        xytext=(0, label_dy),
+                        ha="center",
+                        fontsize=7,
+                        color="#334155",
+                        clip_on=True,
+                    )
 
-    def _plot(self) -> None:
-        self.figure.clear()
-        flow = self._result.flow_result
-        if flow is None:
-            ax = self.figure.add_subplot(111)
-            self._style_axes(ax)
-            ax.text(
-                0.5,
-                0.5,
-                "Akış sonucu yok.",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-                color="#e0e0e0",
-                fontsize=12,
+        if branch_data and selected_branch < 0:
+            ax_v.legend(loc="upper right", fontsize=8, framealpha=0.9)
+
+        if self._target_check.isChecked():
+            tmin, tmax = self._target_v
+            ax_v.axhspan(tmin, tmax, color="#22C55E", alpha=0.12, zorder=1)
+            ax_v.axhline(tmin, color="#22C55E", linestyle="--", linewidth=1.0, zorder=2)
+            ax_v.axhline(tmax, color="#22C55E", linestyle="--", linewidth=1.0, zorder=2)
+            ax_v.text(
+                0.02,
+                0.98,
+                f"Hedef: {tmin:.2f}-{tmax:.2f} m/s",
+                transform=ax_v.transAxes,
+                ha="left",
+                va="top",
+                fontsize=8,
+                color="#15803D",
             )
-            self.canvas.draw()
-            return
 
-        ft = flow.fill_time
-        vm = flow.velocity_magnitude
-        vel = flow.velocity
-        grid = self._result.grid
-        if (
-            ft is None
-            or vm is None
-            or grid is None
-            or ft.size == 0
-            or vm.size == 0
-            or grid.size == 0
-        ):
-            ax = self.figure.add_subplot(111)
-            self._style_axes(ax)
-            ax.text(
-                0.5,
-                0.5,
-                "Hız / dolum zamanı verisi yok.",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-                color="#e0e0e0",
-                fontsize=12,
-            )
-            self.canvas.draw()
-            return
-
-        metric = self._metric_combo.currentData()
-        show_geometry = self._radius_check.isChecked()
-
-        metrics = self._compute_per_voxel_metrics(self._result, ft, vm, grid)
-        m_arr = metrics[metric]
-        valid = metrics["valid"]
-
-        # Shared color scale from the selected metric.
-        m_vals = np.asarray(m_arr[valid], dtype=np.float64)
-        if m_vals.size:
-            vmin = float(np.percentile(m_vals, 2.0))
-            vmax = float(np.percentile(m_vals, 98.0))
-            if vmax <= vmin:
-                vmax = vmin + 1e-6
-        else:
-            vmin, vmax = 0.0, 1.0
-        norm = Normalize(vmin=vmin, vmax=vmax)
-        cmap = self._cmap_for_metric(metric)
-
-        if show_geometry:
-            gs = self.figure.add_gridspec(
-                3, 2, height_ratios=[1, 1, 0.65], width_ratios=[1, 0.04]
-            )
-            ax_time = self.figure.add_subplot(gs[0, 0])
-            ax_path = self.figure.add_subplot(gs[1, 0])
-            ax_geom = self.figure.add_subplot(gs[2, 0])
-            cax = self.figure.add_subplot(gs[:2, 1])
-        else:
-            gs = self.figure.add_gridspec(2, 2, height_ratios=[1, 1], width_ratios=[1, 0.04])
-            ax_time = self.figure.add_subplot(gs[0, 0])
-            ax_path = self.figure.add_subplot(gs[1, 0])
-            ax_geom = None
-            cax = self.figure.add_subplot(gs[:, 1])
-
-        self._style_axes(ax_time)
-        self._style_axes(ax_path)
-        if ax_geom is not None:
-            self._style_axes(ax_geom)
-        cax.set_facecolor("#1a1a2e")
-        cax.tick_params(colors="#e0e0e0")
-
-        self._plot_metric_vs_time(ax_time, ft, m_arr, valid, metric, cmap, norm)
-        self._plot_path_profile(ax_path, metric, cmap, norm)
-        if ax_geom is not None:
-            self._plot_path_geometry(ax_geom)
-
-        sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm = matplotlib.cm.ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
-        cbar = self.figure.colorbar(sm, cax=cax)
-        cbar.ax.set_ylabel(self._metric_label(metric), color="#e0e0e0")
-        cbar.ax.tick_params(colors="#e0e0e0")
+        cbar = self.figure.colorbar(sm, ax=ax_v, pad=0.01)
+        cbar.ax.set_ylabel(metric_label, color="#334155")
+        cbar.ax.tick_params(colors="#334155")
+
+        ax_v.set_ylabel("Hız (m/s)")
+        ax_v.set_title("Akış Hızı Profili (renk: " + metric_label + ")")
+        v_top = max(
+            float(np.nanpercentile(all_v, 99.5)) * 1.2,
+            self._target_v[1] * 1.2,
+            0.01,
+        )
+        ax_v.set_ylim(0.0, v_top)
+
+        # ------------------------------------------------------------------
+        # 5. Re / Fr / Area / Dh panels.
+        # ------------------------------------------------------------------
+        for i, b in enumerate(branch_data):
+            if not _branch_visible(i):
+                continue
+            s = b["s"]
+            re = np.asarray([self._metric_for_node(n, "reynolds") for n in b["path"]])
+            fr = np.asarray([self._metric_for_node(n, "froude") for n in b["path"]])
+            area = np.asarray([self._metric_for_node(n, "area_cm2") for n in b["path"]])
+            dh = np.asarray([self._metric_for_node(n, "dh_mm") for n in b["path"]])
+
+            label = self._branch_names[i]
+            ax_re.plot(s, re, "-", linewidth=2.0, label=label, zorder=3)
+            ax_fr.plot(s, fr, "-", linewidth=2.0, label=label, zorder=3)
+            ax_area.plot(s, area, "-", linewidth=2.0, label=f"A (cm²) - {label}", zorder=3)
+            ax_dh.plot(s, dh, "--", linewidth=2.0, label=f"Dh (mm) - {label}", zorder=3)
+
+        # Reynolds thresholds.
+        re_top = max(float(np.nanmax(all_re)) * 1.15, 4500.0) if all_re.size else 4500.0
+        re_log = re_top > 8000.0
+        if re_log:
+            ax_re.set_yscale("log")
+            positive_re = all_re[all_re > 0.0]
+            data_bottom = float(np.nanmin(positive_re)) * 0.5 if positive_re.size else 500.0
+            # Always keep the Re=2000 / 4000 guidelines inside the y-range.
+            re_bottom = min(data_bottom, 500.0)
+        else:
+            re_bottom = 0.0
+        ax_re.axhline(2000.0, color="#16A34A", linestyle="-", linewidth=1.5, zorder=2, label="Re=2000")
+        ax_re.axhline(4000.0, color="#DC2626", linestyle="--", linewidth=1.5, zorder=2, label="Re=4000")
+        ax_re.fill_between([0.0, x_max], 2000.0, 4000.0, color="#FACC15", alpha=0.08, zorder=1)
+        if re_top > 4000.0:
+            ax_re.fill_between([0.0, x_max], 4000.0, re_top, color="#DC2626", alpha=0.08, zorder=1)
+        ax_re.set_ylim(re_bottom, re_top)
+        ax_re.set_ylabel("Reynolds (Re)")
+        ax_re.set_title("Reynolds Sayısı")
+        ax_re.legend(loc="upper right", fontsize=8)
+
+        # Froude threshold.
+        fr_top = max(float(np.nanmax(all_fr)) * 1.2, 1.5) if all_fr.size else 1.5
+        ax_fr.axhline(1.0, color="#2563EB", linestyle="-", linewidth=2.0, zorder=2, label="Fr=1 (kritik)")
+        if fr_top > 1.0:
+            ax_fr.fill_between([0.0, x_max], 1.0, fr_top, color="#DC2626", alpha=0.08, zorder=1)
+        ax_fr.set_ylim(0.0, fr_top)
+        ax_fr.set_ylabel("Froude (Fr)")
+        ax_fr.set_title("Froude Sayısı")
+        ax_fr.legend(loc="upper right", fontsize=8)
+
+        # Area / hydraulic diameter.
+        a_top = max(float(np.nanpercentile(all_area, 99.5)) * 1.15, 0.01) if all_area.size else 0.01
+        dh_top = max(float(np.nanpercentile(all_dh, 99.5)) * 1.15, 0.01) if all_dh.size else 0.01
+        ax_area.set_ylim(0.0, a_top)
+        ax_dh.set_ylim(0.0, dh_top)
+        ax_area.set_ylabel("Kesit Alanı A (cm²)", color="#334155")
+        ax_area.set_title("Kesit Alanı ve Hidrolik Çap")
+        ax_area.tick_params(axis="y", colors="#334155")
+        ax_dh.set_ylabel("Hidrolik Çap Dh (mm)", color="#7C3AED")
+        ax_dh.tick_params(axis="y", colors="#7C3AED")
+        lines, labels = ax_area.get_legend_handles_labels()
+        lines2, labels2 = ax_dh.get_legend_handles_labels()
+        ax_area.legend(lines + lines2, labels + labels2, loc="upper right", fontsize=8)
+
+        ax_area.set_xlabel("Kaynaktan uzaklık (mm)")
 
         self.canvas.draw()
-
-    def _plot_metric_vs_time(
-        self,
-        ax,
-        ft: np.ndarray,
-        m_arr: np.ndarray,
-        valid: np.ndarray,
-        metric: str,
-        cmap,
-        norm,
-    ) -> None:
-        if not valid.any():
-            ax.text(
-                0.5,
-                0.5,
-                "Geçerli veri yok.",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-                color="#e0e0e0",
-                fontsize=11,
-            )
-            return
-
-        ft_vals = np.asarray(ft[valid], dtype=np.float64)
-        m_vals = np.asarray(m_arr[valid], dtype=np.float64)
-
-        max_t = float(np.percentile(ft_vals, 99.9))
-        if max_t <= 0.0:
-            max_t = float(ft_vals.max())
-
-        n_bins = 80
-        bins = np.linspace(0.0, max_t, n_bins + 1)
-        centers = 0.5 * (bins[:-1] + bins[1:])
-        means = np.full(n_bins, np.nan)
-        medians = np.full(n_bins, np.nan)
-        p10 = np.full(n_bins, np.nan)
-        p25 = np.full(n_bins, np.nan)
-        p75 = np.full(n_bins, np.nan)
-        p90 = np.full(n_bins, np.nan)
-
-        for i in range(n_bins):
-            mask = (ft_vals >= bins[i]) & (ft_vals < bins[i + 1])
-            if mask.any():
-                vals = m_vals[mask]
-                means[i] = float(np.mean(vals))
-                medians[i] = float(np.median(vals))
-                p10[i] = float(np.percentile(vals, 10.0))
-                p25[i] = float(np.percentile(vals, 25.0))
-                p75[i] = float(np.percentile(vals, 75.0))
-                p90[i] = float(np.percentile(vals, 90.0))
-
-        valid_bins = ~np.isnan(means)
-
-        for i in range(n_bins - 1):
-            if valid_bins[i] and valid_bins[i + 1]:
-                avg_m = 0.5 * (means[i] + means[i + 1])
-                color = to_hex(cmap(norm(avg_m)))
-                ax.fill_between(
-                    [centers[i], centers[i + 1]],
-                    [p10[i], p10[i + 1]],
-                    [p90[i], p90[i + 1]],
-                    color=color,
-                    alpha=0.15,
-                    linewidth=0,
-                    zorder=1,
-                )
-
-        x = centers[valid_bins]
-        y = means[valid_bins]
-        if x.size >= 2:
-            points = np.column_stack([x, y]).reshape(-1, 1, 2)
-            segments = np.concatenate([points[:-1], points[1:]], axis=1)
-            colors = y[:-1]
-            lc = LineCollection(
-                segments,
-                cmap=cmap,
-                norm=norm,
-                linewidth=3.0,
-                capstyle="round",
-                joinstyle="round",
-                zorder=3,
-                label="Ortalama",
-            )
-            lc.set_array(colors)
-            ax.add_collection(lc)
-
-        if p25[valid_bins].size:
-            ax.plot(
-                centers[valid_bins],
-                p25[valid_bins],
-                color="white",
-                linestyle="--",
-                linewidth=1.0,
-                alpha=0.6,
-                zorder=2,
-                label="25-75 yüzdelik",
-            )
-            ax.plot(
-                centers[valid_bins],
-                p75[valid_bins],
-                color="white",
-                linestyle="--",
-                linewidth=1.0,
-                alpha=0.6,
-                zorder=2,
-            )
-
-        flow = self._result.flow_result
-        if flow and flow.gating_nodes:
-            node_times: List[float] = []
-            node_ms: List[float] = []
-            node_names: List[str] = []
-            for gn in flow.gating_nodes:
-                t_arrival = self._sample_node_arrival_time(self._result, gn, ft, self._result.grid)
-                if np.isfinite(t_arrival) and t_arrival >= 0.0:
-                    node_times.append(t_arrival)
-                    nm = self._compute_node_metrics(gn)
-                    node_ms.append(nm.get(metric, 0.0))
-                    node_names.append(gn.name)
-            if node_times:
-                ax.scatter(
-                    node_times,
-                    node_ms,
-                    c=node_ms,
-                    cmap=cmap,
-                    norm=norm,
-                    s=120,
-                    zorder=5,
-                    edgecolors="white",
-                    linewidths=1.2,
-                    label="Gating düğümleri",
-                )
-                for i, (x_n, y_n, name) in enumerate(zip(node_times, node_ms, node_names)):
-                    xoff = 10 if i % 2 == 0 else -10
-                    yoff = 12 if (i // 2) % 2 == 0 else -14
-                    ax.annotate(
-                        name,
-                        (x_n, y_n),
-                        textcoords="offset points",
-                        xytext=(xoff, yoff),
-                        fontsize=7,
-                        color="#e0e0e0",
-                        ha="left" if xoff > 0 else "right",
-                        va="bottom" if yoff > 0 else "top",
-                        bbox=dict(boxstyle="round,pad=0.25", fc="#264653", ec="#e0e0e0", alpha=0.85),
-                        arrowprops=dict(arrowstyle="-", color="#e0e0e0", lw=0.5),
-                        zorder=6,
-                    )
-
-        if flow and flow.fill_time_s > 0.0:
-            ax.axvline(
-                flow.fill_time_s,
-                color="#f4a261",
-                linestyle="--",
-                linewidth=1.5,
-                zorder=2,
-                label=f"Toplam dolum: {flow.fill_time_s:.2f} s",
-            )
-
-        ax.set_xlabel("Dolum zamanı (s)")
-        ax.set_ylabel(self._metric_label(metric))
-        ax.set_title(f"Darcy ön cephe {self._metric_label(metric)} - Dolum zamanı")
-        ax.set_xlim(0.0, max_t * 1.05 if max_t > 0.0 else 1.0)
-        if m_vals.size:
-            ax.set_ylim(0.0, float(np.percentile(m_vals, 99.5)) * 1.15)
-        ax.legend(loc="upper right", fontsize=8, facecolor="#16213e", edgecolor="#e0e0e0")
-        ax.text(
-            0.02,
-            0.02,
-            f"ρ={self._rho:.0f} kg/m³, μ={self._mu:.4f} Pa·s, g={self._g:.2f} m/s²",
-            transform=ax.transAxes,
-            fontsize=7,
-            color="#e0e0e0",
-            verticalalignment="bottom",
-        )
-
-    def _build_gating_paths(self) -> Tuple[Optional[str], Dict[str, List[GatingNode]]]:
-        flow = self._result.flow_result
-        if flow is None or not flow.gating_nodes:
-            return None, {}
-
-        children: Dict[str, List[GatingNode]] = {}
-        root: Optional[str] = None
-        source_node: Optional[GatingNode] = None
-        for gn in flow.gating_nodes:
-            if gn.body_type.startswith("SOURCE"):
-                source_node = gn
-                parts = gn.name.split(" → ")
-                if len(parts) == 2:
-                    root = parts[1]
-                continue
-            parts = gn.name.split(" → ")
-            if len(parts) == 2:
-                up, _down = parts
-                children.setdefault(up, []).append(gn)
-
-        if root is None and source_node is None and flow.gating_nodes:
-            root = flow.gating_nodes[0].name.split(" → ")[0]
-
-        paths: List[List[GatingNode]] = []
-
-        def _walk(current: str, path: List[GatingNode]):
-            if current not in children or not children[current]:
-                paths.append(list(path))
-                return
-            for child in children[current]:
-                path.append(child)
-                _walk(child.name.split(" → ")[1], path)
-                path.pop()
-
-        if source_node is not None and root is not None:
-            _walk(root, [source_node])
-        elif root is not None:
-            _walk(root, [])
-
-        if not paths:
-            paths = [list(flow.gating_nodes)]
-
-        return root, children, paths
-
-    def _plot_path_profile(
-        self,
-        ax,
-        metric: str,
-        cmap,
-        norm,
-    ) -> None:
-        flow = self._result.flow_result
-        if flow is None or not flow.gating_nodes:
-            ax.text(
-                0.5,
-                0.5,
-                "Gating düğümü yok, akış yolu profili çizilemiyor.",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-                color="#e0e0e0",
-                fontsize=11,
-            )
-            return
-
-        root, children, paths = self._build_gating_paths()
-
-        all_x: List[float] = []
-        all_y: List[float] = []
-        all_nodes: List[Tuple[float, float, str, Dict[str, float]]] = []
-
-        for path_idx, path in enumerate(paths):
-            distances = [0.0]
-            metric_values = []
-            names = []
-            prev = None
-            for gn in path:
-                if prev is not None:
-                    d = float(
-                        np.linalg.norm(np.asarray(gn.centroid_mm) - np.asarray(prev.centroid_mm))
-                        / 1000.0
-                    )
-                    distances.append(distances[-1] + d)
-                prev = gn
-
-                nm = self._compute_node_metrics(gn)
-                m_val = nm.get(metric, 0.0)
-                metric_values.append(m_val)
-                names.append(gn.name)
-                all_x.append(distances[-1])
-                all_y.append(m_val)
-                all_nodes.append((distances[-1], m_val, gn.name, nm))
-
-            distances = np.asarray(distances, dtype=np.float64)
-            metric_values = np.asarray(metric_values, dtype=np.float64)
-
-            if distances.size >= 2:
-                points = np.column_stack([distances, metric_values]).reshape(-1, 1, 2)
-                segments = np.concatenate([points[:-1], points[1:]], axis=1)
-                colors = metric_values[:-1]
-                lc = LineCollection(
-                    segments,
-                    cmap=cmap,
-                    norm=norm,
-                    linewidth=3.0,
-                    capstyle="round",
-                    joinstyle="round",
-                    zorder=2,
-                    label=f"Meme {path_idx + 1}" if len(paths) > 1 else "Akış yolu",
-                )
-                lc.set_array(colors)
-                ax.add_collection(lc)
-
-            ax.scatter(
-                distances,
-                metric_values,
-                c=metric_values,
-                cmap=cmap,
-                norm=norm,
-                s=100,
-                zorder=4,
-                edgecolors="white",
-                linewidths=1.2,
-            )
-
-            for i, (x_n, y_n, name) in enumerate(zip(distances, metric_values, names)):
-                xoff = 10 if i % 2 == 0 else -10
-                yoff = 12 if (i // 2) % 2 == 0 else -14
-                ax.annotate(
-                    name,
-                    (x_n, y_n),
-                    textcoords="offset points",
-                    xytext=(xoff, yoff),
-                    fontsize=7,
-                    color="#e0e0e0",
-                    ha="left" if xoff > 0 else "right",
-                    va="bottom" if yoff > 0 else "top",
-                    bbox=dict(boxstyle="round,pad=0.25", fc="#264653", ec="#e0e0e0", alpha=0.85),
-                    arrowprops=dict(arrowstyle="-", color="#e0e0e0", lw=0.5),
-                    zorder=5,
-                )
-
-        if all_x:
-            pad = 0.05 * (max(all_x) - min(all_x)) if max(all_x) > min(all_x) else 0.01
-            ax.set_xlim(min(all_x) - pad, max(all_x) + pad)
-            ax.set_ylim(0.0, max(all_y) * 1.15)
-
-        ax.set_xlabel("Akış yolu mesafesi (m)")
-        ax.set_ylabel(self._metric_label(metric))
-        ax.set_title(f"Akış yolu {self._metric_label(metric)} profili")
-        if len(paths) > 1:
-            ax.legend(loc="upper right", fontsize=8, facecolor="#16213e", edgecolor="#e0e0e0")
-        ax.text(
-            0.02,
-            0.02,
-            "Not: Her nokta Q/A kesit hızı üzerinden Re/Fr/Dh hesaplanır.",
-            transform=ax.transAxes,
-            fontsize=7,
-            color="#e0e0e0",
-            verticalalignment="bottom",
-        )
-
-    def _plot_path_geometry(self, ax) -> None:
-        """Bottom panel: cross-section area and hydraulic diameter along the gating path."""
-        flow = self._result.flow_result
-        if flow is None or not flow.gating_nodes:
-            ax.text(
-                0.5,
-                0.5,
-                "Geometri verisi yok.",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-                color="#e0e0e0",
-                fontsize=11,
-            )
-            return
-
-        _, _, paths = self._build_gating_paths()
-        ax2 = ax.twinx()
-        self._style_axes(ax2)
-        ax2.tick_params(colors="#e0e0e0")
-        ax2.spines["right"].set_color("#e0e0e0")
-
-        all_diameters: List[float] = []
-        all_areas: List[float] = []
-        all_x: List[float] = []
-
-        for path in paths:
-            distances = [0.0]
-            areas = []
-            diameters = []
-            prev = None
-            for gn in path:
-                if prev is not None:
-                    d = float(
-                        np.linalg.norm(np.asarray(gn.centroid_mm) - np.asarray(prev.centroid_mm))
-                        / 1000.0
-                    )
-                    distances.append(distances[-1] + d)
-                prev = gn
-                nm = self._compute_node_metrics(gn)
-                areas.append(nm["area_cm2"])
-                diameters.append(nm["diameter"])
-                all_x.append(distances[-1])
-                all_areas.append(nm["area_cm2"])
-                all_diameters.append(nm["diameter"])
-
-            distances = np.asarray(distances, dtype=np.float64)
-            areas = np.asarray(areas, dtype=np.float64)
-            diameters = np.asarray(diameters, dtype=np.float64)
-
-            ax.fill_between(distances, 0, areas, alpha=0.2, color="#2a9d8f")
-            ax.plot(distances, areas, color="#2a9d8f", linewidth=2.0, label="Kesit alanı")
-            ax2.plot(distances, diameters, color="#e9c46a", linewidth=2.0, linestyle="--", label="Dh")
-
-        ax.set_xlabel("Akış yolu mesafesi (m)")
-        ax.set_ylabel("Kesit alanı (cm²)", color="#2a9d8f")
-        ax2.set_ylabel("Hidrolik çap Dh (mm)", color="#e9c46a")
-        ax.set_title("Kesit geometrisi (radyus etkisi)")
-        ax.tick_params(axis="y", colors="#2a9d8f")
-        ax2.tick_params(axis="y", colors="#e9c46a")
-
-        if all_x:
-            pad = 0.05 * (max(all_x) - min(all_x)) if max(all_x) > min(all_x) else 0.01
-            ax.set_xlim(min(all_x) - pad, max(all_x) + pad)
-            ax.set_ylim(0.0, max(all_areas) * 1.2)
-            ax2.set_ylim(0.0, max(all_diameters) * 1.2)
-
-        lines1, labels1 = ax.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=8,
-                  facecolor="#16213e", edgecolor="#e0e0e0")
