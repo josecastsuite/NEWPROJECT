@@ -33,17 +33,20 @@ from scipy.sparse import csr_matrix
 from scipy.sparse import csgraph
 from scipy.sparse import linalg as spla
 
+from core.config import FlowConfig
 from core.gate_flow import solve_gate_flows
 from core.materials import MOLDS, MoldMaterial
 from core.types import Body, BodyType, FillingResult, GatingNode, GatingVelocityError
 from core.voxelizer import build_voxel_grid, compute_face_fractions
+
+_FLOW_CFG = FlowConfig()
 
 
 def _downsample_grid(
     grid: np.ndarray,
     origin: np.ndarray,
     dx: float,
-    max_cells: int = 6_000_000,
+    max_cells: int = _FLOW_CFG.max_solver_cells,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """Downsample a body-type grid with nearest-neighbour interpolation.
 
@@ -204,8 +207,8 @@ def _recommend_filter(
 def _flow_refined_grid(
     bodies: List[Body],
     casting_params,
-    desired_dx_mm: float = 1.75,
-    max_cells: int = 6_000_000,
+    desired_dx_mm: float = _FLOW_CFG.desired_dx_mm,
+    max_cells: int = _FLOW_CFG.max_solver_cells,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float]]:
     """Re-voxelise the casting bodies for the Darcy flow solve.
 
@@ -228,9 +231,10 @@ def _flow_refined_grid(
 
     # Target dimension for the desired voxel pitch, capped by the memory budget.
     target_dim = max(160, int(np.ceil(max_size / desired_dx_mm)))
-    # Total grid cells scale as target_dim^3; leave a 2x safety factor for
-    # margin + empty space, and let _downsample_grid trim the cavity count.
-    max_dim = int(np.floor((max_cells * 2.0) ** (1.0 / 3.0)))
+    # Total grid cells scale as target_dim^3.  Use a larger safety factor so
+    # the desired dx (e.g. 0.8 mm) is not prematurely clipped; _downsample_grid
+    # enforces the cavity-cell budget afterwards.
+    max_dim = int(np.floor((max_cells * 8.0) ** (1.0 / 3.0)))
     target_dim = min(target_dim, max_dim)
     if target_dim < 160:
         target_dim = 160
@@ -537,9 +541,9 @@ def _build_laplace_matrix(
     flat_idx[cavity] = np.arange(int(cavity.sum()))
     n_unknowns = int(cavity.sum())
 
-    rows: List[int] = []
-    cols: List[int] = []
-    data: List[float] = []
+    rows_parts: List[np.ndarray] = []
+    cols_parts: List[np.ndarray] = []
+    data_parts: List[np.ndarray] = []
     rhs = np.zeros(n_unknowns, dtype=np.float64)
     diag = np.zeros(n_unknowns, dtype=np.float64)
 
@@ -575,22 +579,19 @@ def _build_laplace_matrix(
             c = cur_idx[both]
             n = nb_idx[both]
             wb = w[both]
-            rows.extend(c.tolist())
-            cols.extend(n.tolist())
-            data.extend(wb.tolist())
-            rows.extend(n.tolist())
-            cols.extend(c.tolist())
-            data.extend(wb.tolist())
-            diag[c] += wb
-            diag[n] += wb
+            rows_parts.append(np.concatenate([c, n]))
+            cols_parts.append(np.concatenate([n, c]))
+            data_parts.append(np.concatenate([wb, wb]))
+            np.add.at(diag, c, wb)
+            np.add.at(diag, n, wb)
 
         # cur non-Dirichlet, nb Dirichlet
         c_nd_nb_d = (~cdir) & ndir
         if c_nd_nb_d.any():
             c = cur_idx[c_nd_nb_d]
             wb = w[c_nd_nb_d]
-            diag[c] += wb
-            rhs[c] -= wb * nv[c_nd_nb_d]
+            np.add.at(diag, c, wb)
+            np.add.at(rhs, c, -wb * nv[c_nd_nb_d])
 
         # cur Dirichlet, nb non-Dirichlet (the symmetric contribution from
         # the other side of the same face).
@@ -598,8 +599,8 @@ def _build_laplace_matrix(
         if c_d_nb_nd.any():
             n = nb_idx[c_d_nb_nd]
             wb = w[c_d_nb_nd]
-            diag[n] += wb
-            rhs[n] -= wb * cv[c_d_nb_nd]
+            np.add.at(diag, n, wb)
+            np.add.at(rhs, n, -wb * cv[c_d_nb_nd])
 
     # z-faces (axis 0) -- interior face indices 1..nz-1 of f_A_z
     Kz = 2.0 * K[:-1] * K[1:] / (K[:-1] + K[1:]) * f_A_z[1:-1]
@@ -626,17 +627,20 @@ def _build_laplace_matrix(
     unknown = np.arange(n_unknowns, dtype=np.int32)
     dirichlet_unknowns = dirichlet[cavity]
     if dirichlet_unknowns.any():
-        rows.extend(unknown[dirichlet_unknowns].tolist())
-        cols.extend(unknown[dirichlet_unknowns].tolist())
-        data.extend(np.ones(dirichlet_unknowns.sum(), dtype=np.float64).tolist())
+        rows_parts.append(unknown[dirichlet_unknowns])
+        cols_parts.append(unknown[dirichlet_unknowns])
+        data_parts.append(np.ones(dirichlet_unknowns.sum(), dtype=np.float64))
         rhs[dirichlet_unknowns] = dirichlet_value[cavity][dirichlet_unknowns]
 
     non_dirichlet = ~dirichlet_unknowns
     if non_dirichlet.any():
-        rows.extend(unknown[non_dirichlet].tolist())
-        cols.extend(unknown[non_dirichlet].tolist())
-        data.extend((-diag[non_dirichlet]).tolist())
+        rows_parts.append(unknown[non_dirichlet])
+        cols_parts.append(unknown[non_dirichlet])
+        data_parts.append(-diag[non_dirichlet])
 
+    rows = np.concatenate(rows_parts) if rows_parts else np.empty(0, dtype=np.int64)
+    cols = np.concatenate(cols_parts) if cols_parts else np.empty(0, dtype=np.int64)
+    data = np.concatenate(data_parts) if data_parts else np.empty(0, dtype=np.float64)
     A = csr_matrix((data, (rows, cols)), shape=(n_unknowns, n_unknowns))
     return A, rhs, flat_idx, dirichlet_unknowns, dirichlet_value[cavity]
 
@@ -4999,7 +5003,7 @@ def solve_filling_flow(
     alloy,
     bodies=None,
     body_index: Optional[np.ndarray] = None,
-    max_solver_cells: int = 6_000_000,
+    max_solver_cells: int = _FLOW_CFG.max_solver_cells,
     progress_callback=None,
     design_velocity_m_s: float = 0.0,
     design_section_key: str = "SPRUE_THROAT",
@@ -5062,7 +5066,7 @@ def solve_filling_flow(
     # capture gate cross-sections (≤ ~1.8 mm) while staying within the solver
     # cavity budget.  Otherwise fall back to the supplied analysis grid.
     ref_grid, ref_origin, ref_dx = _flow_refined_grid(
-        bodies, casting_params, desired_dx_mm=1.75, max_cells=max_solver_cells
+        bodies, casting_params, desired_dx_mm=_FLOW_CFG.desired_dx_mm, max_cells=max_solver_cells
     )
     if ref_grid is not None and ref_dx < dx * 0.95:
         grid, origin, dx = ref_grid, ref_origin, ref_dx
@@ -5122,8 +5126,11 @@ def solve_filling_flow(
 
     # FAVOR fractional face areas from the CAD geometry.  These replace the raw
     # dx*dx area on curved/staircase surfaces so Q = v * A uses the real area.
+    # At very high resolution the 4x zoom would explode memory (>60 GB for 120 M
+    # cells), so fall back to binary face areas (sub=1) on large grids.
     is_metal_c = grid_c != BodyType.EMPTY
-    face_fractions = compute_face_fractions(is_metal_c, sub=4)
+    sub_frac = 4 if is_metal_c.size < 5_000_000 else 1
+    face_fractions = compute_face_fractions(is_metal_c, sub=sub_frac)
     f_A_z, f_A_y, f_A_x = face_fractions
 
     # Real source throat area (for reporting / validation only).
@@ -5316,7 +5323,9 @@ def solve_filling_flow(
     if not use_cpp_vof:
         vof_max_cells = 500_000
     # LBM is lighter per step but still benefits from a coarse grid for first runs.
-    lbm_max_cells = int(os.environ.get("JOSECAST_CPP_LBM_MAX_CELLS", "60000"))
+    lbm_max_cells = int(
+        os.environ.get("JOSECAST_CPP_LBM_MAX_CELLS", str(_FLOW_CFG.lbm_max_cells))
+    )
 
     vof_res = None
     inflow_v = 0.0

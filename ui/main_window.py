@@ -249,7 +249,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.res_spin = QtWidgets.QSpinBox()
         self.res_spin.setRange(160, MAX_RES)
-        self.res_spin.setValue(160)
+        self.res_spin.setValue(400)
         self.res_spin.setSingleStep(80)
         _settings_labeled(self.res_spin, "Max çözünürlük:", "160 = hızlı, 2040 = Titan mod (yavaş, yerel refine).")
 
