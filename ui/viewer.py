@@ -224,11 +224,13 @@ class Analyzer3DViewer(QtInteractor):
             entries.append([label, color, "circle"])
 
         n = len(entries)
-        # Fixed per-entry height keeps text/bullet size constant regardless of n.
-        line_height = 0.075
+        # Fixed per-entry height keeps the bullet size constant regardless of n.
+        # Text size is set independently on each text actor so it can be smaller
+        # while the bullet stays slightly larger and aligned with the label.
+        line_height = 0.060
         height = min(0.55, max(line_height, line_height * n))
         max_chars = max(len(entry[0]) for entry in entries)
-        width = min(0.35, max(0.16, max_chars * 0.018 + 0.03))
+        width = min(0.35, max(0.15, max_chars * 0.016 + 0.03))
 
         legend = self.add_legend(
             labels=entries,
@@ -250,16 +252,30 @@ class Analyzer3DViewer(QtInteractor):
         legend.SetPadding(4)
 
         text_color = [0.20, 0.26, 0.33]
+        font_size = 10
         for i, (label, color, _) in enumerate(entries):
             symbol = self._make_legend_symbol(color)
             legend.SetEntry(i, symbol, label, text_color)
 
         text_prop = pv._vtk.vtkTextProperty()
         text_prop.SetFontFamilyToArial()
-        text_prop.SetFontSize(13)
+        text_prop.SetFontSize(font_size)
         text_prop.SetBold(1)
         text_prop.SetColor(*text_color)
         legend.SetEntryTextProperty(text_prop)
+
+        # Lock the text size so adding entries does not rescale the font.
+        collection = pv._vtk.vtkPropCollection()
+        legend.GetActors2D(collection)
+        collection.InitTraversal()
+        for _ in range(collection.GetNumberOfItems()):
+            actor = collection.GetNextItemAsObject()
+            if isinstance(actor, pv._vtk.vtkTextActor):
+                actor.SetTextScaleModeToNone()
+                actor.GetTextProperty().SetFontFamilyToArial()
+                actor.GetTextProperty().SetFontSize(font_size)
+                actor.GetTextProperty().SetBold(1)
+                actor.GetTextProperty().SetColor(*text_color)
 
         self._body_legend_actor = legend
 
