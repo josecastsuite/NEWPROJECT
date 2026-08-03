@@ -74,6 +74,84 @@ def _downsample_grid(
     return grid_c.astype(grid.dtype), origin_c, dx_c
 
 
+def _geodesic_distance_field(
+    cavity_mask: np.ndarray, inlet_mask: np.ndarray
+) -> np.ndarray:
+    """26-neighbour geodesic distance from ``inlet_mask`` within ``cavity_mask``.
+
+    Uses vectorised sparse-graph construction so 120 000-cell LBM grids do not
+    hang in Python list append loops.
+    """
+    shape = cavity_mask.shape
+    node_id = np.full(shape, -1, dtype=np.int64)
+    n_nodes = int(cavity_mask.sum())
+    if n_nodes == 0:
+        return np.full(shape, np.inf, dtype=np.float64)
+    node_id[cavity_mask] = np.arange(n_nodes, dtype=np.int64)
+    nz, ny, nx = shape
+
+    src_list: List[np.ndarray] = []
+    dst_list: List[np.ndarray] = []
+    w_list: List[np.ndarray] = []
+    # 13 unique neighbour offsets; csr_graph below is undirected.
+    for dz in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dz == 0 and dy == 0 and dx == 0:
+                    continue
+                if not (
+                    dz > 0 or (dz == 0 and dy > 0) or (dz == 0 and dy == 0 and dx > 0)
+                ):
+                    continue
+                if dz >= 0:
+                    sz = slice(0, nz - dz)
+                    dz_s = slice(dz, nz)
+                else:
+                    sz = slice(-dz, nz)
+                    dz_s = slice(0, nz + dz)
+                if dy >= 0:
+                    sy = slice(0, ny - dy)
+                    dy_s = slice(dy, ny)
+                else:
+                    sy = slice(-dy, ny)
+                    dy_s = slice(0, ny + dy)
+                if dx >= 0:
+                    sx = slice(0, nx - dx)
+                    dx_s = slice(dx, nx)
+                else:
+                    sx = slice(-dx, nx)
+                    dx_s = slice(0, nx + dx)
+                src = node_id[sz, sy, sx]
+                dst = node_id[dz_s, dy_s, dx_s]
+                valid = (src >= 0) & (dst >= 0)
+                if not valid.any():
+                    continue
+                src_list.append(src[valid])
+                dst_list.append(dst[valid])
+                weight = float(np.linalg.norm([dz, dy, dx]))
+                w_list.append(np.full(valid.sum(), weight, dtype=np.float64))
+
+    if src_list:
+        rows = np.concatenate(src_list)
+        cols = np.concatenate(dst_list)
+        data = np.concatenate(w_list)
+    else:
+        rows = cols = data = np.empty(0, dtype=np.float64)
+    graph = csr_matrix((data, (rows, cols)), shape=(n_nodes, n_nodes))
+
+    inlet_nodes = node_id[inlet_mask]
+    inlet_nodes = inlet_nodes[inlet_nodes >= 0]
+    geodesic = np.full(shape, np.inf, dtype=np.float64)
+    if inlet_nodes.size > 0:
+        dists = csgraph.dijkstra(
+            graph, indices=inlet_nodes, directed=False, return_predecessors=False
+        )
+        min_dist = np.min(dists, axis=0)
+        min_dist = np.where(np.isfinite(min_dist), min_dist, np.inf)
+        geodesic[cavity_mask] = min_dist
+    return geodesic
+
+
 def _recommend_filter(
     gating_nodes: List[Any], Q_m3_s: float, alloy: Any
 ) -> Optional[str]:
@@ -126,8 +204,8 @@ def _recommend_filter(
 def _flow_refined_grid(
     bodies: List[Body],
     casting_params,
-    desired_dx_mm: float = 1.0,
-    max_cells: int = 12_000_000,
+    desired_dx_mm: float = 1.75,
+    max_cells: int = 6_000_000,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float]]:
     """Re-voxelise the casting bodies for the Darcy flow solve.
 
@@ -2822,6 +2900,132 @@ def _compute_fill_time_graph(
     return fill
 
 
+def _geodesic_gating_time(
+    grid: np.ndarray,
+    body_index: np.ndarray,
+    bodies: List[Body],
+    gating_nodes: List[GatingNode],
+    source_mask: np.ndarray,
+    dx_mm: float,
+) -> np.ndarray:
+    """Geodesic arrival time (seconds) from the source through the gating system.
+
+    Each connected gating body is treated as a conduit with a local front speed
+    derived from the gating-node velocities.  The shortest-path distance within
+    the metal mask, divided by the local speed, gives a realistic time for the
+    metal front to travel from the source through sprues, runners and ingates.
+    """
+    shape = grid.shape
+    T = np.full(shape, np.inf, dtype=np.float64)
+    gating_types = {
+        int(BodyType.SPRUE),
+        int(BodyType.SPRUE_THROAT),
+        int(BodyType.POURING_BASIN),
+        int(BodyType.RUNNER),
+        int(BodyType.DISTRIBUTOR),
+        int(BodyType.INGATE),
+    }
+    gating_mask = (
+        np.isin(grid, list(gating_types))
+        & (body_index >= 0)
+        & (grid != int(BodyType.CORE))
+    )
+    if not gating_mask.any():
+        return T
+
+    n_bodies = len(bodies)
+    name_to_bidx = {b.name: i for i, b in enumerate(bodies)}
+    q_sum = np.zeros(n_bodies, dtype=np.float64)
+    a_sum = np.zeros(n_bodies, dtype=np.float64)
+    for node in gating_nodes:
+        if "→" not in node.name or "→" not in node.body_type:
+            continue
+        up_name, _ = [s.strip() for s in node.name.split("→")]
+        up_bidx = name_to_bidx.get(up_name)
+        if up_bidx is None:
+            continue
+        q = float(node.flow_rate_m3_s)
+        v = float(
+            node.max_velocity_m_s
+            if node.max_velocity_m_s > 1e-12
+            else node.velocity_m_s
+        )
+        if v <= 1e-18:
+            continue
+        q_sum[up_bidx] += q
+        a_sum[up_bidx] += q / v
+
+    body_speed = np.zeros(n_bodies, dtype=np.float64)
+    valid = a_sum > 1e-18
+    if valid.any():
+        body_speed[valid] = q_sum[valid] / a_sum[valid]
+    avg_speed = float(np.mean(body_speed[body_speed > 1e-18])) if np.any(body_speed > 1e-18) else 1.5
+    body_speed = np.where(body_speed > 1e-18, body_speed, avg_speed)
+
+    cell_bidx = body_index[gating_mask]
+    cell_speed = body_speed[cell_bidx]
+    speed_grid = np.zeros(shape, dtype=np.float64)
+    speed_grid[gating_mask] = cell_speed
+
+    idx = np.full(shape, -1, dtype=np.int64)
+    idx[gating_mask] = np.arange(int(gating_mask.sum()))
+    N = int(gating_mask.sum())
+
+    source_indices = idx[source_mask & gating_mask]
+    if source_indices.size == 0:
+        # Use the top-most (against gravity) gating cells as fallback seed.
+        return T
+
+    rows: List[np.ndarray] = []
+    cols: List[np.ndarray] = []
+    weights: List[np.ndarray] = []
+    dx_m = float(dx_mm) / 1000.0
+
+    # x-faces
+    valid_x = (idx[:-1, :, :] >= 0) & (idx[1:, :, :] >= 0)
+    r = idx[:-1, :, :][valid_x]
+    c = idx[1:, :, :][valid_x]
+    v_face = 0.5 * (speed_grid[:-1, :, :][valid_x] + speed_grid[1:, :, :][valid_x])
+    w = dx_m / np.maximum(v_face, 1e-6)
+    rows.extend([r, c])
+    cols.extend([c, r])
+    weights.extend([w, w])
+
+    # y-faces
+    valid_y = (idx[:, :-1, :] >= 0) & (idx[:, 1:, :] >= 0)
+    r = idx[:, :-1, :][valid_y]
+    c = idx[:, 1:, :][valid_y]
+    v_face = 0.5 * (speed_grid[:, :-1, :][valid_y] + speed_grid[:, 1:, :][valid_y])
+    w = dx_m / np.maximum(v_face, 1e-6)
+    rows.extend([r, c])
+    cols.extend([c, r])
+    weights.extend([w, w])
+
+    # z-faces
+    valid_z = (idx[:, :, :-1] >= 0) & (idx[:, :, 1:] >= 0)
+    r = idx[:, :, :-1][valid_z]
+    c = idx[:, :, 1:][valid_z]
+    v_face = 0.5 * (speed_grid[:, :, :-1][valid_z] + speed_grid[:, :, 1:][valid_z])
+    w = dx_m / np.maximum(v_face, 1e-6)
+    rows.extend([r, c])
+    cols.extend([c, r])
+    weights.extend([w, w])
+
+    if not rows:
+        return T
+
+    rows_a = np.concatenate(rows)
+    cols_a = np.concatenate(cols)
+    weights_a = np.concatenate(weights)
+    graph = csr_matrix((weights_a, (rows_a, cols_a)), shape=(N, N))
+    dist = csgraph.dijkstra(graph, directed=False, indices=source_indices, return_predecessors=False)
+    if dist.ndim == 1:
+        dist = dist.reshape(1, -1)
+    min_dist = np.min(dist, axis=0)
+    T[gating_mask] = min_dist
+    return T
+
+
 def _gating_volume_time(
     grid: np.ndarray,
     body_index: np.ndarray,
@@ -4795,7 +4999,7 @@ def solve_filling_flow(
     alloy,
     bodies=None,
     body_index: Optional[np.ndarray] = None,
-    max_solver_cells: int = 12_000_000,
+    max_solver_cells: int = 6_000_000,
     progress_callback=None,
     design_velocity_m_s: float = 0.0,
     design_section_key: str = "SPRUE_THROAT",
@@ -4858,7 +5062,7 @@ def solve_filling_flow(
     # capture gate cross-sections (≤ ~1.8 mm) while staying within the solver
     # cavity budget.  Otherwise fall back to the supplied analysis grid.
     ref_grid, ref_origin, ref_dx = _flow_refined_grid(
-        bodies, casting_params, desired_dx_mm=1.0, max_cells=max_solver_cells
+        bodies, casting_params, desired_dx_mm=1.75, max_cells=max_solver_cells
     )
     if ref_grid is not None and ref_dx < dx * 0.95:
         grid, origin, dx = ref_grid, ref_origin, ref_dx
@@ -5049,9 +5253,6 @@ def solve_filling_flow(
     # velocities are known.  Placeholder is created here so the variable exists;
     # the actual computation follows ``_gating_node_velocities``.
     fill_time_fine = np.full(orig_grid.shape, 0.0, dtype=np.float64)
-    air_entrapment_fine = np.full(orig_grid.shape, 0.0, dtype=np.float64)
-    trapped_air_volume_m3 = 0.0
-    air_entrapment_centroid_mm = np.array([], dtype=np.float64)
 
     if (
         vmag.shape == orig_grid.shape
@@ -5115,7 +5316,7 @@ def solve_filling_flow(
     if not use_cpp_vof:
         vof_max_cells = 500_000
     # LBM is lighter per step but still benefits from a coarse grid for first runs.
-    lbm_max_cells = int(os.environ.get("JOSECAST_CPP_LBM_MAX_CELLS", "120000"))
+    lbm_max_cells = int(os.environ.get("JOSECAST_CPP_LBM_MAX_CELLS", "60000"))
 
     vof_res = None
     inflow_v = 0.0
@@ -5194,32 +5395,6 @@ def solve_filling_flow(
 
             vof_outlet = _select_vent_cells(vof_grid, vof_cavity, g)
 
-            # Fast Euclidean distance to the nearest inlet and a unit-gradient
-            # target-velocity field.  Passing these to the C++ LBM lets it skip
-            # its internal 26-neighbour Dijkstra pre-computation, which was the
-            # source of the long pause before the solver started.
-            lbm_inlet_distance = ndimage.distance_transform_edt(
-                ~vof_inlet
-            ).astype(np.float64)
-            lbm_inlet_distance[~vof_cavity] = 1e9
-            grad_x, grad_y, grad_z = np.gradient(lbm_inlet_distance)
-            norm = np.sqrt(grad_x * grad_x + grad_y * grad_y + grad_z * grad_z)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                target_x = np.where(
-                    norm > 1e-12, (grad_x / norm) * vof_inflow_v, 0.0
-                )
-                target_y = np.where(
-                    norm > 1e-12, (grad_y / norm) * vof_inflow_v, 0.0
-                )
-                target_z = np.where(
-                    norm > 1e-12, (grad_z / norm) * vof_inflow_v, 0.0
-                )
-            lbm_target_velocity = np.zeros((3,) + vof_grid.shape, dtype=np.float64)
-            lbm_target_velocity[0] = target_x
-            lbm_target_velocity[1] = target_y
-            lbm_target_velocity[2] = target_z
-            lbm_target_velocity[:, ~vof_cavity] = 0.0
-
             if use_cpp_lbm:
                 from core.cpp_bridge import JOSECAST_CORE
 
@@ -5230,9 +5405,10 @@ def solve_filling_flow(
                 # C++ binding expects a plain Python list for the gravity vector.
                 lbm_g = [float(x) for x in g]
 
-                # 12 required positional arguments + 2 optional named arrays.
-                # Passing inlet_distance / target_velocity prevents the C++ LBM
-                # from running its own 26-neighbour Dijkstra at start-up.
+                # The compiled C++ LBM is called with exactly 12 positional
+                # arguments.  Older Windows .pyd builds expose 12 positional-only
+                # arguments; newer builds have default optional target_velocity /
+                # inlet_distance arrays, so 12 arguments is safe on both.
                 print(
                     f"[LBM] C++ D3Q19 solve starting: grid={vof_grid.shape}, "
                     f"dx={vof_dx_m:.4f} m, inflow={vof_inflow_v:.3f} m/s, t_max={t_max_vof:.3f} s",
@@ -5262,8 +5438,6 @@ def solve_filling_flow(
                     int(os.environ.get("JOSECAST_CPP_LBM_MAX_STEPS", "12000")),
                     float(os.environ.get("JOSECAST_CPP_LBM_CFL", "0.3")),
                     float(os.environ.get("JOSECAST_CPP_LBM_SMAG", "0.18")),
-                    target_velocity=lbm_target_velocity,
-                    inlet_distance=lbm_inlet_distance,
                 )
                 vof_res = {
                     "fill_time": ft,
@@ -5394,78 +5568,22 @@ def solve_filling_flow(
             np.nan_to_num(fill_time_fine, nan=vof_final_t, posinf=vof_final_t, neginf=vof_final_t),
             0.0,
         )
+        # The physical source section (sprue / pouring basin) is the metal
+        # reservoir; mark every cell in it as filled at t=0 so the animation
+        # shows the source vessel full from the very first frame and the front
+        # advances from the source body into the runner/gates.
+        if physical_source_key:
+            source_type = getattr(BodyType, physical_source_key, None)
+            if source_type is not None:
+                source_mask = fine_metal & (orig_grid == source_type)
+                if source_mask.any():
+                    fill_time_fine[source_mask] = 0.0
         if fine_metal.any():
             valid = fine_metal & (fill_time_fine < 1e9)
             if valid.any():
                 max_fill_t = float(np.nanmax(np.where(valid, fill_time_fine, np.nan)))
                 if np.isfinite(max_fill_t) and max_fill_t > 0.0:
                     fill_time_s = max_fill_t
-
-        # Resample binary air-entrapment mask from the LBM VOF grid.
-        air_entrapment_c = np.asarray(vof_res.get("air_entrapment", np.zeros_like(fill_time_c)), dtype=np.float64)
-        air_entrapment_c = np.where(np.isfinite(air_entrapment_c), air_entrapment_c, 0.0)
-        air_entrapment_fine = _resample_to_grid(
-            air_entrapment_c,
-            vof_origin,
-            vof_dx,
-            orig_grid.shape,
-            orig_origin,
-            orig_dx,
-            fill_value=0.0,
-            order=0,
-        )
-        air_entrapment_fine = np.where(fine_metal, np.clip(air_entrapment_fine, 0.0, 1.0), 0.0)
-
-        # Mold-permeability correction: in sand molds air can vent through the
-        # mold pores, especially if the trapped pocket is close to the surface.
-        # In metal/ceramic/shell molds the air has no escape path, so the C++
-        # binary trap value is kept as-is.  This makes air entrapment strongly
-        # depend on mold type, as it should.
-        if mold is not None and getattr(mold, "is_sand", True):
-            # Sand molds vent air through their pores; metal/ceramic/shell
-            # molds do not.  Scale the binary C++ trap mask by an escape
-            # factor that grows with sand permeability and is largest near
-            # the casting surface (where the trapped air has the shortest
-            # path through the mold).  In metal/ceramic this branch is skipped,
-            # so the full binary trap value is retained.
-            perm_eff = float(np.clip(getattr(mold, "permeability_proxy", 1.0), 0.0, 1.0))
-            if perm_eff > 1e-9:
-                dist_to_surface_mm = ndimage.distance_transform_edt(fine_metal, sampling=orig_dx)
-                # High-permeability sand vents deeper pockets faster.
-                vent_depth_mm = 2.0 + 20.0 * perm_eff
-                # Even internal pockets lose a small fraction of air through
-                # the sand over the filling time; surface pockets vent most.
-                base_escape = 0.1 + 0.25 * perm_eff
-                escape_factor = base_escape + (perm_eff - base_escape) * np.exp(
-                    -dist_to_surface_mm / max(vent_depth_mm, 1e-3)
-                )
-                air_entrapment_fine = np.where(
-                    fine_metal,
-                    np.clip(air_entrapment_fine * (1.0 - escape_factor), 0.0, 1.0),
-                    0.0,
-                )
-
-        trapped_air_volume_m3 = float(air_entrapment_fine.sum() * (orig_dx / 1000.0) ** 3)
-        # Largest trapped pocket centroid for UI marker.
-        if air_entrapment_fine.max() > 1e-12:
-            try:
-                labeled, _ = ndimage.label(air_entrapment_fine > 0.3, structure=np.ones((3, 3, 3), dtype=np.int32))
-                if labeled.max() > 0:
-                    volumes = ndimage.sum(
-                        air_entrapment_fine,
-                        labeled,
-                        np.arange(1, labeled.max() + 1),
-                    )
-                    largest_label = int(np.argmax(volumes)) + 1
-                    centroid_voxel = ndimage.center_of_mass(
-                        air_entrapment_fine,
-                        labeled,
-                        largest_label,
-                    )
-                    air_entrapment_centroid_mm = np.asarray(centroid_voxel, dtype=np.float64)[[2, 1, 0]]
-                    air_entrapment_centroid_mm = air_entrapment_centroid_mm * orig_dx + orig_origin + 0.5 * orig_dx
-            except Exception:
-                pass
 
     # Post-process 3-D flow turbulence metrics (Re, turbulent intensity).
     orig_dx_m = orig_dx / 1000.0
@@ -5682,7 +5800,4 @@ def solve_filling_flow(
         turbulence_intensity=turb_intensity.astype(np.float32),
         filter_recommendation=filter_recommendation,
         gate_flow_results=gate_flow_results,
-        air_entrapment=air_entrapment_fine.astype(np.float32),
-        trapped_air_volume_m3=trapped_air_volume_m3,
-        air_entrapment_centroid_mm=air_entrapment_centroid_mm,
     )

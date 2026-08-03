@@ -15,11 +15,11 @@ from typing import Any, Dict, Optional
 class AnimationConfig:
     """User-tunable limits for the flow animator."""
 
-    max_anim_cells: int = 600_000
+    max_anim_cells: int = 300_000
     max_frames: int = 1350
     min_fill_frames: int = 1200
-    phi_sigma: float = 1.5  # spatial smoothing for a smooth liquid boundary
-    decimate_target: float = 0.0  # keep full contour resolution; decimation causes visible facets
+    phi_sigma: float = 0.6
+    decimate_target: float = 0.0
     max_streamlines: int = 20
     max_steps: int = 2000
     cfl_fraction: float = 0.5
