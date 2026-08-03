@@ -43,7 +43,7 @@ class FlowAnimator(QtCore.QObject):
     MAX_FRAMES = 1350
     MIN_FILL_FRAMES = 1200  # most frames are allocated to the filling phase
     PHI_SIGMA = 1.2  # voxels; controls how liquid surface is smoothed
-    DECIMATE_TARGET = 0.5  # reduce triangle count per frame for GPU/CPU relief
+    DECIMATE_TARGET = 0.3  # reduce triangle count per frame for GPU/CPU relief
     PORE_RISE_SPEED_M_S = 0.05  # buoyant pore drift against gravity
     GATING_BODY_TYPES = frozenset({
         BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE,
@@ -63,7 +63,7 @@ class FlowAnimator(QtCore.QObject):
         self.MAX_FRAMES = cfg.max_frames
         self.MIN_FILL_FRAMES = cfg.min_fill_frames
         self.PHI_SIGMA = cfg.phi_sigma
-        self.DECIMATE_TARGET = cfg.decimate_target
+        self.DECIMATE_TARGET = max(self.DECIMATE_TARGET, cfg.decimate_target)
         self.MAX_STREAMLINES = cfg.max_streamlines
         self.MAX_STEPS = cfg.max_steps
         self.CFL_FRACTION = cfg.cfl_fraction
@@ -663,6 +663,13 @@ class FlowAnimator(QtCore.QObject):
         # outside the voxelised metal boundary but still inside the CAD wall; the
         # SDF boundary below stops the liquid exactly at the smooth CAD wall.
         phi = np.minimum(phi_time, phi_sdf)
+
+        # Light 3-D Gaussian blur on the level-set removes the remaining voxel
+        # staircase edges before contouring.  sigma=0.6 voxels is enough to
+        # smooth the 2 mm grid without leaking across thin gates/runners because
+        # the SDF wall boundary clips the blur at the CAD wall.
+        phi = ndimage.gaussian_filter(phi, sigma=0.6, mode='constant', cval=0.0)
+
         return phi.astype(np.float32).ravel(order="F")
 
     def _inflate_gating_phi(
@@ -772,14 +779,6 @@ class FlowAnimator(QtCore.QObject):
         eliminates the 'floating sausage' look caused by volume-shrinking
         filters without creating voids between the metal and the runner wall.
         """
-        # Increase triangle density on the voxel-isosurface before smoothing;
-        # wall vertices created by subdivision still lie on the wall, while
-        # free-surface vertices get a smoother triangulation.
-        try:
-            if surface.n_cells > 0:
-                surface = surface.subdivide(2, subfilter='linear')
-        except Exception:
-            pass
         surface = self._constrained_smooth(surface)
         try:
             surface = surface.compute_normals(
