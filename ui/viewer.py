@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyvista as pv
+from PyQt6 import QtCore, QtWidgets
 from pyvistaqt import QtInteractor
 
 from core.gating import (
@@ -170,28 +171,49 @@ class Analyzer3DViewer(QtInteractor):
         self._air_entrapment_marker_actor = None
         self.flow_animator = FlowAnimator(self)
         self._body_legend_actors: List[Any] = []
+        self._body_legend_frame = QtWidgets.QFrame(self)
+        self._body_legend_frame.setObjectName("bodyLegend")
+        self._body_legend_frame.setStyleSheet(
+            "QFrame#bodyLegend {"
+            "  background-color: rgba(248, 250, 252, 0.95);"
+            "  border: 1px solid #94A3B8;"
+            "  border-radius: 6px;"
+            "  padding: 6px;"
+            "}"
+            "QLabel { background: transparent; border: none; }"
+        )
+        self._body_legend_frame.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        legend_layout = QtWidgets.QVBoxLayout(self._body_legend_frame)
+        legend_layout.setContentsMargins(6, 6, 6, 6)
+        legend_layout.setSpacing(4)
+        self._body_legend_frame.setLayout(legend_layout)
+        self._body_legend_frame.hide()
         self._bodies: List[Body] = []
         self._body_index: Optional[np.ndarray] = None
         self._origin_mm: Optional[np.ndarray] = None
         self._dx_mm: float = 0.0
 
     def _remove_body_legend(self) -> None:
-        """Remove all custom body-legend 2D text actors."""
-        for actor in self._body_legend_actors:
-            try:
-                self.remove_actor(actor)
-            except Exception:
-                pass
-        self._body_legend_actors = []
+        """Clear the Qt-based body legend overlay."""
+        layout = self._body_legend_frame.layout()
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._body_legend_frame.hide()
+
+    def _position_body_legend(self) -> None:
+        """Keep the legend frame anchored to the top-right corner."""
+        margin = 10
+        self._body_legend_frame.adjustSize()
+        self._body_legend_frame.move(
+            max(margin, self.width() - self._body_legend_frame.width() - margin),
+            margin,
+        )
 
     def _update_body_legend(self, bodies: List[Body]) -> None:
-        """Add a top-right legend with fixed, bold 12px text and aligned bullets.
-
-        Each bullet is a colored Unicode disc with a black outline drawn with
-        two overlaid text actors. This guarantees the bullet and label share
-        the same vertical center and the font size never scales when the window
-        or left panel is resized.
-        """
+        """Add a top-right Qt legend with fixed bold text and aligned bullets."""
         self._remove_body_legend()
 
         present = sorted(
@@ -201,93 +223,41 @@ class Analyzer3DViewer(QtInteractor):
         if not present:
             return
 
-        entries = []
+        layout = self._body_legend_frame.layout()
         for bt in present:
             color = BODY_COLORS.get(bt, "#F5F5F5")
             label = BODY_LEGEND_LABELS.get(bt, str(bt))
-            entries.append([label, color])
 
-        font_size = 10
-        text_color = (0.20, 0.26, 0.33)
-        win_w, win_h = self.window_size
+            row = QtWidgets.QWidget()
+            row_layout = QtWidgets.QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
 
-        # Tight, right-anchored legend box. Width follows the current entries so
-        # there is no empty space; the panel only resizes when the content grows.
-        max_chars = max(len(label) for label, _ in entries)
-        char_w = 7
-        bullet_diameter = font_size + 2  # thin black outline
-        bullet_to_label_gap = 6
-        pad = 10
-        line_h = 22
-        box_w = max(120, max_chars * char_w + bullet_diameter + bullet_to_label_gap + 2 * pad)
-        box_h = line_h * len(entries) + 2 * pad
-        margin = 10
-        x0 = int(win_w - box_w - margin)
-        y0 = int(win_h - margin)
-
-        # Background box
-        rows = max(1, len(entries))
-        cols = max(1, box_w // char_w)
-        bg_text = (" " * cols + "\n") * rows
-        bg = self.add_text(
-            bg_text,
-            position=(x0, y0 - box_h),
-            font_size=font_size,
-            color="black",
-        )
-        bg_prop = bg.GetTextProperty()
-        bg_prop.SetBackgroundColor(0.97, 0.98, 0.99)
-        bg_prop.SetBackgroundOpacity(0.90)
-        bg.SetTextScaleModeToNone()
-        self._body_legend_actors.append(bg)
-
-        bullet_x = int(x0 + pad + bullet_diameter // 2)
-        label_x = int(bullet_x + bullet_diameter // 2 + bullet_to_label_gap)
-        for i, (label, color) in enumerate(entries):
-            cy = int(y0 - pad - line_h // 2 - i * line_h)
-
-            # Black outline bullet (larger)
-            black_actor = self.add_text(
-                "\u2022",
-                position=(bullet_x, cy),
-                font_size=font_size + 2,
-                color="black",
+            bullet = QtWidgets.QLabel()
+            bullet.setFixedSize(10, 10)
+            bullet.setStyleSheet(
+                f"background-color: {color}; border-radius: 5px; border: 1.5px solid #000000;"
             )
-            black_prop = black_actor.GetTextProperty()
-            black_prop.SetJustificationToCentered()
-            black_prop.SetVerticalJustificationToCentered()
-            black_prop.SetBold(1)
-            black_actor.SetTextScaleModeToNone()
-            self._body_legend_actors.append(black_actor)
+            row_layout.addWidget(bullet)
 
-            # Colored fill bullet
-            rgb = pv.Color(color).float_rgb
-            color_actor = self.add_text(
-                "\u2022",
-                position=(bullet_x, cy),
-                font_size=font_size,
-                color=rgb,
+            text = QtWidgets.QLabel(label)
+            text.setStyleSheet(
+                "font-size: 10pt; font-weight: bold; color: #334155;"
+                "background: transparent; border: none;"
             )
-            color_prop = color_actor.GetTextProperty()
-            color_prop.SetJustificationToCentered()
-            color_prop.SetVerticalJustificationToCentered()
-            color_prop.SetBold(1)
-            color_actor.SetTextScaleModeToNone()
-            self._body_legend_actors.append(color_actor)
+            row_layout.addWidget(text, alignment=QtCore.Qt.AlignmentFlag.AlignVCenter)
+            row_layout.addStretch()
 
-            # Label
-            label_actor = self.add_text(
-                label,
-                position=(label_x, cy),
-                font_size=font_size,
-                color=text_color,
-            )
-            label_prop = label_actor.GetTextProperty()
-            label_prop.SetJustificationToLeft()
-            label_prop.SetVerticalJustificationToCentered()
-            label_prop.SetBold(1)
-            label_actor.SetTextScaleModeToNone()
-            self._body_legend_actors.append(label_actor)
+            layout.addWidget(row)
+
+        self._body_legend_frame.show()
+        self._position_body_legend()
+
+    def resizeEvent(self, event: QtCore.QEvent) -> None:
+        """Keep the body legend in the top-right corner on resize."""
+        super().resizeEvent(event)
+        if self._body_legend_frame.isVisible():
+            self._position_body_legend()
 
     def set_gating_data(
         self,
@@ -329,6 +299,7 @@ class Analyzer3DViewer(QtInteractor):
         self._air_entrapment_actor = None
         self._air_entrapment_marker_actor = None
         self._body_legend_actors = []
+        self._remove_body_legend()
         self._bodies = []
         self._body_index = None
         self._origin_mm = None
