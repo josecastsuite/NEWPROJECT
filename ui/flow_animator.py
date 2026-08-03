@@ -42,7 +42,7 @@ class FlowAnimator(QtCore.QObject):
     MAX_FRAMES = 1350
     MIN_FILL_FRAMES = 1200  # most frames are allocated to the filling phase
     PHI_SIGMA = 1.5  # voxels; spatial smoothing for a smooth clip_scalar surface
-    DECIMATE_TARGET = 0.5  # reduce triangle count per frame for GPU/CPU relief
+    DECIMATE_TARGET = 0.0  # keep full contour resolution; decimation creates visible facets
     PORE_RISE_SPEED_M_S = 0.05  # buoyant pore drift against gravity
     CLIP_UPSAMPLE = 1  # contour interpolates sub-voxel surfaces; upsample disabled for speed
 
@@ -443,16 +443,44 @@ class FlowAnimator(QtCore.QObject):
         grid_p = _pad(grid_d, int(BodyType.EMPTY))
         dist_p = _pad(dist_d, np.inf)
 
+        # Spatially smooth the fill-time field per body so the liquid front is a
+        # continuous surface inside each gate/runner/part, but a gate's early
+        # fill-time is not blurred into the later part (and vice versa).
+        try:
+            fill_smooth = fill_p.astype(np.float64)
+            for body_id in np.unique(grid_p[metal_p]):
+                if body_id == int(BodyType.EMPTY):
+                    continue
+                mask = (grid_p == body_id)
+                if not mask.any():
+                    continue
+                body_fill = fill_p.copy().astype(np.float64)
+                inv_mask = ~mask
+                if inv_mask.any() and mask.any():
+                    idx = ndimage.distance_transform_edt(
+                        inv_mask, return_indices=True, return_distances=False
+                    )
+                    body_fill[inv_mask] = fill_p[idx[0][inv_mask], idx[1][inv_mask], idx[2][inv_mask]]
+                    body_fill = ndimage.gaussian_filter(
+                        body_fill, sigma=1.0, mode="nearest"
+                    )
+                    fill_smooth[mask] = body_fill[mask]
+            fill_smooth[~metal_p.astype(bool)] = self._sentinel
+            fill_p = fill_smooth.astype(np.float32)
+        except Exception:
+            pass
+
         # Pad the signed SDF with a large positive value so the 0.5 surface
         # terminates at the true metal boundary, not at the artificial padding.
         sdf_pad_val = float(max(10.0 * max(spacing), np.max(np.abs(signed_d)) + 10.0))
         sdf_signed_p = _pad(signed_d, sdf_pad_val)
-        sigma_s = max(max(spacing), self._dx) * 0.5
-        # Expand the metal surface outward by half the original voxel size so
-        # the rendered fill volume coincides with the original STEP mesh, closing
-        # the visual gap caused by binary voxelisation.
-        surface_offset = 0.5 * self._dx
-        self._surface_phi = 0.5 * (1.0 - np.tanh((sdf_signed_p - surface_offset) / sigma_s))
+        # A wider surface transition (1 original voxel) keeps the phi=0.5
+        # contour from locking onto voxel faces, giving a smooth part wall.
+        sigma_s = max(max(spacing), self._dx) * 1.0
+        # Keep the phi=0.5 surface at the signed-SDF zero crossing; do not
+        # expand it outward, because outward expansion makes narrow gates and
+        # thin walls look filled before the liquid front actually reaches them.
+        self._surface_phi = 0.5 * (1.0 - np.tanh(sdf_signed_p / sigma_s))
         self._surface_phi = self._surface_phi.astype(np.float32)
 
         self._fill_time_d = fill_p
@@ -546,7 +574,9 @@ class FlowAnimator(QtCore.QObject):
         if not metal.any():
             return None
 
-        sigma_t = max(0.05 * self._max_fill_time, 0.005)
+        # Wider temporal smoothing makes the liquid front gradient gentler so
+        # the contour mesh is smooth instead of stair-stepped along voxel rows.
+        sigma_t = max(0.10 * self._max_fill_time, 0.01)
         # Temporal front inside metal; outside metal use 1 so the part wall is
         # governed solely by the static SDF-based surface_phi.
         liquid_phi = np.where(
@@ -597,12 +627,18 @@ class FlowAnimator(QtCore.QObject):
         self._phase2_mesh = None
 
     def _finalize_surface(
-        self, surface: pv.PolyData, active_scalars: str = "velocity_magnitude"
+        self,
+        surface: pv.PolyData,
+        active_scalars: str = "velocity_magnitude",
+        fill_phase: bool = False,
     ) -> pv.PolyData:
-        """Decimate and normalise a surface mesh."""
-        # The sub-voxel smoothness comes from _clip_smooth; additional mesh
-        # smoothing here re-introduces blocky artifacts and shrinks thin sections.
+        """Normalise a surface mesh for smooth shading."""
+        # Merge coincident contour points and smooth the staircase artifacts from
+        # the voxel grid, then recompute normals for smooth_shading.
         try:
+            surface = surface.clean(tolerance=1e-6)
+            subdivisions = 2 if fill_phase else 1
+            surface = self._subdivide_and_smooth(surface, subdivisions=subdivisions)
             surface = surface.compute_normals(
                 auto_orient_normals=True, flip_normals=False
             )
@@ -671,8 +707,10 @@ class FlowAnimator(QtCore.QObject):
             color[mask] = field[z[mask], y[mask], x[mask]]
         return color
 
-    def _subdivide_and_smooth(self, mesh: pv.PolyData) -> pv.PolyData:
-        """Triangulate, subdivide once, and mildly smooth the fill surface.
+    def _subdivide_and_smooth(
+        self, mesh: pv.PolyData, subdivisions: int = 1
+    ) -> pv.PolyData:
+        """Triangulate, subdivide, and mildly smooth the fill surface.
 
         This is the allowed 'illusion': the liquid boundary becomes visually
         smooth (sub-voxel triangles) while the low-resolution voxel grid still
@@ -687,16 +725,16 @@ class FlowAnimator(QtCore.QObject):
                 return mesh
             sub = vtk.vtkLoopSubdivisionFilter()
             sub.SetInputData(tri)
-            sub.SetNumberOfSubdivisions(1)
+            sub.SetNumberOfSubdivisions(subdivisions)
             sub.Update()
             sub_out = pv.PolyData(sub.GetOutput())
             if sub_out.n_points == 0:
                 return mesh
             smooth = vtk.vtkWindowedSincPolyDataFilter()
             smooth.SetInputData(sub_out)
-            smooth.SetNumberOfIterations(5)
+            smooth.SetNumberOfIterations(8)
             smooth.SetPassBand(0.9)
-            smooth.SetFeatureAngle(120.0)
+            smooth.SetFeatureAngle(180.0)
             smooth.BoundarySmoothingOff()
             smooth.FeatureEdgeSmoothingOff()
             smooth.NonManifoldSmoothingOff()
@@ -786,13 +824,12 @@ class FlowAnimator(QtCore.QObject):
         surf = clip_img.contour(isosurfaces=[0.5], scalars=phi_name)
         if surf.n_faces == 0:
             return pv.PolyData()
-        if temperature is not None:
-            try:
-                surf = surf.compute_normals(
-                    auto_orient_normals=True, flip_normals=False
-                )
-            except Exception:
-                pass
+        try:
+            surf = surf.compute_normals(
+                auto_orient_normals=True, flip_normals=False
+            )
+        except Exception:
+            pass
         return surf
 
     def _sample_scalar_at_points(
@@ -1180,22 +1217,22 @@ class FlowAnimator(QtCore.QObject):
         )
         self._update_scene()
 
-    def _set_body_wireframe(self, wireframe: bool) -> None:
-        """During playback switch the original body mesh to wireframe so the
-        solid red metal volume is clearly visible; restore surface mode on stop.
+    def _set_body_ghost(self, ghost: bool) -> None:
+        """During playback fade the original body mesh to a faint ghost so the
+        solid red metal volume is clearly visible; restore normal opacity on stop.
         """
         if self._viewer is None or not hasattr(self._viewer, "_body_actors"):
             return
         for actor in self._viewer._body_actors:
             try:
                 prop = actor.GetProperty()
-                if wireframe:
+                if ghost:
                     self._body_actor_state[id(actor)] = (
                         prop.GetRepresentation(),
                         prop.GetOpacity(),
                     )
-                    prop.SetRepresentationToWireframe()
-                    prop.SetOpacity(0.25)
+                    prop.SetRepresentationToSurface()
+                    prop.SetOpacity(0.12)
                 else:
                     rep, op = self._body_actor_state.get(id(actor), (2, 1.0))
                     prop.SetRepresentation(rep)
@@ -1213,7 +1250,7 @@ class FlowAnimator(QtCore.QObject):
         # Restart from the beginning if already at the end.
         if self._current_frame >= len(self._frame_times) - 1:
             self._current_frame = 0
-        self._set_body_wireframe(True)
+        self._set_body_ghost(True)
         self._is_running = True
         self._timer.start(self._interval_ms())
 
@@ -1224,7 +1261,7 @@ class FlowAnimator(QtCore.QObject):
 
     def stop(self) -> None:
         self.pause()
-        self._set_body_wireframe(False)
+        self._set_body_ghost(False)
         self._clear_actors()
         self._current_frame = 0
         self._current_time = 0.0
@@ -1322,7 +1359,7 @@ class FlowAnimator(QtCore.QObject):
                         self._frame_actor = None
                         self._frame_actor_scalar = ""
                 else:
-                    surface = self._finalize_surface(surface, active_scalars=None)
+                    surface = self._finalize_surface(surface, active_scalars=None, fill_phase=True)
                     if self._frame_actor is None or self._frame_actor_scalar != "solid":
                         if self._frame_actor is not None:
                             try:

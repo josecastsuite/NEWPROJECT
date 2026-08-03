@@ -57,7 +57,7 @@ for b in bodies:
         continue
     faces = np.c_[np.full(len(b.faces), 3, dtype=np.int64), b.faces].ravel()
     pmesh = pv.PolyData(b.vertices, faces)
-    pl.add_mesh(pmesh, color='gray', opacity=0.35, show_edges=False, smooth_shading=True, style='wireframe')
+    pl.add_mesh(pmesh, color='white', opacity=0.12, show_edges=False, smooth_shading=True)
 
 anim = FlowAnimator(pl)
 anim.set_result(result)

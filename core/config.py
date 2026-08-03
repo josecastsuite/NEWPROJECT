@@ -19,7 +19,7 @@ class AnimationConfig:
     max_frames: int = 1350
     min_fill_frames: int = 1200
     phi_sigma: float = 1.5  # spatial smoothing for a smooth liquid boundary
-    decimate_target: float = 0.5  # reduce triangle count per frame for smooth play
+    decimate_target: float = 0.0  # keep full contour resolution; decimation causes visible facets
     max_streamlines: int = 20
     max_steps: int = 2000
     cfl_fraction: float = 0.5
