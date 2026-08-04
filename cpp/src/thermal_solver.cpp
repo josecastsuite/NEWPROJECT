@@ -129,7 +129,7 @@ nb::tuple solve_thermal(
     const double moisture = getd(mold, "moisture_percent", 4.0);
     const double binder = getd(mold, "binder_percent", 2.0);
     const double compactability = getd(mold, "compactability_percent", 45.0);
-    const bool is_sand_mold = (moisture > 0.0 || afs > 0.0);
+    const bool is_sand_mold = (moisture > 0.0 || afs > 0.0 || getd(mold, "is_sand", 0.0) > 0.5);
 
     // Empirical corrections: finer sand and more moisture/binder reduce k;
     // moisture/binder increase effective heat capacity.
@@ -496,12 +496,21 @@ nb::tuple solve_thermal(
                     dTdz = (T_new[i + 1] - T_new_i) / dx_m;
                 else
                     dTdz = (T_new_i - T_new[i - 1]) / dx_m;
-                G_at_ts[i] = std::sqrt(dTdx * dTdx + dTdy * dTdy + dTdz * dTdz) / 1000.0;
+                double G_new = std::sqrt(dTdx * dTdx + dTdy * dTdy + dTdz * dTdz) / 1000.0;
+                // Simple time-averaging when a cell crosses Ts over more than one step.
+                if (G_at_ts[i] > 0.0)
+                    G_at_ts[i] = 0.5 * (G_at_ts[i] + G_new);
+                else
+                    G_at_ts[i] = G_new;
 
                 double fs_old = scheil_fs(T_old_i, Tl, Ts, k_part);
                 double fs_new = scheil_fs(T_new_i, Tl, Ts, k_part);
                 double dH = cp_eff[i] * (T_new_i - T_old_i) + L * (fs_new - fs_old);
-                R_at_ts[i] = std::fabs(dH) / (dt * std::max(cp_eff[i], 1e-9));
+                double R_new = std::fabs(dH) / (dt * std::max(cp_eff[i], 1e-9));
+                if (R_at_ts[i] > 0.0)
+                    R_at_ts[i] = 0.5 * (R_at_ts[i] + R_new);
+                else
+                    R_at_ts[i] = R_new;
 
                 t_sol[i] = t + dt * (Ts - T_old_i) / (T_new_i - T_old_i + 1e-12);
             }

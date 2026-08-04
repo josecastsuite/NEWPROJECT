@@ -165,6 +165,8 @@ def _mold_to_dict(mold: MoldMaterial) -> dict:
         "moisture_percent": mold.moisture_percent,
         "binder_percent": mold.binder_percent,
         "compactability_percent": mold.compactability_percent,
+        "is_sand": 1.0 if getattr(mold, "is_sand", True) else 0.0,
+        "mold_type": getattr(mold, "mold_type", "sand"),
     }
     # If the selected preset is a chill material, expose its properties
     # explicitly so the C++ thermal solver does not hardcode steel values.
