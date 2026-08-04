@@ -835,10 +835,11 @@ class Analyzer3DViewer(QtInteractor):
     def show_flow_velocity(self, result: Optional[AnalysisResult]):
         """Paint the gating system with a smooth physical velocity heatmap.
 
-        The first choice is the C++/LBM per-voxel velocity_magnitude field.
-        If that field is nearly uniform (no visible cross-section effect), fall
-        back to a 1-D v(s)=Q/A(s) reconstruction using the SDF.  The colourbar
-        is always shown with a 0..v_max scale.
+        Uses the C++/LBM per-voxel velocity_magnitude field when it shows
+        real variation; otherwise falls back to gating-node throat velocities.
+        The colourbar is clamped at 4.5 m/s and capped at the 98th percentile
+        so a single noise spike cannot wash the whole scale.  The surface is
+        heavily smoothed to remove voxel staircasing.
         """
         if self._flow_actor is not None:
             self.remove_actor(self._flow_actor)
@@ -864,23 +865,20 @@ class Analyzer3DViewer(QtInteractor):
 
         fr = result.flow_result
         scalar_arr: Optional[np.ndarray] = None
-        clim_vmax: Optional[float] = None
         vmag = fr.velocity_magnitude
         if vmag is not None and vmag.size > 0:
             gate_vmag = vmag[gate_mask & np.isfinite(vmag)]
             if gate_vmag.size > 0:
                 v_max_raw = float(np.nanmax(gate_vmag))
                 v_min_raw = float(np.nanmin(gate_vmag))
-                clim_vmax = v_max_raw
                 if v_max_raw > 1e-9 and v_max_raw > v_min_raw * 1.05 + 0.05:
                     scalar_arr = vmag.astype(np.float64, copy=False)
                     try:
-                        scalar_arr = ndimage.gaussian_filter(scalar_arr, sigma=0.3)
+                        scalar_arr = ndimage.gaussian_filter(scalar_arr, sigma=0.5)
                     except Exception:
                         pass
                 else:
                     scalar_arr = self._flow_velocity_from_nodes(result, gate_mask)
-                    clim_vmax = None
                     if scalar_arr is None:
                         scalar_arr = vmag.astype(np.float64, copy=False)
             else:
@@ -900,18 +898,36 @@ class Analyzer3DViewer(QtInteractor):
         gate = grid.threshold([1.0, 1.0], scalars="is_gate")
         if gate.n_cells == 0:
             return
-        surf = self._smooth_surface(gate)
+
+        # Convert cell data to point data so colours interpolate smoothly.
+        try:
+            gate = gate.cell_data_to_point_data()
+        except Exception:
+            pass
+
+        # Aggressive smoothing to remove voxel staircasing from the gate surface.
+        try:
+            surf = gate.extract_surface(algorithm="dataset_surface")
+            surf = surf.smooth(
+                n_iter=20,
+                relaxation_factor=0.05,
+                feature_angle=90.0,
+                boundary_smoothing=False,
+            )
+        except Exception:
+            surf = self._smooth_surface(gate)
         if surf.n_cells == 0:
             return
 
-        if clim_vmax is None:
-            gate_vals = scalar_arr[(scalar_arr > 0) & np.isfinite(scalar_arr) & gate_mask]
-            if gate_vals.size > 0:
-                clim_vmax = float(np.nanmax(gate_vals))
-            else:
-                clim_vmax = 1.0
-        v_max = clim_vmax if clim_vmax > 0 else 1.0
-        clim = (0.0, v_max * 1.05)
+        gate_vals = scalar_arr[(scalar_arr > 0) & np.isfinite(scalar_arr) & gate_mask]
+        if gate_vals.size > 0:
+            v_max = float(np.percentile(gate_vals, 98))
+            if not np.isfinite(v_max) or v_max <= 0:
+                v_max = float(np.nanmax(gate_vals))
+            v_max = min(v_max, 4.5)
+        else:
+            v_max = 1.0
+        clim = (0.0, v_max)
 
         self._flow_actor = self.add_mesh(
             surf,
@@ -930,10 +946,53 @@ class Analyzer3DViewer(QtInteractor):
         self._arrange_scalar_bars()
 
     def show_flow_node_labels(self, result: Optional[AnalysisResult]):
-        """Velocity labels are disabled; the heatmap + colourbar are sufficient."""
+        """Add numeric velocity labels at critical gating nodes (ingate, sprue throat, etc.)."""
         if self._flow_node_actor is not None:
             self.remove_actor(self._flow_node_actor)
             self._flow_node_actor = None
+        if result is None or result.flow_result is None:
+            return
+
+        nodes = result.flow_result.gating_nodes
+        label_points: List[Tuple[float, float, float]] = []
+        label_texts: List[str] = []
+        critical_down_types = {
+            BodyType.INGATE.name,
+            BodyType.SPRUE_THROAT.name,
+            BodyType.SPRUE.name,
+            BodyType.RUNNER.name,
+        }
+
+        for node in nodes:
+            body_type = getattr(node, "body_type", "")
+            down_type = ""
+            if "→" in body_type:
+                down_type = body_type.split("→")[-1].strip()
+            elif " → " in getattr(node, "name", ""):
+                down_type = node.name.split(" → ")[-1].strip()
+            if not down_type or down_type not in critical_down_types:
+                continue
+            v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
+            if v > 1e-12:
+                label_points.append(node.centroid_mm)
+                label_texts.append(f"{v:.2f} m/s")
+
+        if label_points:
+            label_points = np.asarray(label_points, dtype=np.float64)
+            self._flow_node_actor = self.add_point_labels(
+                label_points,
+                label_texts,
+                font_size=10,
+                text_color="#334155",
+                point_color="#EF4444",
+                point_size=12,
+                shape="rounded_rect",
+                background_color="#FFFFFF",
+                background_opacity=0.9,
+                always_visible=True,
+                shadow=False,
+                name="flow_node_labels",
+            )
 
     def show_feeding_paths(self, result: Optional[AnalysisResult]):
         for actor in self._path_actors:
