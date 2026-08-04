@@ -335,21 +335,14 @@ def propose_risers(
         if normal[2] < 0:
             normal = np.array([0.0, 0.0, 1.0])
 
-        hs_vox = np.round((hs.position_mm - result.origin_mm) / result.dx_mm).astype(
-            int
-        )
-        hs_vox = np.clip(hs_vox, 0, np.array(result.grid.shape) - 1)
-
-        has_nearby_chill = False
-        if chill_dist is not None:
-            has_nearby_chill = float(
-                chill_dist[hs_vox[0], hs_vox[1], hs_vox[2]]
-            ) < max(20.0, 3.0 * hs.m_value_mm)
-
-        is_small_thin = (
-            hs.m_value_mm <= 10.0
-            and hs.t_section_mm <= 20.0
-            and t_attach <= 20.0
+        # Decide between a feeder (riser) and a chill/çıkıcı.
+        # Small, isolated hot spots on a relatively thin wall are good chill candidates
+        # when at least one riser already exists; otherwise a feeder is still needed.
+        prefer_chill = (
+            existing_riser_count > 0
+            and hs.m_value_mm <= 12.0
+            and hs.t_section_mm <= 25.0
+            and t_attach <= 22.0
         )
 
         # Feeding zone geometry and SFSA shape-factor sizing.

@@ -21,23 +21,10 @@ class CastingParameters:
     viscosity_pa_s: float = 0.006
     # v8.1: user-specified inlet velocity (0 = auto from V_part / t_fill)
     ingate_velocity_m_s: float = 0.0
-    # v9.3: which gating section the user velocity refers to (sprue throat is
-    # the standard single inlet, but INGATE/RUNNER/SPRUE_BASE are still possible).
-    velocity_section_key: str = "SPRUE_THROAT"
-    # v8.7: gravity direction for feeding and gating calculations (default -Z)
-    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0)
-    # v10.0: hot-spot detection thresholds exposed to the user
-    hotspot_min_size_mm: float = 0.0
-    hotspot_cluster_eps_mm: float = 0.0
-    # v10.1: local 3-D gate mesh Darcy–Forchheimer solve.
-    # Active by default; the meshpy/TetGen path is loaded lazily per gate body.
-    enable_gate_mesh: bool = True
-    # v10.3: global mould-sand property overrides (0 = use preset defaults)
-    mold_afs_grain_size: float = 0.0
-    mold_moisture_percent: float = 0.0
-    mold_binder_percent: float = 0.0
-    mold_compactability_percent: float = 0.0
-    mold_rigidity_factor: float = -1.0  # <0 means derive from preset
+    # v8.3: which gating section the velocity above refers to
+    velocity_section_key: str = "INGATE"
+    # v9.1: gravity / casting direction (default: -Z, i.e. downward in world coords)
+    gravity_direction: Tuple[float, float, float] = (0.0, 0.0, -1.0)
 
     @property
     def superheat_c(self) -> float:

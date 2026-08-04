@@ -328,19 +328,110 @@ def _body_flow_length(mesh: trimesh.Trimesh, axis: np.ndarray) -> float:
     return float(proj.max() - proj.min())
 
 
-def _characteristic_cross_section_area(
+def _bbox_connection_axis(
+    up_bbox: np.ndarray,
+    dn_bbox: np.ndarray,
+    up_center: np.ndarray,
+    dn_center: np.ndarray,
+    tol_mm: float = 0.5,
+) -> Optional[np.ndarray]:
+    """Return the axis (unit vector) along which two gating bodies face/feed each other.
+
+    The connection is a pair of bounding boxes that touch/overlap in two axes and
+    are separated by at most ``tol_mm`` in the third axis.  This is far more
+    robust than centroid-to-centroid for offset runners, angled sprues etc.
+    """
+    axes = [np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])]
+    best_i = -1
+    best_contact = -1.0
+    best_sign = 1.0
+    for i in range(3):
+        a_min, a_max = float(up_bbox[0][i]), float(up_bbox[1][i])
+        b_min, b_max = float(dn_bbox[0][i]), float(dn_bbox[1][i])
+        overlap = min(a_max, b_max) - max(a_min, b_min)
+        other = [
+            min(up_bbox[1][j], dn_bbox[1][j]) - max(up_bbox[0][j], dn_bbox[0][j])
+            for j in range(3) if j != i
+        ]
+        # Bodies must overlap or just touch in the other two axes; the candidate
+        # axis must not be deeply embedded (overlap <= tol) and not too far apart.
+        if overlap < -tol_mm or overlap > tol_mm or other[0] <= 0.0 or other[1] <= 0.0:
+            continue
+        contact = float(other[0]) * float(other[1])
+        if contact > best_contact:
+            best_contact = contact
+            best_i = i
+            if b_min >= a_max - tol_mm:
+                best_sign = 1.0
+            elif b_max <= a_min + tol_mm:
+                best_sign = -1.0
+            else:
+                best_sign = 1.0 if dn_center[i] > up_center[i] else -1.0
+    if best_i < 0:
+        return None
+    return float(best_sign) * axes[best_i]
+
+
+def _downstream_body_for(body: Body, bodies: List[Body]) -> Optional[Body]:
+    """Pick the downstream body that this gating element feeds."""
+    candidate_types: Tuple[BodyType, ...]
+    if body.body_type == BodyType.SPRUE:
+        candidate_types = (BodyType.RUNNER, BodyType.INGATE, BodyType.PART)
+    elif body.body_type == BodyType.RUNNER:
+        candidate_types = (BodyType.INGATE, BodyType.PART)
+    elif body.body_type == BodyType.INGATE:
+        candidate_types = (BodyType.PART,)
+    else:
+        return None
+
+    best: Optional[Body] = None
+    best_sep = float("inf")
+    b = _repair_mesh(body.mesh)
+    for cand in bodies:
+        if cand is body or cand.body_type not in candidate_types:
+            continue
+        cb = _repair_mesh(cand.mesh)
+        axis = _bbox_connection_axis(b.bounds, cb.bounds, b.vertices.mean(axis=0), cb.vertices.mean(axis=0))
+        if axis is None:
+            continue
+        # compute scalar separation along that axis
+        i = int(np.argmax(np.abs(axis)))
+        sep = max(
+            0.0,
+            max(b.bounds[0][i] - cb.bounds[1][i], cb.bounds[0][i] - b.bounds[1][i]),
+        )
+        if sep < best_sep:
+            best_sep = sep
+            best = cand
+    return best
+
+
+def _fallback_flow_axis(mesh: trimesh.Trimesh, downstream_center: Optional[np.ndarray] = None) -> np.ndarray:
+    """When no downstream body is adjacent, use the longest bbox dimension as the flow axis."""
+    sizes = mesh.bounds[1] - mesh.bounds[0]
+    i = int(np.argmax(sizes))
+    axis = np.zeros(3, dtype=float)
+    axis[i] = 1.0
+    if downstream_center is not None:
+        v = downstream_center - mesh.vertices.mean(axis=0)
+        if v[i] < 0:
+            axis[i] = -1.0
+    return axis
+
+
+def _body_exit_or_throat_area(
     mesh: trimesh.Trimesh,
     axis: np.ndarray,
-    n: int = 20,
+    is_sprue: bool = False,
+    fallback_min: bool = False,
+    n: int = 80,
 ) -> float:
-    """Return the most representative cross-sectional area [mm2] perpendicular to axis.
+    """Return the representative cross-sectional area [mm²] of a gating body.
 
-    The algorithm looks for a constant (plateau) cross-section first.  If found,
-    it returns the mean of that plateau; for circular plateaus it uses the equivalent
-    circle area from the perimeter to compensate for tessellation coarseness.
-    If no plateau exists, circular bodies are classified as conical (monotonic)
-    or non-monotonic; conical uses the minimum circular area (throat), otherwise the
-    maximum circular area.  Non-circular / prismatic bodies use the median area.
+    For runner/ingate the area is taken near the downstream end (``axis`` points
+    downstream).  For a sprue the throat is the smaller of the two end areas.
+    If ``fallback_min`` is true the minimum area along the axis is used (e.g. an
+    ingate with no part contact).
     """
     axis = np.asarray(axis, dtype=np.float64)
     norm = float(np.linalg.norm(axis))
@@ -355,130 +446,25 @@ def _characteristic_cross_section_area(
             return float(mesh.volume / (length_mm * 1e-3))
         return 0.0
 
-    t = np.array([r[0] for r in rows])
-    areas = np.array([r[1] for r in rows])
-    perims = np.array([r[2] for r in rows])
-    circs = np.array([r[3] for r in rows])
-
+    areas = np.array([r[1] for r in rows], dtype=np.float64)
     max_area = float(areas.max())
     if max_area <= 0.0:
         return 0.0
 
-    best_window: Optional[Tuple[int, int]] = None
-    best_score = -1.0
-    min_len = 3
-    for i in range(len(areas) - min_len + 1):
-        for j in range(i + min_len - 1, len(areas)):
-            w_areas = areas[i : j + 1]
-            if w_areas.min() < 0.15 * max_area:
-                continue
-            if w_areas.max() / w_areas.min() > 1.25:
-                continue
-            score = (j - i + 1) * w_areas.mean()
-            if score > best_score:
-                best_score = score
-                best_window = (i, j)
-
-    if best_window is not None:
-        i, j = best_window
-        mean_circ = float(circs[i : j + 1].mean())
-        if mean_circ > 0.85:
-            return float((perims[i : j + 1] ** 2 / (4.0 * math.pi)).mean())
-        return float(areas[i : j + 1].mean())
-
-    valid = areas > 0.05 * max_area
-    if not valid.any():
+    # Ignore degenerate partial end caps.
+    valid_idx = [i for i, a in enumerate(areas) if a > 0.05 * max_area]
+    if not valid_idx:
         return float(np.median(areas))
 
-    mean_circ = float(circs[valid].mean())
-    if mean_circ > 0.85:
-        circ_areas = perims ** 2 / (4.0 * math.pi)
-        x = np.arange(len(areas))
-        if valid.sum() > 2:
-            a_valid = areas[valid]
-            x_valid = x[valid]
-            cov = np.cov(x_valid, a_valid)
-            if cov[0, 0] > 0.0:
-                r = cov[0, 1] / np.sqrt(cov[0, 0] * cov[1, 1])
-            else:
-                r = 0.0
-            if abs(r) > 0.65:
-                interior = np.ones_like(areas, dtype=bool)
-                interior[0] = interior[-1] = False
-                if not (interior & valid).any():
-                    interior = valid
-                return float(circ_areas[interior & valid].min())
-        return float(circ_areas[valid].max())
-
-    central = areas[1:-1] if len(areas) > 2 else areas
-    return float(np.median(central))
-
-
-def _sprue_circular_base_and_throat(
-    mesh: trimesh.Trimesh,
-    axis: np.ndarray,
-    n: int = 20,
-) -> Tuple[float, float]:
-    """Return (base_area_mm2, throat_area_mm2) for a sprue.
-
-    ``base_area`` is the characteristic/main circular cross-section.
-    ``throat_area`` is the minimum reliable circular cross-section.
-    """
-    axis = np.asarray(axis, dtype=np.float64)
-    norm = float(np.linalg.norm(axis))
-    if norm <= 0:
-        return 0.0, 0.0
-    axis = axis / norm
-
-    rows = _section_profile_detailed(mesh, axis, n=n)
-    if not rows:
-        length_mm = _body_flow_length(mesh, axis)
-        if length_mm > 0.0:
-            avg = float(mesh.volume / (length_mm * 1e-3))
-            return avg, avg
-        return 0.0, 0.0
-
-    t = np.array([r[0] for r in rows])
-    areas = np.array([r[1] for r in rows])
-    perims = np.array([r[2] for r in rows])
-    circs = np.array([r[3] for r in rows])
-    circ_areas = np.where(perims > 0.0, perims ** 2 / (4.0 * math.pi), 0.0)
-
-    max_area = float(areas.max())
-    if max_area <= 0.0:
-        return 0.0, 0.0
-
-    # Use the largest contiguous region where the cross-section is well inside
-    # the body (area > 30 % of max) and reasonably circular.  End-cap partial
-    # intersections are excluded because they can look circular while being tiny.
-    significant = (areas > 0.30 * max_area) & (circs > 0.85) & (circ_areas > 0.0)
-    runs = []
-    i = 0
-    while i < len(areas):
-        if significant[i]:
-            j = i
-            while j < len(areas) and significant[j]:
-                j += 1
-            runs.append((i, j))
-            i = j
-        else:
-            i += 1
-
-    if runs:
-        # Prefer a run that does not touch the first/last slice (avoids partials).
-        good_runs = [r for r in runs if r[0] > 0 and r[1] < len(areas)]
-        if not good_runs:
-            good_runs = runs
-        run = max(good_runs, key=lambda r: r[1] - r[0])
-        i, j = run
-        base = float(circ_areas[i:j].max())
-        throat = float(circ_areas[i:j].min())
-        return base, throat
-
-    # Prismatic / non-circular sprue: use the median cross-sectional area.
-    base = float(np.median(areas[1:-1])) if len(areas) > 2 else float(np.median(areas))
-    throat = base
-    return base, throat
+    n_end = max(1, min(5, len(valid_idx) // 4))
+    if fallback_min:
+        return float(min(areas[i] for i in valid_idx))
+    if is_sprue:
+        front = [areas[i] for i in valid_idx[:n_end]]
+        back = [areas[i] for i in valid_idx[-n_end:]]
+        return float(min(front + back))
+    # runner / ingate: downstream end is the last valid rows
+    return float(np.mean([areas[i] for i in valid_idx[-n_end:]]))
 
 
 _GATING_BODY_TYPES = frozenset([
@@ -663,108 +649,49 @@ def _real_gating_areas_from_bodies(
 ) -> Dict[str, float]:
     """Compute real sprue/runner/distributor/curufluk/ingate cross-section areas from CAD meshes.
 
-    Series elements are not summed; the representative area for RUNNER and
-    DISTRIBUTOR is taken from the terminal body that feeds the next section
-    (gate / distributor / curufluk).  INGATE bodies are summed because they
-    usually represent parallel gates.
+    Areas are measured at body-to-body joints (downstream end) or, for a sprue,
+    at the smaller throat end.  This matches how metal actually flows and avoids
+    the old centroid/PCA heuristics that produced nonsensical cross-sections.
     """
-    topology = _build_gating_topology(bodies, gravity_vector=gravity_vector)
-    if not topology["bodies"]:
-        return {
-            "runner_total_mm2": 0.0,
-            "runner_total_cm2": 0.0,
-            "distributor_total_mm2": 0.0,
-            "distributor_total_cm2": 0.0,
-            "curufluk_total_mm2": 0.0,
-            "curufluk_total_cm2": 0.0,
-            "ingate_total_mm2": 0.0,
-            "ingate_total_cm2": 0.0,
-            "sprue_base_mm2": 0.0,
-            "sprue_base_cm2": 0.0,
-            "sprue_throat_mm2": 0.0,
-            "sprue_throat_cm2": 0.0,
-            "n_ingates": 0,
-        }
+    runner_total_mm2 = 0.0
+    ingate_total_mm2 = 0.0
+    sprue_throats: List[float] = []
 
-    body_map = {b.name: b for b in topology["bodies"]}
-    areas = topology["areas_mm2"]
-    children = topology["children"]
-    order = topology["order"]
+    for body in bodies:
+        if body.body_type not in (BodyType.SPRUE, BodyType.RUNNER, BodyType.INGATE):
+            continue
+        mesh = _repair_mesh(body.mesh)
+        if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+            continue
 
-    def _child_of_types(name: str, types: Tuple[BodyType, ...]) -> bool:
-        return any(body_map[c].body_type in types for c in children.get(name, []))
+        downstream = _downstream_body_for(body, bodies)
+        if downstream is not None:
+            dn_mesh = _repair_mesh(downstream.mesh)
+            axis = _bbox_connection_axis(
+                mesh.bounds, dn_mesh.bounds,
+                mesh.vertices.mean(axis=0), dn_mesh.vertices.mean(axis=0),
+            )
+        else:
+            axis = None
 
-    def _select_terminal(btype: BodyType, feed_types: Tuple[BodyType, ...]) -> List[str]:
-        candidates = [n for n in order if body_map[n].body_type == btype]
-        terminals = [n for n in candidates if _child_of_types(n, feed_types)]
-        if terminals:
-            return terminals
-        # Fallback: if all are in series, take the one closest to the gates.
-        if candidates:
-            return [candidates[-1]]
-        return []
+        if axis is None:
+            dn_center = downstream.mesh.vertices.mean(axis=0) if downstream is not None else None
+            axis = _fallback_flow_axis(mesh, dn_center)
 
-    # INGATE: always sum parallel gates.
-    ingate_names = [n for n in order if body_map[n].body_type == BodyType.INGATE]
-    ingate_total_mm2 = sum(areas[n] for n in ingate_names)
-    n_ingates = len(ingate_names)
+        if body.body_type == BodyType.SPRUE:
+            throat_mm2 = _body_exit_or_throat_area(mesh, axis, is_sprue=True)
+            sprue_throats.append(throat_mm2)
+        elif body.body_type == BodyType.RUNNER:
+            area_mm2 = _body_exit_or_throat_area(mesh, axis, is_sprue=False)
+            runner_total_mm2 += area_mm2
+        elif body.body_type == BodyType.INGATE:
+            area_mm2 = _body_exit_or_throat_area(
+                mesh, axis, is_sprue=False, fallback_min=downstream is None
+            )
+            ingate_total_mm2 += area_mm2
 
-    # RUNNER: terminal runner feeding distributor/curufluk/ingate.
-    runner_names = _select_terminal(
-        BodyType.RUNNER,
-        (BodyType.DISTRIBUTOR, BodyType.CURUFLUK, BodyType.INGATE),
-    )
-    runner_total_mm2 = sum(areas[n] for n in runner_names)
-
-    # DISTRIBUTOR: terminal distributor feeding curufluk/ingate.
-    distributor_names = _select_terminal(
-        BodyType.DISTRIBUTOR,
-        (BodyType.CURUFLUK, BodyType.INGATE),
-    )
-    distributor_total_mm2 = sum(areas[n] for n in distributor_names)
-
-    # CURUFLUK: sum all curufluk bodies that are part of the flow path.
-    curufluk_names = [n for n in order if body_map[n].body_type == BodyType.CURUFLUK]
-    curufluk_total_mm2 = sum(areas[n] for n in curufluk_names)
-
-    # SPRUE/POURING_BASIN: collect base and throat along each source branch.
-    sprue_base_total_mm2 = 0.0
-    sprue_throat_min_mm2 = 0.0
-    has_sprue = any(body_map[n].body_type == BodyType.SPRUE for n in order)
-    visited: set = set()
-
-    def _collect_sprue(name: str) -> None:
-        nonlocal sprue_base_total_mm2, sprue_throat_min_mm2
-        if name in visited:
-            return
-        visited.add(name)
-        b = body_map[name]
-        if b.body_type == BodyType.SPRUE:
-            base = areas[name]
-            throat = areas.get(name + ":throat", base)
-            sprue_base_total_mm2 += base
-            if sprue_throat_min_mm2 == 0.0:
-                sprue_throat_min_mm2 = throat
-            else:
-                sprue_throat_min_mm2 = min(sprue_throat_min_mm2, throat)
-        elif b.body_type == BodyType.SPRUE_THROAT:
-            throat = areas[name]
-            if sprue_throat_min_mm2 == 0.0:
-                sprue_throat_min_mm2 = throat
-            else:
-                sprue_throat_min_mm2 = min(sprue_throat_min_mm2, throat)
-        elif b.body_type == BodyType.POURING_BASIN and not has_sprue:
-            # Only use pouring-basin area as a sprue fallback when no sprue exists.
-            base = areas[name]
-            if sprue_base_total_mm2 == 0.0:
-                sprue_base_total_mm2 = base
-                sprue_throat_min_mm2 = base
-        for c in children.get(name, []):
-            if body_map[c].body_type in _GATING_BODY_TYPES:
-                _collect_sprue(c)
-
-    for src in topology["sources"]:
-        _collect_sprue(src)
+    # For the sprue the choke/throat is the minimum area across all sprue bodies.
+    sprue_throat_mm2 = float(np.min(sprue_throats)) if sprue_throats else 0.0
 
     return {
         "runner_total_mm2": runner_total_mm2,
@@ -775,11 +702,10 @@ def _real_gating_areas_from_bodies(
         "curufluk_total_cm2": curufluk_total_mm2 / 100.0,
         "ingate_total_mm2": ingate_total_mm2,
         "ingate_total_cm2": ingate_total_mm2 / 100.0,
-        "sprue_base_mm2": sprue_base_total_mm2,
-        "sprue_base_cm2": sprue_base_total_mm2 / 100.0,
-        "sprue_throat_mm2": sprue_throat_min_mm2,
-        "sprue_throat_cm2": sprue_throat_min_mm2 / 100.0,
-        "n_ingates": n_ingates,
+        "sprue_base_mm2": sprue_throat_mm2,
+        "sprue_base_cm2": sprue_throat_mm2 / 100.0,
+        "sprue_throat_mm2": sprue_throat_mm2,
+        "sprue_throat_cm2": sprue_throat_mm2 / 100.0,
     }
 
 
@@ -1297,6 +1223,17 @@ def analyze_gating(
             rho_kg_m3=casting_params.rho_liquid_kg_m3,
             viscosity_pa_s=casting_params.viscosity_pa_s,
         )
+    gravity_vec = np.array([0.0, 0.0, -1.0])
+    if casting_params is not None and isinstance(casting_params, CastingParameters):
+        gv = getattr(casting_params, "gravity_direction", None)
+        if gv is not None:
+            gv = np.asarray(gv, dtype=float)
+            n = float(np.linalg.norm(gv))
+            if n > 1e-6:
+                gravity_vec = gv / n
+    if fill_time_s is None:
+        fill_time_s = 10.0
+
     part_mask = grid == BodyType.PART
     is_metal = result.is_metal
     ingate = grid == BodyType.INGATE
@@ -1322,6 +1259,14 @@ def analyze_gating(
         gate_contact_area_cm2 = gate_area_cm2 if gate_area_cm2 > 0.0 else contact_area_mm2 / 100.0
         if gate_area_cm2 <= 0.0:
             gate_area_cm2 = gate_contact_area_cm2
+        # If the system has no ingate, the runner exit feeds the part directly.
+        # Use the smaller of the runner exit cross-section and the part-runner
+        # contact area as the effective gate area.
+        if runner_min_area_cm2 > 0.0 and not has_ingate:
+            if gate_area_cm2 <= 0.0:
+                gate_area_cm2 = runner_min_area_cm2
+            else:
+                gate_area_cm2 = min(gate_area_cm2, runner_min_area_cm2)
 
         part_volume_cm3, total_metal_volume_cm3 = _volumes_from_bodies(bodies)
     else:
@@ -1390,11 +1335,11 @@ def analyze_gating(
         n_ingates = 1
 
     # Effective metal head from geometry + mass reduction + elbow losses.
-    # Use average ferrostatic head (h_max - c/2) to account for backpressure as
-    # the mold fills; c is the part height in the casting direction.
+    # Height is measured along the user-selected gravity direction, not hard-coded Z.
     metal_pts = np.argwhere(result.is_metal)
     if len(metal_pts) > 0:
-        total_height_mm = float((metal_pts[:, 2].max() - metal_pts[:, 2].min()) * dx)
+        projections = metal_pts @ gravity_vec
+        height_mm = float((projections.max() - projections.min()) * dx)
     else:
         total_height_mm = 0.0
     part_mask = result.grid == BodyType.PART

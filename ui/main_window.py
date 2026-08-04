@@ -427,6 +427,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.visc_spin.setValue(0.0060)
         _params_labeled(self.visc_spin, "Viskozite μ (Pa·s):")
 
+        self.gravity_combo = QtWidgets.QComboBox()
+        self.gravity_combo.addItem("Aşağı (-Z)", "0,0,-1")
+        self.gravity_combo.addItem("Yukarı (+Z)", "0,0,1")
+        self.gravity_combo.addItem("-X", "-1,0,0")
+        self.gravity_combo.addItem("+X", "1,0,0")
+        self.gravity_combo.addItem("-Y", "0,-1,0")
+        self.gravity_combo.addItem("+Y", "0,1,0")
+        _params_labeled(self.gravity_combo, "Döküm yönü (yerçekimi):", "Metalin hangi eksende aşağı aktığını seç.")
+
         self.velocity_section_combo = QtWidgets.QComboBox()
         self.velocity_section_combo.addItem("Döküm ağzı boğazı (sprue throat)", "SPRUE_THROAT")
         self.velocity_section_combo.addItem("Döküm ağzı en üst noktası (sprue top)", "SPRUE_BASE")
@@ -854,6 +863,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.visc_spin.setValue(alloy.viscosity_pa_s)
 
     def _casting_params_from_ui(self) -> CastingParameters:
+        gstr = self.gravity_combo.currentData() or "0,0,-1"
+        gravity_direction = tuple(float(x.strip()) for x in gstr.split(","))
         return CastingParameters(
             t_pour_c=self.t_pour_spin.value(),
             t_liquidus_c=self.t_liq_spin.value(),
@@ -864,14 +875,7 @@ class MainWindow(QtWidgets.QMainWindow):
             viscosity_pa_s=self.visc_spin.value(),
             ingate_velocity_m_s=self.v_ingate_spin.value(),
             velocity_section_key=self.velocity_section_combo.currentData(),
-            gravity_vector=self._gravity_vector_from_ui(),
-            hotspot_min_size_mm=self.hs_min_size_spin.value(),
-            hotspot_cluster_eps_mm=self.hs_cluster_eps_spin.value(),
-            mold_afs_grain_size=self.mold_afs_spin.value(),
-            mold_moisture_percent=self.mold_moisture_spin.value(),
-            mold_binder_percent=self.mold_binder_spin.value(),
-            mold_compactability_percent=self.mold_compactability_spin.value(),
-            mold_rigidity_factor=self.mold_rigidity_spin.value(),
+            gravity_direction=gravity_direction,
         )
 
     def _gravity_vector_from_ui(self) -> Tuple[float, float, float]:
