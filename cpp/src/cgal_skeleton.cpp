@@ -16,6 +16,7 @@
 #include <CGAL/Polygon_mesh_processing/stitch_borders.h>
 #include <CGAL/Polygon_mesh_processing/manifoldness.h>
 #include <CGAL/Polygon_mesh_processing/repair.h>
+#include <CGAL/Polygon_mesh_processing/border.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -71,18 +72,17 @@ Mesh build_mesh_from_arrays(nb::ndarray<nb::numpy, double, nb::shape<-1, 3>> ver
 
     // Try to close any remaining holes using CGAL hole filling.
     for (int iter = 0; iter < 10 && !CGAL::is_closed(mesh); ++iter) {
-        std::vector<typename Mesh::Halfedge_index> borders;
-        CGAL::Polygon_mesh_processing::border_halfedges(mesh.faces(), mesh, std::back_inserter(borders));
-        if (borders.empty()) break;
-        std::vector<typename Mesh::Face_index> patch;
-        CGAL::Polygon_mesh_processing::triangulate_hole(mesh, borders.front(), std::back_inserter(patch));
+        std::vector<typename Mesh::Halfedge_index> cycles;
+        CGAL::Polygon_mesh_processing::extract_boundary_cycles(mesh, std::back_inserter(cycles));
+        if (cycles.empty()) break;
+        for (typename Mesh::Halfedge_index h : cycles) {
+            std::vector<typename Mesh::Face_index> patch;
+            CGAL::Polygon_mesh_processing::triangulate_hole(mesh, h, std::back_inserter(patch));
+        }
     }
 
     if (!CGAL::is_closed(mesh)) {
         throw std::runtime_error("cgal skeleton: mesh is not closed after repair; cannot skeletonize");
-    }
-    if (CGAL::Polygon_mesh_processing::number_of_borders(mesh) != 0) {
-        throw std::runtime_error("cgal skeleton: mesh still has borders after repair");
     }
     return mesh;
 }
