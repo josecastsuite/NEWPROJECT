@@ -6,6 +6,7 @@ import numpy as np
 import pyvista as pv
 from PyQt6 import QtCore, QtWidgets
 from pyvistaqt import QtInteractor
+from scipy import ndimage
 from scipy.spatial import cKDTree
 
 from core.gating import (
@@ -766,24 +767,23 @@ class Analyzer3DViewer(QtInteractor):
             branches = [[source_node] + [n for n in nodes if n is not source_node]]
         return branches
 
-    def _flow_section_scalars(
+    def _flow_velocity_from_sdf(
         self, result: AnalysisResult, gate_mask: np.ndarray
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], bool]:
-        """Map each gate voxel to the nearest gating-node edge section.
+    ) -> Optional[np.ndarray]:
+        """Compute a 1-D v(s)=Q/A(s) velocity field for gate voxels using SDF.
 
-        This is independent of how many bodies the user drew: one body can
-        contain several runner branches and each branch/section still gets its
-        own ID and velocity from the directed gating-node graph.
+        If the raw Darcy velocity_magnitude is uniform, this fallback estimates
+        the local cross-section radius from the SDF and applies continuity so
+        that narrow sections show higher velocity.
         """
         fr = result.flow_result
         nodes = getattr(fr, "gating_nodes", None) or []
-        if not nodes:
-            return None, None, False
+        if not nodes or result.sdf is None or result.sdf.size == 0:
+            return None
         branches = self._build_gating_branches(nodes)
         if not branches:
-            return None, None, False
+            return None
 
-        # Collect unique edges (up, down) from every branch.
         edges: List[Tuple[Any, Any]] = []
         seen: set = set()
         for branch in branches:
@@ -793,54 +793,89 @@ class Analyzer3DViewer(QtInteractor):
                     continue
                 seen.add(key)
                 edges.append((up, down))
-        if not edges:
-            return None, None, False
+
+        sdf = np.asarray(result.sdf)
+        dx = float(result.dx_mm)
+        origin = np.asarray(result.origin_mm, dtype=np.float64)
+        shape = sdf.shape
 
         ref_points: List[np.ndarray] = []
-        ref_ids: List[int] = []
         ref_vel: List[float] = []
-        for section_id, (up, down) in enumerate(edges):
+        for up, down in edges:
             p0 = np.asarray(up.centroid_mm, dtype=np.float64)
             p1 = np.asarray(down.centroid_mm, dtype=np.float64)
             dist = float(np.linalg.norm(p1 - p0))
-            n_pts = max(2, int(np.ceil(dist / (result.dx_mm * 0.5))) + 1)
+            n_pts = max(2, int(np.ceil(dist / (dx * 0.5))) + 1)
             pts = np.linspace(p0, p1, n_pts)
-            v = float(down.velocity_m_s) if down.velocity_m_s > 1e-12 else float(up.velocity_m_s)
+
+            Q = 0.0
+            for node in (down, up):
+                q = float(getattr(node, "flow_rate_m3_s", 0.0))
+                if q > 1e-18:
+                    Q = q
+                    break
+            if Q <= 1e-18:
+                Q = float(fr.Q_m3_s)
+            if Q <= 1e-18:
+                continue
+
+            a_up = float(getattr(up, "section_area_cm2", 0.0))
+            a_down = float(getattr(down, "section_area_cm2", 0.0))
+            a_max = max(a_up, a_down)
+            if a_max > 0:
+                r_mm = np.sqrt(a_max / np.pi) * 10.0 * 1.5
+                r_vox = max(2, int(np.ceil(r_mm / dx)) + 2)
+            else:
+                gate_sdf = sdf[gate_mask]
+                max_r = float(np.percentile(gate_sdf[gate_sdf > 0], 95)) if np.any(gate_sdf > 0) else 0.0
+                r_vox = max(2, int(np.ceil(max_r / dx)) + 2)
+
             for p in pts:
+                idx = ((p - origin) / dx).astype(np.int64)
+                slices = tuple(
+                    slice(max(0, i - r_vox), min(s, i + r_vox + 1), None)
+                    for i, s in zip(idx, shape)
+                )
+                local_sdf = sdf[slices]
+                local_gate = gate_mask[slices]
+                if local_gate.any():
+                    r = float(np.max(local_sdf[local_gate])) + 0.5 * dx
+                else:
+                    r = 0.5 * dx
+                if r <= 0:
+                    r = 0.5 * dx
+                A = np.pi * r * r
+                v = float(Q / A) if A > 1e-18 and Q > 0 else 0.0
                 ref_points.append(p)
-                ref_ids.append(section_id)
                 ref_vel.append(v)
 
         if not ref_points:
-            return None, None, False
+            return None
         ref_points_arr = np.asarray(ref_points, dtype=np.float64)
-        ref_ids_arr = np.asarray(ref_ids, dtype=np.int32)
         ref_vel_arr = np.asarray(ref_vel, dtype=np.float64)
 
         tree = cKDTree(ref_points_arr)
         indices = np.argwhere(gate_mask)
         if indices.size == 0:
-            return None, None, False
-        centers = (indices + 0.5) * result.dx_mm + result.origin_mm
+            return None
+        centers = (indices + 0.5) * dx + origin
         try:
             _, nearest = tree.query(centers, k=1, workers=-1)
         except TypeError:
             _, nearest = tree.query(centers, k=1)
         nearest = np.asarray(nearest, dtype=np.int64)
 
-        section_id_arr = np.full(result.grid.shape, -1, dtype=np.int32)
-        section_vel_arr = np.zeros(result.grid.shape, dtype=np.float64)
-        section_id_arr[tuple(indices.T)] = ref_ids_arr[nearest]
-        section_vel_arr[tuple(indices.T)] = ref_vel_arr[nearest]
-        return section_id_arr, section_vel_arr, True
+        vel_arr = np.zeros(result.grid.shape, dtype=np.float64)
+        vel_arr[tuple(indices.T)] = ref_vel_arr[nearest]
+        return vel_arr
 
     def show_flow_velocity(self, result: Optional[AnalysisResult]):
-        """Paint the gating system by flow section.
+        """Paint the gating system with a smooth physical velocity heatmap.
 
-        Each segment between two consecutive gating nodes gets its own colour,
-        so every cross-section/branch change is visible regardless of how the
-        user grouped bodies.  The section velocity is taken from the downstream
-        gating node (Q/A at that throat).
+        The first choice is the C++/LBM per-voxel velocity_magnitude field.
+        If that field is nearly uniform (no visible cross-section effect), fall
+        back to a 1-D v(s)=Q/A(s) reconstruction using the SDF.  The colourbar
+        is always shown with a 0..v_max scale.
         """
         if self._flow_actor is not None:
             self.remove_actor(self._flow_actor)
@@ -861,16 +896,40 @@ class Analyzer3DViewer(QtInteractor):
             BodyType.FILTER,
         ]
         gate_mask = np.isin(result.grid, gate_types)
-        _, section_vel_arr, ok = self._flow_section_scalars(result, gate_mask)
-        if not ok or section_vel_arr is None:
-            self._show_flow_velocity_body_based(result, gate_mask)
+        if not gate_mask.any():
+            return
+
+        fr = result.flow_result
+        scalar_arr: Optional[np.ndarray] = None
+        vmag = fr.velocity_magnitude
+        if vmag is not None and vmag.size > 0:
+            gate_vmag = vmag[gate_mask & np.isfinite(vmag)]
+            if gate_vmag.size > 0:
+                v_max_raw = float(np.nanmax(gate_vmag))
+                v_min_raw = float(np.nanmin(gate_vmag))
+                if v_max_raw > 1e-9 and v_max_raw > v_min_raw * 1.05 + 0.05:
+                    scalar_arr = vmag.astype(np.float64, copy=False)
+                    try:
+                        scalar_arr = ndimage.gaussian_filter(scalar_arr, sigma=0.8)
+                    except Exception:
+                        pass
+                else:
+                    scalar_arr = self._flow_velocity_from_sdf(result, gate_mask)
+                    if scalar_arr is None:
+                        scalar_arr = vmag.astype(np.float64, copy=False)
+            else:
+                scalar_arr = self._flow_velocity_from_sdf(result, gate_mask)
+
+        if scalar_arr is None:
+            scalar_arr = self._flow_velocity_from_sdf(result, gate_mask)
+        if scalar_arr is None:
             return
 
         grid = pv.ImageData()
         grid.dimensions = np.array(result.grid.shape) + 1
         grid.origin = result.origin_mm
         grid.spacing = (result.dx_mm, result.dx_mm, result.dx_mm)
-        grid.cell_data["section_velocity"] = section_vel_arr.ravel(order="F")
+        grid.cell_data["velocity_magnitude"] = scalar_arr.ravel(order="F")
         grid.cell_data["is_gate"] = gate_mask.astype(np.float64).ravel(order="F")
         gate = grid.threshold([1.0, 1.0], scalars="is_gate")
         if gate.n_cells == 0:
@@ -879,84 +938,11 @@ class Analyzer3DViewer(QtInteractor):
         if surf.n_cells == 0:
             return
 
-        gate_vals = section_vel_arr[(section_vel_arr > 0) & np.isfinite(section_vel_arr) & gate_mask]
+        gate_vals = scalar_arr[(scalar_arr > 0) & np.isfinite(scalar_arr) & gate_mask]
         if gate_vals.size > 0:
             v_max = float(np.nanmax(gate_vals))
-            v_min = float(np.nanmin(gate_vals))
-            if v_max <= v_min:
-                v_max = v_min + 0.1
-            clim = (0.0, v_max * 1.05)
-        else:
-            clim = (0.0, 1.0)
-
-        self._flow_actor = self.add_mesh(
-            surf,
-            scalars="section_velocity",
-            cmap="turbo",
-            opacity=1.0,
-            clim=clim,
-            show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.02, 0.02), clim=clim),
-            smooth_shading=True,
-            ambient=0.55,
-            diffuse=0.45,
-            specular=0.05,
-            specular_power=1.0,
-        )
-        self._arrange_scalar_bars()
-
-    def _show_flow_velocity_body_based(self, result: AnalysisResult, gate_mask: np.ndarray):
-        """Fallback body-based velocity colouring when no gating-node graph is present."""
-        fr = result.flow_result
-        vmag = fr.velocity_magnitude
-        if vmag is None or vmag.size == 0:
-            return
-        body_vmag = np.zeros_like(vmag, dtype=np.float64)
-        body_velocities: Dict[str, float] = {}
-
-        if fr.gate_flow_results:
-            for body_name, gres in fr.gate_flow_results.items():
-                v = float(gres.get("section_velocity_m_s", 0.0))
-                if v > 1e-12:
-                    body_velocities[body_name] = v
-
-        for node in getattr(fr, "gating_nodes", []):
-            if "→" not in getattr(node, "name", ""):
-                continue
-            up, down = (p.strip() for p in node.name.split("→"))
-            v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
-            if v > 1e-12:
-                for bn in (up, down):
-                    if not bn:
-                        continue
-                    if bn not in body_velocities or v > body_velocities[bn]:
-                        body_velocities[bn] = v
-
-        if self._bodies is not None and self._body_index is not None:
-            for body in self._bodies:
-                v = body_velocities.get(body.name, 0.0)
-                if v > 1e-12:
-                    mask = (self._body_index == body.index) & gate_mask
-                    body_vmag[mask] = v
-
-        body_vmag = np.where(
-            (body_vmag == 0) & gate_mask & (vmag > 0) & np.isfinite(vmag), vmag, body_vmag
-        ).astype(np.float32)
-
-        grid = self._make_grid(result, body_vmag, "velocity_magnitude")
-        gate = self._gate_only(grid)
-        if gate.n_cells == 0:
-            return
-        surf = self._smooth_surface(gate)
-        if surf.n_points == 0:
-            return
-
-        gate_vals = body_vmag[gate_mask & (body_vmag > 0) & np.isfinite(body_vmag)]
-        if gate_vals.size > 0:
-            v_min = float(np.nanmin(gate_vals))
-            v_max = float(np.nanmax(gate_vals))
-            if v_max <= v_min:
-                v_max = v_min + 0.1
+            if v_max <= 0:
+                v_max = 1.0
             clim = (0.0, v_max * 1.05)
         else:
             clim = (0.0, 1.0)
@@ -978,41 +964,10 @@ class Analyzer3DViewer(QtInteractor):
         self._arrange_scalar_bars()
 
     def show_flow_node_labels(self, result: Optional[AnalysisResult]):
-        """Add numeric velocity labels at every gating node/section."""
+        """Velocity labels are disabled; the heatmap + colourbar are sufficient."""
         if self._flow_node_actor is not None:
             self.remove_actor(self._flow_node_actor)
             self._flow_node_actor = None
-        if result is None or result.flow_result is None:
-            return
-
-        nodes = result.flow_result.gating_nodes
-        label_points: List[Tuple[float, float, float]] = []
-        label_texts: List[str] = []
-
-        for node in nodes:
-            if " → " not in getattr(node, "name", ""):
-                continue
-            v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
-            if v > 1e-12:
-                label_points.append(node.centroid_mm)
-                label_texts.append(f"{v:.2f} m/s")
-
-        if label_points:
-            label_points = np.asarray(label_points, dtype=np.float64)
-            self._flow_node_actor = self.add_point_labels(
-                label_points,
-                label_texts,
-                font_size=10,
-                text_color="#334155",
-                point_color="#EF4444",
-                point_size=12,
-                shape="rounded_rect",
-                background_color="#F1F5F9",
-                background_opacity=0.85,
-                always_visible=True,
-                shadow=False,
-                name="flow_node_labels",
-            )
 
     def show_feeding_paths(self, result: Optional[AnalysisResult]):
         for actor in self._path_actors:
