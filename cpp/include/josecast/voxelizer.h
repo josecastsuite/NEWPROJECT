@@ -40,7 +40,6 @@ public:
 
 private:
     std::vector<BodyInput> bodies_;
-    static bool openvdb_initialized_;
 };
 
 } // namespace josecast

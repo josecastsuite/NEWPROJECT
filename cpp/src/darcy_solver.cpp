@@ -24,7 +24,19 @@ nb::ndarray<nb::numpy, double, nb::shape<-1>> solve_pressure(
     double abstol)
 {
     const size_t n = rhs.shape(0);
+    if (n == 0) {
+        std::vector<double>* x = new std::vector<double>();
+        auto owner = nb::capsule(x, [](void* p) noexcept {
+            delete static_cast<std::vector<double>*>(p);
+        });
+        return nb::ndarray<nb::numpy, double, nb::shape<-1>>(x->data(), {0}, owner);
+    }
     const size_t nnz = data.shape(0);
+
+    // AMGCL uses ptrdiff_t for CSR indices.  Guard against platforms where it
+    // would be narrower than the input int64_t type.
+    static_assert(sizeof(ptrdiff_t) >= sizeof(int64_t),
+                  "ptrdiff_t is too narrow for int64_t CSR indices");
 
     // Copy into STL containers with the signed-index types AMGCL expects.
     const int64_t* ptr_raw = indptr.data();

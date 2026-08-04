@@ -111,6 +111,7 @@ nb::tuple solve_thermal(
     const double Tl = getd(alloy, "t_liquidus_c", 1500.0);
     const double Ts = getd(alloy, "t_solidus_c", 1400.0);
     const double Tp = getd(alloy, "t_pour_c", 1600.0);
+    const double dT_mush = Tl - Ts;
     const double L = getd(alloy, "latent_heat_j_kg", 0.0);
     const double k_part = getd(alloy, "partition_coefficient", 0.5);
 
@@ -147,9 +148,19 @@ nb::tuple solve_thermal(
     double cp_surface = cp_bulk * (1.0 + 0.04 * std::max(0.0, moisture));
     double k_surface = k_bulk * std::max(0.5, 1.0 - 0.005 * moisture);
 
-    const double chill_k = 45.0;
-    const double chill_cp = 460.0;
-    const double chill_rho = 7850.0;
+    // Chill properties: explicit keys allow a different material (e.g. copper
+    // chill) from the bulk mould.  If no explicit keys are supplied, fall back
+    // to the mould conductivity when it looks like a metal chill (k > 100),
+    // otherwise use a steel chill default.
+    const double chill_k = getd(mold, "chill_k_w_mk",
+                                getd(mold, "chill_k",
+                                      (mold_k > 100.0 ? mold_k : 45.0)));
+    const double chill_cp = getd(mold, "chill_cp_j_kgk",
+                                 getd(mold, "chill_cp",
+                                       (mold_k > 100.0 ? mold_cp : 460.0)));
+    const double chill_rho = getd(mold, "chill_rho_kg_m3",
+                                  getd(mold, "chill_rho",
+                                        (mold_k > 100.0 ? mold_rho : 7850.0)));
 
     // ---- normalized gravity ----
     double gx = gravity_vector[0];
@@ -259,8 +270,12 @@ nb::tuple solve_thermal(
                                                         : std::numeric_limits<double>::infinity();
 
     // ---- time step ----
-    if (n_steps <= 0)
+    if (n_steps <= 0) {
         n_steps = std::max(20, std::min(100, static_cast<int>(max_time_s / 3.0)));
+        // Alloys with a very narrow mushy zone (< 10C) need a smaller
+        // diffusion time-step to avoid cp_eff spikes in the latent-heat region.
+        if (dT_mush < 10.0) n_steps *= 2;
+    }
     double dt_diff = max_time_s / std::max(1, n_steps);
     const int max_adv_subcycles = 200;
 
@@ -325,7 +340,7 @@ nb::tuple solve_thermal(
     Eigen::ConjugateGradient<Eigen::SparseMatrix<double>, Eigen::Lower | Eigen::Upper,
                               Eigen::DiagonalPreconditioner<double>> solver;
     solver.setTolerance(1e-5);
-    solver.setMaxIterations(150);
+    solver.setMaxIterations(300);
 
     double t = 0.0;
     int step = 0;
@@ -444,8 +459,8 @@ nb::tuple solve_thermal(
         // keep gating liquid while the mould is still being filled
         if (t + dt <= fill_end) {
             for (size_t i = 0; i < n; ++i) {
-                if (gating[i] && metal[i] && T_new[i] < Tl)
-                    T_new[i] = Tl;
+                if (gating[i] && metal[i] && T_new[i] < Tp)
+                    T_new[i] = Tp;
             }
         }
 

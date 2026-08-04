@@ -155,7 +155,7 @@ def _alloy_to_dict(alloy: Alloy) -> dict:
 
 
 def _mold_to_dict(mold: MoldMaterial) -> dict:
-    return {
+    d = {
         "k_w_mk": mold.k_w_mk,
         "cp_j_kgk": mold.cp_j_kgk,
         "rho_kg_m3": mold.rho_kg_m3,
@@ -166,6 +166,17 @@ def _mold_to_dict(mold: MoldMaterial) -> dict:
         "binder_percent": mold.binder_percent,
         "compactability_percent": mold.compactability_percent,
     }
+    # If the selected preset is a chill material, expose its properties
+    # explicitly so the C++ thermal solver does not hardcode steel values.
+    if getattr(mold, "mold_type", "") == "chill":
+        d["chill_k_w_mk"] = mold.k_w_mk
+        d["chill_cp_j_kgk"] = mold.cp_j_kgk
+        d["chill_rho_kg_m3"] = mold.rho_kg_m3
+    else:
+        d["chill_k_w_mk"] = 45.0
+        d["chill_cp_j_kgk"] = 460.0
+        d["chill_rho_kg_m3"] = 7850.0
+    return d
 
 
 def _solve_thermal_cpp(
@@ -489,14 +500,20 @@ def solve_3d_thermal(
     T = np.where(is_metal_c, alloy.t_pour_c, mold.t0_c).astype(np.float64)
     T0 = float(mold.t0_c)
 
-    # Treat a cooling sprue as a steel/cast-iron chill insert at the mould temperature.
-    # It extracts heat like a high-conductivity metal but never melts.
+    # Treat a cooling sprue as a chill insert at the mould temperature.
+    # Use explicit chill material properties when available, otherwise steel.
     if np.any(chill_mask_3d):
-        rho_chill = 7850.0
-        k_chill = 45.0
-        cp_chill = 460.0
+        if getattr(mold, "mold_type", "") == "chill":
+            k_chill = float(mold.k_w_mk)
+            cp_chill = float(mold.cp_j_kgk)
+            rho_chill = float(mold.rho_kg_m3)
+        else:
+            k_chill = 45.0
+            cp_chill = 460.0
+            rho_chill = 7850.0
         rho[chill_mask_3d.ravel()] = rho_chill
         k[chill_mask_3d] = k_chill
+        # cp_chill is applied to cp_eff each time step (see loop below).
         T[chill_mask_3d] = T0
 
     # Boundary mask: fixed-temperature outer shell

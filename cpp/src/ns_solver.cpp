@@ -636,7 +636,7 @@ private:
             double dt_visc = 0.2 * dx_ * dx_ / nu_;
             dt = std::min(dt, dt_visc);
         }
-        return dt;
+        return std::max(dt, 1e-6);
     }
 };
 

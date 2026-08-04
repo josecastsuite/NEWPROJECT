@@ -33,43 +33,45 @@ if(NOT Eigen3_FOUND)
 endif()
 
 # OpenVDB: prefer CMake config (vcpkg/conda), fallback to Linux -----
-set(JOSECAST_OPENVDB_FOUND FALSE)
-find_package(OpenVDB CONFIG QUIET)
-if(OpenVDB_FOUND)
-    set(JOSECAST_OPENVDB_FOUND TRUE)
-    set(JOSECAST_OPENVDB_TARGET OpenVDB::openvdb)
-    message(STATUS "OpenVDB found via CMake config")
-else()
-    find_library(OPENVDB_LIBRARY openvdb)
-    find_library(BLOSC_LIBRARY blosc)
-    find_library(BOOST_IOSTREAMS_LIBRARY boost_iostreams)
-    find_library(HALF_LIBRARY NAMES Half Half-2_5)
-    find_library(TBB_LIBRARY
-        NAMES libtbb.so.2 tbb
-        PATHS /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu
-        NO_DEFAULT_PATH
-    )
-    find_library(LOG4CPLUS_LIBRARY
-        NAMES log4cplus-2.0 log4cplus
-        PATHS /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu
-    )
-    if(NOT TBB_LIBRARY)
-        set(TBB_LIBRARY "/usr/lib/x86_64-linux-gnu/libtbb.so.2")
-    endif()
-    if(NOT LOG4CPLUS_LIBRARY)
-        set(LOG4CPLUS_LIBRARY "/lib/x86_64-linux-gnu/liblog4cplus-2.0.so.3")
-    endif()
-    if(OPENVDB_LIBRARY)
+if(NOT DEFINED JOSECAST_OPENVDB_FOUND)
+    set(JOSECAST_OPENVDB_FOUND FALSE)
+    find_package(OpenVDB CONFIG QUIET)
+    if(OpenVDB_FOUND)
         set(JOSECAST_OPENVDB_FOUND TRUE)
-        set(JOSECAST_OPENVDB_LIBS
-            ${OPENVDB_LIBRARY}
-            ${TBB_LIBRARY}
-            ${HALF_LIBRARY}
-            ${LOG4CPLUS_LIBRARY}
-            ${BOOST_IOSTREAMS_LIBRARY}
-            ${BLOSC_LIBRARY}
+        set(JOSECAST_OPENVDB_TARGET OpenVDB::openvdb)
+        message(STATUS "OpenVDB found via CMake config")
+    else()
+        find_library(OPENVDB_LIBRARY openvdb)
+        find_library(BLOSC_LIBRARY blosc)
+        find_library(BOOST_IOSTREAMS_LIBRARY boost_iostreams)
+        find_library(HALF_LIBRARY NAMES Half Half-2_5)
+        find_library(TBB_LIBRARY
+            NAMES libtbb.so.2 tbb
+            PATHS /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu
+            NO_DEFAULT_PATH
         )
-        message(STATUS "OpenVDB found via find_library: ${OPENVDB_LIBRARY}")
+        find_library(LOG4CPLUS_LIBRARY
+            NAMES log4cplus-2.0 log4cplus
+            PATHS /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu
+        )
+        if(NOT TBB_LIBRARY)
+            set(TBB_LIBRARY "/usr/lib/x86_64-linux-gnu/libtbb.so.2")
+        endif()
+        if(NOT LOG4CPLUS_LIBRARY)
+            set(LOG4CPLUS_LIBRARY "/lib/x86_64-linux-gnu/liblog4cplus-2.0.so.3")
+        endif()
+        if(OPENVDB_LIBRARY)
+            set(JOSECAST_OPENVDB_FOUND TRUE)
+            set(JOSECAST_OPENVDB_LIBS
+                ${OPENVDB_LIBRARY}
+                ${TBB_LIBRARY}
+                ${HALF_LIBRARY}
+                ${LOG4CPLUS_LIBRARY}
+                ${BOOST_IOSTREAMS_LIBRARY}
+                ${BLOSC_LIBRARY}
+            )
+            message(STATUS "OpenVDB found via find_library: ${OPENVDB_LIBRARY}")
+        endif()
     endif()
 endif()
 
@@ -108,7 +110,7 @@ include_directories(
     "${NANOFLANN_DIR}"
 )
 
-if(NOT OpenVDB_FOUND AND OPENVDB_LIBRARY)
+if(JOSECAST_OPENVDB_FOUND AND OPENVDB_LIBRARY AND NOT OpenVDB_FOUND)
     # The system libopenvdb on Ubuntu 22.04 was built against the old TBB ABI;
     # use the vendored TBB 2020 headers to match that ABI.
     set(JOSECAST_OLD_TBB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tbb2020")

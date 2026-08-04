@@ -37,15 +37,24 @@ def _find_core_module():
         if p not in sys.path:
             sys.path.insert(0, p)
 
-    # Try a normal import first (handles .so / matching .pyd already on path).
+    # Try the canonical package import first so we never load two copies of
+    # the same binary (nanobind type registration fails if the same .so is
+    # imported both as ``josecast_core`` and as ``core.josecast_core``).
     last_error = ""
+    try:
+        import core.josecast_core
+        return core.josecast_core, ""
+    except Exception as exc:
+        last_error = f"import core.josecast_core failed: {exc}"
+
+    # Legacy / development fallback: build tree or bare .so/.pyd on sys.path.
     try:
         import josecast_core
         return josecast_core, ""
     except Exception as exc:
-        last_error = f"import josecast_core failed: {exc}"
+        last_error += f"; import josecast_core failed: {exc}"
 
-    # Fallback: look for a .pyd/.so with a compatible ABI tag and load it
+    # Last resort: explicit file load.
     # explicitly. This helps when the pre-built Windows artifact name does not
     # match what a simple `import` expects.
     suffix = sysconfig.get_config_var("EXT_SUFFIX") or (

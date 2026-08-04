@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <queue>
 #include <vector>
@@ -119,6 +120,14 @@ nb::tuple solve_gating_times(
             if (reachable[ci] && --indeg[ci] == 0) {
                 q.push(ch.first);
             }
+        }
+    }
+
+    // Warn about cycles or disconnected reachable nodes that Kahn could not process.
+    for (size_t u = 0; u < n; ++u) {
+        if (reachable[u] && !std::isfinite(t_enter[u])) {
+            std::cerr << "[josecast_core] gating_tree: cycle detected around node "
+                      << u << "; graph has a loop.\n";
         }
     }
 

@@ -84,9 +84,10 @@ public:
     {
         n_ = static_cast<size_t>(nx_) * ny_ * nz_;
 
-        // Normalise gravity to a unit vector.
+        // Preserve the physical gravity magnitude; only normalize the direction.
         double gnorm = std::sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
-        if (gnorm < 1e-12) gnorm = 1.0;
+        if (gnorm < 1e-12) gnorm = 9.81;
+        g_mag_ = gnorm;
         gx_ = g[0] / gnorm;
         gy_ = g[1] / gnorm;
         gz_ = g[2] / gnorm;
@@ -94,6 +95,12 @@ public:
         // Time step: keep the lattice velocity below cfl_target_ for stability.
         double v = std::max(inflow_velocity_, 1e-6);
         dt_ = cfl_target_ * dx_ / v;
+        // Viscous diffusion limit: tau must stay close to the BGK stability
+        // window.  This is especially important for high-viscosity alloys.
+        if (nu_phys_ > 1e-12) {
+            double dt_visc = dx_ * dx_ / (6.0 * nu_phys_) * 0.2;
+            if (dt_visc < dt_) dt_ = dt_visc;
+        }
         int nsteps = static_cast<int>(std::ceil(t_max_ / dt_));
         if (nsteps > max_steps_ && max_steps_ > 0) {
             nsteps = max_steps_;
@@ -122,8 +129,12 @@ public:
         // A larger minimum relaxation time stabilises the pressure boundaries
         // and complex geometry.  Smagorinsky adds the turbulent viscosity in
         // high-shear regions, so the bulk is not over-damped.
-        tau_min_ = 0.9;
+        tau_min_ = 0.55;
         if (tau0_ < tau_min_) tau0_ = tau_min_;
+        if (tau0_ > 2.0) {
+            std::cerr << "[josecast_core] LBM warning: tau0=" << tau0_
+                      << " is very large; simulation is over-damped.\n";
+        }
 
         flags_.assign(n_, 0);
         for (size_t i = 0; i < n_; ++i) {
@@ -337,6 +348,7 @@ private:
     double cfl_target_, smag_const_;
     double tau0_, tau_min_;
     double gx_, gy_, gz_;
+    double g_mag_ = 9.81;
     double rho_in_ = 1.0;
     double u_in_target_ = 0.0;
     const double* target_velocity_ = nullptr;
@@ -509,7 +521,7 @@ private:
             // Keep the velocity within the lattice stability limit.  If it had
             // to be clipped, re-project the distribution to equilibrium.
             double u2 = ux_[i] * ux_[i] + uy_[i] * uy_[i] + uz_[i] * uz_[i];
-            const double umax = 0.45;
+            const double umax = 0.25;
             if (u2 > umax * umax) {
                 double s = umax / std::sqrt(u2);
                 ux_[i] *= s; uy_[i] *= s; uz_[i] *= s;
@@ -573,9 +585,9 @@ private:
             }
 
             double one_minus_half_omega = 1.0 - 0.5 / tau;
-            double f_body_x = gx_ * 9.81 * dt_ * dt_ / dx_;
-            double f_body_y = gy_ * 9.81 * dt_ * dt_ / dx_;
-            double f_body_z = gz_ * 9.81 * dt_ * dt_ / dx_;
+            double f_body_x = gx_ * g_mag_ * dt_ * dt_ / dx_;
+            double f_body_y = gy_ * g_mag_ * dt_ * dt_ / dx_;
+            double f_body_z = gz_ * g_mag_ * dt_ * dt_ / dx_;
 
             // Velocity relaxation: drive the velocity toward a target (e.g. from a
             // Darcy pressure solve).  If no target is supplied, fallback to the
@@ -640,38 +652,11 @@ private:
             }
         }
 
-        // 2. Half-way bounce-back for fluid cells adjacent to solids.
-        for (int x = 0; x < nx_; ++x) {
-            for (int y = 0; y < ny_; ++y) {
-                for (int z = 0; z < nz_; ++z) {
-                    size_t idx = cidx(x, y, z, ny_, nz_);
-                    if (flags_[idx] == 1) continue;
-                    if (flags_[idx] == 2 || flags_[idx] == 3) continue;
-                    double* fp = &f_new_[idx * Q];
-                    for (int q = 1; q < Q; ++q) {
-                        int nx2 = x + C[q][0];
-                        int ny2 = y + C[q][1];
-                        int nz2 = z + C[q][2];
-                        bool solid_neighbour = false;
-                        if (!in_cell(nx2, ny2, nz2, nx_, ny_, nz_)) {
-                            solid_neighbour = true;
-                        } else {
-                            size_t nidx = cidx(nx2, ny2, nz2, ny_, nz_);
-                            if (flags_[nidx] == 1) solid_neighbour = true;
-                        }
-                        if (solid_neighbour) {
-                            int opp = OPP[q];
-                            if (opp != q) {
-                                std::swap(fp[q], fp[opp]);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Streaming: only the fluid (cavity + inlets/outlets) need be processed.
-        for (size_t i : fluid_list_) {
+        // 2+3. Streaming with proper half-way bounce-back.  Distributions that
+        // would enter a solid cell are returned to the source cell in the
+        // opposite direction.  Distributions that leave the domain are discarded;
+        // for outlet cells this is the correct open-boundary outflow.
+        for (size_t i = 0; i < n_; ++i) {
             for (int q = 0; q < Q; ++q) f_[i * Q + q] = 0.0;
         }
         for (size_t idx = 0; idx < fluid_list_.size(); ++idx) {
@@ -685,10 +670,22 @@ private:
                 int tx = x + C[q][0];
                 int ty = y + C[q][1];
                 int tz = z + C[q][2];
-                if (!in_cell(tx, ty, tz, nx_, ny_, nz_)) continue;
+                bool outside = !in_cell(tx, ty, tz, nx_, ny_, nz_);
+                if (outside) {
+                    // Let distributions leave through outlets; bounce off true
+                    // domain walls (non-outlet cells at the grid boundary).
+                    if (flags_[s] == 3) continue;
+                    int opp = OPP[q];
+                    f_[s * Q + opp] += fp[q];
+                    continue;
+                }
                 size_t t = cidx(tx, ty, tz, ny_, nz_);
-                if (flags_[t] == 1) continue;
-                f_[t * Q + q] += fp[q];
+                if (flags_[t] == 1) {
+                    int opp = OPP[q];
+                    f_[s * Q + opp] += fp[q];
+                } else {
+                    f_[t * Q + q] += fp[q];
+                }
             }
         }
 

@@ -24,10 +24,19 @@ nb::tuple compute_sand_permeability(
     const size_t nz = sand_mask.shape(2);
     const size_t n = nx * ny * nz;
 
-    // Convert AFS grain fineness number to an average grain diameter [mm].
-    // AFS 50 -> ~0.28 mm, AFS 120 -> ~0.18 mm, which is in the foundry-sand
-    // ballpark.  Clamp to avoid nonsensical values.
-    double afs = std::max(1.0, afs_grain_size_mm);
+    // The parameter may be passed either as an AFS grain fineness number (>=5)
+    // or as an average grain diameter in mm (< 5).  Convert mm input to AFS
+    // via  AFS = (2.0 / d_mm)^2  so that the Kozeny-Carman formula below
+    // always receives an AFS number.
+    double afs;
+    if (afs_grain_size_mm < 5.0) {
+        // input is a grain diameter in mm
+        double d_mm = std::max(0.03, afs_grain_size_mm);
+        afs = (2.0 / d_mm) * (2.0 / d_mm);
+    } else {
+        afs = afs_grain_size_mm;
+    }
+    afs = std::max(1.0, afs);
     double grain_d_mm = 2.0 / std::sqrt(afs);
     if (grain_d_mm > 2.0) grain_d_mm = 2.0;
     if (grain_d_mm < 0.03) grain_d_mm = 0.03;
