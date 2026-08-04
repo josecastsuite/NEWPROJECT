@@ -261,9 +261,21 @@ def compute_analytic_flow_velocity(
     q_total = float(getattr(flow, "Q_m3_s", 0.0))
     cfg = EngineConfig(sample_spacing_mm=max(dx_mm, 1.0))
     engine = GateVelocityEngine(cfg)
+
+    casting_params = getattr(result, "casting_params", None)
+    user_velocity_m_s = float(getattr(casting_params, "ingate_velocity_m_s", 0.0) or 0.0)
+    velocity_section_key = getattr(casting_params, "velocity_section_key", None)
+
     try:
         velocity, _colors = engine.compute(
-            bodies, body_index, origin_mm, dx_mm, nodes, q_total
+            bodies,
+            body_index,
+            origin_mm,
+            dx_mm,
+            nodes,
+            q_total,
+            user_velocity_m_s=user_velocity_m_s,
+            velocity_section_key=velocity_section_key,
         )
     except Exception as exc:
         print(f"[cpp_bridge] V8.1 gate velocity engine failed: {exc}", file=sys.stderr)

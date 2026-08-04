@@ -9,6 +9,7 @@ labels.
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -17,6 +18,7 @@ import pyvista as pv
 import shapely.geometry as geom
 import shapely.ops as ops
 import trimesh
+from scipy.ndimage import median_filter
 from scipy.spatial.distance import cdist
 
 from core import josecast_core
@@ -62,6 +64,7 @@ class Section:
     normal: np.ndarray
     area_mm2: float
     r_eff_mm: float
+    theta_deg: float = 0.0
 
 
 class MeshAnalyzer:
@@ -381,9 +384,26 @@ class SkeletonAnalysisEngineV8_1:
             # Far loops are also ignored as isolated artifacts.
         return kept
 
-    def compute_section(self, s_mm: float, point: np.ndarray, normal: np.ndarray) -> Section:
-        slice_pd = self.mesh.slice_at_plane(point, normal)
-        rings = self.section_loops(slice_pd, normal)
+    def compute_section(self, s_mm: float, point: np.ndarray, normal: np.ndarray, tangent: Optional[np.ndarray] = None) -> Section:
+        # The slice plane normal should equal the local centreline tangent.  If
+        # smoothing/resampling has drifted, project the raw area back onto the
+        # plane perpendicular to the true flow direction: A_true = A_raw * cos(theta).
+        t = tangent if tangent is not None else normal
+        n = np.asarray(normal, dtype=float)
+        n_norm = float(np.linalg.norm(n))
+        if n_norm < 1e-12:
+            raise VelocityEngineError(f"Zero section normal at s={s_mm:.2f}")
+        n = n / n_norm
+        t_norm = float(np.linalg.norm(t))
+        if t_norm < 1e-12:
+            t = n
+        else:
+            t = np.asarray(t, dtype=float) / t_norm
+        cos_theta = float(np.clip(np.abs(np.dot(n, t)), 1e-6, 1.0))
+        theta_deg = math.degrees(math.acos(cos_theta))
+
+        slice_pd = self.mesh.slice_at_plane(point, n)
+        rings = self.section_loops(slice_pd, n)
         if not rings:
             raise ZeroAreaError(f"Empty cross-section at s={s_mm:.2f}")
 
@@ -396,20 +416,22 @@ class SkeletonAnalysisEngineV8_1:
 
         # Effective radius from the unioned section area.
         union = ops.unary_union(rings)
-        area = float(union.area)
-        if area <= 1e-12:
+        area_raw = float(union.area)
+        if area_raw <= 1e-12:
             raise ZeroAreaError(f"Zero union section area at s={s_mm:.2f}")
 
+        # Project the measured area onto the plane perpendicular to the flow.
+        area = area_raw * cos_theta
         r_eff = math.sqrt(area / math.pi)
         if math.isnan(r_eff) or math.isinf(r_eff) or r_eff <= 0.0:
             raise InvalidRadiusError(f"Invalid effective radius {r_eff} at s={s_mm:.2f}")
 
         kept_rings = self.evaluate_loops(list(union.geoms) if union.geom_type == "MultiPolygon" else [union], r_eff)
-        kept_area = sum(r.area for r in kept_rings)
+        kept_area = sum(r.area for r in kept_rings) * cos_theta
         if kept_area <= 1e-12:
             raise ZeroAreaError(f"Kept loop area is zero at s={s_mm:.2f}")
 
-        return Section(s_mm=s_mm, point=point.copy(), normal=normal.copy(), area_mm2=kept_area, r_eff_mm=r_eff)
+        return Section(s_mm=s_mm, point=point.copy(), normal=n.copy(), area_mm2=kept_area, r_eff_mm=r_eff, theta_deg=theta_deg)
 
     def build_sections(self, points: np.ndarray, tangents: np.ndarray) -> List[Section]:
         sections: List[Section] = []
@@ -419,7 +441,7 @@ class SkeletonAnalysisEngineV8_1:
                 raise VelocityEngineError(f"Zero tangent at sample {i}")
             n = t / norm
             try:
-                sec = self.compute_section(float(i) * self.cfg.sample_spacing_mm, p, n)
+                sec = self.compute_section(float(i) * self.cfg.sample_spacing_mm, p, n, tangent=t)
                 sections.append(sec)
             except VelocityEngineError:
                 raise
@@ -427,7 +449,14 @@ class SkeletonAnalysisEngineV8_1:
 
 
 class GateVelocityEngine:
-    """Multi-body orchestrator that builds one velocity array for the whole grid."""
+    """Multi-body orchestrator that builds one velocity array for the whole grid.
+
+    The engine extracts a centreline for each gate body, slices the original CAD
+    mesh perpendicular to the local centreline tangent, and computes
+    v(s) = Q_body / A_true(s).  Q is propagated from the source using an
+    area-weighted split at every junction; source Q comes from the user velocity
+    and the measured source entry area.
+    """
 
     def __init__(self, cfg: EngineConfig = None):
         self.cfg = cfg or EngineConfig()
@@ -440,118 +469,267 @@ class GateVelocityEngine:
         dx_mm: float,
         gating_nodes: Sequence[Any],
         Q_total_m3_s: float,
+        user_velocity_m_s: Optional[float] = None,
+        velocity_section_key: Optional[str] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         grid_shape = body_index.shape
         velocity = np.zeros(grid_shape, dtype=np.float64)
-        colors = np.zeros((velocity.size, 3), dtype=np.uint8)
 
-        # Body index -> upstream/downstream Q.
-        body_Q = self._body_flow_rates(bodies, gating_nodes, Q_total_m3_s)
-
+        # First pass: centreline + sections for every gate body.
+        name_to_idx = {b.name: i for i, b in enumerate(bodies)}
+        body_sections: Dict[int, List[Section]] = {}
+        body_entry_area_mm2: Dict[int, float] = {}
         for bidx, body in enumerate(bodies):
+            if not self._is_gate(body):
+                continue
+            sections = self._extract_sections(body)
+            if not sections:
+                continue
+            body_sections[bidx] = sections
+            body_entry_area_mm2[bidx] = float(sections[0].area_mm2)
+
+        if not body_sections:
+            raise VelocityEngineError("No gate body cross-sections could be computed")
+
+        # Identify source body from the SOURCE gating node.
+        source_bidx, source_node = self._find_source_body(bodies, gating_nodes, body_sections)
+        source_sections = body_sections[source_bidx]
+        # The user-entered velocity is at the choke/minimum section of the source.
+        source_A_mm2 = float(min(float(s.area_mm2) for s in source_sections))
+        source_A_m2 = source_A_mm2 * 1e-6
+        if source_A_m2 <= 1e-18:
+            raise VelocityEngineError(f"Source body {bodies[source_bidx].name} has zero minimum area")
+
+        # Source velocity: user input has absolute priority when the velocity
+        # reference section is compatible with the source body type.
+        source_v = 0.0
+        user_v = float(user_velocity_m_s) if user_velocity_m_s is not None and user_velocity_m_s > 1e-12 else 0.0
+        if user_v > 0 and velocity_section_key is not None:
+            src_type = bodies[source_bidx].body_type.name
+            allowed = self._source_types_for_section(velocity_section_key)
+            if src_type in allowed:
+                source_v = user_v
+            elif source_node is not None:
+                node_down_type = (getattr(source_node, "body_type", "") or "").split("→")[-1].strip()
+                if node_down_type in allowed:
+                    source_v = user_v
+        if source_v <= 1e-12 and source_node is not None:
+            source_v = float(getattr(source_node, "velocity_m_s", 0.0) or 0.0)
+        if source_v <= 1e-12 and Q_total_m3_s > 1e-18:
+            source_v = Q_total_m3_s / source_A_m2
+        if source_v <= 1e-12:
+            raise VelocityEngineError("Cannot determine source velocity")
+
+        Q_total_m3_s = source_v * source_A_m2
+
+        # Propagate Q with an area-weighted split at junctions.
+        body_Q = self._distribute_q(
+            bodies, gating_nodes, name_to_idx, body_sections, source_bidx, Q_total_m3_s
+        )
+
+        # Second pass: v(s) = Q / A_true(s) per body and per section.
+        for bidx, sections in body_sections.items():
             q_m3_s = body_Q.get(bidx, 0.0)
             if q_m3_s <= 1e-18:
                 continue
 
-            analyzer = MeshAnalyzer(
-                np.asarray(body.mesh.vertices, dtype=float),
-                np.asarray(body.mesh.faces, dtype=int),
-                name=body.name,
-            )
-            engine = SkeletonAnalysisEngineV8_1(analyzer, self.cfg)
-
-            try:
-                pts, eds = josecast_core.extract_skeleton(
-                    analyzer.pv.points.astype(np.float64),
-                    analyzer.tm.faces.astype(np.int32),
-                    True,
-                )
-                if pts.shape[0] < 2:
-                    continue
-                # Spur pruning is intentionally conservative: a simple path
-                # (line/cycle skeleton) is preserved, only true short side
-                # branches are removed.
-                pts, eds = engine.prune_skeleton_spurs(pts, eds, self.cfg.alpha_spur)
-                if pts.shape[0] < 2:
-                    continue
-                path = engine.longest_path(pts, eds)
-                if path.shape[0] < 2:
-                    continue
-                path = engine.resample_and_smooth_curve(path)
-                tangents = engine.compute_tangents(path)
-                sections = engine.build_sections(path, tangents)
-            except Exception as exc:
-                print(f"[GATE_VELOCITY] {body.name}: {exc}", flush=True)
-                continue
-
-            if not sections:
-                continue
-
             s_vals = np.array([sec.s_mm for sec in sections])
-            a_vals = np.array([sec.area_mm2 for sec in sections])
-            v_vals = q_m3_s / (a_vals * 1e-6)  # mm2 -> m2
+            a_raw = np.array([sec.area_mm2 for sec in sections])
+            a_smooth = self._smooth_area_profile(a_raw, dx_mm)
+
+            v_vals = q_m3_s / (a_smooth * 1e-6)  # mm2 -> m2
             if (
                 np.any(np.isnan(v_vals))
                 or np.any(np.isinf(v_vals))
                 or np.any(v_vals <= 1e-12)
             ):
                 raise VelocityEngineError(
-                    f"{body.name}: unphysical velocity values computed from sections"
+                    f"{bodies[bidx].name}: unphysical velocity values computed from sections"
                 )
 
+            # Per-s debug log.
+            print(f"[GATE_VELOCITY] {bodies[bidx].name} Q={q_m3_s:.6e} m3/s", flush=True)
+            for sec, a_sm, v in zip(sections, a_smooth, v_vals):
+                print(
+                    f"  s={sec.s_mm:7.2f} A_raw_mm2={sec.area_mm2:10.3f} "
+                    f"theta_deg={sec.theta_deg:6.2f} A_true_m2={a_sm*1e-6:12.9f} "
+                    f"Q={q_m3_s:.6e} v={v:8.4f}",
+                    flush=True,
+                )
+
+            path = np.array([sec.point for sec in sections])
+            tangents = np.array([sec.normal for sec in sections])
             mask = body_index == bidx
             if not mask.any():
                 continue
             coords = _voxel_coords(mask, origin_mm, dx_mm)
-
-            # Map each voxel to the closest centerline segment by perpendicular
-            # distance, then evaluate v(s) at the projected arc-length.
             values = self._map_to_centerline(coords, path, s_vals, v_vals, tangents)
             velocity[mask] = values
 
-        # Global min/max for colour scale (exclude zero).
+        # Global colour scale (exclude zero/unphysical).
         nonzero = velocity[velocity > 1e-12]
         v_min = float(nonzero.min()) if nonzero.size else 0.0
         v_max = float(nonzero.max()) if nonzero.size else 1.0
         colors = self._colorize(velocity.ravel(), v_min, v_max)
-
-        # Make sure the rendered color array is per-voxel in the 3-D grid shape.
         color_grid = colors.reshape((*grid_shape, 3))
         return velocity, color_grid
 
-    def _body_flow_rates(self, bodies, gating_nodes, Q_total_m3_s) -> Dict[int, float]:
-        body_Q: Dict[int, float] = {}
+    def _is_gate(self, body: Body) -> bool:
+        return getattr(body, "body_type", BodyType.PART) in _GATING_BODY_TYPES
+
+    def _source_types_for_section(self, section_key: str) -> set:
+        key = (section_key or "SPRUE_THROAT").upper()
+        return {
+            "SPRUE": {"SPRUE", "SPRUE_THROAT", "POURING_BASIN"},
+            "SPRUE_BASE": {"SPRUE", "POURING_BASIN"},
+            "SPRUE_THROAT": {"SPRUE_THROAT", "SPRUE", "POURING_BASIN"},
+            "POURING_BASIN": {"POURING_BASIN", "SPRUE"},
+            "RUNNER": {"RUNNER", "DISTRIBUTOR", "SPRUE"},
+            "DISTRIBUTOR": {"DISTRIBUTOR", "RUNNER", "SPRUE"},
+            "CURUFLUK": {"CURUFLUK"},
+            "FILTER": {"FILTER"},
+            "INGATE": {"INGATE", "RUNNER", "DISTRIBUTOR"},
+        }.get(key, {"SPRUE_THROAT", "SPRUE", "POURING_BASIN"})
+
+    def _extract_sections(self, body: Body) -> List[Section]:
+        analyzer = MeshAnalyzer(
+            np.asarray(body.mesh.vertices, dtype=float),
+            np.asarray(body.mesh.faces, dtype=int),
+            name=body.name,
+        )
+        engine = SkeletonAnalysisEngineV8_1(analyzer, self.cfg)
+
+        pts, eds = josecast_core.extract_skeleton(
+            analyzer.pv.points.astype(np.float64),
+            analyzer.tm.faces.astype(np.int32),
+            True,
+        )
+        if pts.shape[0] < 2:
+            raise VelocityEngineError(f"{body.name}: skeleton has <2 points")
+        pts, eds = engine.prune_skeleton_spurs(pts, eds, self.cfg.alpha_spur)
+        if pts.shape[0] < 2:
+            raise VelocityEngineError(f"{body.name}: skeleton pruned away")
+        path = engine.longest_path(pts, eds)
+        if path.shape[0] < 2:
+            raise VelocityEngineError(f"{body.name}: longest path has <2 points")
+        path = engine.resample_and_smooth_curve(path)
+        tangents = engine.compute_tangents(path)
+        sections = engine.build_sections(path, tangents)
+        if not sections:
+            raise VelocityEngineError(f"{body.name}: no sections computed")
+        return sections
+
+    def _find_source_body(
+        self,
+        bodies: Sequence[Body],
+        gating_nodes: Sequence[Any],
+        body_sections: Dict[int, List[Section]],
+    ) -> Tuple[int, Any]:
         name_to_idx = {b.name: i for i, b in enumerate(bodies)}
-
-        # Source node.
+        source_node = None
+        source_name = None
         for node in gating_nodes:
-            if "→" not in getattr(node, "body_type", ""):
+            bt = getattr(node, "body_type", "") or ""
+            if "→" not in bt:
                 continue
-            up, down = [s.strip() for s in node.body_type.split("→", 1)]
+            up, _ = [s.strip() for s in bt.split("→", 1)]
             if up.startswith("SOURCE"):
-                down_name = getattr(node, "name", "").split("→", 1)[-1].strip()
-                bidx = name_to_idx.get(down_name)
-                if bidx is not None:
-                    body_Q[bidx] = max(body_Q.get(bidx, 0.0), float(node.flow_rate_m3_s))
+                nm = getattr(node, "name", "") or ""
+                if "→" in nm:
+                    source_name = nm.split("→", 1)[-1].strip()
+                source_node = node
+                break
 
-        # Every downstream body receives the flow from its upstream edge.
+        if source_name is not None and source_name in name_to_idx:
+            bidx = name_to_idx[source_name]
+            if bidx in body_sections:
+                return bidx, source_node
+
+        # Fallback: first gate body with sections.
+        first_bidx = sorted(body_sections.keys())[0]
+        return first_bidx, source_node
+
+    def _distribute_q(
+        self,
+        bodies: Sequence[Body],
+        gating_nodes: Sequence[Any],
+        name_to_idx: Dict[str, int],
+        body_sections: Dict[int, List[Section]],
+        source_bidx: int,
+        Q_total_m3_s: float,
+    ) -> Dict[int, float]:
+        # Build directed graph from gating node names: "Body_A -> Body_B".
+        children: Dict[int, List[int]] = {bidx: [] for bidx in body_sections}
         for node in gating_nodes:
-            name = getattr(node, "name", "")
+            name = getattr(node, "name", "") or ""
             if "→" not in name:
                 continue
             up_name, down_name = [s.strip() for s in name.split("→", 1)]
             if up_name == "Kaynak":
                 continue
-            bidx = name_to_idx.get(down_name)
-            if bidx is None:
+            up_idx = name_to_idx.get(up_name)
+            down_idx = name_to_idx.get(down_name)
+            if up_idx is None or down_idx is None:
                 continue
-            q = float(node.flow_rate_m3_s)
-            body_Q[bidx] = max(body_Q.get(bidx, 0.0), q)
+            if up_idx not in body_sections or down_idx not in body_sections:
+                continue
+            if down_idx not in children[up_idx]:
+                children[up_idx].append(down_idx)
 
-        # If nothing found, the source body gets the total Q.
-        if not body_Q and bodies:
-            body_Q[0] = Q_total_m3_s
+        body_Q: Dict[int, float] = {bidx: 0.0 for bidx in body_sections}
+        body_Q[source_bidx] = Q_total_m3_s
+
+        # BFS from source, area-weighted split at each junction.
+        visited = {source_bidx}
+        queue = deque([source_bidx])
+        while queue:
+            parent = queue.popleft()
+            childs = children.get(parent, [])
+            if not childs:
+                continue
+            A_entries = np.array(
+                [body_sections[c][0].area_mm2 * 1e-6 for c in childs], dtype=np.float64
+            )
+            A_total = float(A_entries.sum())
+            if A_total <= 1e-18:
+                raise VelocityEngineError(
+                    f"Parent {bodies[parent].name} has children with zero entry area"
+                )
+            Q_parent = body_Q.get(parent, 0.0)
+            Q_children = Q_parent * A_entries / A_total
+            # Mass conservation guard.
+            if abs(float(Q_children.sum()) - Q_parent) > 1e-6 * max(abs(Q_parent), 1e-18):
+                raise VelocityEngineError(
+                    f"Mass conservation failed at {bodies[parent].name}: "
+                    f"sum(Q_children)={float(Q_children.sum()):.6e} != Q_parent={Q_parent:.6e}"
+                )
+            for c, q_c in zip(childs, Q_children):
+                body_Q[c] += float(q_c)
+                if c not in visited:
+                    visited.add(c)
+                    queue.append(c)
+
         return body_Q
+
+    def _smooth_area_profile(self, a: np.ndarray, dx_mm: float) -> np.ndarray:
+        """Median-area clamp guard: removes single-point radius/area spikes
+        while preserving real geometric steps.
+        """
+        if a.size < 3:
+            return a
+        a_med = median_filter(a, size=3, mode="nearest")
+        r = np.sqrt(np.maximum(a, 0.0) / math.pi)
+        r_med = np.sqrt(np.maximum(a_med, 0.0) / math.pi)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            spike = (r > 2.0 * r_med) | (
+                (r < 0.5 * dx_mm) & (r_med > dx_mm)
+            ) | (
+                (r > 0.0) & (r_med > 0.0) & (r < 0.5 * r_med)
+            )
+        spike = np.nan_to_num(spike, copy=False, nan=False).astype(bool)
+        a_out = a.copy()
+        a_out[spike] = a_med[spike]
+        return a_out
 
     def _map_to_centerline(
         self,
@@ -566,18 +744,14 @@ class GateVelocityEngine:
         if n < 2:
             return np.zeros(coords.shape[0])
 
-        # Segment data.
         seg = path[1:] - path[:-1]
         seg_len = np.linalg.norm(seg, axis=1)
         seg_len[seg_len == 0] = 1e-12
         seg_unit = seg / seg_len[:, None]
-
-        # Accumulated arc length along path.
         s_cum = np.concatenate([[0.0], np.cumsum(seg_len)])
 
         out = np.zeros(coords.shape[0], dtype=float)
         for i, p in enumerate(coords):
-            # Project onto each segment, clamp to [0,1].
             rel = p - path[:-1]
             t = np.einsum("ij,ij->i", rel, seg_unit)
             t = np.clip(t, 0.0, seg_len)
@@ -586,7 +760,6 @@ class GateVelocityEngine:
             best = int(np.argmin(dist))
             s_local = t[best]
             s = s_cum[best] + s_local
-            # Interpolate velocity from the section profile.
             v = float(np.interp(s, s_vals, v_vals))
             out[i] = v
         return out

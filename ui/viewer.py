@@ -888,8 +888,7 @@ class Analyzer3DViewer(QtInteractor):
                 print(f"[viewer] analytic flow field failed: {exc}")
 
         if scalar_arr is None:
-            scalar_arr = self._flow_velocity_from_nodes(result, gate_mask)
-        if scalar_arr is None:
+            print("[viewer] analytic flow field unavailable; not painting flow velocity")
             return
 
         velocity_mask = (scalar_arr > 1e-12) | gate_mask
@@ -926,9 +925,15 @@ class Analyzer3DViewer(QtInteractor):
         if surf.n_cells == 0:
             return
 
-        v_max = float(np.nanmax(scalar_arr[velocity_mask])) if velocity_mask.any() else 1.0
-        if not np.isfinite(v_max) or v_max <= 0:
-            v_max = 1.0
+        # Fixed 0-5 m/s colour scale with percentile cap to avoid single spikes
+        # washing the whole image.  Exact velocities are still shown in labels.
+        if velocity_mask.any():
+            v_p99 = float(np.nanpercentile(scalar_arr[velocity_mask], 99.5))
+        else:
+            v_p99 = 0.0
+        if not np.isfinite(v_p99) or v_p99 <= 0:
+            v_p99 = 5.0
+        v_max = max(5.0, min(v_p99, 20.0))
         clim = (0.0, v_max)
 
         self._flow_actor = self.add_mesh(
@@ -1014,9 +1019,9 @@ class Analyzer3DViewer(QtInteractor):
                 v = node.velocity_m_s
             else:
                 v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
-            if v > 1e-12:
-                label_points.append(node.centroid_mm)
-                label_texts.append(f"{v:.2f} m/s")
+            # No fallback to node velocity: labels must come from the same bulk
+            # velocity_magnitude array used by show_flow_velocity.
+            continue
 
         if label_points:
             label_points = np.asarray(label_points, dtype=np.float64)
