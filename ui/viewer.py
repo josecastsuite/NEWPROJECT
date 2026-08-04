@@ -6,6 +6,7 @@ import numpy as np
 import pyvista as pv
 from PyQt6 import QtCore, QtWidgets
 from pyvistaqt import QtInteractor
+from scipy.spatial import cKDTree
 
 from core.gating import (
     _characteristic_cross_section_area,
@@ -729,14 +730,117 @@ class Analyzer3DViewer(QtInteractor):
         self._niyama_actors.append(actor)
         self._arrange_scalar_bars()
 
-    def show_flow_velocity(self, result: Optional[AnalysisResult]):
-        """Paint the entire gating system with the physically correct velocity.
+    @staticmethod
+    def _build_gating_branches(nodes: List) -> List[List]:
+        """Return every source -> ingate path as a list of gating nodes."""
+        if not nodes:
+            return []
+        down_to_node: Dict[str, Any] = {}
+        source_node: Optional[Any] = None
+        for n in nodes:
+            name = getattr(n, "name", "")
+            if " → " not in name:
+                continue
+            up, down = name.split(" → ", 1)
+            if up == "Kaynak":
+                source_node = n
+            down_to_node[down] = n
+        if source_node is None:
+            source_node = nodes[0]
+        up_names = {n.name.split(" → ", 1)[0] for n in nodes if " → " in getattr(n, "name", "")}
+        leaves = [
+            n
+            for n in nodes
+            if n is not source_node and " → " in getattr(n, "name", "") and n.name.split(" → ", 1)[1] not in up_names
+        ]
+        branches: List[List] = []
+        for leaf in leaves:
+            path = [leaf]
+            while True:
+                up = path[0].name.split(" → ", 1)[0]
+                if up == "Kaynak" or up not in down_to_node:
+                    break
+                path.insert(0, down_to_node[up])
+            branches.append(path)
+        if not branches:
+            branches = [[source_node] + [n for n in nodes if n is not source_node]]
+        return branches
 
-        Görsellik güzel ama en önemli şey hızların %100 doğru olması.
-        Her gate gövdesi, 3-B gate mesh / Darcy-Forchheimer çözümünden gelen
-        kesit ortalama hızı (Q / A) ile boyanır. Böylece renk, o gövdenin
-        gerçek akış hızını yansıtır. Hücresel Darcy |v| = sqrt(vx^2+vy^2+vz^2)
-        sadece gate mesh verisi yoksa yedek olarak kullanılır.
+    def _flow_section_scalars(
+        self, result: AnalysisResult, gate_mask: np.ndarray
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], bool]:
+        """Map each gate voxel to the nearest gating-node edge section.
+
+        This is independent of how many bodies the user drew: one body can
+        contain several runner branches and each branch/section still gets its
+        own ID and velocity from the directed gating-node graph.
+        """
+        fr = result.flow_result
+        nodes = getattr(fr, "gating_nodes", None) or []
+        if not nodes:
+            return None, None, False
+        branches = self._build_gating_branches(nodes)
+        if not branches:
+            return None, None, False
+
+        # Collect unique edges (up, down) from every branch.
+        edges: List[Tuple[Any, Any]] = []
+        seen: set = set()
+        for branch in branches:
+            for up, down in zip(branch[:-1], branch[1:]):
+                key = (up.name, down.name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                edges.append((up, down))
+        if not edges:
+            return None, None, False
+
+        ref_points: List[np.ndarray] = []
+        ref_ids: List[int] = []
+        ref_vel: List[float] = []
+        for section_id, (up, down) in enumerate(edges):
+            p0 = np.asarray(up.centroid_mm, dtype=np.float64)
+            p1 = np.asarray(down.centroid_mm, dtype=np.float64)
+            dist = float(np.linalg.norm(p1 - p0))
+            n_pts = max(2, int(np.ceil(dist / (result.dx_mm * 0.5))) + 1)
+            pts = np.linspace(p0, p1, n_pts)
+            v = float(down.velocity_m_s) if down.velocity_m_s > 1e-12 else float(up.velocity_m_s)
+            for p in pts:
+                ref_points.append(p)
+                ref_ids.append(section_id)
+                ref_vel.append(v)
+
+        if not ref_points:
+            return None, None, False
+        ref_points_arr = np.asarray(ref_points, dtype=np.float64)
+        ref_ids_arr = np.asarray(ref_ids, dtype=np.int32)
+        ref_vel_arr = np.asarray(ref_vel, dtype=np.float64)
+
+        tree = cKDTree(ref_points_arr)
+        indices = np.argwhere(gate_mask)
+        if indices.size == 0:
+            return None, None, False
+        centers = (indices + 0.5) * result.dx_mm + result.origin_mm
+        try:
+            _, nearest = tree.query(centers, k=1, workers=-1)
+        except TypeError:
+            _, nearest = tree.query(centers, k=1)
+        nearest = np.asarray(nearest, dtype=np.int64)
+
+        section_id_arr = np.full(result.grid.shape, -1, dtype=np.int32)
+        section_vel_arr = np.zeros(result.grid.shape, dtype=np.float64)
+        section_id_arr[tuple(indices.T)] = ref_ids_arr[nearest]
+        section_vel_arr[tuple(indices.T)] = ref_vel_arr[nearest]
+        return section_id_arr, section_vel_arr, True
+
+    def show_flow_velocity(self, result: Optional[AnalysisResult]):
+        """Paint the gating system by flow section.
+
+        Each segment between two consecutive gating nodes gets its own colour,
+        so every cross-section/branch change is visible regardless of how the
+        user grouped bodies.  The section velocity is taken from the downstream
+        gating node (Q/A at that throat).
         """
         if self._flow_actor is not None:
             self.remove_actor(self._flow_actor)
@@ -744,24 +848,59 @@ class Analyzer3DViewer(QtInteractor):
         self._remove_scalar_bar("Akış hızı (m/s)")
         if result is None or result.flow_result is None:
             return
-        fr = result.flow_result
-        vmag = fr.velocity_magnitude
-        if vmag is None or vmag.size == 0:
-            return
 
-        # Prefer the section-averaged velocity (Q/A) from the 3-D gate mesh.
-        # It is physically consistent and free of local Darcy/LBM spikes.
         gate_types = [
             BodyType.SPRUE_THROAT,
             BodyType.SPRUE,
             BodyType.RUNNER,
             BodyType.DISTRIBUTOR,
+            BodyType.CURUFLUK,
             BodyType.INGATE,
             BodyType.POURING_BASIN,
             BodyType.COOLING_SPRUE,
             BodyType.FILTER,
         ]
         gate_mask = np.isin(result.grid, gate_types)
+        section_id_arr, _, ok = self._flow_section_scalars(result, gate_mask)
+        if not ok or section_id_arr is None:
+            self._show_flow_velocity_body_based(result, gate_mask)
+            return
+
+        grid = pv.ImageData()
+        grid.dimensions = np.array(result.grid.shape) + 1
+        grid.origin = result.origin_mm
+        grid.spacing = (result.dx_mm, result.dx_mm, result.dx_mm)
+        grid.cell_data["section_id"] = section_id_arr.ravel(order="F")
+        grid.cell_data["is_gate"] = gate_mask.astype(np.float64).ravel(order="F")
+        gate = grid.threshold([1.0, 1.0], scalars="is_gate")
+        if gate.n_cells == 0:
+            return
+        surf = self._smooth_surface(gate)
+        if surf.n_cells == 0:
+            return
+
+        n_sections = int(np.max(section_id_arr)) + 1
+        vmax = max(1, n_sections - 1)
+        self._flow_actor = self.add_mesh(
+            surf,
+            scalars="section_id",
+            cmap="turbo",
+            opacity=1.0,
+            clim=[0.0, float(vmax)],
+            show_scalar_bar=False,
+            smooth_shading=True,
+            ambient=0.55,
+            diffuse=0.45,
+            specular=0.05,
+            specular_power=1.0,
+        )
+
+    def _show_flow_velocity_body_based(self, result: AnalysisResult, gate_mask: np.ndarray):
+        """Fallback body-based velocity colouring when no gating-node graph is present."""
+        fr = result.flow_result
+        vmag = fr.velocity_magnitude
+        if vmag is None or vmag.size == 0:
+            return
         body_vmag = np.zeros_like(vmag, dtype=np.float64)
         body_velocities: Dict[str, float] = {}
 
@@ -771,7 +910,6 @@ class Analyzer3DViewer(QtInteractor):
                 if v > 1e-12:
                     body_velocities[body_name] = v
 
-        # Fallback from the gating node network where a body lacks a mesh result.
         for node in getattr(fr, "gating_nodes", []):
             if "→" not in getattr(node, "name", ""):
                 continue
@@ -791,8 +929,9 @@ class Analyzer3DViewer(QtInteractor):
                     mask = (self._body_index == body.index) & gate_mask
                     body_vmag[mask] = v
 
-        # Any gate cell still without a body-level value uses the local Darcy |v|.
-        body_vmag = np.where((body_vmag == 0) & gate_mask & (vmag > 0) & np.isfinite(vmag), vmag, body_vmag).astype(np.float32)
+        body_vmag = np.where(
+            (body_vmag == 0) & gate_mask & (vmag > 0) & np.isfinite(vmag), vmag, body_vmag
+        ).astype(np.float32)
 
         grid = self._make_grid(result, body_vmag, "velocity_magnitude")
         gate = self._gate_only(grid)
@@ -808,7 +947,6 @@ class Analyzer3DViewer(QtInteractor):
             v_max = float(np.nanmax(gate_vals))
             if v_max <= v_min:
                 v_max = v_min + 0.1
-            # Full range so every distinct section velocity gets a different colour.
             clim = (0.0, v_max * 1.05)
         else:
             clim = (0.0, 1.0)
@@ -822,11 +960,15 @@ class Analyzer3DViewer(QtInteractor):
             show_scalar_bar=True,
             scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.02, 0.02), clim=clim),
             smooth_shading=True,
+            ambient=0.55,
+            diffuse=0.45,
+            specular=0.05,
+            specular_power=1.0,
         )
         self._arrange_scalar_bars()
 
     def show_flow_node_labels(self, result: Optional[AnalysisResult]):
-        """Add numeric velocity labels at the source inlet and each ingate-part entry."""
+        """Add numeric velocity labels at every gating node/section."""
         if self._flow_node_actor is not None:
             self.remove_actor(self._flow_node_actor)
             self._flow_node_actor = None
@@ -837,15 +979,8 @@ class Analyzer3DViewer(QtInteractor):
         label_points: List[Tuple[float, float, float]] = []
         label_texts: List[str] = []
 
-        has_source = any("→" in n.body_type and n.body_type.split("→")[0].strip() == "SOURCE" for n in nodes)
-
         for node in nodes:
-            if "→" not in node.name or "→" not in node.body_type:
-                continue
-            up_type, down_type = (p.strip() for p in node.body_type.split("→"))
-            is_ingate_entry = down_type == "PART"
-            is_inlet = up_type == "SOURCE" or (not has_source and up_type == "SPRUE_THROAT")
-            if not (is_ingate_entry or is_inlet):
+            if " → " not in getattr(node, "name", ""):
                 continue
             v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
             if v > 1e-12:

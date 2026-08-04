@@ -612,7 +612,7 @@ class MainWindow(QtWidgets.QMainWindow):
         vis_layout.addWidget(self.niyama_toggle)
 
         self.flow_lines_toggle = QtWidgets.QCheckBox("Akış Hızı")
-        self.flow_lines_toggle.setToolTip("Gate elemanlarını Darcy hızıyla boya, giriş ve meme hızı etiketlerini göster")
+        self.flow_lines_toggle.setToolTip("Gate elemanlarını akış kesitlerine göre boya; her kesit farklı renk, düğüm hızları etiket olarak gösterilir")
         self.flow_lines_toggle.setChecked(True)
         self.flow_lines_toggle.toggled.connect(self.on_toggle_flow_velocity)
         vis_layout.addWidget(self.flow_lines_toggle)
