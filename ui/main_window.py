@@ -611,12 +611,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.niyama_toggle.toggled.connect(self.on_toggle_niyama)
         vis_layout.addWidget(self.niyama_toggle)
 
-        self.flow_lines_toggle = QtWidgets.QCheckBox("Akış Hızı")
-        self.flow_lines_toggle.setToolTip("Gate elemanlarını akış kesitlerine göre boya; her kesit farklı renk, düğüm hızları etiket olarak gösterilir")
-        self.flow_lines_toggle.setChecked(True)
-        self.flow_lines_toggle.toggled.connect(self.on_toggle_flow_velocity)
-        vis_layout.addWidget(self.flow_lines_toggle)
-
         self.mold_wall_toggle = QtWidgets.QCheckBox("Kalıp Şişmesi Riski")
         self.mold_wall_toggle.setToolTip("Grafit genleşmesinin kalıp duvarını dışarı ittiği bölgeleri göster")
         self.mold_wall_toggle.setChecked(False)
@@ -1226,8 +1220,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
             if self.niyama_toggle.isChecked():
                 self.viewer.show_niyama_isosurfaces(self._analysis)
-            if self.flow_lines_toggle.isChecked():
-                self.viewer.toggle_flow_velocity(self._analysis, True)
             if self.mold_wall_toggle.isChecked():
                 self.viewer.toggle_mold_wall_movement(self._analysis, True)
             if self.cold_shot_toggle.isChecked():
@@ -1241,6 +1233,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.local_toggle.isChecked():
                 self.viewer.show_local_regions(self._analysis, self.slice_field.currentData())
             self.viewer.show_hotspots(self._analysis)
+            self.viewer.show_flow_node_labels(self._analysis)
             self._update_flow_controls()
             if self.flow_anim_toggle.isChecked() and self._analysis.flow_result is not None:
                 self.viewer.toggle_flow_animation(self._analysis, True)
@@ -1569,10 +1562,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_toggle_niyama(self, checked: bool):
         if self._analysis:
             self.viewer.toggle_niyama(self._analysis, checked)
-
-    def on_toggle_flow_velocity(self, checked: bool):
-        if self._analysis:
-            self.viewer.toggle_flow_velocity(self._analysis, checked)
 
     def on_toggle_mold_wall_movement(self, checked: bool):
         if self._analysis:

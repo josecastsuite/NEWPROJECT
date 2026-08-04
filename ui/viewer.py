@@ -9,7 +9,6 @@ from pyvistaqt import QtInteractor
 from scipy import ndimage
 from scipy.spatial import cKDTree
 
-from core.cpp_bridge import compute_analytic_flow_velocity
 from core.gating import (
     _characteristic_cross_section_area,
     _flow_axis,
@@ -165,8 +164,6 @@ class Analyzer3DViewer(QtInteractor):
         self._flow_node_actor = None
         self._flow_arrow_actor = None
         self._flow_colorbar_actor = None
-        self._flow_velocity_bulk: Optional[np.ndarray] = None
-        self._flow_velocity_poiseuille: Optional[np.ndarray] = None
         self._mold_wall_actor = None
         self._cold_shot_actor = None
         self._cold_shot_scalar_bar_actor = None
@@ -296,8 +293,6 @@ class Analyzer3DViewer(QtInteractor):
         self._flow_node_actor = None
         self._flow_arrow_actor = None
         self._flow_colorbar_actor = None
-        self._flow_velocity_bulk = None
-        self._flow_velocity_poiseuille = None
         self._mold_wall_actor = None
         self._cold_shot_actor = None
         self._cold_shot_scalar_bar_actor = None
@@ -837,123 +832,12 @@ class Analyzer3DViewer(QtInteractor):
         vel_arr[tuple(indices.T)] = ref_vel_arr[nearest]
         return vel_arr
 
-    def show_flow_velocity(self, result: Optional[AnalysisResult]):
-        """Paint the gating system with a smooth physical velocity heatmap.
-
-        Uses the C++/LBM per-voxel velocity_magnitude field when it shows
-        real variation; otherwise falls back to gating-node throat velocities.
-        The colourbar is clamped at 4.5 m/s and capped at the 98th percentile
-        so a single noise spike cannot wash the whole scale.  The surface is
-        heavily smoothed to remove voxel staircasing.
-        """
-        if self._flow_actor is not None:
-            self.remove_actor(self._flow_actor)
-            self._flow_actor = None
-        self._remove_scalar_bar("Akış hızı (m/s)")
-        if result is None or result.flow_result is None:
-            return
-
-        gate_types = [
-            BodyType.SPRUE_THROAT,
-            BodyType.SPRUE,
-            BodyType.RUNNER,
-            BodyType.DISTRIBUTOR,
-            BodyType.CURUFLUK,
-            BodyType.INGATE,
-            BodyType.POURING_BASIN,
-            BodyType.COOLING_SPRUE,
-            BodyType.FILTER,
-        ]
-        gate_mask = np.isin(result.grid, gate_types)
-        if not gate_mask.any():
-            return
-
-        # Prefer the analytic spline-tube field built from the same gating-node
-        # velocities used for labels.  Fall back to the node-throat field if the
-        # C++ solver is unavailable.
-        fr = result.flow_result
-        scalar_arr: Optional[np.ndarray] = None
-        pois_arr: Optional[np.ndarray] = None
-        if self._bodies and self._body_index is not None:
-            try:
-                analytic = compute_analytic_flow_velocity(
-                    result, self._bodies, self._body_index,
-                    self._origin_mm, self._dx_mm
-                )
-                if analytic is not None:
-                    scalar_arr, pois_arr = analytic
-                    self._flow_velocity_bulk = scalar_arr
-                    self._flow_velocity_poiseuille = pois_arr
-            except Exception as exc:
-                print(f"[viewer] analytic flow field failed: {exc}")
-
-        if scalar_arr is None:
-            print("[viewer] analytic flow field unavailable; not painting flow velocity")
-            return
-
-        velocity_mask = (scalar_arr > 1e-12) | gate_mask
-        if not velocity_mask.any():
-            return
-
-        grid = pv.ImageData()
-        grid.dimensions = np.array(result.grid.shape) + 1
-        grid.origin = result.origin_mm
-        grid.spacing = (result.dx_mm, result.dx_mm, result.dx_mm)
-        grid.cell_data["velocity_magnitude"] = scalar_arr.ravel(order="F")
-        grid.cell_data["is_gate"] = velocity_mask.astype(np.float64).ravel(order="F")
-        gate = grid.threshold([1.0, 1.0], scalars="is_gate")
-        if gate.n_cells == 0:
-            return
-
-        # Convert cell data to point data so colours interpolate smoothly.
-        try:
-            gate = gate.cell_data_to_point_data()
-        except Exception:
-            pass
-
-        # Aggressive smoothing to remove voxel staircasing from the gate surface.
-        try:
-            surf = gate.extract_surface(algorithm="dataset_surface")
-            surf = surf.smooth(
-                n_iter=20,
-                relaxation_factor=0.05,
-                feature_angle=90.0,
-                boundary_smoothing=False,
-            )
-        except Exception:
-            surf = self._smooth_surface(gate)
-        if surf.n_cells == 0:
-            return
-
-        # Fixed 0-5 m/s colour scale with percentile cap to avoid single spikes
-        # washing the whole image.  Exact velocities are still shown in labels.
-        if velocity_mask.any():
-            v_p99 = float(np.nanpercentile(scalar_arr[velocity_mask], 99.5))
-        else:
-            v_p99 = 0.0
-        if not np.isfinite(v_p99) or v_p99 <= 0:
-            v_p99 = 5.0
-        v_max = max(5.0, min(v_p99, 20.0))
-        clim = (0.0, v_max)
-
-        self._flow_actor = self.add_mesh(
-            surf,
-            scalars="velocity_magnitude",
-            cmap="turbo",
-            opacity=1.0,
-            clim=clim,
-            show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.02, 0.02), clim=clim),
-            smooth_shading=True,
-            ambient=0.55,
-            diffuse=0.45,
-            specular=0.05,
-            specular_power=1.0,
-        )
-        self._arrange_scalar_bars()
-
     def show_flow_node_labels(self, result: Optional[AnalysisResult]):
-        """Add numeric velocity labels at critical gating nodes (ingate, sprue throat, etc.)."""
+        """Add fixed numeric velocity labels at the sprue and ingate nodes.
+
+        Velocity is the simple hydraulic estimate v = Q / A already stored on
+        each gating node; no 3-D colour field is rendered.
+        """
         if self._flow_node_actor is not None:
             self.remove_actor(self._flow_node_actor)
             self._flow_node_actor = None
@@ -975,53 +859,28 @@ class Analyzer3DViewer(QtInteractor):
             BodyType.FILTER.name,
         }
 
-        bulk = getattr(self, "_flow_velocity_bulk", None)
-        origin = np.asarray(result.origin_mm, dtype=np.float64)
-        dx = float(result.dx_mm)
-        name_to_idx = {b.name: i for i, b in enumerate(self._bodies)}
-
         for node in nodes:
             body_type = getattr(node, "body_type", "")
             node_name = getattr(node, "name", "")
             if not body_type or "→" not in body_type or not node_name or "→" not in node_name:
                 continue
             up_type, down_type = [s.strip() for s in body_type.split("→", 1)]
-            up_name, down_name = [s.strip() for s in node_name.split("→", 1)]
-            target_name = None
-            if down_type in gate_type_names:
-                target_name = down_name
-            elif up_type in gate_type_names:
-                target_name = up_name
-            if not target_name:
+            _, down_name = [s.strip() for s in node_name.split("→", 1)]
+            # Label the downstream gate element (meme, sprue, runner, etc.).
+            if down_type not in gate_type_names and up_type not in gate_type_names:
                 continue
 
-            v = 0.0
-            if bulk is not None and dx > 0:
-                coords = None
-                if target_name in name_to_idx:
-                    bidx = name_to_idx[target_name]
-                    mask = (self._body_index == bidx) & (bulk > 1e-12)
-                    if mask.any():
-                        coords = np.argwhere(mask)
-                if coords is None and (bulk > 1e-12).any():
-                    coords = np.argwhere(bulk > 1e-12)
-                if coords is not None and coords.size:
-                    vals = bulk[coords[:, 0], coords[:, 1], coords[:, 2]]
-                    i = int(np.argmax(vals))
-                    v = float(vals[i])
-                    label_points.append(coords[i] * dx + origin)
-                    label_texts.append(f"{v:.2f} m/s")
-                    continue
-
-            # Fallback to the node velocity if no analytic field is available.
-            is_source = up_type.startswith("SOURCE")
-            if is_source:
-                v = node.velocity_m_s
+            area_cm2 = float(getattr(node, "section_area_cm2", 0.0) or 0.0)
+            q_m3_s = float(getattr(node, "flow_rate_m3_s", 0.0) or 0.0)
+            if area_cm2 > 1e-9 and q_m3_s > 1e-12:
+                v = q_m3_s / (area_cm2 * 1e-4)
             else:
-                v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
-            # No fallback to node velocity: labels must come from the same bulk
-            # velocity_magnitude array used by show_flow_velocity.
-            continue
+                v = float(getattr(node, "velocity_m_s", 0.0) or 0.0)
+            if v <= 1e-12:
+                continue
+
+            label_points.append(getattr(node, "centroid_mm", (0.0, 0.0, 0.0)))
+            label_texts.append(f"{v:.2f} m/s")
 
         if label_points:
             label_points = np.asarray(label_points, dtype=np.float64)
@@ -1249,19 +1108,6 @@ class Analyzer3DViewer(QtInteractor):
                 self.remove_actor(actor)
             self._niyama_actors.clear()
             self._remove_scalar_bar("Niyama")
-
-    def toggle_flow_velocity(self, result: AnalysisResult, checked: bool):
-        if checked:
-            self.show_flow_velocity(result)
-            self.show_flow_node_labels(result)
-        else:
-            if self._flow_actor is not None:
-                self.remove_actor(self._flow_actor)
-                self._flow_actor = None
-            if self._flow_node_actor is not None:
-                self.remove_actor(self._flow_node_actor)
-                self._flow_node_actor = None
-            self._remove_scalar_bar("Akış hızı (m/s)")
 
     def toggle_flow_animation(self, result: AnalysisResult, checked: bool):
         if checked:
