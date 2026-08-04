@@ -206,6 +206,93 @@ struct SDFGrid {
 };
 
 // ----------------------------------------------------------------------------
+// Compute the true cross-sectional area on the plane perpendicular to the
+// local tangent at pos.  SDF > 0 marks metal; we take the connected component
+// that contains the spline axis so stray metal regions are ignored.
+// The returned area is in mm^2.
+// ----------------------------------------------------------------------------
+double cross_section_area_mm2(
+    const SDFGrid& sdf,
+    const std::array<double, 3>& pos,
+    const std::array<double, 3>& t,
+    double max_radius_mm,
+    double plane_dx_mm) {
+
+    // Build an orthonormal basis (u, v) perpendicular to t.
+    double ux = 0.0, uy = 0.0, uz = 0.0;
+    if (std::abs(t[2]) < 0.9) {
+        // u = t x (0, 0, 1)
+        ux =  t[1];
+        uy = -t[0];
+        uz =  0.0;
+    } else {
+        // u = t x (0, 1, 0)
+        ux = -t[2];
+        uy =  0.0;
+        uz =  t[0];
+    }
+    double ulen = std::sqrt(ux * ux + uy * uy + uz * uz);
+    if (ulen < 1e-12) { ux = 1.0; ulen = 1.0; }
+    ux /= ulen; uy /= ulen; uz /= ulen;
+
+    // v = t x u
+    double vx = t[1] * uz - t[2] * uy;
+    double vy = t[2] * ux - t[0] * uz;
+    double vz = t[0] * uy - t[1] * ux;
+    double vlen = std::sqrt(vx * vx + vy * vy + vz * vz);
+    if (vlen < 1e-12) { vy = 1.0; vlen = 1.0; }
+    vx /= vlen; vy /= vlen; vz /= vlen;
+
+    int N = static_cast<int>(std::ceil(max_radius_mm / plane_dx_mm));
+    if (N < 2) N = 2;
+    const int S = 2 * N + 1;
+
+    // Sample the SDF on the plane grid.
+    std::vector<double> vals(S * S, -1.0);
+    for (int i = -N; i <= N; ++i) {
+        double du = i * plane_dx_mm;
+        for (int j = -N; j <= N; ++j) {
+            double dv = j * plane_dx_mm;
+            double x = pos[0] + du * ux + dv * vx;
+            double y = pos[1] + du * uy + dv * vy;
+            double z = pos[2] + du * uz + dv * vz;
+            vals[(i + N) * S + (j + N)] = sdf.sample(x, y, z);
+        }
+    }
+
+    int center = N;
+    if (vals[center * S + center] <= 0.0) return 0.0;
+
+    // BFS over the connected inside region from the axis.
+    std::vector<char> visited(S * S, 0);
+    std::vector<std::pair<int, int>> stack;
+    stack.reserve(S * S);
+    stack.push_back({center, center});
+    visited[center * S + center] = 1;
+
+    const int di[4] = {-1, 1, 0, 0};
+    const int dj[4] = {0, 0, -1, 1};
+    long long count = 0;
+    while (!stack.empty()) {
+        auto [ci, cj] = stack.back();
+        stack.pop_back();
+        ++count;
+        for (int d = 0; d < 4; ++d) {
+            int ni = ci + di[d];
+            int nj = cj + dj[d];
+            if (ni < 0 || ni >= S || nj < 0 || nj >= S) continue;
+            int idx = ni * S + nj;
+            if (visited[idx]) continue;
+            if (vals[idx] > 0.0) {
+                visited[idx] = 1;
+                stack.push_back({ni, nj});
+            }
+        }
+    }
+    return static_cast<double>(count) * plane_dx_mm * plane_dx_mm;
+}
+
+// ----------------------------------------------------------------------------
 // Branch discretised into spline samples, one nanoflann tree per branch.
 // ----------------------------------------------------------------------------
 struct BranchSamples {
@@ -318,6 +405,8 @@ void build_branch_samples(
         A_node_node[i] = node_area[node_indices[i]];
         v_node_node[i] = node_velocity[node_indices[i]];
     }
+    double max_A_node = 0.0;
+    for (double a : A_node_node) max_A_node = std::max(max_A_node, a);
     for (int i = 1; i < n_nodes; ++i) {
         auto d0 = spline.deriv(0.5 * (u_node[i - 1] + u_node[i]));
         double mag = norm2(d0[0], d0[1], d0[2]);
@@ -405,20 +494,28 @@ void build_branch_samples(
         out.z[k] = pos[2];
         out.s[k] = s_sample_raw[k];
 
-        // Effective cross-section is the node-derived hydraulic area interpolated
-        // along the spline.  SDF may be used for the local wall radius, but the
-        // bulk velocity v = Q / A is driven by the hydraulic area from the
-        // gating-node data, which is robust for non-circular cross-sections.
+        // Effective cross-section: integrate the real metal area on the plane
+        // perpendicular to the local tangent.  If SDF gives an outlier area,
+        // fall back to the node-derived hydraulic area interpolated along s.
         double s_val = out.s[k];
-        double A_eff = linear_node(s_val, A_node_node);
-        double R_hydr_mm = std::sqrt(std::max(0.0, A_eff / J_PI)) * 1000.0;
+        double A_node_s = linear_node(s_val, A_node_node);
+        double R_node_mm = std::sqrt(std::max(0.0, A_node_s / J_PI)) * 1000.0;
 
-        double R_sdf = sdf.sample(pos[0], pos[1], pos[2]);
-        double R_eff_mm = R_hydr_mm;
-        if (std::isfinite(R_sdf) && R_sdf >= 0.5 * dx && R_sdf <= 2.0 * R_hydr_mm) {
-            // Use the sampled SDF radius if it is plausible for this cross-section,
-            // otherwise fall back to the hydraulic radius.
-            R_eff_mm = R_sdf;
+        double A_real_m2 = 0.0;
+        double R_eff_mm = R_node_mm;
+        if (max_A_node > 1e-18) {
+            double R_bound_mm = std::sqrt(max_A_node / J_PI) * 1000.0 * 2.0;
+            double plane_dx_mm = std::max(0.5 * dx, 0.5);
+            double A_real_mm2 = cross_section_area_mm2(
+                sdf, pos, {out.tx[k], out.ty[k], out.tz[k]}, R_bound_mm, plane_dx_mm);
+            A_real_m2 = A_real_mm2 * 1e-6;
+        }
+
+        double A_eff = A_node_s;
+        if (A_real_m2 > 1e-18 &&
+            A_real_m2 >= 0.1 * A_node_s && A_real_m2 <= 10.0 * A_node_s) {
+            A_eff = A_real_m2;
+            R_eff_mm = std::sqrt(std::max(0.0, A_eff / J_PI)) * 1000.0;
         }
         out.R[k] = R_eff_mm;
 
