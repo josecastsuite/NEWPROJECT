@@ -419,6 +419,159 @@ def _fallback_flow_axis(mesh: trimesh.Trimesh, downstream_center: Optional[np.nd
     return axis
 
 
+def _characteristic_cross_section_area(
+    mesh: trimesh.Trimesh,
+    axis: np.ndarray,
+    n: int = 20,
+) -> float:
+    """Return the most representative cross-sectional area [mm2] perpendicular to axis.
+
+    The algorithm looks for a constant (plateau) cross-section first.  If found,
+    it returns the mean of that plateau; for circular plateaus it uses the equivalent
+    circle area from the perimeter to compensate for tessellation coarseness.
+    If no plateau exists, circular bodies are classified as conical (monotonic)
+    or non-monotonic; conical uses the minimum circular area (throat), otherwise the
+    maximum circular area.  Non-circular / prismatic bodies use the median area.
+    """
+    axis = np.asarray(axis, dtype=np.float64)
+    norm = float(np.linalg.norm(axis))
+    if norm <= 0:
+        return 0.0
+    axis = axis / norm
+
+    rows = _section_profile_detailed(mesh, axis, n=n)
+    if not rows:
+        length_mm = _body_flow_length(mesh, axis)
+        if length_mm > 0.0:
+            return float(mesh.volume / (length_mm * 1e-3))
+        return 0.0
+
+    t = np.array([r[0] for r in rows])
+    areas = np.array([r[1] for r in rows])
+    perims = np.array([r[2] for r in rows])
+    circs = np.array([r[3] for r in rows])
+
+    max_area = float(areas.max())
+    if max_area <= 0.0:
+        return 0.0
+
+    best_window: Optional[Tuple[int, int]] = None
+    best_score = -1.0
+    min_len = 3
+    for i in range(len(areas) - min_len + 1):
+        for j in range(i + min_len - 1, len(areas)):
+            w_areas = areas[i : j + 1]
+            if w_areas.min() < 0.15 * max_area:
+                continue
+            if w_areas.max() / w_areas.min() > 1.25:
+                continue
+            score = (j - i + 1) * w_areas.mean()
+            if score > best_score:
+                best_score = score
+                best_window = (i, j)
+
+    if best_window is not None:
+        i, j = best_window
+        mean_circ = float(circs[i : j + 1].mean())
+        if mean_circ > 0.85:
+            return float((perims[i : j + 1] ** 2 / (4.0 * math.pi)).mean())
+        return float(areas[i : j + 1].mean())
+
+    valid = areas > 0.05 * max_area
+    if not valid.any():
+        return float(np.median(areas))
+
+    mean_circ = float(circs[valid].mean())
+    if mean_circ > 0.85:
+        circ_areas = perims ** 2 / (4.0 * math.pi)
+        x = np.arange(len(areas))
+        if valid.sum() > 2:
+            a_valid = areas[valid]
+            x_valid = x[valid]
+            cov = np.cov(x_valid, a_valid)
+            if cov[0, 0] > 0.0:
+                r = cov[0, 1] / np.sqrt(cov[0, 0] * cov[1, 1])
+            else:
+                r = 0.0
+            if abs(r) > 0.65:
+                interior = np.ones_like(areas, dtype=bool)
+                interior[0] = interior[-1] = False
+                if not (interior & valid).any():
+                    interior = valid
+                return float(circ_areas[interior & valid].min())
+        return float(circ_areas[valid].max())
+
+    central = areas[1:-1] if len(areas) > 2 else areas
+    return float(np.median(central))
+
+
+def _sprue_circular_base_and_throat(
+    mesh: trimesh.Trimesh,
+    axis: np.ndarray,
+    n: int = 20,
+) -> Tuple[float, float]:
+    """Return (base_area_mm2, throat_area_mm2) for a sprue.
+
+    ``base_area`` is the characteristic/main circular cross-section.
+    ``throat_area`` is the minimum reliable circular cross-section.
+    """
+    axis = np.asarray(axis, dtype=np.float64)
+    norm = float(np.linalg.norm(axis))
+    if norm <= 0:
+        return 0.0, 0.0
+    axis = axis / norm
+
+    rows = _section_profile_detailed(mesh, axis, n=n)
+    if not rows:
+        length_mm = _body_flow_length(mesh, axis)
+        if length_mm > 0.0:
+            avg = float(mesh.volume / (length_mm * 1e-3))
+            return avg, avg
+        return 0.0, 0.0
+
+    t = np.array([r[0] for r in rows])
+    areas = np.array([r[1] for r in rows])
+    perims = np.array([r[2] for r in rows])
+    circs = np.array([r[3] for r in rows])
+    circ_areas = np.where(perims > 0.0, perims ** 2 / (4.0 * math.pi), 0.0)
+
+    max_area = float(areas.max())
+    if max_area <= 0.0:
+        return 0.0, 0.0
+
+    # Use the largest contiguous region where the cross-section is well inside
+    # the body (area > 30 % of max) and reasonably circular.  End-cap partial
+    # intersections are excluded because they can look circular while being tiny.
+    significant = (areas > 0.30 * max_area) & (circs > 0.85) & (circ_areas > 0.0)
+    runs = []
+    i = 0
+    while i < len(areas):
+        if significant[i]:
+            j = i
+            while j < len(areas) and significant[j]:
+                j += 1
+            runs.append((i, j))
+            i = j
+        else:
+            i += 1
+
+    if runs:
+        # Prefer a run that does not touch the first/last slice (avoids partials).
+        good_runs = [r for r in runs if r[0] > 0 and r[1] < len(areas)]
+        if not good_runs:
+            good_runs = runs
+        run = max(good_runs, key=lambda r: r[1] - r[0])
+        i, j = run
+        base = float(circ_areas[i:j].max())
+        throat = float(circ_areas[i:j].min())
+        return base, throat
+
+    # Prismatic / non-circular sprue: use the median cross-sectional area.
+    base = float(np.median(areas[1:-1])) if len(areas) > 2 else float(np.median(areas))
+    throat = base
+    return base, throat
+
+
 def _body_exit_or_throat_area(
     mesh: trimesh.Trimesh,
     axis: np.ndarray,
