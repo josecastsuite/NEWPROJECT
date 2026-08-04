@@ -861,8 +861,8 @@ class Analyzer3DViewer(QtInteractor):
             BodyType.FILTER,
         ]
         gate_mask = np.isin(result.grid, gate_types)
-        section_id_arr, _, ok = self._flow_section_scalars(result, gate_mask)
-        if not ok or section_id_arr is None:
+        _, section_vel_arr, ok = self._flow_section_scalars(result, gate_mask)
+        if not ok or section_vel_arr is None:
             self._show_flow_velocity_body_based(result, gate_mask)
             return
 
@@ -870,7 +870,7 @@ class Analyzer3DViewer(QtInteractor):
         grid.dimensions = np.array(result.grid.shape) + 1
         grid.origin = result.origin_mm
         grid.spacing = (result.dx_mm, result.dx_mm, result.dx_mm)
-        grid.cell_data["section_id"] = section_id_arr.ravel(order="F")
+        grid.cell_data["section_velocity"] = section_vel_arr.ravel(order="F")
         grid.cell_data["is_gate"] = gate_mask.astype(np.float64).ravel(order="F")
         gate = grid.threshold([1.0, 1.0], scalars="is_gate")
         if gate.n_cells == 0:
@@ -879,21 +879,31 @@ class Analyzer3DViewer(QtInteractor):
         if surf.n_cells == 0:
             return
 
-        n_sections = int(np.max(section_id_arr)) + 1
-        vmax = max(1, n_sections - 1)
+        gate_vals = section_vel_arr[(section_vel_arr > 0) & np.isfinite(section_vel_arr) & gate_mask]
+        if gate_vals.size > 0:
+            v_max = float(np.nanmax(gate_vals))
+            v_min = float(np.nanmin(gate_vals))
+            if v_max <= v_min:
+                v_max = v_min + 0.1
+            clim = (0.0, v_max * 1.05)
+        else:
+            clim = (0.0, 1.0)
+
         self._flow_actor = self.add_mesh(
             surf,
-            scalars="section_id",
+            scalars="section_velocity",
             cmap="turbo",
             opacity=1.0,
-            clim=[0.0, float(vmax)],
-            show_scalar_bar=False,
+            clim=clim,
+            show_scalar_bar=True,
+            scalar_bar_args=_scalar_bar_args("Akış hızı (m/s)", (0.02, 0.02), clim=clim),
             smooth_shading=True,
             ambient=0.55,
             diffuse=0.45,
             specular=0.05,
             specular_power=1.0,
         )
+        self._arrange_scalar_bars()
 
     def _show_flow_velocity_body_based(self, result: AnalysisResult, gate_mask: np.ndarray):
         """Fallback body-based velocity colouring when no gating-node graph is present."""
