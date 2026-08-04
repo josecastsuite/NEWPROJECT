@@ -106,11 +106,11 @@ def _scalar_bar_args(title: str, pos: Tuple[float, float], clim: Optional[Tuple[
     height = 0.08 * 1.5
     n_labels = 2
     for n in (5, 4, 3, 2):
-        needed = title_chars * 0.013 + 0.04 + n * (max(label_chars, 1) * 0.011 + 0.008)
-        if needed <= 0.80:
+        needed = title_chars * 0.014 + 0.05 + n * (max(label_chars, 1) * 0.013 + 0.010)
+        if needed <= 0.85:
             n_labels = n
             break
-    width = min(0.80, max(0.20, needed))
+    width = min(0.85, max(0.25, needed))
     # Center the bar horizontally near the requested bottom position.
     pos_x = max(0.0, 0.5 - width / 2.0)
     args = {
@@ -767,18 +767,16 @@ class Analyzer3DViewer(QtInteractor):
             branches = [[source_node] + [n for n in nodes if n is not source_node]]
         return branches
 
-    def _flow_velocity_from_sdf(
+    def _flow_velocity_from_nodes(
         self, result: AnalysisResult, gate_mask: np.ndarray
     ) -> Optional[np.ndarray]:
-        """Compute a 1-D v(s)=Q/A(s) velocity field for gate voxels using SDF.
-
-        If the raw Darcy velocity_magnitude is uniform, this fallback estimates
-        the local cross-section radius from the SDF and applies continuity so
-        that narrow sections show higher velocity.
+        """Fallback: assign each gate voxel the throat velocity v=Q/A of the
+        nearest gating-node edge.  This works even when the raw Darcy field is
+        uniform, so section/branch changes still show up as colour changes.
         """
         fr = result.flow_result
         nodes = getattr(fr, "gating_nodes", None) or []
-        if not nodes or result.sdf is None or result.sdf.size == 0:
+        if not nodes:
             return None
         branches = self._build_gating_branches(nodes)
         if not branches:
@@ -793,11 +791,11 @@ class Analyzer3DViewer(QtInteractor):
                     continue
                 seen.add(key)
                 edges.append((up, down))
+        if not edges:
+            return None
 
-        sdf = np.asarray(result.sdf)
         dx = float(result.dx_mm)
         origin = np.asarray(result.origin_mm, dtype=np.float64)
-        shape = sdf.shape
 
         ref_points: List[np.ndarray] = []
         ref_vel: List[float] = []
@@ -807,45 +805,10 @@ class Analyzer3DViewer(QtInteractor):
             dist = float(np.linalg.norm(p1 - p0))
             n_pts = max(2, int(np.ceil(dist / (dx * 0.5))) + 1)
             pts = np.linspace(p0, p1, n_pts)
-
-            Q = 0.0
-            for node in (down, up):
-                q = float(getattr(node, "flow_rate_m3_s", 0.0))
-                if q > 1e-18:
-                    Q = q
-                    break
-            if Q <= 1e-18:
-                Q = float(fr.Q_m3_s)
-            if Q <= 1e-18:
+            v = float(down.velocity_m_s) if down.velocity_m_s > 1e-12 else float(up.velocity_m_s)
+            if v <= 1e-12:
                 continue
-
-            a_up = float(getattr(up, "section_area_cm2", 0.0))
-            a_down = float(getattr(down, "section_area_cm2", 0.0))
-            a_max = max(a_up, a_down)
-            if a_max > 0:
-                r_mm = np.sqrt(a_max / np.pi) * 10.0 * 1.5
-                r_vox = max(2, int(np.ceil(r_mm / dx)) + 2)
-            else:
-                gate_sdf = sdf[gate_mask]
-                max_r = float(np.percentile(gate_sdf[gate_sdf > 0], 95)) if np.any(gate_sdf > 0) else 0.0
-                r_vox = max(2, int(np.ceil(max_r / dx)) + 2)
-
             for p in pts:
-                idx = ((p - origin) / dx).astype(np.int64)
-                slices = tuple(
-                    slice(max(0, i - r_vox), min(s, i + r_vox + 1), None)
-                    for i, s in zip(idx, shape)
-                )
-                local_sdf = sdf[slices]
-                local_gate = gate_mask[slices]
-                if local_gate.any():
-                    r = float(np.max(local_sdf[local_gate])) + 0.5 * dx
-                else:
-                    r = 0.5 * dx
-                if r <= 0:
-                    r = 0.5 * dx
-                A = np.pi * r * r
-                v = float(Q / A) if A > 1e-18 and Q > 0 else 0.0
                 ref_points.append(p)
                 ref_vel.append(v)
 
@@ -901,27 +864,30 @@ class Analyzer3DViewer(QtInteractor):
 
         fr = result.flow_result
         scalar_arr: Optional[np.ndarray] = None
+        clim_vmax: Optional[float] = None
         vmag = fr.velocity_magnitude
         if vmag is not None and vmag.size > 0:
             gate_vmag = vmag[gate_mask & np.isfinite(vmag)]
             if gate_vmag.size > 0:
                 v_max_raw = float(np.nanmax(gate_vmag))
                 v_min_raw = float(np.nanmin(gate_vmag))
+                clim_vmax = v_max_raw
                 if v_max_raw > 1e-9 and v_max_raw > v_min_raw * 1.05 + 0.05:
                     scalar_arr = vmag.astype(np.float64, copy=False)
                     try:
-                        scalar_arr = ndimage.gaussian_filter(scalar_arr, sigma=0.8)
+                        scalar_arr = ndimage.gaussian_filter(scalar_arr, sigma=0.3)
                     except Exception:
                         pass
                 else:
-                    scalar_arr = self._flow_velocity_from_sdf(result, gate_mask)
+                    scalar_arr = self._flow_velocity_from_nodes(result, gate_mask)
+                    clim_vmax = None
                     if scalar_arr is None:
                         scalar_arr = vmag.astype(np.float64, copy=False)
             else:
-                scalar_arr = self._flow_velocity_from_sdf(result, gate_mask)
+                scalar_arr = self._flow_velocity_from_nodes(result, gate_mask)
 
         if scalar_arr is None:
-            scalar_arr = self._flow_velocity_from_sdf(result, gate_mask)
+            scalar_arr = self._flow_velocity_from_nodes(result, gate_mask)
         if scalar_arr is None:
             return
 
@@ -938,14 +904,14 @@ class Analyzer3DViewer(QtInteractor):
         if surf.n_cells == 0:
             return
 
-        gate_vals = scalar_arr[(scalar_arr > 0) & np.isfinite(scalar_arr) & gate_mask]
-        if gate_vals.size > 0:
-            v_max = float(np.nanmax(gate_vals))
-            if v_max <= 0:
-                v_max = 1.0
-            clim = (0.0, v_max * 1.05)
-        else:
-            clim = (0.0, 1.0)
+        if clim_vmax is None:
+            gate_vals = scalar_arr[(scalar_arr > 0) & np.isfinite(scalar_arr) & gate_mask]
+            if gate_vals.size > 0:
+                clim_vmax = float(np.nanmax(gate_vals))
+            else:
+                clim_vmax = 1.0
+        v_max = clim_vmax if clim_vmax > 0 else 1.0
+        clim = (0.0, v_max * 1.05)
 
         self._flow_actor = self.add_mesh(
             surf,
