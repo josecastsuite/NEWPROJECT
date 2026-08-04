@@ -892,12 +892,16 @@ class Analyzer3DViewer(QtInteractor):
         if scalar_arr is None:
             return
 
+        velocity_mask = (scalar_arr > 1e-12) | gate_mask
+        if not velocity_mask.any():
+            return
+
         grid = pv.ImageData()
         grid.dimensions = np.array(result.grid.shape) + 1
         grid.origin = result.origin_mm
         grid.spacing = (result.dx_mm, result.dx_mm, result.dx_mm)
         grid.cell_data["velocity_magnitude"] = scalar_arr.ravel(order="F")
-        grid.cell_data["is_gate"] = gate_mask.astype(np.float64).ravel(order="F")
+        grid.cell_data["is_gate"] = velocity_mask.astype(np.float64).ravel(order="F")
         gate = grid.threshold([1.0, 1.0], scalars="is_gate")
         if gate.n_cells == 0:
             return
@@ -922,12 +926,8 @@ class Analyzer3DViewer(QtInteractor):
         if surf.n_cells == 0:
             return
 
-        gate_vals = scalar_arr[(scalar_arr > 0) & np.isfinite(scalar_arr) & gate_mask]
-        if gate_vals.size > 0:
-            v_max = float(np.nanmax(gate_vals))
-            if not np.isfinite(v_max) or v_max <= 0:
-                v_max = 1.0
-        else:
+        v_max = float(np.nanmax(scalar_arr[velocity_mask])) if velocity_mask.any() else 1.0
+        if not np.isfinite(v_max) or v_max <= 0:
             v_max = 1.0
         clim = (0.0, v_max)
 
@@ -958,40 +958,62 @@ class Analyzer3DViewer(QtInteractor):
         nodes = result.flow_result.gating_nodes
         label_points: List[Tuple[float, float, float]] = []
         label_texts: List[str] = []
-        critical_down_types = {
+        gate_type_names = {
             BodyType.INGATE.name,
             BodyType.SPRUE_THROAT.name,
             BodyType.SPRUE.name,
             BodyType.RUNNER.name,
-            BodyType.PART.name,
+            BodyType.DISTRIBUTOR.name,
+            BodyType.CURUFLUK.name,
+            BodyType.POURING_BASIN.name,
+            BodyType.COOLING_SPRUE.name,
+            BodyType.FILTER.name,
         }
 
         bulk = getattr(self, "_flow_velocity_bulk", None)
         origin = np.asarray(result.origin_mm, dtype=np.float64)
         dx = float(result.dx_mm)
-        shape = result.grid.shape
+        name_to_idx = {b.name: i for i, b in enumerate(self._bodies)}
 
         for node in nodes:
             body_type = getattr(node, "body_type", "")
-            if not body_type or "→" not in body_type:
+            node_name = getattr(node, "name", "")
+            if not body_type or "→" not in body_type or not node_name or "→" not in node_name:
                 continue
             up_type, down_type = [s.strip() for s in body_type.split("→", 1)]
-            is_source = up_type.startswith("SOURCE")
-            if not is_source and down_type not in critical_down_types:
+            up_name, down_name = [s.strip() for s in node_name.split("→", 1)]
+            target_name = None
+            if down_type in gate_type_names:
+                target_name = down_name
+            elif up_type in gate_type_names:
+                target_name = up_name
+            if not target_name:
                 continue
+
+            v = 0.0
+            if bulk is not None and dx > 0:
+                coords = None
+                if target_name in name_to_idx:
+                    bidx = name_to_idx[target_name]
+                    mask = (self._body_index == bidx) & (bulk > 1e-12)
+                    if mask.any():
+                        coords = np.argwhere(mask)
+                if coords is None and (bulk > 1e-12).any():
+                    coords = np.argwhere(bulk > 1e-12)
+                if coords is not None and coords.size:
+                    vals = bulk[coords[:, 0], coords[:, 1], coords[:, 2]]
+                    i = int(np.argmax(vals))
+                    v = float(vals[i])
+                    label_points.append(coords[i] * dx + origin)
+                    label_texts.append(f"{v:.2f} m/s")
+                    continue
+
+            # Fallback to the node velocity if no analytic field is available.
+            is_source = up_type.startswith("SOURCE")
             if is_source:
                 v = node.velocity_m_s
             else:
                 v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
-            # Prefer the actually rendered analytic velocity at the node centroid.
-            if bulk is not None and dx > 0:
-                c = np.asarray(node.centroid_mm, dtype=np.float64)
-                idx = (c - origin) / dx - 0.5
-                z, y, x = int(round(idx[2])), int(round(idx[1])), int(round(idx[0]))
-                if 0 <= z < shape[0] and 0 <= y < shape[1] and 0 <= x < shape[2]:
-                    vv = bulk[z, y, x]
-                    if vv > 1e-12:
-                        v = float(vv)
             if v > 1e-12:
                 label_points.append(node.centroid_mm)
                 label_texts.append(f"{v:.2f} m/s")

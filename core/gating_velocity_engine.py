@@ -449,8 +449,6 @@ class GateVelocityEngine:
         body_Q = self._body_flow_rates(bodies, gating_nodes, Q_total_m3_s)
 
         for bidx, body in enumerate(bodies):
-            if body.body_type not in _GATING_BODY_TYPES:
-                continue
             q_m3_s = body_Q.get(bidx, 0.0)
             if q_m3_s <= 1e-18:
                 continue
@@ -492,12 +490,14 @@ class GateVelocityEngine:
             s_vals = np.array([sec.s_mm for sec in sections])
             a_vals = np.array([sec.area_mm2 for sec in sections])
             v_vals = q_m3_s / (a_vals * 1e-6)  # mm2 -> m2
-            # Replace unphysical values with the nearest valid one.
-            v_vals = np.nan_to_num(v_vals, nan=0.0, posinf=0.0, neginf=0.0)
-            bad = v_vals <= 1e-12
-            if bad.all():
-                continue
-            v_vals[bad] = v_vals[~bad].mean()
+            if (
+                np.any(np.isnan(v_vals))
+                or np.any(np.isinf(v_vals))
+                or np.any(v_vals <= 1e-12)
+            ):
+                raise VelocityEngineError(
+                    f"{body.name}: unphysical velocity values computed from sections"
+                )
 
             mask = body_index == bidx
             if not mask.any():
