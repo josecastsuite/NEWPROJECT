@@ -16,7 +16,7 @@
 #include <CGAL/Polygon_mesh_processing/stitch_borders.h>
 #include <CGAL/Polygon_mesh_processing/manifoldness.h>
 #include <CGAL/Polygon_mesh_processing/repair.h>
-#include <CGAL/Polygon_mesh_processing/border.h>
+#include <CGAL/boost/graph/helpers.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -72,13 +72,16 @@ Mesh build_mesh_from_arrays(nb::ndarray<nb::numpy, double, nb::shape<-1, 3>> ver
 
     // Try to close any remaining holes using CGAL hole filling.
     for (int iter = 0; iter < 10 && !CGAL::is_closed(mesh); ++iter) {
-        std::vector<typename Mesh::Halfedge_index> cycles;
-        CGAL::Polygon_mesh_processing::extract_boundary_cycles(mesh, std::back_inserter(cycles));
-        if (cycles.empty()) break;
-        for (typename Mesh::Halfedge_index h : cycles) {
-            std::vector<typename Mesh::Face_index> patch;
-            CGAL::Polygon_mesh_processing::triangulate_hole(mesh, h, std::back_inserter(patch));
+        typename Mesh::Halfedge_index border_h = Mesh::null_halfedge();
+        for (auto h : mesh.halfedges()) {
+            if (CGAL::is_border(h, mesh)) {
+                border_h = h;
+                break;
+            }
         }
+        if (border_h == Mesh::null_halfedge()) break;
+        std::vector<typename Mesh::Face_index> patch;
+        CGAL::Polygon_mesh_processing::triangulate_hole(mesh, border_h, std::back_inserter(patch));
     }
 
     if (!CGAL::is_closed(mesh)) {
