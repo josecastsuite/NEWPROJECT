@@ -804,11 +804,12 @@ class Analyzer3DViewer(QtInteractor):
 
         gate_vals = body_vmag[gate_mask & (body_vmag > 0) & np.isfinite(body_vmag)]
         if gate_vals.size > 0:
-            p2 = float(np.percentile(gate_vals, 2.0))
-            p98 = float(np.percentile(gate_vals, 98.0))
-            if p98 <= p2:
-                p98 = p2 + max(0.1, 0.05 * abs(p2))
-            clim = (p2, p98)
+            v_min = float(np.nanmin(gate_vals))
+            v_max = float(np.nanmax(gate_vals))
+            if v_max <= v_min:
+                v_max = v_min + 0.1
+            # Full range so every distinct section velocity gets a different colour.
+            clim = (0.0, v_max * 1.05)
         else:
             clim = (0.0, 1.0)
 
