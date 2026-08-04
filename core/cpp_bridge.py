@@ -10,7 +10,7 @@ import trimesh
 from core.gate_mesh import _safe_fill_holes
 from typing import Any, Dict, List, Tuple, Optional, Callable
 
-from core.types import Body, BodyType
+from core.types import Body, BodyType, GatingNode
 
 
 def _find_core_module():
@@ -251,7 +251,7 @@ def compute_analytic_flow_velocity(
     flow = getattr(result, "flow_result", None)
     if flow is None:
         return None
-    nodes = getattr(flow, "gating_nodes", None) or []
+    nodes = list(getattr(flow, "gating_nodes", None) or [])
     if not nodes:
         return None
     if not hasattr(result, "sdf") or result.sdf.size == 0:
@@ -260,15 +260,96 @@ def compute_analytic_flow_velocity(
     if sdf.shape != body_index.shape:
         return None
 
+    # Per-body 3-D gate-flow summaries; used to assign sensible Q/A values to
+    # gating bodies that are not on the main source->ingate path.
+    gate_summaries: Dict[str, Dict[str, float]] = getattr(flow, "gate_flow_results", {}) or {}
+
     branches = _build_gating_branches(nodes)
     if not branches:
         return None
 
-    n = len(nodes)
+    # ------------------------------------------------------------------
+    # Map body names referenced by gating nodes to their branch.
+    # A body name may appear as the upstream or downstream end of a node;
+    # the source body is shared by all branches and can use any of them.
+    # ------------------------------------------------------------------
+    body_name_to_idx: Dict[str, int] = {
+        b.name: i for i, b in enumerate(bodies) if b.name
+    }
+    node_body_to_branch: Dict[str, int] = {}
+    for bi, branch in enumerate(branches):
+        for ni in branch:
+            up, down = _parse_node_name(getattr(nodes[ni], "name", ""))
+            if up and up not in node_body_to_branch and up in body_name_to_idx:
+                node_body_to_branch[up] = bi
+            if down and down not in node_body_to_branch and down in body_name_to_idx:
+                node_body_to_branch[down] = bi
+
+    # ------------------------------------------------------------------
+    # Augment the gating-node list with one-node "branches" for any gate
+    # body that is not referenced by the main gating graph.  This lets the
+    # analytic solver paint those bodies with a physically consistent local
+    # velocity from the per-body 3-D gate-flow summary (Q/A) instead of
+    # snapping them to an unrelated branch.
+    # ------------------------------------------------------------------
+    synthetic_nodes: List[GatingNode] = []
+    synthetic_branches: List[List[int]] = []
+    synthetic_body_name: List[str] = []
+    for idx, body in enumerate(bodies):
+        if body.name in node_body_to_branch:
+            continue
+        if body.body_type not in _GATING_BODY_TYPES:
+            continue
+        summary = gate_summaries.get(body.name, {})
+        v = float(summary.get("section_velocity_m_s", 0.0))
+        q = float(summary.get("outlet_flux_m3_s", 0.0))
+        if v <= 1e-18 or q <= 1e-18:
+            # Fallback to geometric / user-specified area and a nearby node
+            # velocity if the 3-D gate summary is unavailable.
+            v = 0.0
+            q = 0.0
+            for n in nodes:
+                nv = getattr(n, "max_velocity_m_s", 0.0)
+                if nv > v:
+                    v = nv
+                    q = getattr(n, "flow_rate_m3_s", 0.0)
+        a_cm2 = 0.0
+        if v > 1e-18 and q > 1e-18:
+            a_cm2 = float(q / v) * 1e4
+        if a_cm2 <= 1e-12:
+            a_cm2 = float(getattr(body, "section_area_cm2", 0.0))
+        if a_cm2 <= 1e-12:
+            continue
+        centroid = getattr(body, "center", None)
+        if centroid is None or not isinstance(centroid, np.ndarray):
+            mask = body_index == idx
+            if mask.any():
+                coords = np.argwhere(mask)
+                centroid = (coords.mean(axis=0) + 0.5) * dx_mm + origin_mm
+            else:
+                centroid = np.zeros(3)
+        synth = GatingNode(
+            name=body.name,
+            body_type=body.body_type.name,
+            velocity_m_s=v,
+            section_area_cm2=float(a_cm2),
+            centroid_mm=tuple(float(x) for x in centroid),
+            flow_rate_m3_s=q,
+            max_velocity_m_s=v,
+        )
+        synth_idx = len(nodes) + len(synthetic_nodes)
+        synthetic_nodes.append(synth)
+        synthetic_branches.append([synth_idx])
+        synthetic_body_name.append(body.name)
+
+    all_nodes = nodes + synthetic_nodes
+    all_branches = branches + synthetic_branches
+
+    n = len(all_nodes)
     centroids = np.zeros((n, 3), dtype=np.float64)
     velocity = np.zeros(n, dtype=np.float64)
     area = np.zeros(n, dtype=np.float64)
-    for i, node in enumerate(nodes):
+    for i, node in enumerate(all_nodes):
         centroids[i] = getattr(node, "centroid_mm", (0.0, 0.0, 0.0))
         v = getattr(node, "max_velocity_m_s", 0.0)
         if v <= 1e-12:
@@ -276,52 +357,33 @@ def compute_analytic_flow_velocity(
         velocity[i] = v
         area[i] = float(getattr(node, "section_area_cm2", 0.0)) * 1e-4
 
-    branch_offsets = np.zeros(len(branches) + 1, dtype=np.int32)
-    flat_nodes = []
-    for bi, b in enumerate(branches):
+    branch_offsets = np.zeros(len(all_branches) + 1, dtype=np.int32)
+    flat_nodes: List[int] = []
+    for bi, b in enumerate(all_branches):
         flat_nodes.extend(int(i) for i in b)
         branch_offsets[bi + 1] = len(flat_nodes)
     branch_node_indices = np.asarray(flat_nodes, dtype=np.int32)
 
-    body_name_to_branch: Dict[str, int] = {}
-    for bi, branch in enumerate(branches):
-        for ni in branch:
-            up, down = _parse_node_name(getattr(nodes[ni], "name", ""))
-            if up and up not in body_name_to_branch:
-                body_name_to_branch[up] = bi
-            if down and down not in body_name_to_branch:
-                body_name_to_branch[down] = bi
-
-    # Bodies not explicitly named in any node (e.g. an intermediate distributor)
-    # are attached to the nearest branch by centroid distance.
-    branch_centroids: List[np.ndarray] = []
-    for branch in branches:
-        pts = np.asarray([nodes[ni].centroid_mm for ni in branch], dtype=np.float64)
-        branch_centroids.append(pts.mean(axis=0))
-
+    # ------------------------------------------------------------------
+    # Build the per-voxel branch map.  Node-referenced bodies use the node
+    # branch so the colour at a node centroid equals the label.  Synthetic
+    # (single-node) bodies get their own branch.  A body may be referenced
+    # by multiple branches; the first one is used (shared source segments are
+    # identical anyway).
+    # ------------------------------------------------------------------
     voxel_branch = np.full(body_index.shape, -1, dtype=np.int32)
     for idx, body in enumerate(bodies):
-        if body.body_type not in _GATING_BODY_TYPES:
+        mask = body_index == idx
+        if not mask.any():
             continue
-        branch = body_name_to_branch.get(body.name)
-        if branch is None and branches:
-            # nearest branch by body centre
-            center = getattr(body, "center", None)
-            if center is None or not isinstance(center, np.ndarray):
-                mask = body_index == idx
-                if mask.any():
-                    coords = np.argwhere(mask)
-                    center = (coords.mean(axis=0) + 0.5) * dx_mm + origin_mm
-                else:
-                    center = np.zeros(3)
-            center = np.asarray(center, dtype=np.float64)
-            dists = [np.linalg.norm(center - c) for c in branch_centroids]
-            branch = int(np.argmin(dists))
+        branch: Optional[int] = None
+        if body.name in node_body_to_branch:
+            branch = node_body_to_branch[body.name]
+        elif body.name in synthetic_body_name:
+            branch = len(branches) + synthetic_body_name.index(body.name)
         if branch is None:
             continue
-        mask = body_index == idx
-        if mask.any():
-            voxel_branch[mask] = branch
+        voxel_branch[mask] = branch
 
     try:
         bulk, pois = JOSECAST_CORE.solve_spline_tube_field(

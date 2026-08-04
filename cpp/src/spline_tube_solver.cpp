@@ -240,6 +240,47 @@ void build_branch_samples(
     }
     NaturalCubicSpline3D spline(pts);
 
+    // Degenerate single-node branch: one sample at the node position.
+    if (n_nodes == 1) {
+        out.x.resize(1);
+        out.y.resize(1);
+        out.z.resize(1);
+        out.tx.resize(1);
+        out.ty.resize(1);
+        out.tz.resize(1);
+        out.s.resize(1);
+        out.R.resize(1);
+        out.v_bulk.resize(1);
+        out.v_raw.resize(1);
+        out.x[0] = pts[0][0];
+        out.y[0] = pts[0][1];
+        out.z[0] = pts[0][2];
+        out.tx[0] = 0.0;
+        out.ty[0] = 0.0;
+        out.tz[0] = 1.0;
+        out.s[0] = 0.0;
+        double A = std::max(0.0, node_area[node_indices[0]]);
+        double R_hydr = std::sqrt(A / J_PI) * 1000.0;
+        auto pos = pts[0];
+        double R_sdf = sdf.sample(pos[0], pos[1], pos[2]);
+        double R_eff = R_hydr;
+        if (std::isfinite(R_sdf) && R_sdf >= 0.5 * dx && R_sdf <= 2.0 * R_hydr) {
+            R_eff = R_sdf;
+        }
+        out.R[0] = R_eff;
+        out.v_bulk[0] = node_velocity[node_indices[0]];
+        out.v_raw[0] = node_velocity[node_indices[0]];
+
+        out.points.resize(1, 3);
+        out.points(0, 0) = pos[0];
+        out.points(0, 1) = pos[1];
+        out.points(0, 2) = pos[2];
+        using MatrixType = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+        out.kdtree = std::make_unique<nanoflann::KDTreeEigenMatrixAdaptor<MatrixType, 3>>(
+            3, std::cref(out.points), 10);
+        return;
+    }
+
     // Physical chord length for sample density.
     double chord_length = 0.0;
     for (int i = 1; i < n_nodes; ++i) {
@@ -322,14 +363,15 @@ void build_branch_samples(
         return node_vals[i0] * (1.0 - t) + node_vals[i1] * t;
     };
 
-    // Upstream node index for the segment that contains s.  Q is conserved along a
-    // branch until a split, so the velocity uses the upstream node flow rate.
-    auto upstream_index = [&](double s) -> int {
+    // Segment downstream index for Q(s).  Q is conserved along a branch, but the
+    // source node stores the *total* pre-split flow.  For any s past the source
+    // use the first downstream node's Q (half of the source Q after a split).
+    auto downstream_index = [&](double s) -> int {
         if (n_nodes == 1) return 0;
-        if (s <= s_node.front()) return 0;
+        if (s <= s_node[1]) return 1;
         if (s >= s_node.back()) return n_nodes - 1;
-        auto it = std::upper_bound(s_node.begin(), s_node.end(), s);
-        return static_cast<int>(it - s_node.begin()) - 1;
+        auto it = std::upper_bound(s_node.begin() + 1, s_node.end(), s);
+        return static_cast<int>(it - s_node.begin());
     };
 
     const size_t n_samples = u_samples.size();
@@ -363,26 +405,26 @@ void build_branch_samples(
         out.z[k] = pos[2];
         out.s[k] = s_sample_raw[k];
 
-        // Effective cross-section: prefer the smooth SDF radius; only fall back to
-        // the theoretical node area if the sampled SDF is too small (noisy/wall).
+        // Effective cross-section is the node-derived hydraulic area interpolated
+        // along the spline.  SDF may be used for the local wall radius, but the
+        // bulk velocity v = Q / A is driven by the hydraulic area from the
+        // gating-node data, which is robust for non-circular cross-sections.
         double s_val = out.s[k];
-        double A_node_s = linear_node(s_val, A_node_node);
+        double A_eff = linear_node(s_val, A_node_node);
+        double R_hydr_mm = std::sqrt(std::max(0.0, A_eff / J_PI)) * 1000.0;
+
         double R_sdf = sdf.sample(pos[0], pos[1], pos[2]);
-        double A_eff = A_node_s;
-        double R_eff_mm = std::sqrt(std::max(0.0, A_node_s / J_PI)) * 1000.0;
-        if (std::isfinite(R_sdf) && R_sdf >= 0.5 * dx) {
-            double A_sdf = J_PI * (R_sdf * MM_TO_M) * (R_sdf * MM_TO_M);
-            // Accept SDF area unless it is unreasonably small compared to the
-            // node-derived hydraulic area (i.e. SDF hit a wall / noise).
-            if (A_sdf >= A_node_s * 0.75) {
-                A_eff = A_sdf;
-                R_eff_mm = R_sdf;
-            }
+        double R_eff_mm = R_hydr_mm;
+        if (std::isfinite(R_sdf) && R_sdf >= 0.5 * dx && R_sdf <= 2.0 * R_hydr_mm) {
+            // Use the sampled SDF radius if it is plausible for this cross-section,
+            // otherwise fall back to the hydraulic radius.
+            R_eff_mm = R_sdf;
         }
         out.R[k] = R_eff_mm;
 
-        // v = Q / A(s).  Q is the upstream flow rate for the current segment.
-        double Q_s = Q_node[upstream_index(s_val)];
+        // v = Q / A(s).  Q is the downstream flow rate for the current segment
+        // so a pre-split source node does not inflate velocities after the split.
+        double Q_s = Q_node[downstream_index(s_val)];
         double v_bulk = (A_eff > 1e-18) ? Q_s / A_eff : 0.0;
 
         // Force exact node velocities at the node samples.
