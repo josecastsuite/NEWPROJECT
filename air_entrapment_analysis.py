@@ -28,7 +28,7 @@ params = CastingParameters(
     t_fill_s=0.0,
     rho_liquid_kg_m3=7850.0,
     viscosity_pa_s=0.005,
-    gravity_vector=gravity,
+    gravity_direction=gravity,
     ingate_velocity_m_s=0.0,
     velocity_section_key='SPRUE_THROAT',
 )

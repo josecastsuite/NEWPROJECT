@@ -166,7 +166,6 @@ def _mold_to_dict(mold: MoldMaterial) -> dict:
         "binder_percent": mold.binder_percent,
         "compactability_percent": mold.compactability_percent,
         "is_sand": 1.0 if getattr(mold, "is_sand", True) else 0.0,
-        "mold_type": getattr(mold, "mold_type", "sand"),
     }
     # If the selected preset is a chill material, expose its properties
     # explicitly so the C++ thermal solver does not hardcode steel values.
@@ -269,7 +268,7 @@ def _solve_thermal_cpp(
         _alloy_to_dict(alloy),
         _mold_to_dict(mold),
         float(feed_velocity_m_s),
-        [float(x) for x in gravity_vector],
+        tuple(float(x) for x in gravity_vector),
     )
 
     T_fine = _upsample(T_c, fine_shape, order=1)

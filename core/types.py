@@ -25,10 +25,24 @@ class CastingParameters:
     velocity_section_key: str = "INGATE"
     # v9.1: gravity / casting direction (default: -Z, i.e. downward in world coords)
     gravity_direction: Tuple[float, float, float] = (0.0, 0.0, -1.0)
+    # v9.4: hotspot filtering overrides (0 = use defaults from sdf_analyzer)
+    hotspot_min_size_mm: float = 0.0
+    hotspot_cluster_eps_mm: float = 0.0
+    # Optional per-run mould property overrides (0/-1 = use preset defaults)
+    mold_afs_grain_size: float = 0.0
+    mold_moisture_percent: float = 0.0
+    mold_binder_percent: float = 0.0
+    mold_compactability_percent: float = 0.0
+    mold_rigidity_factor: float = -1.0
 
     @property
     def superheat_c(self) -> float:
         return max(self.t_pour_c - self.t_liquidus_c, 0.0)
+
+    # v9.1 backwards-compatible alias used by some callers/ui modules.
+    @property
+    def gravity_vector(self) -> Tuple[float, float, float]:
+        return self.gravity_direction
 
 
 class BodyType(IntEnum):

@@ -802,16 +802,29 @@ def _real_gating_areas_from_bodies(
 ) -> Dict[str, float]:
     """Compute real sprue/runner/distributor/curufluk/ingate cross-section areas from CAD meshes.
 
-    Areas are measured at body-to-body joints (downstream end) or, for a sprue,
-    at the smaller throat end.  This matches how metal actually flows and avoids
-    the old centroid/PCA heuristics that produced nonsensical cross-sections.
+    Areas are measured perpendicular to the local flow axis; for a sprue both the
+    base and the smaller throat are returned.  This matches how metal actually
+    flows and avoids the old centroid/PCA heuristics.
     """
     runner_total_mm2 = 0.0
+    distributor_total_mm2 = 0.0
+    curufluk_total_mm2 = 0.0
     ingate_total_mm2 = 0.0
+    n_ingates = 0
+    sprue_bases: List[float] = []
     sprue_throats: List[float] = []
 
+    gating_types = (
+        BodyType.SPRUE,
+        BodyType.SPRUE_THROAT,
+        BodyType.RUNNER,
+        BodyType.DISTRIBUTOR,
+        BodyType.CURUFLUK,
+        BodyType.INGATE,
+    )
+
     for body in bodies:
-        if body.body_type not in (BodyType.SPRUE, BodyType.RUNNER, BodyType.INGATE):
+        if body.body_type not in gating_types:
             continue
         mesh = _repair_mesh(body.mesh)
         if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
@@ -831,20 +844,30 @@ def _real_gating_areas_from_bodies(
             dn_center = downstream.mesh.vertices.mean(axis=0) if downstream is not None else None
             axis = _fallback_flow_axis(mesh, dn_center)
 
-        if body.body_type == BodyType.SPRUE:
-            throat_mm2 = _body_exit_or_throat_area(mesh, axis, is_sprue=True)
+        main_mm2, throat_mm2 = _body_cross_section_mm2(body, axis=axis)
+        main_mm2 = float(main_mm2) if main_mm2 > 0.0 else 0.0
+        throat_mm2 = float(throat_mm2) if throat_mm2 is not None and throat_mm2 > 0.0 else main_mm2
+
+        if body.body_type in (BodyType.SPRUE, BodyType.SPRUE_THROAT):
+            sprue_bases.append(main_mm2)
             sprue_throats.append(throat_mm2)
         elif body.body_type == BodyType.RUNNER:
-            area_mm2 = _body_exit_or_throat_area(mesh, axis, is_sprue=False)
-            runner_total_mm2 += area_mm2
+            runner_total_mm2 += main_mm2
+        elif body.body_type == BodyType.DISTRIBUTOR:
+            distributor_total_mm2 += main_mm2
+        elif body.body_type == BodyType.CURUFLUK:
+            curufluk_total_mm2 += main_mm2
         elif body.body_type == BodyType.INGATE:
-            area_mm2 = _body_exit_or_throat_area(
-                mesh, axis, is_sprue=False, fallback_min=downstream is None
-            )
-            ingate_total_mm2 += area_mm2
+            ingate_total_mm2 += main_mm2
+            n_ingates += 1
 
-    # For the sprue the choke/throat is the minimum area across all sprue bodies.
-    sprue_throat_mm2 = float(np.min(sprue_throats)) if sprue_throats else 0.0
+    sprue_base_mm2 = float(np.sum(sprue_bases)) if sprue_bases else 0.0
+    positive_throats = [t for t in sprue_throats if t > 0.0]
+    sprue_throat_mm2 = (
+        float(np.min(positive_throats))
+        if positive_throats
+        else (float(np.sum(sprue_throats)) if sprue_throats else 0.0)
+    )
 
     return {
         "runner_total_mm2": runner_total_mm2,
@@ -855,10 +878,11 @@ def _real_gating_areas_from_bodies(
         "curufluk_total_cm2": curufluk_total_mm2 / 100.0,
         "ingate_total_mm2": ingate_total_mm2,
         "ingate_total_cm2": ingate_total_mm2 / 100.0,
-        "sprue_base_mm2": sprue_throat_mm2,
-        "sprue_base_cm2": sprue_throat_mm2 / 100.0,
+        "sprue_base_mm2": sprue_base_mm2,
+        "sprue_base_cm2": sprue_base_mm2 / 100.0,
         "sprue_throat_mm2": sprue_throat_mm2,
         "sprue_throat_cm2": sprue_throat_mm2 / 100.0,
+        "n_ingates": n_ingates,
     }
 
 
@@ -1341,7 +1365,11 @@ def analyze_gating(
     use_bodies = bodies is not None and len(bodies) > 0
     gravity_vector = (0.0, 0.0, -1.0)
     if casting_params is not None and isinstance(casting_params, CastingParameters):
-        gravity_vector = getattr(casting_params, "gravity_vector", gravity_vector) or gravity_vector
+        gravity_vector = (
+            getattr(casting_params, "gravity_direction", None)
+            or getattr(casting_params, "gravity_vector", None)
+            or gravity_vector
+        )
     real_areas = (
         _real_gating_areas_from_bodies(bodies, gravity_vector=gravity_vector)
         if use_bodies
@@ -1492,7 +1520,7 @@ def analyze_gating(
     metal_pts = np.argwhere(result.is_metal)
     if len(metal_pts) > 0:
         projections = metal_pts @ gravity_vec
-        height_mm = float((projections.max() - projections.min()) * dx)
+        total_height_mm = float((projections.max() - projections.min()) * dx)
     else:
         total_height_mm = 0.0
     part_mask = result.grid == BodyType.PART
