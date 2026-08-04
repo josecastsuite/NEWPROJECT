@@ -1,5 +1,6 @@
 set(JOSECAST_SOURCES
     bindings.cpp
+    cgal_skeleton.cpp
     darcy_solver.cpp
     gating_tree.cpp
     lbm_solver.cpp

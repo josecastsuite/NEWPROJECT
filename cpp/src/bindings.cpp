@@ -81,6 +81,11 @@ NB_MODULE(josecast_core, m) {
           "Build a conformal spline-tube velocity field from gating nodes and SDF. "
           "Returns (velocity_bulk, velocity_poiseuille).");
 
+    m.def("extract_skeleton", &josecast::extract_skeleton,
+          nb::arg("vertices"), nb::arg("faces"), nb::arg("repair") = true,
+          "Extract the CGAL mean-curvature-flow skeleton of a closed triangle mesh. "
+          "Returns (points, edges) as numpy arrays.");
+
     m.def("compute_porosity", &josecast::compute_porosity,
           nb::arg("niyama"), nb::arg("M_mod"), nb::arg("feed_risk"), nb::arg("feed_eff"),
           nb::arg("part_mask"), nb::arg("velocity_magnitude"), nb::arg("darcy_factor"),

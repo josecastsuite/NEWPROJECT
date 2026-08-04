@@ -34,4 +34,14 @@ nb::tuple solve_spline_tube_field(
     nb::ndarray<nb::numpy, int32_t, nb::shape<-1>> branch_node_indices,
     nb::ndarray<nb::numpy, int32_t, nb::shape<-1>> branch_offsets);
 
+/**
+ * Extract the CGAL mean-curvature-flow skeleton of a closed triangle mesh.
+ *
+ * Returns a (points, edges) tuple.  points is Nx3 and edges is Mx2.
+ */
+nb::tuple extract_skeleton(
+    nb::ndarray<nb::numpy, double, nb::shape<-1, 3>> vertices,
+    nb::ndarray<nb::numpy, int32_t, nb::shape<-1, 3>> faces,
+    bool repair = true);
+
 } // namespace josecast

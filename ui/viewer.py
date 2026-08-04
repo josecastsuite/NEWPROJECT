@@ -966,16 +966,32 @@ class Analyzer3DViewer(QtInteractor):
             BodyType.PART.name,
         }
 
+        bulk = getattr(self, "_flow_velocity_bulk", None)
+        origin = np.asarray(result.origin_mm, dtype=np.float64)
+        dx = float(result.dx_mm)
+        shape = result.grid.shape
+
         for node in nodes:
             body_type = getattr(node, "body_type", "")
             if not body_type or "→" not in body_type:
                 continue
             up_type, down_type = [s.strip() for s in body_type.split("→", 1)]
-            if up_type.startswith("SOURCE"):
+            is_source = up_type.startswith("SOURCE")
+            if not is_source and down_type not in critical_down_types:
                 continue
-            if down_type not in critical_down_types:
-                continue
-            v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
+            if is_source:
+                v = node.velocity_m_s
+            else:
+                v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
+            # Prefer the actually rendered analytic velocity at the node centroid.
+            if bulk is not None and dx > 0:
+                c = np.asarray(node.centroid_mm, dtype=np.float64)
+                idx = (c - origin) / dx - 0.5
+                z, y, x = int(round(idx[2])), int(round(idx[1])), int(round(idx[0]))
+                if 0 <= z < shape[0] and 0 <= y < shape[1] and 0 <= x < shape[2]:
+                    vv = bulk[z, y, x]
+                    if vv > 1e-12:
+                        v = float(vv)
             if v > 1e-12:
                 label_points.append(node.centroid_mm)
                 label_texts.append(f"{v:.2f} m/s")

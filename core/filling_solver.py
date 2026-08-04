@@ -4895,33 +4895,9 @@ def _gating_node_velocities(
             "Hız kesitleri parça/geometri nedeniyle hesaplanamadı."
         )
 
-    # Her gövde için kendisine bağlı tüm kenarlardaki en küçük (darboğaz) alanı
-    # bul.  Böylece DISTRIBUTOR→INGATE ve INGATE→PART aynı memenin dar
-    # kesitinden hesaplanır, parça yüzeyi genişlemesinde oluşan saçma düşük hızlar
-    # ortadan kalkar.
-    body_min_area_m2: Dict[int, float] = {}
-    for up_id, down_id, node in node_entries:
-        if node.body_type.startswith("SOURCE"):
-            continue
-        area_m2 = float(node.section_area_cm2) * 1e-4
-        if area_m2 <= 1e-18:
-            continue
-        # Parçaya akan kenar için gövde yukarıdaki elemandır, diğer tüm
-        # kenarlarda gövde aşağıdaki elemandır.
-        body = up_id if down_id == part_id else down_id
-        if body not in body_min_area_m2 or area_m2 < body_min_area_m2[body]:
-            body_min_area_m2[body] = area_m2
-
-    for up_id, down_id, node in node_entries:
-        if node.body_type.startswith("SOURCE"):
-            continue
-        q = float(node.flow_rate_m3_s)
-        body = up_id if down_id == part_id else down_id
-        a = body_min_area_m2.get(body, float(node.section_area_cm2) * 1e-4)
-        if a > 1e-18 and q > 1e-18:
-            node.section_area_cm2 = float(a * 1e4)
-            node.velocity_m_s = float(q / a)
-            node.max_velocity_m_s = node.velocity_m_s
+    # Node velocities are already v = Q / A_contact from _make_node.
+    # Using each contact's own area preserves distinct velocities through the
+    # gating chain (source throat, sprue throat, ingate exit, etc.).
 
     # Sort so the report follows the BFS fill path (source first).
     up_name_to_cid = {name: cid for cid, (_, name) in comp_meta.items()}
