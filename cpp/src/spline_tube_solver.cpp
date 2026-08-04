@@ -20,6 +20,7 @@ namespace {
 
 constexpr double MM_TO_M = 1.0e-3;
 constexpr double M2_TO_MM2 = 1.0e6;
+constexpr double J_PI = 3.141592653589793238462643383279502884;
 
 inline double clamp(double x, double lo, double hi) {
     return (x < lo) ? lo : (x > hi ? hi : x);
@@ -357,9 +358,9 @@ void build_branch_samples(
         double A_node_s = linear_node(s_val, A_node_node);
         double R_sdf = sdf.sample(pos[0], pos[1], pos[2]);
         double A_eff = A_node_s;
-        double R_eff_mm = std::sqrt(std::max(0.0, A_node_s / M_PI)) * 1000.0;
+        double R_eff_mm = std::sqrt(std::max(0.0, A_node_s / J_PI)) * 1000.0;
         if (std::isfinite(R_sdf) && R_sdf >= 0.5 * dx) {
-            double A_sdf = M_PI * (R_sdf * MM_TO_M) * (R_sdf * MM_TO_M);
+            double A_sdf = J_PI * (R_sdf * MM_TO_M) * (R_sdf * MM_TO_M);
             if (A_sdf >= A_node_s * 0.5 && A_sdf <= A_node_s * 2.0) {
                 A_eff = A_sdf;
                 R_eff_mm = R_sdf;
@@ -375,7 +376,7 @@ void build_branch_samples(
             if (std::abs(s_val - s_node[i]) < node_eps) {
                 v_bulk = v_node_node[i];
                 A_eff = A_node_node[i];
-                R_eff_mm = std::sqrt(std::max(0.0, A_eff / M_PI)) * 1000.0;
+                R_eff_mm = std::sqrt(std::max(0.0, A_eff / J_PI)) * 1000.0;
                 out.R[k] = R_eff_mm;
                 break;
             }
