@@ -286,16 +286,42 @@ def compute_analytic_flow_velocity(
     body_name_to_branch: Dict[str, int] = {}
     for bi, branch in enumerate(branches):
         for ni in branch:
-            _, down = _parse_node_name(getattr(nodes[ni], "name", ""))
+            up, down = _parse_node_name(getattr(nodes[ni], "name", ""))
+            if up and up not in body_name_to_branch:
+                body_name_to_branch[up] = bi
             if down and down not in body_name_to_branch:
                 body_name_to_branch[down] = bi
 
+    # Bodies not explicitly named in any node (e.g. an intermediate distributor)
+    # are attached to the nearest branch by centroid distance.
+    branch_centroids: List[np.ndarray] = []
+    for branch in branches:
+        pts = np.asarray([nodes[ni].centroid_mm for ni in branch], dtype=np.float64)
+        branch_centroids.append(pts.mean(axis=0))
+
     voxel_branch = np.full(body_index.shape, -1, dtype=np.int32)
     for idx, body in enumerate(bodies):
-        if body.body_type in _GATING_BODY_TYPES and body.name in body_name_to_branch:
-            mask = body_index == idx
-            if mask.any():
-                voxel_branch[mask] = body_name_to_branch[body.name]
+        if body.body_type not in _GATING_BODY_TYPES:
+            continue
+        branch = body_name_to_branch.get(body.name)
+        if branch is None and branches:
+            # nearest branch by body centre
+            center = getattr(body, "center", None)
+            if center is None or not isinstance(center, np.ndarray):
+                mask = body_index == idx
+                if mask.any():
+                    coords = np.argwhere(mask)
+                    center = (coords.mean(axis=0) + 0.5) * dx_mm + origin_mm
+                else:
+                    center = np.zeros(3)
+            center = np.asarray(center, dtype=np.float64)
+            dists = [np.linalg.norm(center - c) for c in branch_centroids]
+            branch = int(np.argmin(dists))
+        if branch is None:
+            continue
+        mask = body_index == idx
+        if mask.any():
+            voxel_branch[mask] = branch
 
     try:
         bulk, pois = JOSECAST_CORE.solve_spline_tube_field(

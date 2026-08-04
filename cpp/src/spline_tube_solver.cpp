@@ -304,7 +304,7 @@ void build_branch_samples(
         s_node[i] = s_sample_raw[k];
     }
 
-    // Node flow rates (m^3/s) and the linear interpolator.
+    // Node flow rates (m^3/s) and helpers.
     std::vector<double> Q_node(n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         Q_node[i] = node_velocity[node_indices[i]] * node_area[node_indices[i]];
@@ -320,6 +320,16 @@ void build_branch_samples(
         int i1 = i;
         double t = (s - s_node[i0]) / (s_node[i1] - s_node[i0]);
         return node_vals[i0] * (1.0 - t) + node_vals[i1] * t;
+    };
+
+    // Upstream node index for the segment that contains s.  Q is conserved along a
+    // branch until a split, so the velocity uses the upstream node flow rate.
+    auto upstream_index = [&](double s) -> int {
+        if (n_nodes == 1) return 0;
+        if (s <= s_node.front()) return 0;
+        if (s >= s_node.back()) return n_nodes - 1;
+        auto it = std::upper_bound(s_node.begin(), s_node.end(), s);
+        return static_cast<int>(it - s_node.begin()) - 1;
     };
 
     const size_t n_samples = u_samples.size();
@@ -353,7 +363,8 @@ void build_branch_samples(
         out.z[k] = pos[2];
         out.s[k] = s_sample_raw[k];
 
-        // Effective cross-section
+        // Effective cross-section: prefer the smooth SDF radius; only fall back to
+        // the theoretical node area if the sampled SDF is too small (noisy/wall).
         double s_val = out.s[k];
         double A_node_s = linear_node(s_val, A_node_node);
         double R_sdf = sdf.sample(pos[0], pos[1], pos[2]);
@@ -361,14 +372,17 @@ void build_branch_samples(
         double R_eff_mm = std::sqrt(std::max(0.0, A_node_s / J_PI)) * 1000.0;
         if (std::isfinite(R_sdf) && R_sdf >= 0.5 * dx) {
             double A_sdf = J_PI * (R_sdf * MM_TO_M) * (R_sdf * MM_TO_M);
-            if (A_sdf >= A_node_s * 0.5 && A_sdf <= A_node_s * 2.0) {
+            // Accept SDF area unless it is unreasonably small compared to the
+            // node-derived hydraulic area (i.e. SDF hit a wall / noise).
+            if (A_sdf >= A_node_s * 0.75) {
                 A_eff = A_sdf;
                 R_eff_mm = R_sdf;
             }
         }
         out.R[k] = R_eff_mm;
 
-        double Q_s = linear_node(s_val, Q_node);
+        // v = Q / A(s).  Q is the upstream flow rate for the current segment.
+        double Q_s = Q_node[upstream_index(s_val)];
         double v_bulk = (A_eff > 1e-18) ? Q_s / A_eff : 0.0;
 
         // Force exact node velocities at the node samples.
