@@ -13,6 +13,7 @@
 #include "josecast/lbm_solver.h"
 #include "josecast/ns_solver.h"
 #include "josecast/sand_solver.h"
+#include "josecast/spline_tube_solver.h"
 #include "josecast/thermal_solver.h"
 
 namespace nb = nanobind;
@@ -72,6 +73,13 @@ NB_MODULE(josecast_core, m) {
           nb::arg("feed_velocity_m_s") = 0.005,
           nb::arg("gravity_vector") = std::array<double, 3>{0.0, 0.0, -1.0},
           "Solve the 3-D enthalpy-based solidification problem. Returns (T, fs, t_liq, t_sol, G, R, niyama).");
+
+    m.def("solve_spline_tube_field", &josecast::solve_spline_tube_field,
+          nb::arg("sdf"), nb::arg("voxel_branch"), nb::arg("dx"), nb::arg("origin"),
+          nb::arg("node_centroids"), nb::arg("node_velocity"), nb::arg("node_area"),
+          nb::arg("branch_node_indices"), nb::arg("branch_offsets"),
+          "Build a conformal spline-tube velocity field from gating nodes and SDF. "
+          "Returns (velocity_bulk, velocity_poiseuille).");
 
     m.def("compute_porosity", &josecast::compute_porosity,
           nb::arg("niyama"), nb::arg("M_mod"), nb::arg("feed_risk"), nb::arg("feed_eff"),

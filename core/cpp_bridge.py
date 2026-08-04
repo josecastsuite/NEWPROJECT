@@ -8,7 +8,7 @@ import numpy as np
 import trimesh
 
 from core.gate_mesh import _safe_fill_holes
-from typing import List, Tuple, Optional, Callable
+from typing import Any, Dict, List, Tuple, Optional, Callable
 
 from core.types import Body, BodyType
 
@@ -162,3 +162,154 @@ def build_voxel_grid_cpp(
             body_index = np.where(is_metal, body_index, -1)
 
     return grid, body_index, origin, dx, repaired_bodies
+
+
+_GATING_BODY_TYPES = {
+    BodyType.SPRUE_THROAT,
+    BodyType.SPRUE,
+    BodyType.RUNNER,
+    BodyType.DISTRIBUTOR,
+    BodyType.CURUFLUK,
+    BodyType.INGATE,
+    BodyType.POURING_BASIN,
+    BodyType.COOLING_SPRUE,
+    BodyType.FILTER,
+}
+
+
+def _parse_node_name(name: str) -> Tuple[str, str]:
+    if " → " in name:
+        up, down = name.split(" → ", 1)
+        return up.strip(), down.strip()
+    return "", ""
+
+
+def _build_gating_branches(nodes: List[Any]) -> List[List[int]]:
+    """Return every source -> ingate path as a list of node indices."""
+    if not nodes:
+        return []
+    down_to_node: Dict[str, int] = {}
+    source_node: Optional[int] = None
+    for i, n in enumerate(nodes):
+        name = getattr(n, "name", "")
+        if " → " not in name:
+            continue
+        up, down = _parse_node_name(name)
+        if up == "Kaynak":
+            source_node = i
+        down_to_node[down] = i
+
+    up_names = set()
+    for n in nodes:
+        name = getattr(n, "name", "")
+        if " → " in name:
+            up_names.add(_parse_node_name(name)[0])
+
+    leaves: List[int] = []
+    for i, n in enumerate(nodes):
+        name = getattr(n, "name", "")
+        if " → " not in name or i == source_node:
+            continue
+        down = _parse_node_name(name)[1]
+        if down not in up_names:
+            leaves.append(i)
+
+    branches: List[List[int]] = []
+    for leaf in leaves:
+        path = [leaf]
+        while True:
+            name = getattr(nodes[path[0]], "name", "")
+            if " → " not in name:
+                break
+            up = _parse_node_name(name)[0]
+            if up == "Kaynak" or up not in down_to_node:
+                break
+            path.insert(0, down_to_node[up])
+        branches.append(path)
+
+    if not branches and source_node is not None:
+        branches = [[source_node] + [i for i in range(len(nodes)) if i != source_node]]
+    return branches
+
+
+def compute_analytic_flow_velocity(
+    result: Any,
+    bodies: List[Body],
+    body_index: np.ndarray,
+    origin_mm: np.ndarray,
+    dx_mm: float,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Build a conformal spline-tube velocity field for UI visualisation.
+
+    Returns ``(velocity_bulk, velocity_poiseuille)`` arrays with the same shape
+    as ``result.grid``.  The bulk array is intended for surface colouring and
+    matches the gating-node label values at the node centroids.
+    """
+    if JOSECAST_CORE is None or not hasattr(JOSECAST_CORE, "solve_spline_tube_field"):
+        return None
+
+    flow = getattr(result, "flow_result", None)
+    if flow is None:
+        return None
+    nodes = getattr(flow, "gating_nodes", None) or []
+    if not nodes:
+        return None
+    if not hasattr(result, "sdf") or result.sdf.size == 0:
+        return None
+    sdf = result.sdf
+    if sdf.shape != body_index.shape:
+        return None
+
+    branches = _build_gating_branches(nodes)
+    if not branches:
+        return None
+
+    n = len(nodes)
+    centroids = np.zeros((n, 3), dtype=np.float64)
+    velocity = np.zeros(n, dtype=np.float64)
+    area = np.zeros(n, dtype=np.float64)
+    for i, node in enumerate(nodes):
+        centroids[i] = getattr(node, "centroid_mm", (0.0, 0.0, 0.0))
+        v = getattr(node, "max_velocity_m_s", 0.0)
+        if v <= 1e-12:
+            v = getattr(node, "velocity_m_s", 0.0)
+        velocity[i] = v
+        area[i] = float(getattr(node, "section_area_cm2", 0.0)) * 1e-4
+
+    branch_offsets = np.zeros(len(branches) + 1, dtype=np.int32)
+    flat_nodes = []
+    for bi, b in enumerate(branches):
+        flat_nodes.extend(int(i) for i in b)
+        branch_offsets[bi + 1] = len(flat_nodes)
+    branch_node_indices = np.asarray(flat_nodes, dtype=np.int32)
+
+    body_name_to_branch: Dict[str, int] = {}
+    for bi, branch in enumerate(branches):
+        for ni in branch:
+            _, down = _parse_node_name(getattr(nodes[ni], "name", ""))
+            if down and down not in body_name_to_branch:
+                body_name_to_branch[down] = bi
+
+    voxel_branch = np.full(body_index.shape, -1, dtype=np.int32)
+    for idx, body in enumerate(bodies):
+        if body.body_type in _GATING_BODY_TYPES and body.name in body_name_to_branch:
+            mask = body_index == idx
+            if mask.any():
+                voxel_branch[mask] = body_name_to_branch[body.name]
+
+    try:
+        bulk, pois = JOSECAST_CORE.solve_spline_tube_field(
+            np.ascontiguousarray(sdf.astype(np.float64, copy=False)),
+            np.ascontiguousarray(voxel_branch.astype(np.int32, copy=False)),
+            float(dx_mm),
+            np.asarray(origin_mm, dtype=np.float64).tolist(),
+            np.ascontiguousarray(centroids),
+            velocity,
+            area,
+            branch_node_indices,
+            branch_offsets,
+        )
+    except Exception as exc:
+        print(f"[cpp_bridge] solve_spline_tube_field failed: {exc}", file=sys.stderr)
+        return None
+    return bulk, pois

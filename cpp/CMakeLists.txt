@@ -73,11 +73,21 @@ else()
     endif()
 endif()
 
+# nanoflann (header-only KD-tree) -------------------------------------
+set(NANOFLANN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanoflann")
+if(NOT EXISTS "${NANOFLANN_DIR}/nanoflann.hpp")
+    message(FATAL_ERROR "nanoflann.hpp not found at ${NANOFLANN_DIR}")
+endif()
+
+# OpenMP -------------------------------------------------------------
+find_package(OpenMP COMPONENTS CXX QUIET)
+
 # Include dirs common to all sources
 include_directories(
     BEFORE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${AMGCL_ROOT}"
+    "${NANOFLANN_DIR}"
 )
 
 if(NOT OpenVDB_FOUND AND OPENVDB_LIBRARY)

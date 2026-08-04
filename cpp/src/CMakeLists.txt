@@ -5,6 +5,7 @@ set(JOSECAST_SOURCES
     lbm_solver.cpp
     ns_solver.cpp
     sand_solver.cpp
+    spline_tube_solver.cpp
     thermal_solver.cpp
 )
 
@@ -33,6 +34,10 @@ endif()
 
 if(Eigen3_FOUND)
     target_link_libraries(josecast_core PRIVATE Eigen3::Eigen)
+endif()
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(josecast_core PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
 # Copy the compiled extension module next to the Python package so it can be

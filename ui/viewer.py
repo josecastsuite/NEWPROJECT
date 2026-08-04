@@ -9,6 +9,7 @@ from pyvistaqt import QtInteractor
 from scipy import ndimage
 from scipy.spatial import cKDTree
 
+from core.cpp_bridge import compute_analytic_flow_velocity
 from core.gating import (
     _characteristic_cross_section_area,
     _flow_axis,
@@ -164,6 +165,8 @@ class Analyzer3DViewer(QtInteractor):
         self._flow_node_actor = None
         self._flow_arrow_actor = None
         self._flow_colorbar_actor = None
+        self._flow_velocity_bulk: Optional[np.ndarray] = None
+        self._flow_velocity_poiseuille: Optional[np.ndarray] = None
         self._mold_wall_actor = None
         self._cold_shot_actor = None
         self._cold_shot_scalar_bar_actor = None
@@ -293,6 +296,8 @@ class Analyzer3DViewer(QtInteractor):
         self._flow_node_actor = None
         self._flow_arrow_actor = None
         self._flow_colorbar_actor = None
+        self._flow_velocity_bulk = None
+        self._flow_velocity_poiseuille = None
         self._mold_wall_actor = None
         self._cold_shot_actor = None
         self._cold_shot_scalar_bar_actor = None
@@ -863,26 +868,24 @@ class Analyzer3DViewer(QtInteractor):
         if not gate_mask.any():
             return
 
+        # Prefer the analytic spline-tube field built from the same gating-node
+        # velocities used for labels.  Fall back to the node-throat field if the
+        # C++ solver is unavailable.
         fr = result.flow_result
         scalar_arr: Optional[np.ndarray] = None
-        vmag = fr.velocity_magnitude
-        if vmag is not None and vmag.size > 0:
-            gate_vmag = vmag[gate_mask & np.isfinite(vmag)]
-            if gate_vmag.size > 0:
-                v_max_raw = float(np.nanmax(gate_vmag))
-                v_min_raw = float(np.nanmin(gate_vmag))
-                if v_max_raw > 1e-9 and v_max_raw > v_min_raw * 1.05 + 0.05:
-                    scalar_arr = vmag.astype(np.float64, copy=False)
-                    try:
-                        scalar_arr = ndimage.gaussian_filter(scalar_arr, sigma=0.5)
-                    except Exception:
-                        pass
-                else:
-                    scalar_arr = self._flow_velocity_from_nodes(result, gate_mask)
-                    if scalar_arr is None:
-                        scalar_arr = vmag.astype(np.float64, copy=False)
-            else:
-                scalar_arr = self._flow_velocity_from_nodes(result, gate_mask)
+        pois_arr: Optional[np.ndarray] = None
+        if self._bodies and self._body_index is not None:
+            try:
+                analytic = compute_analytic_flow_velocity(
+                    result, self._bodies, self._body_index,
+                    self._origin_mm, self._dx_mm
+                )
+                if analytic is not None:
+                    scalar_arr, pois_arr = analytic
+                    self._flow_velocity_bulk = scalar_arr
+                    self._flow_velocity_poiseuille = pois_arr
+            except Exception as exc:
+                print(f"[viewer] analytic flow field failed: {exc}")
 
         if scalar_arr is None:
             scalar_arr = self._flow_velocity_from_nodes(result, gate_mask)
@@ -921,10 +924,9 @@ class Analyzer3DViewer(QtInteractor):
 
         gate_vals = scalar_arr[(scalar_arr > 0) & np.isfinite(scalar_arr) & gate_mask]
         if gate_vals.size > 0:
-            v_max = float(np.percentile(gate_vals, 98))
+            v_max = float(np.nanmax(gate_vals))
             if not np.isfinite(v_max) or v_max <= 0:
-                v_max = float(np.nanmax(gate_vals))
-            v_max = min(v_max, 4.5)
+                v_max = 1.0
         else:
             v_max = 1.0
         clim = (0.0, v_max)
@@ -961,16 +963,17 @@ class Analyzer3DViewer(QtInteractor):
             BodyType.SPRUE_THROAT.name,
             BodyType.SPRUE.name,
             BodyType.RUNNER.name,
+            BodyType.PART.name,
         }
 
         for node in nodes:
             body_type = getattr(node, "body_type", "")
-            down_type = ""
-            if "→" in body_type:
-                down_type = body_type.split("→")[-1].strip()
-            elif " → " in getattr(node, "name", ""):
-                down_type = node.name.split(" → ")[-1].strip()
-            if not down_type or down_type not in critical_down_types:
+            if not body_type or "→" not in body_type:
+                continue
+            up_type, down_type = [s.strip() for s in body_type.split("→", 1)]
+            if up_type.startswith("SOURCE"):
+                continue
+            if down_type not in critical_down_types:
                 continue
             v = node.max_velocity_m_s if node.max_velocity_m_s > 1e-12 else node.velocity_m_s
             if v > 1e-12:
