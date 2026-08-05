@@ -407,15 +407,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.visc_spin.setValue(0.0060)
         _params_labeled(self.visc_spin, "Viskozite μ (Pa·s):")
 
-        self.gravity_combo = QtWidgets.QComboBox()
-        self.gravity_combo.addItem("Aşağı (-Z)", "0,0,-1")
-        self.gravity_combo.addItem("Yukarı (+Z)", "0,0,1")
-        self.gravity_combo.addItem("-X", "-1,0,0")
-        self.gravity_combo.addItem("+X", "1,0,0")
-        self.gravity_combo.addItem("-Y", "0,-1,0")
-        self.gravity_combo.addItem("+Y", "0,1,0")
-        _params_labeled(self.gravity_combo, "Döküm yönü (yerçekimi):", "Metalin hangi eksende aşağı aktığını seç.")
-
         self.velocity_section_combo = QtWidgets.QComboBox()
         self.velocity_section_combo.addItem("Döküm ağzı boğazı (sprue throat)", "SPRUE_THROAT")
         self.velocity_section_combo.addItem("Döküm ağzı en üst noktası (sprue top)", "SPRUE_BASE")

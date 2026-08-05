@@ -4979,20 +4979,23 @@ def _area_to_diameter_mm(area_m2: float) -> float:
 
 def _simple_hydraulic_filling_result(
     grid: np.ndarray,
+    origin: np.ndarray,
     dx: float,
     bodies: Optional[List[Body]],
     design_velocity_m_s: float,
     design_section_key: str,
     design_area_m2: float,
     section_areas_m2: Optional[Dict[str, float]],
+    g: Tuple[float, float, float] = (0.0, 0.0, -1.0),
 ) -> FillingResult:
     """Fast Q = v * A hydraulic fill estimate without Darcy/LBM.
 
     Total flow rate is fixed from the user/design velocity and the selected
-    section area.  Each gating body receives an area-weighted share of Q and a
-    constant section velocity v_i = Q_i / A_i.  3-D velocity / fill-time arrays
-    are not produced; only discrete gating-node labels and scalar totals are
-    returned, which is enough for the UI and the thermal solver.
+    section area.  When bodies are available we use the same CAD-contact
+    graph and throat-area propagation as the full solver; otherwise we fall
+    back to the aggregate section-area split.  3-D velocity / fill-time
+    arrays are not produced; only discrete gating-node labels and scalar
+    totals are returned, which is enough for the UI and the thermal solver.
     """
     section_areas_m2 = section_areas_m2 or {}
     Q_m3_s = design_velocity_m_s * design_area_m2 if design_velocity_m_s > 0.0 and design_area_m2 > 0.0 else 0.0
@@ -5003,16 +5006,76 @@ def _simple_hydraulic_filling_result(
     V_metal_m3 = float(np.count_nonzero(is_metal)) * (dx_m ** 3)
     fill_time_s = V_metal_m3 / Q_m3_s if Q_m3_s > 1e-12 else 0.0
 
+    g_vec = _gravity_unit(g)
     gating_nodes: List[GatingNode] = []
     per_gate_v: Dict[str, float] = {}
     per_gate_area: Dict[str, float] = {}
     per_gate_q: Dict[str, float] = {}
     node_velocities: Dict[str, float] = {}
     ingate_contact_velocity_m_s = 0.0
-    total_ingate_area_m2 = 0.0
     total_ingate_q = 0.0
 
-    # Body types that should appear as velocity labels.
+    inlet_key = (design_section_key or "SPRUE_THROAT").upper()
+    inlet_area_m2 = section_areas_m2.get(inlet_key, design_area_m2)
+
+    if bodies:
+        try:
+            nodes, _, _, _, _ = _gating_node_velocities(
+                grid=grid,
+                origin_mm=origin,
+                dx_mm=dx,
+                Q_user=Q_m3_s,
+                source_area_m2=design_area_m2,
+                source_section_key=design_section_key,
+                g=g_vec,
+                bodies=bodies,
+                section_areas_m2=None,
+                velocity_m_s=None,
+                dx_m=0.0,
+                u_m_s=None,
+                v_m_s=None,
+                w_m_s=None,
+                face_fractions=None,
+            )
+            gating_nodes = nodes
+            node_velocities, ingate_contact_velocity_m_s = _aggregate_section_velocities(
+                gating_nodes, Q_m3_s, design_area_m2
+            )
+            for n in gating_nodes:
+                parts = n.body_type.split("→")
+                if len(parts) != 2:
+                    continue
+                up, down = parts
+                if down in ("PART", "Parça") and not up.startswith("SOURCE"):
+                    gate_name = n.name.split(" → ")[0]
+                    per_gate_v[gate_name] = (
+                        n.max_velocity_m_s if n.max_velocity_m_s > 1e-12 else n.velocity_m_s
+                    )
+                    per_gate_area[gate_name] = n.section_area_cm2
+                    per_gate_q[gate_name] = n.flow_rate_m3_s
+            total_ingate_q = float(sum(per_gate_q.values())) if per_gate_q else 0.0
+            reason = (
+                f"Basit hidrolik dolum (CAD temas Q/A): Q={Q_m3_s*1e3:.3f} L/s, "
+                f"kaynak={design_section_key}, V_metal={V_metal_m3*1e6:.1f} cm³, "
+                f"t_fill={fill_time_s:.2f} s."
+            )
+            return FillingResult(
+                gating_nodes=gating_nodes,
+                node_velocities=node_velocities,
+                ingate_contact_velocity_m_s=ingate_contact_velocity_m_s,
+                Q_m3_s=Q_m3_s,
+                inlet_area_m2=inlet_area_m2,
+                fill_time_s=fill_time_s,
+                per_gate_contact_velocity_m_s=per_gate_v,
+                per_gate_contact_area_cm2=per_gate_area,
+                per_gate_flow_rate_m3_s=per_gate_q,
+                total_ingate_flow_m3_s=total_ingate_q,
+                reason=reason,
+            )
+        except GatingVelocityError:
+            pass
+
+    # Fallback: aggregate section areas when no bodies/contact graph.
     gate_body_types = {
         BodyType.INGATE,
         BodyType.RUNNER,
@@ -5024,6 +5087,7 @@ def _simple_hydraulic_filling_result(
         BodyType.POURING_BASIN,
         BodyType.COOLING_SPRUE,
     }
+    total_ingate_area_m2 = 0.0
 
     if bodies:
         from collections import Counter
@@ -5041,7 +5105,6 @@ def _simple_hydraulic_filling_result(
 
             if type_name == BodyType.INGATE.name:
                 total_ingate_area_m2 += area_m2
-                # Distribute Q area-weighted among parallel ingates.
                 A_total_ingate = section_areas_m2.get(BodyType.INGATE.name, 0.0)
                 if A_total_ingate > 1e-12:
                     q_i = Q_m3_s * (area_m2 / A_total_ingate)
@@ -5053,12 +5116,10 @@ def _simple_hydraulic_filling_result(
 
             v_i = q_i / area_m2 if area_m2 > 1e-12 else 0.0
             centroid = tuple(float(x) for x in getattr(b, "center", (0.0, 0.0, 0.0)))
-            name = f"source → {b.name}"
-            body_type_str = f"{type_name}→{type_name}"
             gating_nodes.append(
                 GatingNode(
-                    name=name,
-                    body_type=body_type_str,
+                    name=f"source → {b.name}",
+                    body_type=f"{type_name}→{type_name}",
                     velocity_m_s=v_i,
                     section_area_cm2=area_cm2,
                     centroid_mm=centroid,
@@ -5075,13 +5136,9 @@ def _simple_hydraulic_filling_result(
         if total_ingate_area_m2 > 1e-12:
             ingate_contact_velocity_m_s = Q_m3_s / total_ingate_area_m2
 
-    # Source / inlet area for reporting.
-    inlet_key = (design_section_key or "SPRUE_THROAT").upper()
-    inlet_area_m2 = section_areas_m2.get(inlet_key, design_area_m2)
-
     reason = (
         f"Basit hidrolik dolum: Q={Q_m3_s*1e3:.3f} L/s, "
-        f"H_eff kaynağı={design_section_key}, V_metal={V_metal_m3*1e6:.1f} cm³, "
+        f"kaynak={design_section_key}, V_metal={V_metal_m3*1e6:.1f} cm³, "
         f"t_fill={fill_time_s:.2f} s."
     )
 
@@ -5157,16 +5214,21 @@ def solve_filling_flow(
     if progress_callback:
         progress_callback(2)
 
-    # Fast hydraulic path: Q = v * A.  Avoids expensive Darcy/LBM solves.
+    g_vec = _gravity_unit(getattr(casting_params, "gravity_vector", (0.0, 0.0, -1.0)))
+
+    # Fast hydraulic path: Q = v * A using the same CAD-contact Q/A
+    # propagation as the Darcy path, but without the expensive solve.
     if design_velocity_m_s > 0.0 and design_area_m2 > 0.0:
         return _simple_hydraulic_filling_result(
             grid=grid,
+            origin=origin,
             dx=dx,
             bodies=bodies,
             design_velocity_m_s=design_velocity_m_s,
             design_section_key=design_section_key,
             design_area_m2=design_area_m2,
             section_areas_m2=section_areas_m2,
+            g=g_vec,
         )
 
     # Blend global mould with per-CORE sand overrides before the flow solve.
