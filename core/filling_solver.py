@@ -525,29 +525,18 @@ def _select_lbm_outlet_cells(
     g: np.ndarray,
     mold=None,
 ) -> np.ndarray:
-    """Select air-escape cells for the LBM free-surface solver.
+    """Select LBM air-escape cells.
 
-    Sand molds are vented through the parting line / riser top, so the top
-    surface of the PART / RISER is a legitimate vent.  Ceramic or metal molds are
-    essentially closed boxes: displaced air can only leave through explicit vents,
-    risers, or the top of the pouring basin / sprue.  Using the part top as an
-    outlet in a closed mold would falsely suppress air-entrapment warnings.
+    Meme, yolluk, sagu, döküm hunisi ve parça ASLA vent sayılmaz. Vent sadece
+    açık besleyici/riser (RISER) veya özel VENT body'lerinin üst yüzeyidir.
+    Kum kalıplarda yüzeysel hava kacisi LBM sonrası `permeability_proxy` ile
+    uygulanan bir düzeltme ile modellenir, LBM sınırı olarak değil.
     """
-    is_sand = bool(getattr(mold, "is_sand", True))
-    if is_sand:
-        return _select_vent_cells(grid, cavity, g)
-
     outlet = np.zeros_like(cavity, dtype=bool)
-    # Explicit vent / riser / exhaust bodies (always open to atmosphere).
-    for bt in (BodyType.RISER, BodyType.CURUFLUK):
-        mask = (grid == bt) & cavity
-        if mask.any():
-            outlet |= _find_boundary_cells_along(mask, g, side="up") & cavity
-
-    # If no explicit vent exists, the LBM grid boundary acts as the last-resort
-    # vent.  We deliberately do NOT mark the top of the sprue/pouring basin as a
-    # free outlet: it is the metal source, and forcing those cells to stay empty
-    # lets the metal drain out instead of filling the cavity.
+    # RISER = açık besleyici; üst yüzeyi atmosfere açık kabul edilir.
+    riser_mask = (grid == BodyType.RISER) & cavity
+    if riser_mask.any():
+        outlet |= _find_boundary_cells_along(riser_mask, g, side="up") & cavity
     return outlet
 
 
