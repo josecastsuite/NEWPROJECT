@@ -1224,9 +1224,6 @@ class MainWindow(QtWidgets.QMainWindow):
             recs.append(
                 f"Not: giriş/kontakt bölgesi kalın kesimde (ortalama M={gr.ingate_avg_m_mm:.2f} mm)."
             )
-        if getattr(gr, "gating_system_reason", ""):
-            recs.append(gr.gating_system_reason)
-
         # Per-section velocity / Re / Fr report with reference target ranges.
         for key, sf in getattr(gr, "section_flows", {}).items():
             if sf.area_cm2 <= 0:

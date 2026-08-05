@@ -4971,6 +4971,135 @@ def _effective_mold_from_bodies(
     )
 
 
+def _area_to_diameter_mm(area_m2: float) -> float:
+    if area_m2 <= 0.0:
+        return 0.0
+    return 1000.0 * math.sqrt(4.0 * area_m2 / math.pi)
+
+
+def _simple_hydraulic_filling_result(
+    grid: np.ndarray,
+    dx: float,
+    bodies: Optional[List[Body]],
+    design_velocity_m_s: float,
+    design_section_key: str,
+    design_area_m2: float,
+    section_areas_m2: Optional[Dict[str, float]],
+) -> FillingResult:
+    """Fast Q = v * A hydraulic fill estimate without Darcy/LBM.
+
+    Total flow rate is fixed from the user/design velocity and the selected
+    section area.  Each gating body receives an area-weighted share of Q and a
+    constant section velocity v_i = Q_i / A_i.  3-D velocity / fill-time arrays
+    are not produced; only discrete gating-node labels and scalar totals are
+    returned, which is enough for the UI and the thermal solver.
+    """
+    section_areas_m2 = section_areas_m2 or {}
+    Q_m3_s = design_velocity_m_s * design_area_m2 if design_velocity_m_s > 0.0 and design_area_m2 > 0.0 else 0.0
+
+    # Total metal volume from the voxel grid (mm -> m).
+    is_metal = grid != int(BodyType.EMPTY)
+    dx_m = dx / 1000.0
+    V_metal_m3 = float(np.count_nonzero(is_metal)) * (dx_m ** 3)
+    fill_time_s = V_metal_m3 / Q_m3_s if Q_m3_s > 1e-12 else 0.0
+
+    gating_nodes: List[GatingNode] = []
+    per_gate_v: Dict[str, float] = {}
+    per_gate_area: Dict[str, float] = {}
+    per_gate_q: Dict[str, float] = {}
+    node_velocities: Dict[str, float] = {}
+    ingate_contact_velocity_m_s = 0.0
+    total_ingate_area_m2 = 0.0
+    total_ingate_q = 0.0
+
+    # Body types that should appear as velocity labels.
+    gate_body_types = {
+        BodyType.INGATE,
+        BodyType.RUNNER,
+        BodyType.SPRUE,
+        BodyType.SPRUE_THROAT,
+        BodyType.DISTRIBUTOR,
+        BodyType.CURUFLUK,
+        BodyType.FILTER,
+        BodyType.POURING_BASIN,
+        BodyType.COOLING_SPRUE,
+    }
+
+    if bodies:
+        from collections import Counter
+        type_counts = Counter()
+        gating_bodies = [b for b in bodies if b.body_type in gate_body_types]
+        for b in gating_bodies:
+            type_counts[BodyType(b.body_type).name] += 1
+
+        for b in gating_bodies:
+            type_name = BodyType(b.body_type).name
+            total_area_m2 = section_areas_m2.get(type_name, 0.0)
+            n_type = max(type_counts[type_name], 1)
+            area_m2 = total_area_m2 / n_type
+            area_cm2 = area_m2 * 1e4
+
+            if type_name == BodyType.INGATE.name:
+                total_ingate_area_m2 += area_m2
+                # Distribute Q area-weighted among parallel ingates.
+                A_total_ingate = section_areas_m2.get(BodyType.INGATE.name, 0.0)
+                if A_total_ingate > 1e-12:
+                    q_i = Q_m3_s * (area_m2 / A_total_ingate)
+                else:
+                    q_i = Q_m3_s / max(n_type, 1)
+                total_ingate_q += q_i
+            else:
+                q_i = Q_m3_s
+
+            v_i = q_i / area_m2 if area_m2 > 1e-12 else 0.0
+            centroid = tuple(float(x) for x in getattr(b, "center", (0.0, 0.0, 0.0)))
+            name = f"source → {b.name}"
+            body_type_str = f"{type_name}→{type_name}"
+            gating_nodes.append(
+                GatingNode(
+                    name=name,
+                    body_type=body_type_str,
+                    velocity_m_s=v_i,
+                    section_area_cm2=area_cm2,
+                    centroid_mm=centroid,
+                    flow_rate_m3_s=q_i,
+                    max_velocity_m_s=v_i,
+                )
+            )
+            node_velocities[type_name] = max(node_velocities.get(type_name, 0.0), v_i)
+            if type_name == BodyType.INGATE.name:
+                per_gate_v[b.name] = v_i
+                per_gate_area[b.name] = area_cm2
+                per_gate_q[b.name] = q_i
+
+        if total_ingate_area_m2 > 1e-12:
+            ingate_contact_velocity_m_s = Q_m3_s / total_ingate_area_m2
+
+    # Source / inlet area for reporting.
+    inlet_key = (design_section_key or "SPRUE_THROAT").upper()
+    inlet_area_m2 = section_areas_m2.get(inlet_key, design_area_m2)
+
+    reason = (
+        f"Basit hidrolik dolum: Q={Q_m3_s*1e3:.3f} L/s, "
+        f"H_eff kaynağı={design_section_key}, V_metal={V_metal_m3*1e6:.1f} cm³, "
+        f"t_fill={fill_time_s:.2f} s."
+    )
+
+    return FillingResult(
+        gating_nodes=gating_nodes,
+        node_velocities=node_velocities,
+        ingate_contact_velocity_m_s=ingate_contact_velocity_m_s,
+        Q_m3_s=Q_m3_s,
+        inlet_area_m2=inlet_area_m2,
+        fill_time_s=fill_time_s,
+        per_gate_contact_velocity_m_s=per_gate_v,
+        per_gate_contact_area_cm2=per_gate_area,
+        per_gate_flow_rate_m3_s=per_gate_q,
+        total_ingate_flow_m3_s=total_ingate_q,
+        reason=reason,
+    )
+
+
 def solve_filling_flow(
     grid: np.ndarray,
     origin: np.ndarray,
@@ -5027,6 +5156,18 @@ def solve_filling_flow(
     """
     if progress_callback:
         progress_callback(2)
+
+    # Fast hydraulic path: Q = v * A.  Avoids expensive Darcy/LBM solves.
+    if design_velocity_m_s > 0.0 and design_area_m2 > 0.0:
+        return _simple_hydraulic_filling_result(
+            grid=grid,
+            dx=dx,
+            bodies=bodies,
+            design_velocity_m_s=design_velocity_m_s,
+            design_section_key=design_section_key,
+            design_area_m2=design_area_m2,
+            section_areas_m2=section_areas_m2,
+        )
 
     # Blend global mould with per-CORE sand overrides before the flow solve.
     if mold is not None:

@@ -21,7 +21,10 @@ from core.gating_engine import (
     GatingEngineInput,
     _VELOCITY_RANGES as _ENGINE_VELOCITY_RANGES,
     _classify_from_velocities,
+    _max_gate_velocity_m_s,
+    _safe_gate_velocity_m_s,
     _section_velocity_limit,
+    _wall_class,
     calculate_gating_design,
 )
 from core.materials import get_alloy, get_mold, chvorinov_c_from_properties
@@ -1296,6 +1299,37 @@ def _recommend_gating_system(category: str) -> Tuple[str, str]:
     )
 
 
+def _classify_from_ingate_velocity(
+    v_ingate_m_s: float,
+    alloy_key: str,
+    wall_thickness_mm: float,
+) -> Tuple[str, str]:
+    """Classify the real gating system from the actual ingate velocity only.
+
+    Uses material-specific safe and maximum gate velocities.  Returns the
+    system name and a short Turkish explanation.
+    """
+    wall_class = _wall_class(wall_thickness_mm)
+    v_safe = _safe_gate_velocity_m_s(alloy_key, wall_class)
+    v_max = _max_gate_velocity_m_s(alloy_key)
+    # Pressurized means the gate is the fastest section -> high gate velocity.
+    # Unpressurized means the gate is the slowest section -> low gate velocity.
+    if v_ingate_m_s >= max(v_safe, v_max * 0.8):
+        return (
+            "basınçlı (pressurized)",
+            f"Meme hızı {v_ingate_m_s:.2f} m/s; basınçlı sistem için hedef üst sınırın üzerinde.",
+        )
+    if v_ingate_m_s <= v_safe * 0.5:
+        return (
+            "basınçsız (unpressurized)",
+            f"Meme hızı {v_ingate_m_s:.2f} m/s; basınçsız sistem için hedef alt sınırın altında.",
+        )
+    return (
+        "yarı basınçlı (semi-pressurized)",
+        f"Meme hızı {v_ingate_m_s:.2f} m/s; basınçlı ve basınçsız arası orta değer.",
+    )
+
+
 def _compute_section_flow(
     section_key: str,
     area_cm2: float,
@@ -1647,7 +1681,7 @@ def analyze_gating(
     Q_design_m3_s = design.q_m3_s
     fill_time_s = design.t_fill_s
     design_fill_time_s = fill_time_s
-    ingate_Q_each = Q_design_m3_s / max(design.n_gates, 1)
+    ingate_Q_each = Q_design_m3_s / max(n_ingates, 1)
 
     v_sprue_design = design.sprue_velocity_m_s
     v_runner_design = design.runner_velocity_m_s
@@ -1655,6 +1689,29 @@ def analyze_gating(
 
     d_sprue_mm = 1000.0 * math.sqrt(4.0 * max(As_m2, 0.0) / math.pi)
     d_ingate_each_mm = 1000.0 * math.sqrt(4.0 * max(Ag_each_m2, 0.0) / math.pi)
+
+    # Override with the exact gating_calculator_tr.py / compute_gating output.
+    gating_ratio = _default_gating_ratio(alloy.key)
+    gating_design = _gating_area_design(
+        W_total_kg=total_mass_kg,
+        rho_kg_m3=alloy.rho_kg_m3,
+        H_eff_m=H_eff_m,
+        t_fill_s=fill_time_s,
+        Cd=discharge_coeff,
+        gating_ratio=gating_ratio,
+        n_ingates=n_ingates,
+    )
+    As_m2 = gating_design["As_cm2"] / 1e4
+    Ar_total_m2 = gating_design["Ar_total_cm2"] / 1e4
+    Ag_total_m2 = gating_design["Ag_total_cm2"] / 1e4
+    Ag_each_m2 = gating_design["Ag_each_cm2"] / 1e4
+    Vc_ms = gating_design["Vc_ms"]
+    d_sprue_mm = gating_design["d_sprue_mm"]
+    d_ingate_each_mm = gating_design["d_ingate_each_mm"]
+    Q_design_m3_s = total_mass_kg / (alloy.rho_kg_m3 * fill_time_s) if fill_time_s > 0 else design.q_m3_s
+    v_sprue_design = Q_design_m3_s / As_m2 if As_m2 > 1e-12 else Vc_ms
+    v_runner_design = Q_design_m3_s / Ar_total_m2 if Ar_total_m2 > 1e-12 else 0.0
+    v_gate_design = Q_design_m3_s / Ag_total_m2 if Ag_total_m2 > 1e-12 else 0.0
 
     # Keep a ratio for reporting; engine uses velocities, not a fixed ratio.
     if As_m2 > 0.0:
@@ -1700,10 +1757,10 @@ def analyze_gating(
     d_runner_mm = 1000.0 * math.sqrt(4.0 * max(Ar_total_m2, 0.0) / math.pi)
     section_flows: Dict[str, SectionFlow] = {}
     section_specs = [
-        ("SPRUE_BASE", design.sprue_base_area_cm2, d_sprue_mm, sprue_v_range[0], sprue_v_range[1], sprue_A_min, sprue_A_max, Q_design_m3_s),
-        ("SPRUE_THROAT", design.sprue_throat_area_cm2, d_sprue_mm, sprue_v_range[0], sprue_v_range[1], sprue_A_min, sprue_A_max, Q_design_m3_s),
-        ("RUNNER", design.runner_total_area_cm2, d_runner_mm, runner_v_range[0], runner_v_range[1], runner_A_min, runner_A_max, Q_design_m3_s),
-        ("INGATE", design.gate_each_area_cm2, d_ingate_each_mm, gate_v_range[0], gate_v_range[1], gate_A_min, gate_A_max, ingate_Q_each),
+        ("SPRUE_BASE", As_m2 * 1e4, d_sprue_mm, sprue_v_range[0], sprue_v_range[1], sprue_A_min, sprue_A_max, Q_design_m3_s),
+        ("SPRUE_THROAT", As_m2 * 1e4, d_sprue_mm, sprue_v_range[0], sprue_v_range[1], sprue_A_min, sprue_A_max, Q_design_m3_s),
+        ("RUNNER", Ar_total_m2 * 1e4, d_runner_mm, runner_v_range[0], runner_v_range[1], runner_A_min, runner_A_max, Q_design_m3_s),
+        ("INGATE", Ag_each_m2 * 1e4, d_ingate_each_mm, gate_v_range[0], gate_v_range[1], gate_A_min, gate_A_max, ingate_Q_each),
     ]
     mu = max(alloy.viscosity_pa_s, 1e-6)
     for key, area_cm2, thickness_mm, v_min, v_max, a_min, a_max, q_for_section in section_specs:
@@ -1755,14 +1812,20 @@ def analyze_gating(
     if flow_result is not None and getattr(flow_result, "Q_m3_s", 0.0) > 0.0:
         actual_v.update(_actual_velocities_from_flow(flow_result))
 
-    # Classify the real system from the measured velocities.
-    detected_system = _classify_from_velocities(
-        actual_v.get("sprue", 0.0),
-        actual_v.get("runner", 0.0),
-        actual_v.get("gate", 0.0),
-        v_distributor=actual_v.get("distributor", 0.0),
-        v_curufluk=actual_v.get("curufluk", 0.0),
+    # Classify the real system from the actual INGATE (meme) velocity only.
+    v_meme_actual = actual_v.get("gate", 0.0)
+    actual_ingate_area_cm2 = actual_area["gate"]
+    if use_bodies:
+        actual_n_ingates = max(int(real_areas.get("n_ingates", 1)), 1)
+    elif has_ingate:
+        _, actual_n_ingates = ndimage.label(ingate)
+    else:
+        actual_n_ingates = 1
+
+    detected_system, detected_reason = _classify_from_ingate_velocity(
+        v_meme_actual, alloy.key, wall_thickness_mm
     )
+    recommended_system, recommended_reason = _recommend_gating_system(wall_cat)
 
     # Recompute target ranges based on the measured system so warnings match
     # the physical behaviour, not just the design assumption.
@@ -1814,17 +1877,23 @@ def analyze_gating(
                 f"hedef maksimum {hi:.2f} m/s'yi aşıyor; kesit alanını büyütün veya sayısını artırın."
             )
 
-    # Update the gating system reason with the measured velocities and system.
-    gating_system_reason = (
-        f"Ölçülen gating sistemi: {detected_system} (önerilen: {recommended_system}). Parça: {wall_cat}. "
-        f"Hızlar (tasarım / ölçülen): sprue={v_sprue_design:.2f}/{actual_v.get('sprue', 0.0):.2f}, "
-        f"runner={v_runner_design:.2f}/{actual_v.get('runner', 0.0):.2f}, "
-        f"dağıtıcı={actual_v.get('distributor', 0.0):.2f}, curufluk={actual_v.get('curufluk', 0.0):.2f}, "
-        f"gate={v_gate_design:.2f}/{actual_v.get('gate', 0.0):.2f} m/s. "
-        f"Oran As:Ar:Ag ≈ {final_ratio[0]:.2f}:{final_ratio[1]:.2f}:{final_ratio[2]:.2f}."
+    # Human-readable gating recommendation: meme velocity + all gate areas.
+    human_summary = (
+        f"Gating sistemi: {detected_system}. "
+        f"Parçada {actual_n_ingates} meme var; toplam meme alanı {actual_ingate_area_cm2:.2f} cm², "
+        f"gerçek meme hızı {v_meme_actual:.2f} m/s. "
+        f"Parça geometrisine göre {recommended_system} daha uygun olabilir. "
+        f"{detected_reason} {recommended_reason} "
+        f"Önerilen alanlar: sprue tabanı {As_m2*1e4:.2f} cm², "
+        f"runner toplam {Ar_total_m2*1e4:.2f} cm², "
+        f"ingate toplam {Ag_total_m2*1e4:.2f} cm² ({Ag_each_m2*1e4:.2f} cm²/her biri); "
+        f"önerilen çaplar: sprue Ø{d_sprue_mm:.1f} mm, ingate Ø{d_ingate_each_mm:.1f} mm; "
+        f"dolum süresi {fill_time_s:.2f} s, Q={Q_design_m3_s*1e3:.3f} L/s."
     )
     if design.warnings:
-        gating_system_reason += " Uyarılar: " + "; ".join(design.warnings)
+        human_summary += " Uyarılar: " + "; ".join(design.warnings)
+
+    gating_system_reason = human_summary
 
     # Add measured distributor / curufluk flows to the section report.
     if (has_distributor or distributor_area_cm2 > 0.0) and mu > 0.0:
@@ -1925,9 +1994,11 @@ def analyze_gating(
     # Feeder / part mass and volume ratios
     if result.riser_results:
         total_riser_mass_kg = sum(r.mass_kg for r in result.riser_results)
-    else:
+    elif bodies is not None:
         riser_volume_cm3 = sum(b.volume_cm3 for b in bodies if b.body_type == BodyType.RISER)
         total_riser_mass_kg = riser_volume_cm3 * alloy.density_g_cm3 / 1000.0
+    else:
+        total_riser_mass_kg = 0.0
     gating_mass_kg = max(0.0, total_mass_kg - part_mass_kg - total_riser_mass_kg)
     feed_to_part_mass_ratio = ((total_riser_mass_kg + gating_mass_kg) / part_mass_kg) if part_mass_kg > 0 else 0.0
     feed_to_part_volume_ratio = ((total_metal_volume_cm3 - part_volume_cm3) / part_volume_cm3) if part_volume_cm3 > 0 else 0.0
@@ -1969,7 +2040,7 @@ def analyze_gating(
             <= 0.2 * max(design_fill_time_s, 1e-9)
         )
     else:
-        ingate_velocity_m_s = v_gate_design
+        ingate_velocity_m_s = v_meme_actual if v_meme_actual > 0.0 else v_gate_design
         ingate_flow_rate_m3_s = Q_design_m3_s
         ingate_fill_time_s = design_fill_time_s
         velocity_fill_time_match_ok = True
