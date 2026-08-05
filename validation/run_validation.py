@@ -31,8 +31,19 @@ def _collect(result) -> Dict[str, Any]:
     fr = result.flow_result
     flow: Dict[str, Any] = {}
     if fr is not None:
-        vmag = np.asarray(fr.velocity_magnitude)
-        nonzero = vmag[vmag > 1e-12]
+        vmag_arr = fr.velocity_magnitude
+        if vmag_arr is None:
+            # Fallback to discrete gating-node velocities (simple hydraulic path).
+            vmag_arr = np.array(
+                [
+                    float(getattr(n, "max_velocity_m_s", 0.0) or n.velocity_m_s)
+                    for n in (fr.gating_nodes or [])
+                    if getattr(n, "velocity_m_s", 0.0) > 1e-12
+                ],
+                dtype=np.float64,
+            )
+        vmag = np.asarray(vmag_arr)
+        nonzero = vmag[vmag > 1e-12] if vmag.size else vmag
         flow = {
             "fill_time_s": float(fr.fill_time_s),
             "Q_m3_s": float(fr.Q_m3_s),
@@ -136,7 +147,7 @@ def _run_one(step_path: Path) -> Dict[str, Any]:
 
 def _check(summary: Dict[str, Any]) -> List[str]:
     issues: List[str] = []
-    if summary["elapsed_s"] > 180.0:
+    if summary.get("elapsed_s", 0.0) > 180.0:
         issues.append(f"analyze > {180.0}s")
     flow = summary.get("flow", {})
     if not flow:
@@ -146,8 +157,9 @@ def _check(summary: Dict[str, Any]) -> List[str]:
             issues.append("fill_time <= 0")
         if flow.get("Q_m3_s", 0.0) <= 0.0:
             issues.append("flow rate <= 0")
-    if summary["thermal"].get("visible_hotspots", 0) > 0:
-        issues.append(f"{summary['thermal']['visible_hotspots']} unresolved hot spot(s)")
+    thermal = summary.get("thermal", {})
+    if thermal.get("visible_hotspots", 0) > 0:
+        issues.append(f"{thermal['visible_hotspots']} unresolved hot spot(s)")
     return issues
 
 
@@ -156,10 +168,12 @@ def main() -> None:
     rows: List[Dict[str, Any]] = []
     for step_path in MODELS:
         print(f"[validation] {step_path.name} ...", flush=True)
+        t0 = time.time()
         try:
             row = _run_one(step_path)
         except Exception as exc:
-            row = {"model": step_path.name, "error": str(exc)}
+            elapsed = time.time() - t0
+            row = {"model": step_path.name, "error": str(exc), "elapsed_s": elapsed}
         row["issues"] = _check(row)
         rows.append(row)
         print(f"  elapsed={row.get('elapsed_s', 'n/a')}s issues={row['issues']}", flush=True)
@@ -175,10 +189,13 @@ def main() -> None:
     md_lines.append("|-------|--------|------|---------|----------|--------|------------|--------|\n")
     for r in rows:
         flow = r.get("flow", {})
+        dx_s = f"{r['dx_mm']:.4f}" if "dx_mm" in r else "-"
+        ft_s = f"{flow['fill_time_s']:.2f}" if "fill_time_s" in flow else "-"
+        re_s = f"{flow['max_reynolds']:.0f}" if "max_reynolds" in flow else "-"
+        hs_s = f"{r.get('thermal', {}).get('visible_hotspots', '-')}" if "thermal" in r else "-"
         md_lines.append(
             f"| {r['model']} | {r.get('bodies', '-')} | {r.get('grid_shape', '-')} | "
-            f"{r.get('dx_mm', '-'):.4f} | {flow.get('fill_time_s', '-'):.2f} | "
-            f"{flow.get('max_reynolds', '-'):.0f} | {r.get('thermal', {}).get('visible_hotspots', '-')} | "
+            f"{dx_s} | {ft_s} | {re_s} | {hs_s} | "
             f"{', '.join(r.get('issues', [])) or 'ok'} |\n"
         )
     md_lines.append("\n## Details\n\n")

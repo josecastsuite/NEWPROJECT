@@ -679,7 +679,11 @@ class Analyzer3DViewer(QtInteractor):
             except Exception:
                 pass
 
-        title = "Pore size (µm)" if scalar_name == "pore_size_um" else ("Solidification time" if scalar_name == "t_solid" else scalar_name)
+        title = (
+            "Pore size (µm)"
+            if scalar_name == "pore_size_um"
+            else ("Solidification time (s)" if scalar_name == "t_solid" else scalar_name)
+        )
         self._porosity_actor = self.add_mesh(
             cloud,
             scalars=scalar_name if scalar_name in cloud.array_names else None,

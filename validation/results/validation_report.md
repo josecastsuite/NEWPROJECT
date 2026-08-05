@@ -1,13 +1,14 @@
 # JoséCast Batch Validation Report
-Models: 4
-Total issues: 4
+Models: 5
+Total issues: 5
 
 | Model | Bodies | Grid | dx (mm) | Fill (s) | max Re | Visible HS | Issues |
 |-------|--------|------|---------|----------|--------|------------|--------|
-| Deneme_Ring.STEP | 9 | [159, 87, 168] | 2.8662 | 0.27 | 38427 | 1 | 1 unresolved hot spot(s) |
-| Knuckle.STEP | 4 | [151, 168, 151] | 1.4775 | 0.05 | 30439 | 3 | 3 unresolved hot spot(s) |
-| Model_Knuckle_Dusuk.STEP | 11 | [90, 168, 93] | 2.5691 | 0.73 | 31261 | 1 | 1 unresolved hot spot(s) |
-| Parca1.STEP | 5 | [169, 100, 123] | 1.3153 | 0.20 | 28523 | 1 | 1 unresolved hot spot(s) |
+| Deneme_Ring.STEP | 9 | [159, 87, 168] | 2.8662 | 4.13 | - | 1 | 1 unresolved hot spot(s) |
+| Knuckle.STEP | 4 | [151, 168, 151] | 1.4775 | 1.47 | - | 3 | 3 unresolved hot spot(s) |
+| Model_Knuckle.STEP | 10 | [92, 168, 100] | 2.3121 | 0.70 | - | 2 | 2 unresolved hot spot(s) |
+| Model_Knuckle_Dusuk.STEP | 11 | [90, 168, 93] | 2.5691 | 1.61 | - | 1 | 1 unresolved hot spot(s) |
+| Parca1.STEP | 5 | [169, 100, 123] | 1.3153 | 0.45 | - | 1 | 1 unresolved hot spot(s) |
 
 ## Details
 
@@ -22,40 +23,37 @@ Total issues: 4
     168
   ],
   "dx_mm": 2.866198376503409,
-  "elapsed_s": 78.02590465545654,
-  "chvorinov_c": 2.099078939161428,
+  "elapsed_s": 23.290826082229614,
+  "chvorinov_c": 2.8,
   "flow": {
-    "fill_time_s": 0.26581481630443804,
+    "fill_time_s": 4.1290065752363425,
     "Q_m3_s": 0.001494675140441415,
     "inlet_area_cm2": 9.964500936276101,
-    "ingate_contact_velocity_m_s": 0.6967965655023449,
-    "max_velocity_m_s": 0.696796715259552,
-    "mean_velocity_m_s": 0.6967965960502625,
-    "filter_recommendation": "Seramik filtre \u00f6nerisi: 'Kaynak \u2192 Body_7' b\u00f6lgesine \u00d865 mm, 20 PPI, 15 mm kal\u0131nl\u0131k; yakla\u015f\u0131k 15188 Pa ek bas\u0131n\u00e7 d\u00fc\u015f\u00fcm\u00fc, y\u00fczey h\u0131z\u0131 ~0.45 m/s.",
-    "reason": "C++ LBM D3Q19 dolum: giri\u015f 'SPRUE_THROAT', Q=89.68 L/dak, kaynak h\u0131z\u0131=1.500 m/s, tahmini doldurma s\u00fcresi=0.27 s, bas\u0131n\u00e7 d\u00fc\u015f\u00fcm\u00fc=21.2 Pa.",
+    "ingate_contact_velocity_m_s": 0.6967965653491994,
+    "max_velocity_m_s": 1.5,
+    "mean_velocity_m_s": 0.8574368809490455,
+    "filter_recommendation": "",
+    "reason": "Basit hidrolik dolum (CAD temas Q/A): Q=1.495 L/s, kaynak=SPRUE_THROAT, V_metal=6171.5 cm\u00b3, t_fill=4.13 s.",
     "node_velocities": {
       "SPRUE_THROAT": 1.5,
-      "SPRUE_BASE": 0.6967956362973254,
-      "INGATE": 0.6967965655023449
-    },
-    "max_reynolds": 38427.3984375,
-    "mean_reynolds": 6695.9921875,
-    "max_turbulence_intensity_pct": 13.08265495300293
+      "SPRUE_BASE": 0.6967956370234143,
+      "INGATE": 0.6967965653491994
+    }
   },
   "thermal": {
     "total_hotspots": 1,
     "visible_hotspots": 1,
-    "max_pore_um": 222.67880638090156
+    "max_pore_um": 217.97961969778993
   },
   "riser_proposals": [
     {
-      "shape": "cylinder",
-      "diameter_mm": 0.0,
-      "height_mm": 0.0,
-      "volume_cm3": 0.0,
+      "shape": "chill",
+      "diameter_mm": 48.72537240055796,
+      "height_mm": 48.72537240055796,
+      "volume_cm3": 90.8563702359569,
       "exothermic": false,
       "infeasible": true,
-      "reason": "besleme mesafesi/yol yetersiz; Darcy bas\u0131n\u00e7 kayb\u0131 kesme; Heuver \u00e7emberleri bozuk; y\u00f6nl\u00fc kat\u0131la\u015fma bozuk; konvansiyonel silindirik besleyici \u00f6nerildi; \u00f6nerilen besleyici/\u00e7\u0131k\u0131c\u0131 par\u00e7a geometrisine s\u0131\u011fm\u0131yor; kullan\u0131c\u0131 karar\u0131 gerekiyor | ba\u011flant\u0131: (-9.8, 2.7, -8.0) cm, normal=(0.71,0.00,0.71)"
+      "reason": "besleme mesafesi/yol yetersiz; Darcy bas\u0131n\u00e7 kayb\u0131 kesme; Heuver \u00e7emberleri bozuk; y\u00f6nl\u00fc kat\u0131la\u015fma bozuk; \u00e7\u0131k\u0131c\u0131 (chill) \u00f6nerildi; \u00f6nerilen besleyici/\u00e7\u0131k\u0131c\u0131 par\u00e7a geometrisine s\u0131\u011fm\u0131yor; kullan\u0131c\u0131 karar\u0131 gerekiyor | ba\u011flant\u0131: (-9.8, 2.7, -8.0) cm, normal=(0.71,0.00,0.71)"
     }
   ],
   "gate_exists": true,
@@ -75,62 +73,117 @@ Total issues: 4
     151
   ],
   "dx_mm": 1.4775000000000003,
-  "elapsed_s": 53.86274266242981,
-  "chvorinov_c": 2.099078939161428,
+  "elapsed_s": 22.804110288619995,
+  "chvorinov_c": 2.8,
   "flow": {
-    "fill_time_s": 0.04636517859240012,
-    "Q_m3_s": 0.0004710436194935888,
-    "inlet_area_cm2": 3.1402907966239253,
-    "ingate_contact_velocity_m_s": 1.499999999999999,
+    "fill_time_s": 1.4749699475076044,
+    "Q_m3_s": 0.0004710436194935886,
+    "inlet_area_cm2": 3.140290796623924,
+    "ingate_contact_velocity_m_s": 1.4999999999999982,
     "max_velocity_m_s": 1.5,
-    "mean_velocity_m_s": 1.5,
-    "filter_recommendation": "Seramik filtre \u00f6nerisi: 'Kaynak \u2192 Body_4' b\u00f6lgesine \u00d837 mm, 20 PPI, 15 mm kal\u0131nl\u0131k; yakla\u015f\u0131k 15188 Pa ek bas\u0131n\u00e7 d\u00fc\u015f\u00fcm\u00fc, y\u00fczey h\u0131z\u0131 ~0.45 m/s.",
-    "reason": "C++ LBM D3Q19 dolum: giri\u015f 'SPRUE_THROAT', Q=28.26 L/dak, kaynak h\u0131z\u0131=1.500 m/s, tahmini doldurma s\u00fcresi=0.05 s, bas\u0131n\u00e7 d\u00fc\u015f\u00fcm\u00fc=1308.7 Pa.",
+    "mean_velocity_m_s": 1.4999999999999993,
+    "filter_recommendation": "",
+    "reason": "Basit hidrolik dolum (CAD temas Q/A): Q=0.471 L/s, kaynak=SPRUE_THROAT, V_metal=694.8 cm\u00b3, t_fill=1.47 s.",
     "node_velocities": {
       "SPRUE_THROAT": 1.5,
-      "INGATE": 1.499999999999999
-    },
-    "max_reynolds": 30439.1953125,
-    "mean_reynolds": 4961.30908203125,
-    "max_turbulence_intensity_pct": 15.049436569213867
+      "INGATE": 1.4999999999999982
+    }
   },
   "thermal": {
     "total_hotspots": 3,
     "visible_hotspots": 3,
-    "max_pore_um": 1000.468268954902
+    "max_pore_um": 1080.0
   },
   "riser_proposals": [
     {
-      "shape": "cylinder",
-      "diameter_mm": 0.0,
-      "height_mm": 0.0,
-      "volume_cm3": 0.0,
+      "shape": "chill",
+      "diameter_mm": 57.62250000000001,
+      "height_mm": 57.62250000000001,
+      "volume_cm3": 150.2678840619793,
       "exothermic": false,
       "infeasible": true,
-      "reason": "besleme mesafesi/yol yetersiz; sistemde riser yok; konvansiyonel silindirik besleyici \u00f6nerildi; \u00f6nerilen besleyici/\u00e7\u0131k\u0131c\u0131 par\u00e7a geometrisine s\u0131\u011fm\u0131yor; kullan\u0131c\u0131 karar\u0131 gerekiyor | ba\u011flant\u0131: (-5.4, 6.8, -35.2) cm, normal=(0.00,0.00,1.00)"
+      "reason": "besleme mesafesi/yol yetersiz; sistemde riser yok; \u00e7\u0131k\u0131c\u0131 (chill) \u00f6nerildi; \u00f6nerilen besleyici/\u00e7\u0131k\u0131c\u0131 par\u00e7a geometrisine s\u0131\u011fm\u0131yor; kullan\u0131c\u0131 karar\u0131 gerekiyor | ba\u011flant\u0131: (-1.8, -0.1, -32.4) cm, normal=(0.00,0.00,1.00)"
     },
     {
-      "shape": "cylinder",
-      "diameter_mm": 0.0,
-      "height_mm": 0.0,
-      "volume_cm3": 0.0,
+      "shape": "chill",
+      "diameter_mm": 57.62250000000001,
+      "height_mm": 49.62019806292067,
+      "volume_cm3": 129.3994909913907,
       "exothermic": false,
       "infeasible": true,
-      "reason": "besleme mesafesi/yol yetersiz; sistemde riser yok; konvansiyonel silindirik besleyici \u00f6nerildi; \u00f6nerilen besleyici/\u00e7\u0131k\u0131c\u0131 par\u00e7a geometrisine s\u0131\u011fm\u0131yor; kullan\u0131c\u0131 karar\u0131 gerekiyor | ba\u011flant\u0131: (-1.8, -0.1, -32.4) cm, normal=(0.00,0.00,1.00)"
+      "reason": "besleme mesafesi/yol yetersiz; sistemde riser yok; \u00e7\u0131k\u0131c\u0131 (chill) \u00f6nerildi; \u00f6nerilen besleyici/\u00e7\u0131k\u0131c\u0131 par\u00e7a geometrisine s\u0131\u011fm\u0131yor; kullan\u0131c\u0131 karar\u0131 gerekiyor | ba\u011flant\u0131: (-5.4, 6.8, -35.2) cm, normal=(0.00,0.00,1.00)"
     },
     {
-      "shape": "cylinder",
-      "diameter_mm": 0.0,
-      "height_mm": 0.0,
-      "volume_cm3": 0.0,
+      "shape": "chill",
+      "diameter_mm": 57.62250000000001,
+      "height_mm": 33.25328759738989,
+      "volume_cm3": 86.7178821704063,
       "exothermic": false,
       "infeasible": true,
-      "reason": "besleme mesafesi/yol yetersiz; sistemde riser yok; konvansiyonel silindirik besleyici \u00f6nerildi; \u00f6nerilen besleyici/\u00e7\u0131k\u0131c\u0131 par\u00e7a geometrisine s\u0131\u011fm\u0131yor; kullan\u0131c\u0131 karar\u0131 gerekiyor | ba\u011flant\u0131: (-8.8, 8.3, -34.9) cm, normal=(0.00,0.00,1.00)"
+      "reason": "besleme mesafesi/yol yetersiz; sistemde riser yok; \u00e7\u0131k\u0131c\u0131 (chill) \u00f6nerildi; \u00f6nerilen besleyici/\u00e7\u0131k\u0131c\u0131 par\u00e7a geometrisine s\u0131\u011fm\u0131yor; kullan\u0131c\u0131 karar\u0131 gerekiyor | ba\u011flant\u0131: (-8.8, 8.3, -34.9) cm, normal=(0.00,0.00,1.00)"
     }
   ],
   "gate_exists": true,
   "issues": [
     "3 unresolved hot spot(s)"
+  ]
+}
+```
+### Model_Knuckle.STEP
+```json
+{
+  "model": "Model_Knuckle.STEP",
+  "bodies": 10,
+  "grid_shape": [
+    92,
+    168,
+    100
+  ],
+  "dx_mm": 2.312070312499947,
+  "elapsed_s": 63.02645468711853,
+  "chvorinov_c": 2.8,
+  "flow": {
+    "fill_time_s": 0.7006182960203999,
+    "Q_m3_s": 0.0017280885020927895,
+    "inlet_area_cm2": 11.52059001395193,
+    "ingate_contact_velocity_m_s": 4.299185106396607,
+    "max_velocity_m_s": 4.891517276611181,
+    "mean_velocity_m_s": 3.9762809532031147,
+    "filter_recommendation": "",
+    "reason": "Basit hidrolik dolum (CAD temas Q/A): Q=1.728 L/s, kaynak=SPRUE_THROAT, V_metal=1210.7 cm\u00b3, t_fill=0.70 s.",
+    "node_velocities": {
+      "SPRUE_THROAT": 3.761011517740787,
+      "INGATE": 4.299185106396607
+    }
+  },
+  "thermal": {
+    "total_hotspots": 2,
+    "visible_hotspots": 2,
+    "max_pore_um": 450.3415138435814
+  },
+  "riser_proposals": [
+    {
+      "shape": "chill",
+      "diameter_mm": 56.64572265624871,
+      "height_mm": 32.780489045103806,
+      "volume_cm3": 82.61131839546054,
+      "exothermic": false,
+      "infeasible": true,
+      "reason": "besleme mesafesi/yol yetersiz; Darcy bas\u0131n\u00e7 kayb\u0131 kesme; Heuver \u00e7emberleri bozuk; y\u00f6nl\u00fc kat\u0131la\u015fma bozuk; \u00e7\u0131k\u0131c\u0131 (chill) \u00f6nerildi; \u00f6nerilen besleyici/\u00e7\u0131k\u0131c\u0131 par\u00e7a geometrisine s\u0131\u011fm\u0131yor; kullan\u0131c\u0131 karar\u0131 gerekiyor | ba\u011flant\u0131: (-8.7, 7.7, 94.9) cm, normal=(0.00,0.00,1.00)"
+    },
+    {
+      "shape": "chill",
+      "diameter_mm": 56.64572265624871,
+      "height_mm": 56.64572265624871,
+      "volume_cm3": 142.75497304684876,
+      "exothermic": false,
+      "infeasible": true,
+      "reason": "besleme mesafesi/yol yetersiz; Darcy bas\u0131n\u00e7 kayb\u0131 kesme; Heuver \u00e7emberleri bozuk; y\u00f6nl\u00fc kat\u0131la\u015fma bozuk; \u00e7\u0131k\u0131c\u0131 (chill) \u00f6nerildi; \u00f6nerilen besleyici/\u00e7\u0131k\u0131c\u0131 par\u00e7a geometrisine s\u0131\u011fm\u0131yor; kullan\u0131c\u0131 karar\u0131 gerekiyor | ba\u011flant\u0131: (-2.0, -0.2, 97.7) cm, normal=(0.00,0.00,1.00)"
+    }
+  ],
+  "gate_exists": true,
+  "issues": [
+    "2 unresolved hot spot(s)"
   ]
 }
 ```
@@ -145,41 +198,38 @@ Total issues: 4
     93
   ],
   "dx_mm": 2.5691015624999567,
-  "elapsed_s": 108.56621146202087,
-  "chvorinov_c": 2.099078939161428,
+  "elapsed_s": 40.80727577209473,
+  "chvorinov_c": 2.8,
   "flow": {
-    "fill_time_s": 0.7310872184224103,
+    "fill_time_s": 1.6096476840884608,
     "Q_m3_s": 0.0008692629270489904,
     "inlet_area_cm2": 5.795086180326603,
     "ingate_contact_velocity_m_s": 0.5866155767260667,
-    "max_velocity_m_s": 0.803970456123352,
-    "mean_velocity_m_s": 0.8039703965187073,
-    "filter_recommendation": "Seramik filtre \u00f6nerisi: 'Body_8 \u2192 Body_9' b\u00f6lgesine \u00d850 mm, 20 PPI, 15 mm kal\u0131nl\u0131k; yakla\u015f\u0131k 15188 Pa ek bas\u0131n\u00e7 d\u00fc\u015f\u00fcm\u00fc, y\u00fczey h\u0131z\u0131 ~0.45 m/s.",
-    "reason": "C++ LBM D3Q19 dolum: giri\u015f 'SPRUE_THROAT', Q=52.16 L/dak, kaynak h\u0131z\u0131=1.500 m/s, tahmini doldurma s\u00fcresi=0.73 s, bas\u0131n\u00e7 d\u00fc\u015f\u00fcm\u00fc=12.3 Pa.",
+    "max_velocity_m_s": 1.5000116914598758,
+    "mean_velocity_m_s": 0.963529980408469,
+    "filter_recommendation": "",
+    "reason": "Basit hidrolik dolum (CAD temas Q/A): Q=0.869 L/s, kaynak=SPRUE_THROAT, V_metal=1399.2 cm\u00b3, t_fill=1.61 s.",
     "node_velocities": {
       "SPRUE_THROAT": 1.5,
       "RUNNER": 1.5000116914598758,
       "DISTRIBUTOR": 0.8039704673460483,
       "INGATE": 0.5866155767260667
-    },
-    "max_reynolds": 31260.587890625,
-    "mean_reynolds": 5021.7373046875,
-    "max_turbulence_intensity_pct": 10.76789665222168
+    }
   },
   "thermal": {
     "total_hotspots": 1,
     "visible_hotspots": 1,
-    "max_pore_um": 1200.0
+    "max_pore_um": 192.27005209915023
   },
   "riser_proposals": [
     {
-      "shape": "cylinder",
-      "diameter_mm": 0.0,
-      "height_mm": 0.0,
-      "volume_cm3": 0.0,
+      "shape": "chill",
+      "diameter_mm": 20.552812499999654,
+      "height_mm": 2.529977255295064,
+      "volume_cm3": 0.839361449182268,
       "exothermic": false,
       "infeasible": true,
-      "reason": "besleme mesafesi/yol yetersiz; Darcy bas\u0131n\u00e7 kayb\u0131 kesme; Heuver \u00e7emberleri bozuk; konvansiyonel silindirik besleyici \u00f6nerildi; \u00f6nerilen besleyici/\u00e7\u0131k\u0131c\u0131 par\u00e7a geometrisine s\u0131\u011fm\u0131yor; kullan\u0131c\u0131 karar\u0131 gerekiyor | ba\u011flant\u0131: (-1.8, -0.5, 97.7) cm, normal=(0.00,0.00,1.00)"
+      "reason": "besleme mesafesi/yol yetersiz; Darcy bas\u0131n\u00e7 kayb\u0131 kesme; Heuver \u00e7emberleri bozuk; y\u00f6nl\u00fc kat\u0131la\u015fma bozuk; \u00e7\u0131k\u0131c\u0131 (chill) \u00f6nerildi; \u00f6nerilen besleyici/\u00e7\u0131k\u0131c\u0131 par\u00e7a geometrisine s\u0131\u011fm\u0131yor; kullan\u0131c\u0131 karar\u0131 gerekiyor | ba\u011flant\u0131: (-1.8, -0.5, 97.7) cm, normal=(0.00,0.00,1.00)"
     }
   ],
   "gate_exists": true,
@@ -199,40 +249,37 @@ Total issues: 4
     123
   ],
   "dx_mm": 1.3153124999999997,
-  "elapsed_s": 38.17332744598389,
-  "chvorinov_c": 2.099078939161428,
+  "elapsed_s": 17.747180223464966,
+  "chvorinov_c": 2.8,
   "flow": {
-    "fill_time_s": 0.1963087029808457,
+    "fill_time_s": 0.44618959858342305,
     "Q_m3_s": 0.0014774095572275057,
     "inlet_area_cm2": 9.849397048183372,
     "ingate_contact_velocity_m_s": 3.02237997689804,
-    "max_velocity_m_s": 3.0223798751831055,
-    "mean_velocity_m_s": 3.022379159927368,
-    "filter_recommendation": "Seramik filtre \u00f6nerisi: 'Body_4 \u2192 Body_3' b\u00f6lgesine \u00d865 mm, 20 PPI, 15 mm kal\u0131nl\u0131k; yakla\u015f\u0131k 15188 Pa ek bas\u0131n\u00e7 d\u00fc\u015f\u00fcm\u00fc, y\u00fczey h\u0131z\u0131 ~0.45 m/s.",
-    "reason": "C++ LBM D3Q19 dolum: giri\u015f 'SPRUE_THROAT', Q=88.64 L/dak, kaynak h\u0131z\u0131=1.500 m/s, tahmini doldurma s\u00fcresi=0.20 s, bas\u0131n\u00e7 d\u00fc\u015f\u00fcm\u00fc=1805.3 Pa.",
+    "max_velocity_m_s": 3.0223799768980406,
+    "mean_velocity_m_s": 2.2611899884490203,
+    "filter_recommendation": "",
+    "reason": "Basit hidrolik dolum (CAD temas Q/A): Q=1.477 L/s, kaynak=SPRUE_THROAT, V_metal=659.2 cm\u00b3, t_fill=0.45 s.",
     "node_velocities": {
       "SPRUE_THROAT": 1.5,
       "RUNNER": 3.0223799768980406,
       "INGATE": 3.02237997689804
-    },
-    "max_reynolds": 28522.91796875,
-    "mean_reynolds": 4356.66796875,
-    "max_turbulence_intensity_pct": 9.899985313415527
+    }
   },
   "thermal": {
     "total_hotspots": 1,
     "visible_hotspots": 1,
-    "max_pore_um": 30.63401108401552
+    "max_pore_um": 21.101379972686583
   },
   "riser_proposals": [
     {
-      "shape": "cylinder",
-      "diameter_mm": 0.0,
-      "height_mm": 0.0,
-      "volume_cm3": 0.0,
+      "shape": "chill",
+      "diameter_mm": 9.2071875,
+      "height_mm": 3.5886597614667157,
+      "volume_cm3": 0.2389330029158018,
       "exothermic": false,
       "infeasible": true,
-      "reason": "besleme mesafesi/yol yetersiz; Darcy bas\u0131n\u00e7 kayb\u0131 kesme; konvansiyonel silindirik besleyici \u00f6nerildi; \u00f6nerilen besleyici/\u00e7\u0131k\u0131c\u0131 par\u00e7a geometrisine s\u0131\u011fm\u0131yor; kullan\u0131c\u0131 karar\u0131 gerekiyor | ba\u011flant\u0131: (2.3, 1.9, -0.3) cm, normal=(0.00,1.00,0.00)"
+      "reason": "besleme mesafesi/yol yetersiz; Darcy bas\u0131n\u00e7 kayb\u0131 kesme; \u00e7\u0131k\u0131c\u0131 (chill) \u00f6nerildi; \u00f6nerilen besleyici/\u00e7\u0131k\u0131c\u0131 par\u00e7a geometrisine s\u0131\u011fm\u0131yor; kullan\u0131c\u0131 karar\u0131 gerekiyor | ba\u011flant\u0131: (2.3, 1.9, -0.3) cm, normal=(0.00,1.00,0.00)"
     }
   ],
   "gate_exists": true,
