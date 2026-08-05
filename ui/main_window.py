@@ -447,6 +447,14 @@ class MainWindow(QtWidgets.QMainWindow):
             "0 = otomatik. Etkin metal yüksekliği (m). Şimdilik bağlanmadı.",
         )
 
+        self.fast_flow_chk = QtWidgets.QCheckBox("Hızlı akış hesabı (animasyon yok)")
+        self.fast_flow_chk.setToolTip(
+            "İşaretlenirse 3-B Darcy/VOF çözümü atlanır; sadece Q=vA ile düğüm hızları "
+            "hesaplanır. Animasyon çalışmaz. Varsayılan: kapalı (tam simülasyon)."
+        )
+        self.fast_flow_chk.setChecked(False)
+        params_layout.addWidget(self.fast_flow_chk)
+
         left_layout.addWidget(params_group)
 
         # Gravity direction group
@@ -830,6 +838,7 @@ class MainWindow(QtWidgets.QMainWindow):
             velocity_section_key=self.velocity_section_combo.currentData(),
             gravity_direction=gravity_direction,
             h_eff_m=self.h_eff_spin.value(),
+            fast_flow=self.fast_flow_chk.isChecked(),
         )
 
     def _gravity_vector_from_ui(self) -> Tuple[float, float, float]:

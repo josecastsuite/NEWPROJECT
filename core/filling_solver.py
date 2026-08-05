@@ -5172,6 +5172,7 @@ def solve_filling_flow(
     design_area_m2: float = 0.0,
     section_areas_m2: Optional[Dict[str, float]] = None,
     mold=None,
+    fast_hydraulic: bool = False,
 ) -> FillingResult:
     """Run the Darcy filling-flow solver and return section/node velocities.
 
@@ -5206,6 +5207,10 @@ def solve_filling_flow(
     section_areas_m2 : dict[str, float]
         Optional measured cross-sectional areas (m²) for each gating section.
         If provided, node velocities use these areas instead of the voxel grid.
+    fast_hydraulic : bool
+        If True, bypass the 3-D Darcy/VOF solve and return a fast Q=vA
+        estimate.  This is quick but does not produce 3-D velocity/fill-time
+        arrays, so the flow animation will not work.
 
     Returns
     -------
@@ -5218,7 +5223,7 @@ def solve_filling_flow(
 
     # Fast hydraulic path: Q = v * A using the same CAD-contact Q/A
     # propagation as the Darcy path, but without the expensive solve.
-    if design_velocity_m_s > 0.0 and design_area_m2 > 0.0:
+    if fast_hydraulic and design_velocity_m_s > 0.0 and design_area_m2 > 0.0:
         return _simple_hydraulic_filling_result(
             grid=grid,
             origin=origin,

@@ -2293,6 +2293,7 @@ def _run_filling_flow(
         for key, val in user_section_areas_cm2.items():
             if val and val > 0.0:
                 section_areas_m2[key.upper()] = float(val) * 1e-4
+    fast_hydraulic = bool(getattr(casting_params, "fast_flow", False))
     return solve_filling_flow(
         grid,
         origin_mm,
@@ -2307,6 +2308,7 @@ def _run_filling_flow(
         design_area_m2=design_area_cm2 * 1e-4,
         section_areas_m2=section_areas_m2,
         mold=mold,
+        fast_hydraulic=fast_hydraulic,
     )
 
 

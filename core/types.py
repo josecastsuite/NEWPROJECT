@@ -36,6 +36,8 @@ class CastingParameters:
     mold_rigidity_factor: float = -1.0
     # v9.5: effective metal head height (m). 0 = automatic from geometry.
     h_eff_m: float = 0.0
+    # v9.7: skip the 3-D Darcy/VOF solve and use the fast Q=vA hydraulic path.
+    fast_flow: bool = False
 
     @property
     def superheat_c(self) -> float:
