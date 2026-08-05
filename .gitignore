@@ -6,10 +6,13 @@ __pycache__/
 .Python
 data/
 sample_results/
-tmp/
 *.step
 *.stp
 *.pdf
 *.png
 *.jpg
 .DS_Store
+cpp/build/
+*.so
+*.dylib
+*.dll

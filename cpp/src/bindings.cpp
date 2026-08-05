@@ -1,0 +1,100 @@
+#include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
+#include <nanobind/stl/array.h>
+#include <nanobind/stl/map.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
+
+#ifdef JOSECAST_HAS_OPENVDB
+#include "josecast/voxelizer.h"
+#endif
+#include "josecast/darcy_solver.h"
+#include "josecast/gating_tree.h"
+#include "josecast/lbm_solver.h"
+#include "josecast/ns_solver.h"
+#include "josecast/sand_solver.h"
+#include "josecast/spline_tube_solver.h"
+#include "josecast/thermal_solver.h"
+
+namespace nb = nanobind;
+
+NB_MODULE(josecast_core, m) {
+    m.doc() = "JoseCast C++ core (OpenVDB + AMGCL + nanobind)";
+
+#ifdef JOSECAST_HAS_OPENVDB
+    nb::class_<josecast::Voxelizer>(m, "Voxelizer")
+        .def(nb::init<>())
+        .def("add_body", &josecast::Voxelizer::add_body,
+             nb::arg("body_id"), nb::arg("body_type"),
+             nb::arg("vertices"), nb::arg("faces"))
+        .def("build", &josecast::Voxelizer::build,
+             nb::arg("voxel_size"), nb::arg("origin"), nb::arg("dims"),
+             "Returns (grid, body_index, sdf) as 3-D numpy arrays.");
+#endif
+
+    m.def("solve_pressure", &josecast::solve_pressure,
+          nb::arg("indptr"), nb::arg("indices"), nb::arg("data"), nb::arg("rhs"),
+          nb::arg("max_iter") = 1000, nb::arg("rtol") = 1e-5, nb::arg("abstol") = 1e-12,
+          "Solve a sparse symmetric-positive-definite pressure system with AMGCL (BiCGStab + AMG).");
+
+    m.def("solve_gating_times", &josecast::solve_gating_times,
+          nb::arg("source_bidx"), nb::arg("source_q"),
+          nb::arg("body_volumes"), nb::arg("edges"), nb::arg("edge_q"), nb::arg("q_in"),
+          "Compute t_enter/t_exit/Q for the gating tree using Kahn topological sort.");
+
+    m.def("solve_ns_vof", &josecast::solve_ns_vof,
+          nb::arg("grid"), nb::arg("phi_init"), nb::arg("source_mask"),
+          nb::arg("dx"), nb::arg("g"), nb::arg("rho"), nb::arg("nu"),
+          nb::arg("inflow_velocity"), nb::arg("t_max"), nb::arg("max_steps"),
+          nb::arg("cfl"), nb::arg("max_pressure_iter"), nb::arg("pressure_tol"),
+          "Run a 3-D fractional-step Navier-Stokes + level-set mold-filling solver.");
+
+    m.def("solve_lbm_filling", &josecast::solve_lbm_filling,
+          nb::arg("grid"), nb::arg("inlet_mask"), nb::arg("outlet_mask"),
+          nb::arg("dx"), nb::arg("g"), nb::arg("rho"), nb::arg("nu"),
+          nb::arg("inflow_velocity"), nb::arg("t_max"), nb::arg("max_steps"),
+          nb::arg("cfl_target") = 0.15, nb::arg("smagorinsky") = 0.18,
+          nb::arg("target_velocity") = nb::ndarray<nb::numpy, double>(),
+          nb::arg("inlet_distance") = nb::ndarray<nb::numpy, double>(),
+          "Run a 3-D D3Q19 LBM + Smagorinsky + VOF free-surface mold-filling solver.");
+
+    m.def("compute_sand_permeability", &josecast::compute_sand_permeability,
+          nb::arg("sand_mask"), nb::arg("afs_grain_size_mm"),
+          nb::arg("moisture_percent") = 4.0, nb::arg("binder_percent") = 2.0,
+          nb::arg("compactability_percent") = 45.0, nb::arg("pressure_pa") = 5000.0,
+          nb::arg("air_viscosity_pa_s") = 1.81e-5, nb::arg("dx_m") = 1e-3,
+          "Compute sand-mold permeability and air-leakage rate from AFS grain size, moisture and binder.");
+
+    m.def("solve_thermal", &josecast::solve_thermal,
+          nb::arg("is_metal"), nb::arg("is_gating"), nb::arg("is_chill"),
+          nb::arg("fill_time"), nb::arg("velocity"),
+          nb::arg("dx_mm"), nb::arg("max_time_s"), nb::arg("n_steps"),
+          nb::arg("alloy"), nb::arg("mold"),
+          nb::arg("feed_velocity_m_s") = 0.005,
+          nb::arg("gravity_vector") = std::array<double, 3>{0.0, 0.0, -1.0},
+          "Solve the 3-D enthalpy-based solidification problem. Returns (T, fs, t_liq, t_sol, G, R, niyama).");
+
+    m.def("solve_spline_tube_field", &josecast::solve_spline_tube_field,
+          nb::arg("sdf"), nb::arg("voxel_branch"), nb::arg("dx"), nb::arg("origin"),
+          nb::arg("node_centroids"), nb::arg("node_velocity"), nb::arg("node_area"),
+          nb::arg("branch_node_indices"), nb::arg("branch_offsets"),
+          "Build a conformal spline-tube velocity field from gating nodes and SDF. "
+          "Returns (velocity_bulk, velocity_poiseuille).");
+
+    m.def("extract_skeleton", &josecast::extract_skeleton,
+          nb::arg("vertices"), nb::arg("faces"), nb::arg("repair") = true,
+          "Extract the CGAL mean-curvature-flow skeleton of a closed triangle mesh. "
+          "Returns (points, edges) as numpy arrays.");
+
+    m.def("compute_porosity", &josecast::compute_porosity,
+          nb::arg("niyama"), nb::arg("M_mod"), nb::arg("feed_risk"), nb::arg("feed_eff"),
+          nb::arg("part_mask"), nb::arg("velocity_magnitude"), nb::arg("darcy_factor"),
+          nb::arg("alloy"), nb::arg("carlson_curve_key") = std::string("WCB"),
+          nb::arg("material_family") = std::string(""),
+          nb::arg("solid_fraction") = nb::ndarray<nb::numpy, double>(),
+          nb::arg("carbon_equivalent") = -1.0,
+          nb::arg("mold_rigidity_factor") = -1.0,
+          nb::arg("graphite_expansion_fraction") = -1.0,
+          nb::arg("inoculation_factor") = -1.0,
+          "Compute Carlson-Beckermann pore size and volume maps.");
+}

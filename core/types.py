@@ -15,7 +15,8 @@ class CastingParameters:
     t_liquidus_c: float = 1510.0
     t_solidus_c: float = 1410.0
     t_mold_c: float = 25.0
-    t_fill_s: float = 10.0
+    # v9.3: fill time defaults to 0 -> auto from gating design; user may override.
+    t_fill_s: float = 0.0
     rho_liquid_kg_m3: float = 7000.0
     viscosity_pa_s: float = 0.006
     # v8.1: user-specified inlet velocity (0 = auto from V_part / t_fill)
@@ -24,10 +25,28 @@ class CastingParameters:
     velocity_section_key: str = "INGATE"
     # v9.1: gravity / casting direction (default: -Z, i.e. downward in world coords)
     gravity_direction: Tuple[float, float, float] = (0.0, 0.0, -1.0)
+    # v9.4: hotspot filtering overrides (0 = use defaults from sdf_analyzer)
+    hotspot_min_size_mm: float = 0.0
+    hotspot_cluster_eps_mm: float = 0.0
+    # Optional per-run mould property overrides (0/-1 = use preset defaults)
+    mold_afs_grain_size: float = 0.0
+    mold_moisture_percent: float = 0.0
+    mold_binder_percent: float = 0.0
+    mold_compactability_percent: float = 0.0
+    mold_rigidity_factor: float = -1.0
+    # v9.5: effective metal head height (m). 0 = automatic from geometry.
+    h_eff_m: float = 0.0
+    # v9.7: skip the 3-D Darcy/VOF solve and use the fast Q=vA hydraulic path.
+    fast_flow: bool = False
 
     @property
     def superheat_c(self) -> float:
         return max(self.t_pour_c - self.t_liquidus_c, 0.0)
+
+    # v9.1 backwards-compatible alias used by some callers/ui modules.
+    @property
+    def gravity_vector(self) -> Tuple[float, float, float]:
+        return self.gravity_direction
 
 
 class BodyType(IntEnum):
@@ -42,6 +61,9 @@ class BodyType(IntEnum):
     COOLING_SPRUE = 11
     FILTER = 13
     POURING_BASIN = 15
+    SPRUE_THROAT = 17
+    DISTRIBUTOR = 19
+    CURUFLUK = 21
 
 
 BODY_TYPE_LABELS = {
@@ -54,6 +76,9 @@ BODY_TYPE_LABELS = {
     BodyType.COOLING_SPRUE: "SOĞUTUCU DÖKÜM AĞZI",
     BodyType.FILTER: "FİLTRE",
     BodyType.POURING_BASIN: "DÖKÜM HAVZASI",
+    BodyType.SPRUE_THROAT: "D.AĞZI BOĞAZI",
+    BodyType.DISTRIBUTOR: "DAĞITICI",
+    BodyType.CURUFLUK: "CURUFLUK",
 }
 
 # Body types that contain liquid metal during pouring (part + gating + riser).
@@ -65,7 +90,10 @@ BODY_CASTING_METAL_TYPES = [
     BodyType.INGATE,
     BodyType.RUNNER,
     BodyType.SPRUE,
+    BodyType.SPRUE_THROAT,
     BodyType.POURING_BASIN,
+    BodyType.DISTRIBUTOR,
+    BodyType.CURUFLUK,
 ]
 
 # Backwards-compatible alias; cooling sprue and filter are excluded from
@@ -78,11 +106,22 @@ BODY_FEEDER_TYPES = [
     BodyType.INGATE,
     BodyType.RUNNER,
     BodyType.SPRUE,
+    BodyType.SPRUE_THROAT,
     BodyType.POURING_BASIN,
+    BodyType.DISTRIBUTOR,
 ]
 
 # Inserts that accelerate local cooling and must never be treated as feeders.
 CHILL_BODY_TYPES = [BodyType.COOLING_SPRUE]
+
+
+class GatingVelocityError(RuntimeError):
+    """Raised when the hydraulic node-velocity network cannot be solved.
+
+    The solver treats this as a fatal, user-visible error so that bad geometry
+    (missing contacts, unmeasurable throat sections, disconnected gating
+    components) stops the analysis instead of producing silent zero velocities.
+    """
 
 
 @dataclass
@@ -95,7 +134,24 @@ class Body:
     mesh: trimesh.Trimesh
     body_type: BodyType = BodyType.PART
     volume_cm3: float = 0.0
+    surface_area_cm2: float = 0.0
+    # STEP / CAD source length unit; used to auto-scale to mm on load.
+    source_unit: str = "mm"
     center: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    # v10.1: Aşama 5 mesh repair warnings to surface in the UI.
+    watertight_warning: str = ""
+    # v9.3: per-body user overrides from the GUI
+    section_key: str = ""  # INGATE / RUNNER / SPRUE_BASE / SPRUE_THROAT
+    section_area_cm2: float = 0.0
+    feeder_type: str = ""  # conventional / exothermic / insulated / chilled / sleeve / side / blind
+    feeder_m_mm: float = 0.0
+    # v10.2: per-body mould material overrides for CORE bodies
+    mold_preset: str = ""  # green_sand / silica_sand / chromite_sand / zircon_sand
+    mold_afs_grain_size: float = 0.0       # AFS grain fineness number
+    mold_moisture_percent: float = 0.0      # % moisture
+    mold_binder_percent: float = 0.0       # % bentonite/binder
+    mold_compactability_percent: float = 0.0  # % compactability
+    mold_rigidity_factor: float = 0.0       # 0=soft green sand, 1=rigid; 0=use preset default
 
 
 @dataclass
@@ -127,6 +183,17 @@ class HotSpot:
     heuvers_ok: bool = True
     feeding_cost: float = 0.0
     darcy_ok: bool = True
+    feedable_fraction: float = 1.0
+    # v8.8: estimated pore size from Niyama + SDAS + feeding risk
+    pore_size_um: float = 0.0
+    pore_size_mm: float = 0.0
+    pore_size_class: str = ""
+    # P3: hotspot is considered solved if a feeder or chill is close/effective enough.
+    chill_ok: bool = False
+
+    @property
+    def solved(self) -> bool:
+        return self.feed_ok or self.chill_ok
 
 
 @dataclass
@@ -150,6 +217,10 @@ class RiserResult:
     mass_kg: float = 0.0
     feed_to_part_mass_ratio: float = 0.0
     feed_to_part_volume_ratio: float = 0.0
+    # v9.3: user feeder type / modulus and the effective modulus used in checks
+    feeder_type: str = ""
+    feeder_m_user_mm: float = 0.0
+    effective_m_value_mm: float = 0.0
 
 
 @dataclass
@@ -165,6 +236,10 @@ class RiserProposal:
     volume_cm3: float
     neck_diameter_mm: float = 0.0
     neck_height_mm: float = 0.0
+    # v9.2: proposal metadata
+    exothermic: bool = False
+    infeasible: bool = False
+    warning: str = ""
 
 
 @dataclass
@@ -182,6 +257,67 @@ class SectionFlow:
     target_v_max_m_s: float = 0.0
     target_area_min_cm2: float = 0.0
     target_area_max_cm2: float = 0.0
+
+
+@dataclass
+class GatingNode:
+    """One discrete gating element (sprue, runner, gate, etc.) with its
+    throat velocity and cross-sectional area extracted from the 3-D flow field."""
+
+    name: str
+    body_type: str
+    velocity_m_s: float
+    section_area_cm2: float
+    centroid_mm: Tuple[float, float, float]
+    flow_rate_m3_s: float = 0.0
+    # v10.1: local 3-D gate mesh maximum velocity used for labels/reports.
+    max_velocity_m_s: float = 0.0
+
+
+@dataclass
+class FillingResult:
+    """3-D Darcy-flow solver output (v9.3+)."""
+
+    node_velocities: Dict[str, float] = field(default_factory=dict)
+    ingate_contact_velocity_m_s: float = 0.0
+    Q_m3_s: float = 0.0
+    inlet_area_m2: float = 0.0
+    fill_time_s: float = 0.0
+    velocity_magnitude: Optional[np.ndarray] = None
+    velocity: Optional[np.ndarray] = None  # (3, nz, ny, nx) vector field (m/s)
+    fill_time: Optional[np.ndarray] = None
+    solver_grid: Optional[np.ndarray] = None
+    solver_dx_mm: float = 0.0
+    pressure: Optional[np.ndarray] = None
+    reason: str = ""
+    # Per-gate contact velocity / area / flow rate when multiple INGATE bodies exist.
+    per_gate_contact_velocity_m_s: Dict[str, float] = field(default_factory=dict)
+    per_gate_contact_area_cm2: Dict[str, float] = field(default_factory=dict)
+    per_gate_flow_rate_m3_s: Dict[str, float] = field(default_factory=dict)
+    total_ingate_flow_m3_s: float = 0.0
+    # Discrete gating nodes (sprue, runner, distributor, each INGATE, etc.)
+    # with their throat velocity, area and 3-D position for labelling/marker display.
+    gating_nodes: List[GatingNode] = field(default_factory=list)
+    # P2: pressure drop (Pa) inferred from the Q_user / Q_raw scale.  With
+    # viscosity in the Darcy matrix this is proportional to alloy.viscosity_pa_s
+    # even though the scaled velocity field is independent of a uniform viscosity.
+    pressure_drop_pa: float = 0.0
+    # P2: sand-mold particle-based permeability and air leakage.
+    sand_permeability_m2: float = 0.0
+    air_leak_rate_m3_s: float = 0.0
+    sand_porosity: float = 0.0
+    sand_grain_diameter_mm: float = 0.0
+    # Filling turbulence metrics (Darcy / LBM post-processed).
+    reynolds: Optional[np.ndarray] = None  # per-voxel Reynolds number
+    turbulence_intensity: Optional[np.ndarray] = None  # I = 0.16 Re^-0.08 (pipe fit)
+    # Phase 5: automatic ceramic filter recommendation for high-turbulence gating.
+    filter_recommendation: Optional[str] = None
+    # Local 3-D Darcy–Forchheimer gate-mesh summaries, keyed by Body.name.
+    gate_flow_results: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    # Air entrapment from LBM/VOF free-surface solver (1 = trapped air pocket).
+    air_entrapment: Optional[np.ndarray] = None
+    trapped_air_volume_m3: float = 0.0
+    air_entrapment_centroid_mm: np.ndarray = field(default_factory=lambda: np.array([]))
 
 
 @dataclass
@@ -244,6 +380,7 @@ class GateResult:
     pouring_yield: float = 0.0
     design_sprue_base_area_cm2: float = 0.0
     design_runner_area_cm2: float = 0.0
+    design_distributor_area_cm2: float = 0.0
     design_gate_total_area_cm2: float = 0.0
     design_gate_each_area_cm2: float = 0.0
     design_sprue_diameter_mm: float = 0.0
@@ -253,12 +390,19 @@ class GateResult:
     sprue_design_ok: bool = True
     runner_design_ok: bool = True
     gate_design_ok: bool = True
+    # P1: distributor / curufluk measured values
+    distributor_area_cm2: float = 0.0
+    curufluk_area_cm2: float = 0.0
+    distributor_velocity_m_s: float = 0.0
+    curufluk_velocity_m_s: float = 0.0
     # v9.0: part and feed metal masses for feeder/part ratio checks.
     part_mass_kg: float = 0.0
     total_riser_mass_kg: float = 0.0
     gating_mass_kg: float = 0.0
     feed_to_part_mass_ratio: float = 0.0
     feed_to_part_volume_ratio: float = 0.0
+    # v9.3: 3-D Darcy filling-flow result (node velocities, gate contact velocity)
+    flow_result: Optional[FillingResult] = None
 
 
 @dataclass
@@ -297,7 +441,7 @@ class AnalysisResult:
     mold_key: str = "sand"
     alloy_name: str = "42CrMo4 (Çelik)"
     mold_name: str = "Kum Kalıp"
-    chvorinov_c: float = 2.8
+    chvorinov_c: float = 2.8  # Chvorinov mould constant in dk/cm²
     unit_scale: float = 1.0
     # section / histogram
     dominant_m_mm: float = 0.0
@@ -321,5 +465,42 @@ class AnalysisResult:
     part_surface_area_mm2: float = 0.0
     thermal_divergence: np.ndarray = field(default_factory=lambda: np.array([]))
     riser_proposals: List[RiserProposal] = field(default_factory=list)
+    # v9.3: 3-D Darcy filling-flow result
+    flow_result: Optional[FillingResult] = None
+    # v8.8: per-voxel estimated pore size (µm) and macro/micro/fine masks
+    pore_size_um: np.ndarray = field(default_factory=lambda: np.array([]))
+    pore_size_mm: np.ndarray = field(default_factory=lambda: np.array([]))
+    # v9.2: shrinkage-only pore size (µm) for cloud filtering, excluding gas baseline
+    pore_size_shrinkage_um: np.ndarray = field(default_factory=lambda: np.array([]))
+    pore_size_shrinkage_mm: np.ndarray = field(default_factory=lambda: np.array([]))
+    pore_size_macro_mask: np.ndarray = field(default_factory=lambda: np.array([]))
+    pore_size_micro_mask: np.ndarray = field(default_factory=lambda: np.array([]))
+    pore_size_fine_mask: np.ndarray = field(default_factory=lambda: np.array([]))
+    # v10.3: per-voxel mold wall movement risk from unabsorbed graphite expansion
+    mold_wall_movement: np.ndarray = field(default_factory=lambda: np.array([]))
+    # v10.4: per-voxel cold-shut (cold shot) risk and the last fill location
+    cold_shot_risk: np.ndarray = field(default_factory=lambda: np.array([]))
+    last_fill_point_mm: np.ndarray = field(default_factory=lambda: np.array([]))
+    # v10.5: per-voxel mold-sand erosion risk from high metal velocity
+    erosion_risk: np.ndarray = field(default_factory=lambda: np.array([]))
+    # v10.6: per-voxel air entrapment from LBM free-surface solver
+    air_entrapment: np.ndarray = field(default_factory=lambda: np.array([]))
+    trapped_air_volume_m3: float = 0.0
+    air_entrapment_centroid_mm: np.ndarray = field(default_factory=lambda: np.array([]))
+    # v8.9: per-class display filters (top % of computed porosity to display)
+    pore_size_noise_percent: float = 3.0
+    pore_size_threshold_um: float = 0.0
+    pore_size_macro_percent: float = 0.0
+    pore_size_macro_threshold_um: float = 0.0
+    pore_size_micro_percent: float = 0.0
+    pore_size_micro_threshold_um: float = 0.0
+    pore_size_fine_percent: float = 0.0
+    pore_size_fine_threshold_um: float = 0.0
+    # v9.4: hot spots detected inside risers/feeders (shown separately, not part defects)
+    feeder_hotspots: List[HotSpot] = field(default_factory=list)
+    # v9.5: simplified thermomechanical stress and crack risk maps
+    thermal_stress_pa: np.ndarray = field(default_factory=lambda: np.array([]))
+    hot_tear_risk: np.ndarray = field(default_factory=lambda: np.array([]))
+    cold_crack_risk: np.ndarray = field(default_factory=lambda: np.array([]))
     # metadata
     bbox_size_mm: np.ndarray = field(default_factory=lambda: np.zeros(3))

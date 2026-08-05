@@ -1,0 +1,1968 @@
+"""Lightweight flow-animation engine for JoséCast Analyzer.
+
+Renders metal filling and solidification as a sequence of pre-computed,
+smooth isosurface frames.  The geometry of each frame comes from the Darcy
+``fill_time`` field, and the surface colour comes from a simple cooling model
+based on ``fill_time`` and ``solidification_time``.  No extra physics is
+introduced: the timing and solidification data come directly from the
+engineering solver.
+"""
+
+import heapq
+import time
+from typing import List, Optional, Tuple
+
+import numpy as np
+import pyvista as pv
+from PyQt6 import QtCore, QtWidgets
+from scipy import ndimage
+from scipy.special import erf, erfc
+
+try:
+    from matplotlib.colors import LinearSegmentedColormap
+except Exception:  # pragma: no cover - fallback if matplotlib is missing
+    LinearSegmentedColormap = None  # type: ignore
+
+from core.config import load_animation_config
+from core.materials import get_alloy, get_mold
+from core.types import AnalysisResult, BodyType
+
+from ui.flow_velocity_graph import FlowVelocityGraph
+
+
+class FlowAnimator(QtCore.QObject):
+    """Animate metal filling and solidification as a sequence of 3-D frames."""
+
+    frameChanged = QtCore.pyqtSignal(int, float, float)
+    stateChanged = QtCore.pyqtSignal(bool)
+
+    TIMER_INTERVAL = 0.10  # base interval between live frames (s) - slow cinematic
+    MAX_STREAMLINES = 20
+    MAX_STEPS = 2000
+    CFL_FRACTION = 0.5
+    N_SIDES = 4
+    MARKER_SIZE = 10
+    MAX_ANIM_CELLS = 120_000
+    MAX_FRAMES = 1350
+    MIN_FILL_FRAMES = 1200  # most frames are allocated to the filling phase
+    PHI_SIGMA = 1.2  # voxels; controls how liquid surface is smoothed
+    DECIMATE_TARGET = 0.3  # reduce triangle count per frame for GPU/CPU relief
+    PORE_RISE_SPEED_M_S = 0.05  # buoyant pore drift against gravity
+    GATING_BODY_TYPES = frozenset({
+        BodyType.INGATE, BodyType.RUNNER, BodyType.SPRUE,
+        BodyType.FILTER, BodyType.POURING_BASIN, BodyType.SPRUE_THROAT,
+        BodyType.DISTRIBUTOR, BodyType.CURUFLUK,
+    })
+    GATING_INFLATION_THRESHOLD = 0.05  # phi value that triggers local inflation
+    GATING_INFLATION_ITERATIONS = 1    # binary-dilation radius inside gating mask
+
+    def __init__(self, viewer, config_path=None):
+        super().__init__(parent=None)
+        self._viewer = viewer
+        # Load user-configurable animation limits (JSON) and shadow the class
+        # constants so the rest of the module keeps using self.ATTR_NAME.
+        cfg = load_animation_config(config_path)
+        self.MAX_ANIM_CELLS = cfg.max_anim_cells
+        self.MAX_FRAMES = cfg.max_frames
+        self.MIN_FILL_FRAMES = cfg.min_fill_frames
+        self.PHI_SIGMA = cfg.phi_sigma
+        self.DECIMATE_TARGET = max(self.DECIMATE_TARGET, cfg.decimate_target)
+        self.MAX_STREAMLINES = cfg.max_streamlines
+        self.MAX_STEPS = cfg.max_steps
+        self.CFL_FRACTION = cfg.cfl_fraction
+        self.PORE_RISE_SPEED_M_S = cfg.pore_rise_speed_m_s
+        self._timer = QtCore.QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._on_timer)
+
+        self._result: Optional[AnalysisResult] = None
+        self._is_running: bool = False
+        self._current_frame: int = -1
+        self._current_time: float = 0.0
+        self._speed_multiplier: float = 1.0
+        self._max_time: float = 0.0
+        self._max_fill_time: float = 0.0
+        self._max_solid_time: float = 0.0
+        self._show_streamlines: bool = True
+
+        # Streamline data (optional overlay)
+        self._streamlines: Optional[pv.PolyData] = None
+        self._tube_mesh: Optional[pv.PolyData] = None
+        self._edt: Optional[np.ndarray] = None
+        self._streamline_actor = None
+        self._marker_actor = None
+        self._pore_actor = None
+
+        # Two-phase pre-computed scalar matrices (NO full 3-D mesh geometry).
+        # Phase 1: one phi scalar volume per fill frame.
+        self._phase1_phi: List[np.ndarray] = []
+        self._phase1_times: List[float] = []
+        # Phase 2: fixed decimated mesh; per-frame temperature/solid-fraction.
+        self._phase2_mesh: Optional[pv.PolyData] = None
+        self._phase2_temps: List[np.ndarray] = []
+        self._phase2_solids: List[np.ndarray] = []
+        self._phase2_times: List[float] = []
+        self._n_fill: int = 0
+        self._n_solid: int = 0
+        self._frame_times: Optional[np.ndarray] = None
+        self._frame_actor = None
+        self._frame_actor_scalar: str = ""
+
+        self._t_pour: float = 1600.0
+        self._t_liq: float = 1510.0
+        self._t_sol: float = 1410.0
+        self._t_mold: float = 25.0
+
+        # Downsampled animation grid
+        self._base_image: Optional[pv.ImageData] = None
+        self._fill_time_d: Optional[np.ndarray] = None
+        self._solid_time_d: Optional[np.ndarray] = None
+        self._metal_d: Optional[np.ndarray] = None
+        self._vmag_d: Optional[np.ndarray] = None
+        self._outside_mask: Optional[np.ndarray] = None
+        self._outside_idx: Optional[np.ndarray] = None
+        self._sentinel: float = 1e9
+
+        # Macro porosity data: full-res mask, downsampled mask, and the smooth
+        # metal indicator used to carve live holes during solidification.
+        self._pore_mask_full: Optional[np.ndarray] = None
+        self._pore_mask_d: Optional[np.ndarray] = None
+        self._phi_base_d: Optional[np.ndarray] = None
+        self._grid_d: Optional[np.ndarray] = None
+        self._dist_to_riser_d: Optional[np.ndarray] = None
+        self._sdf_d: Optional[np.ndarray] = None
+        self._feeder_actor = None
+        self._gravity: np.ndarray = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+        self._source_section_key: str = "SPRUE_THROAT"
+        self._source_mask_d: Optional[np.ndarray] = None
+
+    def set_result(self, result: Optional[AnalysisResult]) -> None:
+        """Attach a completed analysis result and build the animation frames."""
+        self.stop()
+        self._clear_actors()
+        self._reset_data()
+        self._result = result
+
+        if result is None or result.flow_result is None:
+            return
+
+        fr = result.flow_result
+        fill_time = fr.fill_time
+        velocity = fr.velocity
+        if (
+            velocity is None
+            or fill_time is None
+            or fill_time.size == 0
+            or result.grid is None
+            or result.grid.size == 0
+        ):
+            return
+
+        self._fill_time = np.asarray(fill_time, dtype=np.float64)
+        self._velocity = np.asarray(velocity, dtype=np.float64)
+        self._origin = np.asarray(result.origin_mm, dtype=np.float64)
+        self._dx = float(result.dx_mm)
+        self._shape = tuple(int(s) for s in result.grid.shape)
+
+        metal = (result.grid > 0) & (result.grid != int(BodyType.CORE))
+        if not metal.any():
+            return
+
+        # ---- animation time window ----
+        max_fill = self._finite_max(self._fill_time, metal)
+        self._max_fill_time = float(max_fill)
+        solid_time = result.solidification_time
+        if solid_time is not None and solid_time.size == fill_time.size:
+            self._solid_time = np.asarray(solid_time, dtype=np.float64)
+            # Extrapolate cells that did not reach solidus within the thermal
+            # solver horizon using Chvorinov t_s = C * M^2 so the animation can
+            # cover their actual solidification and pores can appear in time.
+            metal_inf = metal & ~np.isfinite(self._solid_time)
+            if (
+                metal_inf.any()
+                and getattr(result, "sdf", None) is not None
+                and result.sdf.size == fill_time.size
+                and getattr(result, "chvorinov_c", 0.0) > 0.0
+            ):
+                sdf = np.maximum(np.asarray(result.sdf, dtype=np.float64), 0.1)
+                t_est = result.chvorinov_c * (sdf / 10.0) ** 2 * 60.0
+                # Never shorten an already-known solidification time.
+                known = np.where(np.isfinite(self._solid_time) & metal, self._solid_time, 0.0)
+                t_est = np.maximum(t_est, known + 1.0)
+                self._solid_time = np.where(metal_inf, t_est, self._solid_time)
+            max_solid = self._finite_max(self._solid_time, metal)
+        else:
+            self._solid_time = np.full_like(self._fill_time, np.inf)
+            max_solid = -np.inf
+        self._max_solid_time = float(max_solid) if np.isfinite(max_solid) else max_fill
+
+        self._max_time = max(self._max_fill_time, self._max_solid_time)
+        if self._max_time <= 0.0:
+            return
+
+        alloy = get_alloy(getattr(result, "alloy_key", "42CrMo4"))
+        self._shrinkage_factor = getattr(alloy, "shrinkage_factor", 0.03)
+
+        # ---- temperature bounds ----
+        self._load_temperature_bounds(result)
+
+        # ---- macro-pore mask from backend (full resolution; cropped/downsampled below) ----
+        self._load_pore_mask(result)
+
+        # ---- build downsampled animation grid and precompute frames ----
+        if not self._build_animation_grid(metal):
+            return
+
+        # ---- optional red streamlines through the gating ----
+        self._edt = ndimage.distance_transform_edt(metal) * self._dx
+        source_pts = self._build_source_points()
+        if source_pts is not None and source_pts.shape[0] > 0:
+            try:
+                self._streamlines = self._integrate_streamlines(source_pts)
+                if self._streamlines is not None and self._streamlines.n_points > 0:
+                    self._streamlines = self._trim_streamlines(self._streamlines)
+                    self._compute_streamline_radius()
+                    self._build_tube_mesh()
+            except Exception:
+                self._streamlines = None
+
+        self._current_frame = 0
+        self._current_time = 0.0
+        if self._phase1_phi or self._phase2_mesh is not None:
+            self._update_scene()
+
+    def _reset_data(self) -> None:
+        self._streamlines = None
+        self._tube_mesh = None
+        self._edt = None
+        self._phase1_phi = []
+        self._phase1_times = []
+        self._phase2_mesh = None
+        self._phase2_temps = []
+        self._phase2_solids = []
+        self._phase2_times = []
+        self._n_fill = 0
+        self._n_solid = 0
+        self._frame_times = None
+        self._base_image = None
+        self._fill_time_d = None
+        self._solid_time_d = None
+        self._metal_d = None
+        self._outside_mask = None
+        self._outside_idx = None
+        self._pore_mask_full = None
+        self._pore_mask_d = None
+        self._filled_d = None
+        self._grid_d = None
+        self._dist_to_riser_d = None
+        self._sdf_d = None
+        self._gating_mask = None
+        self._gating_mask_fat = None
+        self._gating_labels = None
+        self._gating_radius = None
+        self._gravity = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+        self._source_section_key = "SPRUE_THROAT"
+        self._source_mask_d = None
+        self._frame_actor = None
+        self._frame_actor_scalar = ""
+        self._streamline_actor = None
+        self._marker_actor = None
+        self._pore_actor = None
+        self._feeder_actor = None
+
+    def _finite_max(self, arr: np.ndarray, mask: np.ndarray) -> float:
+        finite = mask & np.isfinite(arr)
+        if finite.any():
+            return float(np.max(arr[finite]))
+        return -np.inf
+
+    def _section_body_type(self, key: str) -> BodyType:
+        type_map = {
+            "SPRUE": BodyType.SPRUE,
+            "SPRUE_BASE": BodyType.SPRUE,
+            "SPRUE_THROAT": BodyType.SPRUE_THROAT,
+            "POURING_BASIN": BodyType.POURING_BASIN,
+            "RUNNER": BodyType.RUNNER,
+            "DISTRIBUTOR": BodyType.DISTRIBUTOR,
+            "CURUFLUK": BodyType.CURUFLUK,
+            "INGATE": BodyType.INGATE,
+            "FILTER": BodyType.FILTER,
+        }
+        return type_map.get((key or "SPRUE_THROAT").upper(), BodyType.SPRUE_THROAT)
+
+    def _build_source_mask(
+        self,
+        grid: np.ndarray,
+        metal: np.ndarray,
+        spacing: Tuple[float, float, float],
+        origin: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        """Return a mask of the upstream (top) face cells of the selected inlet body."""
+        body_type = self._section_body_type(self._source_section_key)
+        body_mask = (grid == int(body_type)) & metal
+        if not body_mask.any():
+            return None
+
+        idx = np.argwhere(body_mask)
+        spacing = np.asarray(spacing, dtype=np.float64)
+        coords = idx * spacing + origin + 0.5 * spacing
+        # Upstream is opposite to gravity, so project onto -gravity.
+        up = -self._gravity
+        proj = coords @ up
+        max_proj = float(proj.max())
+        tol = 0.5 * float(np.min(spacing))
+
+        mask = np.zeros(grid.shape, dtype=bool)
+        mask[body_mask] = proj >= max_proj - tol
+        return mask
+
+    def _load_temperature_bounds(self, result: AnalysisResult) -> None:
+        cp = getattr(result, "casting_params", None)
+        alloy = get_alloy(getattr(result, "alloy_key", "42CrMo4"))
+        mold = get_mold(getattr(result, "mold_key", "sand"))
+
+        if cp is not None:
+            self._t_pour = float(cp.t_pour_c)
+            self._t_mold = float(cp.t_mold_c)
+            self._t_liq = float(cp.t_liquidus_c)
+            self._t_sol = float(cp.t_solidus_c)
+            g_dir = getattr(cp, "gravity_vector", None) or getattr(cp, "gravity_direction", None) or (0.0, 0.0, -1.0)
+            g = np.asarray(g_dir, dtype=np.float64)
+            norm = float(np.linalg.norm(g)) + 1e-9
+            self._gravity = g / norm
+            self._source_section_key = (
+                getattr(cp, "velocity_section_key", None) or "SPRUE_THROAT"
+            )
+        else:
+            self._t_pour = float(alloy.t_pour_c)
+            self._t_mold = float(mold.t0_c)
+            self._t_liq = float(alloy.t_liquidus_c)
+            self._t_sol = float(alloy.t_solidus_c)
+
+    def _load_pore_mask(self, result: AnalysisResult) -> None:
+        """Load or derive the full-resolution macro-pore mask from the result.
+
+        Priority:
+          1. result.pore_size_macro_mask (backend classification)
+          2. result.pore_size_um >= alloy macro limit
+          3. result.pore_size_shrinkage_um >= alloy macro limit
+          4. empty mask if no pore data are present.
+        """
+        grid_shape = tuple(int(s) for s in result.grid.shape)
+        mask = np.zeros(grid_shape, dtype=bool)
+
+        macro_thr = 1000.0
+        try:
+            alloy = get_alloy(getattr(result, "alloy_key", "42CrMo4"))
+            macro_thr = float(getattr(alloy, "macro_pore_limit_um", 1000.0))
+        except Exception:
+            pass
+
+        candidate = getattr(result, "pore_size_macro_mask", None)
+        if candidate is not None and candidate.shape == grid_shape:
+            mask = np.asarray(candidate, dtype=bool)
+        else:
+            pore_um = getattr(result, "pore_size_um", None)
+            if pore_um is not None and pore_um.shape == grid_shape:
+                mask = np.asarray(pore_um, dtype=np.float64) >= macro_thr
+            else:
+                pore_shrink = getattr(result, "pore_size_shrinkage_um", None)
+                if pore_shrink is not None and pore_shrink.shape == grid_shape:
+                    mask = np.asarray(pore_shrink, dtype=np.float64) >= macro_thr
+
+        # Restrict to actual metal voxels; EMPTY/void cells cannot host porosity.
+        self._pore_mask_full = mask & (result.grid > 0)
+
+    def _build_animation_grid(self, metal: np.ndarray) -> bool:
+        """Crop, downsample, and precompute the frame meshes."""
+        # Crop to the metal bounding box with a small pad.
+        idx = np.nonzero(metal)
+        if len(idx[0]) == 0:
+            return False
+
+        pad = 1
+        bbox = [
+            max(0, int(idx[0].min()) - pad),
+            min(self._shape[0], int(idx[0].max()) + 1 + pad),
+            max(0, int(idx[1].min()) - pad),
+            min(self._shape[1], int(idx[1].max()) + 1 + pad),
+            max(0, int(idx[2].min()) - pad),
+            min(self._shape[2], int(idx[2].max()) + 1 + pad),
+        ]
+
+        fill_c = self._fill_time[
+            bbox[0] : bbox[1], bbox[2] : bbox[3], bbox[4] : bbox[5]
+        ].copy()
+        solid_c = self._solid_time[
+            bbox[0] : bbox[1], bbox[2] : bbox[3], bbox[4] : bbox[5]
+        ].copy()
+        metal_c = metal[
+            bbox[0] : bbox[1], bbox[2] : bbox[3], bbox[4] : bbox[5]
+        ]
+        pore_c = self._pore_mask_full[
+            bbox[0] : bbox[1], bbox[2] : bbox[3], bbox[4] : bbox[5]
+        ]
+        grid_c = self._result.grid[
+            bbox[0] : bbox[1], bbox[2] : bbox[3], bbox[4] : bbox[5]
+        ].copy()
+        if (
+            self._result.dist_to_riser is not None
+            and self._result.dist_to_riser.shape == self._result.grid.shape
+        ):
+            dist_c = self._result.dist_to_riser[
+                bbox[0] : bbox[1], bbox[2] : bbox[3], bbox[4] : bbox[5]
+            ].copy()
+        else:
+            dist_c = np.full_like(fill_c, np.inf)
+
+        if (
+            getattr(self._result, "sdf", None) is not None
+            and self._result.sdf.shape == self._result.grid.shape
+        ):
+            raw_sdf = np.asarray(self._result.sdf, dtype=np.float64)[
+                bbox[0] : bbox[1], bbox[2] : bbox[3], bbox[4] : bbox[5]
+            ].copy()
+            # result.sdf may be unsigned distance; sign it using the metal mask.
+            if raw_sdf.min() < -1e-9 and raw_sdf.max() > 1e-9:
+                sdf_c = raw_sdf
+            else:
+                sdf_c = np.where(metal_c, raw_sdf, -raw_sdf)
+        else:
+            # Fallback: signed distance transform from the metal indicator.
+            # Positive inside metal, negative outside; zero at the CAD wall.
+            dist_to_wall = ndimage.distance_transform_edt(
+                ~metal_c, sampling=(self._dx, self._dx, self._dx)
+            )
+            dist_to_metal = ndimage.distance_transform_edt(
+                metal_c, sampling=(self._dx, self._dx, self._dx)
+            )
+            sdf_c = dist_to_wall - dist_to_metal
+
+        self._sentinel = max(10.0 * self._max_time, 1e6) + 1.0
+        fill_c = np.where(np.isfinite(fill_c) & metal_c, fill_c, self._sentinel)
+        solid_c = np.where(np.isfinite(solid_c) & metal_c, solid_c, self._sentinel)
+
+        crop_shape = fill_c.shape
+        cells = int(np.prod(crop_shape))
+        factor = 1
+        if cells > self.MAX_ANIM_CELLS:
+            factor = max(
+                1,
+                int(np.ceil((cells / self.MAX_ANIM_CELLS) ** (1.0 / 3.0))),
+            )
+
+        if factor > 1:
+            target_shape = tuple(max(1, crop_shape[i] // factor) for i in range(3))
+            ratios = tuple(
+                target_shape[i] / crop_shape[i] for i in range(3)
+            )
+            # Nearest-neighbour for fill/solid times: a cell is either filled
+            # at a known time or not (sentinel); linear interpolation would
+            # invent bogus mid-times next to the sentinel.
+            fill_d = ndimage.zoom(fill_c, ratios, order=0)
+            solid_d = ndimage.zoom(solid_c, ratios, order=0)
+            metal_d = ndimage.zoom(metal_c.astype(np.float32), ratios, order=0) > 0.5
+            # Trilinear interpolation for the pore mask keeps the purple cavity
+            # surfaces smooth; threshold at 0.5 preserves the binary decision.
+            pore_d = ndimage.zoom(pore_c.astype(np.float32), ratios, order=1) > 0.5
+            grid_d = ndimage.zoom(grid_c.astype(np.float32), ratios, order=0).astype(np.int16)
+            dist_d = ndimage.zoom(dist_c, ratios, order=1)
+            sdf_d = ndimage.zoom(sdf_c, ratios, order=1)
+            fill_d = np.where(metal_d, fill_d, self._sentinel)
+            solid_d = np.where(metal_d, solid_d, self._sentinel)
+            dist_d = np.where(metal_d, dist_d, np.inf)
+            spacing = tuple(self._dx * crop_shape[i] / target_shape[i] for i in range(3))
+            shape = target_shape
+        else:
+            fill_d, solid_d, metal_d, pore_d = fill_c, solid_c, metal_c, pore_c
+            grid_d, dist_d, sdf_d = grid_c, dist_c, sdf_c
+            spacing = (self._dx, self._dx, self._dx)
+            shape = crop_shape
+
+        # Restrict pores to metal cells; zoom may have bled into void voxels.
+        pore_d = pore_d & metal_d
+
+        origin_c = self._origin + np.array(
+            [bbox[0], bbox[2], bbox[4]], dtype=np.float64
+        ) * self._dx
+
+        self._fill_time_d = fill_d
+        self._solid_time_d = solid_d
+        self._metal_d = metal_d
+        self._pore_mask_d = pore_d
+        self._grid_d = grid_d
+        self._dist_to_riser_d = dist_d
+        self._sdf_d = sdf_d
+
+        # Source mask for the user-selected inlet (upstream face of the section).
+        self._source_mask_d = self._build_source_mask(grid_d, metal_d, spacing, origin_c)
+
+        # Precompute a fat gating mask and per-component radius for the boundary
+        # inflation step.  Voxelised runners often lose their outermost wall
+        # cells, so we add a one-voxel shell around the gating mask and store the
+        # local radius (max SDF) of each connected gating component.
+        gating_mask = np.isin(grid_d, list(self.GATING_BODY_TYPES))
+        self._gating_mask = gating_mask
+        fat_structure = np.ones((3, 3, 3), dtype=bool)
+        gating_fat = ndimage.binary_dilation(gating_mask, structure=fat_structure, iterations=1)
+
+        # Two kinds of missing cells need to be recovered so the isosurface can
+        # reach the smooth CAD wall:
+        #   1) metal cells that lost their gating body type during downsampling;
+        #   2) a one-voxel void shell between the voxelised metal boundary and
+        #      the actual CAD wall (still inside the wall, sdf > -0.5 voxel).
+        wall_shell_metal = gating_fat & metal_d & (sdf_d > -0.5 * min(spacing)) & ~gating_mask
+        dist_to_gating = ndimage.distance_transform_edt(~gating_mask, sampling=tuple(spacing))
+        wall_shell_void = (
+            (dist_to_gating <= 0.5 * min(spacing))
+            & ~metal_d
+            & (sdf_d > -0.5 * min(spacing))
+            & (sdf_d <= 2.0 * min(spacing))
+        )
+        self._gating_mask_fat = gating_mask | wall_shell_metal | wall_shell_void
+
+        labels, nlabels = ndimage.label(self._gating_mask_fat, structure=fat_structure)
+        self._gating_labels = labels
+        self._gating_radius = np.zeros(nlabels + 1, dtype=np.float64)
+        if nlabels > 0:
+            max_sdf = ndimage.maximum(
+                sdf_d, labels, index=np.arange(1, nlabels + 1)
+            )
+            self._gating_radius[1:] = np.asarray(max_sdf, dtype=np.float64)
+
+        # Make sure downstream voxels can never be marked as filled before the
+        # upstream gate/runner cells that feed them.  This fixes the LBM front
+        # occasionally jumping into the part through a narrow gate before the
+        # gate itself is fully registered as filled.
+        # The source mask now comes from the user-selected inlet so t=0 starts
+        # exactly at the pour point (sprue throat / selected entry section).
+        self._enforce_monotonic_fill_time(source_mask=self._source_mask_d)
+        fill_d = self._fill_time_d
+
+        img = pv.ImageData(
+            dimensions=shape, spacing=spacing, origin=origin_c
+        )
+        img.point_data["fill_time"] = fill_d.ravel(order="F")
+        img.point_data["solid_time"] = solid_d.ravel(order="F")
+        img.point_data["sdf"] = sdf_d.ravel(order="F")
+        self._base_image = img
+
+        self._build_frames()
+        return bool(self._phase1_phi) or (self._phase2_mesh is not None)
+
+    def _enforce_monotonic_fill_time(
+        self, source_mask: Optional[np.ndarray] = None
+    ) -> None:
+        """Correct the LBM fill-time field so a voxel cannot fill before any
+        upstream voxel on a path from the source.
+
+        The LBM donor-cell advection can mark a downstream cavity cell as filled
+        slightly before the gate/runner cells that feed it, producing the
+        appearance that the part fills while the gate is still empty.  This
+        method runs a 26-neighbour minimax Dijkstra from the inlet cells and
+        replaces each cell's fill time with the smallest bottleneck along any
+        path, guaranteeing a monotone front.
+
+        If ``source_mask`` is supplied, the cells it marks become the unique
+        t=0 source so the animation starts exactly at the user-selected inlet
+        (sprue throat / pour basin / etc.).
+        """
+        ft = self._fill_time_d
+        metal = self._metal_d
+        if not metal.any():
+            return
+        shape = ft.shape
+        finite = metal & np.isfinite(ft) & (ft < self._sentinel - 1.0)
+        if not finite.any():
+            return
+
+        if source_mask is not None and source_mask.any():
+            source = finite & source_mask
+            if not source.any():
+                source = finite & (ft <= float(ft[finite].min()) + 1e-12)
+            else:
+                # The selected inlet is the unique t=0 source.  Clamp every
+                # other cell to a small positive time so the first frame only
+                # shows the inlet and not stray downstream voxels.
+                ft[source] = 0.0
+                non_source = finite & ~source
+                if non_source.any():
+                    ft[non_source] = np.maximum(ft[non_source], 1e-6)
+        else:
+            t_min = float(ft[finite].min())
+            source = finite & (ft <= t_min + 1e-12)
+
+        if not source.any():
+            return
+
+        dist = np.full(shape, np.inf, dtype=np.float64)
+        dist[source] = 0.0
+        final = np.zeros(shape, dtype=bool)
+        heap = []
+        for (sx, sy, sz) in zip(*np.where(source)):
+            heapq.heappush(heap, (0.0, int(sx), int(sy), int(sz)))
+
+        while heap:
+            d, x, y, z = heapq.heappop(heap)
+            if final[x, y, z]:
+                continue
+            if d > dist[x, y, z] + 1e-12:
+                continue
+            final[x, y, z] = True
+            for dx in (-1, 0, 1):
+                nx = x + dx
+                if nx < 0 or nx >= shape[0]:
+                    continue
+                for dy in (-1, 0, 1):
+                    ny = y + dy
+                    if ny < 0 or ny >= shape[1]:
+                        continue
+                    for dz in (-1, 0, 1):
+                        if dx == 0 and dy == 0 and dz == 0:
+                            continue
+                        nz = z + dz
+                        if nz < 0 or nz >= shape[2]:
+                            continue
+                        if not metal[nx, ny, nz] or final[nx, ny, nz]:
+                            continue
+                        nd = max(d, ft[nx, ny, nz])
+                        if nd < dist[nx, ny, nz] - 1e-12:
+                            dist[nx, ny, nz] = nd
+                            heapq.heappush(heap, (nd, nx, ny, nz))
+
+        self._fill_time_d = np.where(metal, np.where(np.isfinite(dist), dist, ft), ft)
+
+    def _build_frames(self) -> None:
+        """Precompute lightweight scalar matrices; 3-D meshes are built live."""
+        n_frames = max(2, self.MAX_FRAMES)
+        has_solid = self._max_solid_time > self._max_fill_time
+        # Fill phase gets the lion's share of frames so the liquid rise is
+        # cinematic and physically readable; remaining frames are for solidification.
+        if has_solid:
+            self._n_fill = min(self.MIN_FILL_FRAMES, n_frames - 2)
+            self._n_solid = n_frames - self._n_fill
+        else:
+            self._n_fill = n_frames
+            self._n_solid = 0
+
+        fill_times = np.linspace(0.0, self._max_fill_time, self._n_fill)
+        solid_times = np.linspace(self._max_fill_time, self._max_time, self._n_solid)
+        self._frame_times = np.concatenate([fill_times, solid_times])
+
+        app = QtCore.QCoreApplication.instance()
+
+        # Precompute nearest-metal extrapolation indices and static phase-1 colour.
+        inv = ~self._metal_d
+        if self._metal_d.any() and inv.any():
+            self._outside_idx = ndimage.distance_transform_edt(
+                inv, return_indices=True, return_distances=False
+            )
+            self._outside_mask = inv
+        else:
+            self._outside_idx = None
+            self._outside_mask = None
+
+        if self._base_image is not None:
+            # The base image carries a placeholder temperature array; each frame
+            # overwrites it with the actual temperature field before contouring.
+            self._base_image.point_data["temperature"] = np.full(
+                self._base_image.n_points, self._t_pour, dtype=np.float32
+            )
+
+        # Phase 1: only store the phi scalar volume per frame.
+        for i, t in enumerate(fill_times):
+            phi = self._build_fill_phi(t)
+            self._phase1_phi.append(phi)
+            self._phase1_times.append(float(t))
+            if app is not None and i % 20 == 0:
+                app.processEvents()
+
+        # Phase 2: build the decimated base mesh once, then store per-frame
+        # temperature / solid-fraction surface arrays.
+        if self._n_solid > 0:
+            self._build_solid_base()
+            for i, t in enumerate(solid_times[1:], start=1):
+                surf_t, surf_sf = self._solid_scalars_for_time(t)
+                self._phase2_temps.append(surf_t)
+                self._phase2_solids.append(surf_sf)
+                self._phase2_times.append(float(t))
+                if app is not None and i % 20 == 0:
+                    app.processEvents()
+
+    def _build_fill_phi(self, t: float) -> Optional[np.ndarray]:
+        """Return the raveled phi level-set for the liquid front at time t.
+
+        Two level-set components are merged:
+        * ``phi_time`` is a smooth error-function transition centred on ``ft==t``;
+          it creates the water-like free surface inside the part.
+        * ``phi_sdf`` is a signed-distance wall boundary (tanh(sdf/sigma_s));
+          it is 1 inside metal, 0.5 exactly at the CAD wall, and 0 outside.
+
+        ``phi = min(phi_time, phi_sdf)`` then forces the isosurface to sit on
+        the CAD wall wherever the metal has reached the wall, while the free
+        surface away from walls stays smooth.
+        """
+        if self._base_image is None or self._sdf_d is None:
+            return None
+
+        ft = self._fill_time_d
+        metal = ft < self._sentinel
+        if not metal.any():
+            return None
+
+        # Time thickness of the interface: at least 5 % of the total fill time
+        # or ~5 ms, whichever is larger.
+        sigma_t = max(0.05 * self._max_fill_time, 0.005)
+
+        # Temporal Heaviside for the free surface inside the metal.
+        dt = np.where(metal, t - ft, -self._sentinel)
+        phi_time = 0.5 * (1.0 + erf(dt / (np.sqrt(2.0) * sigma_t)))
+
+        # Inflate gating regions so the runner/sprue/ingate cross-section fills
+        # completely before the part.  This raises phi_time to 1 inside the gating
+        # cells that are inside the temporal window; phi_sdf below will clip the
+        # isosurface to the CAD wall.
+        phi_time = self._inflate_gating_phi(phi_time, metal, t)
+
+        # SDF wall boundary: 1 well inside, 0.5 at the wall, 0 outside.
+        # sigma_s controls the transition width; it must be >= 0.5 voxel so the
+        # wall contour is smooth, but small enough not to over-inflate.
+        spacing = np.asarray(self._base_image.spacing, dtype=np.float64)
+        sigma_s = 0.8 * float(np.min(spacing))
+        # Add a half-voxel shift so the phi=0.5 isosurface lands on the CAD wall
+        # instead of half a voxel inside the metal due to point-data/cell-center
+        # mismatch in the ImageData grid.
+        phi_sdf = 0.5 * (1.0 + np.tanh((self._sdf_d + 0.5 * np.min(spacing)) / sigma_s))
+
+        # Combined level-set: the isosurface is the closer of the free surface
+        # (phi_time) and the wall (phi_sdf).  We do NOT clamp to ``metal`` here,
+        # because _inflate_gating_phi deliberately fills a one-voxel shell just
+        # outside the voxelised metal boundary but still inside the CAD wall; the
+        # SDF boundary below stops the liquid exactly at the smooth CAD wall.
+        phi = np.minimum(phi_time, phi_sdf)
+
+        # Light 3-D Gaussian blur on the level-set removes the remaining voxel
+        # staircase edges before contouring.  sigma=0.6 voxels is enough to
+        # smooth the 2 mm grid without leaking across thin gates/runners because
+        # the SDF wall boundary clips the blur at the CAD wall.
+        phi = ndimage.gaussian_filter(phi, sigma=0.6, mode='constant', cval=0.0)
+
+        return phi.astype(np.float32).ravel(order="F")
+
+    def _inflate_gating_phi(
+        self, phi: np.ndarray, metal: np.ndarray, t: float
+    ) -> np.ndarray:
+        """Push the liquid front to the CAD wall inside gating geometries.
+
+        Gating cells whose fill time is inside the temporal interface window
+        (t + sigma_t) are forced to phi = 1.  Then a component-aware dilation
+        fills every cell in the same gating component up to the local radius
+        (max SDF of the component) from an already-filled cell.  This closes
+        cross-sectional holes, reaches wall cells that the LBM/voxeliser may
+        have lost, and keeps the liquid inside the CAD wall.
+        """
+        if (
+            self._grid_d is None
+            or self._base_image is None
+            or self._sdf_d is None
+            or self._gating_mask_fat is None
+            or self._gating_labels is None
+            or self._gating_radius is None
+        ):
+            return phi
+
+        shape = self._fill_time_d.shape
+        phi_3d = phi.reshape(shape, order="F")
+        gating_mask = self._gating_mask_fat
+
+        # Tight temporal window so the first frame only inflates around the
+        # selected inlet; the spatial radius below then fills the cross-section.
+        sigma_t = max(0.001 * self._max_fill_time, 0.005)
+        # Fill gating cells that are inside the smooth interface window.
+        gating_seed = gating_mask & metal & (self._fill_time_d <= t + sigma_t)
+        if not gating_seed.any():
+            return phi
+
+        # Local reach = the maximum SDF in the connected gating component.
+        # This is approximately the component radius, so a filled centreline
+        # cell can propagate across the entire runner/sprue cross-section.
+        local_radius = self._gating_radius[self._gating_labels]
+
+        spacing = np.asarray(self._base_image.spacing, dtype=np.float64)
+        half_voxel = 0.5 * float(np.min(spacing))
+
+        # Distance to the nearest filled gating cell, computed only inside the
+        # fat gating mask so the propagation stays inside the gating geometry.
+        not_filled = np.where(gating_mask, ~gating_seed, True)
+        dist_to_seed = ndimage.distance_transform_edt(
+            not_filled, sampling=tuple(spacing)
+        )
+
+        # Fill a cell if it is inside the gating geometry, inside the CAD wall,
+        # and closer to a filled cell than the local component radius.
+        fill_more = (
+            gating_mask
+            & (self._sdf_d > -half_voxel)
+            & (dist_to_seed <= local_radius + half_voxel)
+        )
+
+        phi_3d = np.where(fill_more, 1.0, phi_3d)
+        return phi_3d
+
+    def _build_solid_base(self) -> None:
+        """Precompute the smooth metal indicator used for live phase-2 frames.
+
+        The solidification mesh is rebuilt every frame so that macro-pores can
+        appear as true holes in the metal surface and a separate purple pore
+        surface can grow with time.  This method stores the base metal level-set
+        (without pores) and an empty pore-phi placeholder; per-frame updates
+        subtract the active pore mask and contour both surfaces live.
+        """
+        if self._base_image is None:
+            return
+
+        ft = self._fill_time_d
+        metal = ft < self._sentinel
+        filled = (ft <= self._max_fill_time) & metal
+        if not filled.any():
+            self._filled_d = None
+            self._phase2_mesh = None
+            return
+
+        # Boolean metal indicator for the fully-filled part.  Pore cells are
+        # carved out per-frame in _update_scene by smoothing (filled & ~pore).
+        self._filled_d = filled
+
+        # Placeholders; overwritten every phase-2 frame.
+        self._base_image.point_data["phi"] = np.zeros(
+            self._base_image.n_points, dtype=np.float32
+        )
+        self._base_image.point_data["pore_phi"] = np.zeros(
+            self._base_image.n_points, dtype=np.float32
+        )
+        # Temperature array is also overwritten per frame.
+        self._base_image.point_data["temperature"] = np.full(
+            self._base_image.n_points, self._t_pour, dtype=np.float32
+        )
+
+        # The fixed phase-2 mesh is no longer used; surfaces are contoured live.
+        self._phase2_mesh = None
+
+    def _finalize_surface(
+        self, surface: pv.PolyData, active_scalars: str = "velocity_magnitude"
+    ) -> pv.PolyData:
+        """Smooth, decimate and normalise a surface mesh.
+
+        Uses constrained smoothing so the liquid free surface can be smoothed
+        while vertices that lie on the CAD wall are locked in place.  This
+        eliminates the 'floating sausage' look caused by volume-shrinking
+        filters without creating voids between the metal and the runner wall.
+        """
+        surface = self._constrained_smooth(surface)
+        try:
+            surface = surface.compute_normals(
+                auto_orient_normals=True, flip_normals=False
+            )
+        except Exception:
+            pass
+        surface = self._decimate(surface)
+        surface.set_active_scalars(active_scalars)
+        return surface
+
+    def _decimate(self, mesh: pv.PolyData) -> pv.PolyData:
+        """Reduce polygon count to keep GPU/CPU usage low."""
+        try:
+            if mesh.n_cells == 0:
+                return mesh
+            dec = mesh.decimate(
+                target_reduction=self.DECIMATE_TARGET,
+                volume_preserving=True,
+                attribute_error_bound=0.5,
+                preserve_topology=True,
+            )
+            return dec if dec.n_points > 0 else mesh
+        except Exception:
+            return mesh
+
+    def _solid_scalars_for_time(self, t: float) -> Tuple[np.ndarray, np.ndarray]:
+        """Return per-surface temperature and solid-fraction for a solid phase time."""
+        if self._phase2_mesh is None or self._phase2_mesh.n_points == 0:
+            return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
+
+        ft = self._fill_time_d
+        st = self._solid_time_d
+
+        t_arr = self._compute_temperature(t)
+        # Extrapolate metal values into the surrounding void so the isosurface
+        # never interpolates cold mould/air values.
+        t_color = self._extrapolate_metal_scalar(t_arr)
+
+        dt = t - ft
+        solid_span = st - ft
+        sf = np.clip(
+            np.divide(dt, solid_span, out=np.zeros_like(dt), where=solid_span > 1e-9),
+            0.0,
+            1.0,
+        )
+        sf = self._extrapolate_metal_scalar(sf)
+
+        # Sample the volume scalars onto the fixed decimated surface.
+        surf_t = self._sample_scalar_at_points(
+            self._phase2_mesh.points, t_color, order=1
+        )
+        surf_sf = self._sample_scalar_at_points(
+            self._phase2_mesh.points, sf, order=1
+        )
+        return surf_t, surf_sf
+
+    def _extrapolate_metal_scalar(self, field: np.ndarray) -> np.ndarray:
+        """Copy the nearest metal value into every void/off-metal cell.
+
+        This is precomputed once via distance_transform_edt and reused for every
+        solid-phase frame, so per-frame extrapolation stays cheap.
+        """
+        color = field.copy()
+        if self._outside_idx is not None and self._outside_mask is not None:
+            z, y, x = self._outside_idx
+            mask = self._outside_mask
+            color[mask] = field[z[mask], y[mask], x[mask]]
+        return color
+
+    def _windowed_sinc_smooth(self, mesh: pv.PolyData) -> pv.PolyData:
+        """Apply a VTK windowed-sinc filter for fluid-like smooth surfaces."""
+        try:
+            import vtk
+
+            smooth = vtk.vtkWindowedSincPolyDataFilter()
+            smooth.SetInputData(mesh)
+            smooth.SetNumberOfIterations(20)
+            smooth.SetPassBand(0.1)
+            smooth.SetFeatureAngle(60.0)
+            smooth.BoundarySmoothingOff()
+            smooth.FeatureEdgeSmoothingOn()
+            smooth.NonManifoldSmoothingOff()
+            smooth.NormalizeCoordinatesOn()
+            smooth.Update()
+            out = pv.PolyData(smooth.GetOutput())
+            return out if out.n_points > 0 else mesh
+        except Exception:
+            return mesh
+
+    def _constrained_smooth(self, mesh: pv.PolyData) -> pv.PolyData:
+        """Smooth the surface while locking vertices that lie on the CAD wall.
+
+        The signed-distance field (SDF) tells us how far each surface vertex is
+        from the original body wall.  Vertices with |sdf| below a voxel-based
+        tolerance are treated as wall vertices and get a zero motion budget;
+        every other vertex receives a small, finite budget so the free liquid
+        surface can be smoothed without the whole volume collapsing inward.
+        """
+        if self._base_image is None or self._sdf_d is None or mesh.n_points == 0:
+            return self._windowed_sinc_smooth(mesh)
+
+        try:
+            import vtk
+
+            spacing = np.asarray(self._base_image.spacing, dtype=np.float64)
+            wall_tol = 0.8 * float(np.min(spacing))
+            free_budget = 0.3 * float(np.min(spacing))
+
+            # SDF at the surface vertices: prefer the point data carried by
+            # clip_scalar/contour, otherwise sample the downsampled grid.
+            if "sdf" in mesh.point_data:
+                sdf_vals = np.asarray(mesh.point_data["sdf"], dtype=np.float64)
+            else:
+                sdf_vals = self._sample_scalar_at_points(
+                    np.asarray(mesh.points, dtype=np.float64), self._sdf_d, order=1
+                )
+
+            is_wall = np.abs(sdf_vals) <= wall_tol
+            constraints = np.full(mesh.n_points, free_budget, dtype=np.float64)
+            constraints[is_wall] = 0.0
+
+            mesh_copy = mesh.copy()
+            mesh_copy.point_data["SmoothingConstraints"] = constraints
+
+            smooth = vtk.vtkConstrainedSmoothingFilter()
+            smooth.SetInputData(mesh_copy)
+            smooth.SetNumberOfIterations(15)
+            smooth.SetRelaxationFactor(0.2)
+            smooth.SetConvergence(1e-6)
+            smooth.SetConstraintStrategyToConstraintArray()
+            smooth.Update()
+            out = pv.PolyData(smooth.GetOutput())
+            return out if out.n_points > 0 else mesh
+        except Exception:
+            return self._windowed_sinc_smooth(mesh)
+
+    def _sample_scalar_at_points(
+        self, points: np.ndarray, field: np.ndarray, order: int = 1
+    ) -> np.ndarray:
+        """Sample a 3-D scalar field at physical point positions."""
+        origin = np.asarray(self._base_image.origin, dtype=np.float64)
+        spacing = np.asarray(self._base_image.spacing, dtype=np.float64)
+        ijk = (points - origin) / spacing
+        return np.asarray(
+            ndimage.map_coordinates(
+                field,
+                ijk.T,
+                order=order,
+                mode="nearest",
+            ),
+            dtype=np.float64,
+        )
+
+    def _compute_temperature(self, t: float) -> np.ndarray:
+        """Return a temperature field for the downsampled animation grid."""
+        ft = self._fill_time_d
+        st = self._solid_time_d
+
+        local = t - ft
+        metal = ft < self._sentinel
+        filled = (ft <= t) & metal
+
+        # Cooling time constant chosen so that T reaches solidus at solid_time.
+        local_solid = np.maximum(st - ft, 1e-9)
+        local_solid = np.where(np.isfinite(local_solid), local_solid, self._max_time)
+
+        ratio = (self._t_sol - self._t_mold) / max(
+            self._t_pour - self._t_mold, 1e-9
+        )
+        ratio = np.clip(ratio, 1e-6, 1.0 - 1e-6)
+        log_ratio = np.log(ratio)  # negative
+        tau = local_solid / np.maximum(-log_ratio, 1e-9)
+
+        T = self._t_mold + (self._t_pour - self._t_mold) * np.exp(
+            -np.maximum(local, 0.0) / tau
+        )
+        T = np.clip(T, self._t_mold, self._t_pour)
+        # Not-yet-filled metal stays at pour temperature so the advancing front
+        # appears hot; true empty space is cold.
+        T = np.where(filled, T, np.where(metal, self._t_pour, self._t_mold))
+        return T
+
+    # ------------------------------------------------------------------
+    # Streamline helpers (kept as an optional red overlay)
+    # ------------------------------------------------------------------
+    def _build_source_points(self) -> Optional[np.ndarray]:
+        """Seed up to MAX_STREAMLINES start points uniformly across the inlet."""
+        metal = self._result.grid > 0
+        finite_fill = np.isfinite(self._fill_time)
+        inlet_mask = finite_fill & (self._fill_time <= 1e-9) & metal
+        if not inlet_mask.any():
+            finite_vals = np.where(finite_fill & metal, self._fill_time, np.inf)
+            min_t = float(np.min(finite_vals))
+            inlet_mask = finite_fill & (self._fill_time <= min_t + 1e-9) & metal
+
+        inlet_idx = np.argwhere(inlet_mask)
+        if inlet_idx.shape[0] == 0:
+            return None
+
+        n = inlet_idx.shape[0]
+        if n > self.MAX_STREAMLINES:
+            step = max(1, n // self.MAX_STREAMLINES)
+            inlet_idx = inlet_idx[::step][: self.MAX_STREAMLINES]
+
+        return inlet_idx * self._dx + self._origin + 0.5 * self._dx
+
+    def _sample_velocity(self, pos: np.ndarray) -> np.ndarray:
+        """Trilinear interpolation of the Darcy velocity field (m/s)."""
+        if pos.shape[0] == 0:
+            return np.empty((0, 3), dtype=np.float64)
+        inv_dx = 1.0 / self._dx
+        ijk = (pos - self._origin) * inv_dx - 0.5
+        ijk = np.ascontiguousarray(ijk, dtype=np.float64)
+        coords = np.stack([ijk[:, 0], ijk[:, 1], ijk[:, 2]], axis=0)
+        out = np.empty((pos.shape[0], 3), dtype=np.float64)
+        for comp in range(3):
+            out[:, comp] = ndimage.map_coordinates(
+                self._velocity[comp],
+                coords,
+                order=1,
+                mode="constant",
+                cval=0.0,
+            )
+        return out
+
+    def _sample_scalar(self, pos: np.ndarray, field: np.ndarray) -> np.ndarray:
+        """Trilinear interpolation of a scalar voxel field at physical positions."""
+        if pos.shape[0] == 0:
+            return np.empty(0, dtype=np.float64)
+        inv_dx = 1.0 / self._dx
+        ijk = (pos - self._origin) * inv_dx - 0.5
+        ijk = np.ascontiguousarray(ijk, dtype=np.float64)
+        coords = np.stack([ijk[:, 0], ijk[:, 1], ijk[:, 2]], axis=0)
+        return ndimage.map_coordinates(
+            field,
+            coords,
+            order=1,
+            mode="constant",
+            cval=0.0,
+        )
+
+    def _inside_metal(self, pos: np.ndarray) -> np.ndarray:
+        """Nearest-neighbour metal mask check for streamline integration."""
+        if pos.shape[0] == 0:
+            return np.zeros(0, dtype=bool)
+        inv_dx = 1.0 / self._dx
+        ijk = (pos - self._origin) * inv_dx - 0.5
+        coords = np.stack([ijk[:, 0], ijk[:, 1], ijk[:, 2]], axis=0)
+        sampled = ndimage.map_coordinates(
+            self._result.grid.astype(np.float32),
+            coords,
+            order=0,
+            mode="constant",
+            cval=0.0,
+        )
+        return sampled > 0.5
+
+    def _sample_body_type(self, pos: np.ndarray) -> np.ndarray:
+        """Nearest-neighbour body-type sampling at physical positions."""
+        if pos.shape[0] == 0:
+            return np.empty(0, dtype=np.int16)
+        inv_dx = 1.0 / self._dx
+        ijk = (pos - self._origin) * inv_dx - 0.5
+        coords = np.stack([ijk[:, 0], ijk[:, 1], ijk[:, 2]], axis=0)
+        sampled = ndimage.map_coordinates(
+            self._result.grid.astype(np.float32),
+            coords,
+            order=0,
+            mode="constant",
+            cval=0.0,
+        )
+        return sampled.astype(np.int16)
+
+    def _integrate_streamlines(self, source_pts: np.ndarray) -> Optional[pv.PolyData]:
+        """Integrate streamlines from inlet seeds through the Darcy velocity field."""
+        n = source_pts.shape[0]
+        pos = source_pts.copy().astype(np.float64)
+        active = np.ones(n, dtype=bool)
+        t = np.zeros(n, dtype=np.float64)
+
+        line_points: List[List[np.ndarray]] = [[] for _ in range(n)]
+        line_vel: List[List[float]] = [[] for _ in range(n)]
+        line_time: List[List[float]] = [[] for _ in range(n)]
+
+        for i in range(n):
+            line_points[i].append(pos[i].copy())
+            line_vel[i].append(0.0)
+            line_time[i].append(0.0)
+
+        vmag = np.linalg.norm(self._velocity, axis=0)
+        max_speed = float(np.nanmax(vmag)) if vmag.size else 0.0
+        if max_speed > 0.0:
+            dt_min = self.CFL_FRACTION * self._dx / (1000.0 * max_speed)
+            needed_steps = int(np.ceil(self._max_time / dt_min))
+            max_steps = max(self.MAX_STEPS, needed_steps)
+        else:
+            max_steps = self.MAX_STEPS
+        max_steps = min(max_steps, 20000)
+
+        pos_active = pos[active]
+        for _ in range(max_steps):
+            m_active = pos_active.shape[0]
+            if m_active == 0:
+                break
+
+            active_indices = np.nonzero(active)[0]
+            v = self._sample_velocity(pos_active)
+            speed = np.linalg.norm(v, axis=1)
+
+            stop = speed <= 1e-9
+            if stop.any():
+                stop_global = active_indices[stop]
+                active[stop_global] = False
+                keep = ~stop
+                pos_active = pos_active[keep]
+                v = v[keep]
+                speed = speed[keep]
+                if pos_active.shape[0] == 0:
+                    break
+                active_indices = np.nonzero(active)[0]
+
+            dt_space = self.CFL_FRACTION * self._dx / (1000.0 * speed.max())
+            dt_time = self._max_time / max_steps
+            dt = float(min(dt_space, dt_time))
+            if dt <= 1e-12:
+                break
+
+            new_pos = pos_active + v * (dt * 1000.0)
+            inside = self._inside_metal(new_pos)
+            body_type = self._sample_body_type(new_pos)
+
+            for local, global_idx in enumerate(active_indices):
+                if not inside[local]:
+                    active[global_idx] = False
+                elif body_type[local] == BodyType.PART:
+                    pos[global_idx] = new_pos[local]
+                    line_points[global_idx].append(pos[global_idx].copy())
+                    line_vel[global_idx].append(float(speed[local]))
+                    t[global_idx] += dt
+                    line_time[global_idx].append(t[global_idx])
+                    active[global_idx] = False
+                else:
+                    pos[global_idx] = new_pos[local]
+                    line_points[global_idx].append(pos[global_idx].copy())
+                    line_vel[global_idx].append(float(speed[local]))
+                    t[global_idx] += dt
+                    line_time[global_idx].append(t[global_idx])
+
+            pos_active = pos[active]
+
+        points = []
+        magnitudes = []
+        arrival = []
+        lines = []
+        cursor = 0
+        for i in range(n):
+            lp = line_points[i]
+            if len(lp) < 2:
+                continue
+            pts = np.stack(lp, axis=0)
+            points.append(pts)
+            magnitudes.extend(line_vel[i])
+            arrival.extend(line_time[i])
+            m = pts.shape[0]
+            lines.append(m)
+            lines.extend(range(cursor, cursor + m))
+            cursor += m
+
+        if not points:
+            return None
+
+        poly = pv.PolyData()
+        poly.points = np.concatenate(points, axis=0)
+        poly.lines = np.array(lines, dtype=np.int64)
+        poly["velocity_magnitude"] = np.array(magnitudes, dtype=np.float64)
+        poly["arrival_time"] = np.array(arrival, dtype=np.float64)
+        return poly
+
+    def _trim_streamlines(self, poly: pv.PolyData) -> Optional[pv.PolyData]:
+        """Remove any trailing points of each line that fell just outside metal."""
+        if poly is None or poly.n_points == 0:
+            return poly
+        pts = poly.points
+        mag = poly["velocity_magnitude"]
+        arr = poly["arrival_time"]
+        lines = poly.lines
+        inside = self._inside_metal(pts)
+
+        out_pts = []
+        out_mag = []
+        out_arr = []
+        out_lines = []
+        cursor = 0
+        idx = 0
+        while idx < len(lines):
+            n = int(lines[idx])
+            inds = lines[idx + 1 : idx + 1 + n]
+            idx += 1 + n
+
+            m = n
+            while m > 0 and not inside[inds[m - 1]]:
+                m -= 1
+            if m < 2:
+                continue
+
+            out_lines.append(m)
+            out_lines.extend(range(cursor, cursor + m))
+            out_pts.append(pts[inds[:m]])
+            out_mag.append(mag[inds[:m]])
+            out_arr.append(arr[inds[:m]])
+            cursor += m
+
+        if not out_pts:
+            return None
+
+        trimmed = pv.PolyData()
+        trimmed.points = np.concatenate(out_pts, axis=0)
+        trimmed.lines = np.array(out_lines, dtype=np.int64)
+        trimmed["velocity_magnitude"] = np.concatenate(out_mag)
+        trimmed["arrival_time"] = np.concatenate(out_arr)
+        return trimmed
+
+    def _compute_streamline_radius(self) -> None:
+        """Add a per-point tube radius based on the local channel thickness."""
+        if self._streamlines is None or self._edt is None:
+            return
+
+        radii = self._sample_scalar(self._streamlines.points, self._edt)
+        lines = self._streamlines.lines
+        out_radii = np.empty(self._streamlines.n_points, dtype=np.float64)
+        idx = 0
+        while idx < len(lines):
+            n = int(lines[idx])
+            inds = lines[idx + 1 : idx + 1 + n]
+            idx += 1 + n
+            seg = radii[inds]
+            seg = ndimage.maximum_filter1d(seg, size=5, mode="nearest")
+            seg = np.maximum(seg, self._dx)
+            out_radii[inds] = seg
+
+        self._streamlines["tube_radius"] = out_radii
+
+    def _build_tube_mesh(self) -> None:
+        """Convert the streamline network into a red tube mesh."""
+        if self._streamlines is None or self._streamlines.n_points == 0:
+            self._tube_mesh = None
+            return
+
+        try:
+            self._tube_mesh = self._streamlines.tube(
+                radius=0.1,
+                scalars="tube_radius",
+                absolute=True,
+                n_sides=self.N_SIDES,
+                capping=False,
+            )
+            self._tube_mesh.set_active_scalars(None)
+        except Exception:
+            self._tube_mesh = None
+
+    def _marker_positions(self, t: float) -> Optional[np.ndarray]:
+        """Return the current marker position on each streamline."""
+        if self._streamlines is None:
+            return None
+
+        t = float(np.clip(t, 0.0, self._max_time))
+        pts = self._streamlines.points
+        arr = self._streamlines["arrival_time"]
+        lines = self._streamlines.lines
+
+        markers = []
+        idx = 0
+        while idx < len(lines):
+            n = int(lines[idx])
+            inds = lines[idx + 1 : idx + 1 + n]
+            idx += 1 + n
+
+            p = pts[inds]
+            a = arr[inds]
+            if a[-1] <= a[0]:
+                markers.append(p[-1])
+                continue
+            if t <= a[0]:
+                markers.append(p[0])
+            elif t >= a[-1]:
+                markers.append(p[-1])
+            else:
+                x = np.interp(t, a, p[:, 0])
+                y = np.interp(t, a, p[:, 1])
+                z = np.interp(t, a, p[:, 2])
+                markers.append([x, y, z])
+
+        if not markers:
+            return None
+        return np.array(markers, dtype=np.float64)
+
+    # ------------------------------------------------------------------
+    # Public control API
+    # ------------------------------------------------------------------
+    def _interval_ms(self) -> int:
+        """Timer interval in ms for the current speed multiplier."""
+        ms = int(1000.0 * self.TIMER_INTERVAL / max(0.01, self._speed_multiplier))
+        return max(10, min(ms, 10000))
+
+    def set_speed_multiplier(self, speed: float) -> None:
+        self._speed_multiplier = min(20.0, max(0.01, float(speed)))
+
+    def set_show_streamlines(self, show: bool) -> None:
+        """Show/hide the red flow-path lines."""
+        self._show_streamlines = bool(show)
+        self._update_scene()
+
+    def set_current_time(self, t: float) -> None:
+        if self._frame_times is None or len(self._frame_times) == 0:
+            return
+        t = float(np.clip(t, 0.0, self._max_time))
+        self._current_frame = int(
+            max(0, np.searchsorted(self._frame_times, t, side="right") - 1)
+        )
+        self._update_scene()
+
+    def play(self) -> None:
+        if self._frame_times is None or len(self._frame_times) == 0:
+            return
+        if self._is_running:
+            # Already playing -> toggle pause.
+            self.pause()
+            return
+        # Restart from the beginning if already at the end.
+        if self._current_frame >= len(self._frame_times) - 1:
+            self._current_frame = 0
+        self._is_running = True
+        self.stateChanged.emit(True)
+        self._timer.start(self._interval_ms())
+
+    def pause(self) -> None:
+        if self._is_running:
+            self._is_running = False
+            self._timer.stop()
+            self.stateChanged.emit(False)
+
+    def stop(self) -> None:
+        self.pause()
+        self._clear_actors()
+        self._current_frame = 0
+        self._current_time = 0.0
+        # Do NOT re-render frame 0 here; stop() means "hide the animation".
+        # set_result() calls _update_scene() itself when frames are ready.
+
+    def _clear_actors(self) -> None:
+        if self._streamline_actor is not None:
+            try:
+                self._viewer.remove_actor(self._streamline_actor)
+            except Exception:
+                pass
+            self._streamline_actor = None
+        if self._marker_actor is not None:
+            try:
+                self._viewer.remove_actor(self._marker_actor)
+            except Exception:
+                pass
+            self._marker_actor = None
+        if self._frame_actor is not None:
+            try:
+                self._viewer.remove_actor(self._frame_actor)
+            except Exception:
+                pass
+            self._frame_actor = None
+        if self._pore_actor is not None:
+            try:
+                self._viewer.remove_actor(self._pore_actor)
+            except Exception:
+                pass
+            self._pore_actor = None
+        if self._feeder_actor is not None:
+            try:
+                self._viewer.remove_actor(self._feeder_actor)
+            except Exception:
+                pass
+            self._feeder_actor = None
+        # Alt renk skalasını (dolum/katılaşma sıcaklık çubuğu) da kaldır.
+        try:
+            self._viewer.remove_scalar_bar("Sıcaklık (°C)")
+        except Exception:
+            pass
+
+    def _on_timer(self) -> None:
+        if not self._is_running or self._frame_times is None or len(self._frame_times) == 0:
+            return
+        if self._current_frame >= len(self._frame_times) - 1:
+            self.pause()
+            return
+        t0 = time.perf_counter()
+        self._current_frame += 1
+        self._update_scene()
+        if self._is_running:
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            self._timer.start(max(10, self._interval_ms() - elapsed_ms))
+
+    def _update_scene(self) -> None:
+        if self._frame_times is None or len(self._frame_times) == 0:
+            return
+
+        n_frames = len(self._frame_times)
+        frame = max(0, min(self._current_frame, n_frames - 1))
+        self._current_frame = frame
+        self._current_time = float(self._frame_times[frame])
+
+        if frame < self._n_fill:
+            # Phase 1: build the liquid surface live from the stored phi matrix
+            # and colour it by temperature (hot red -> cold blue).
+            phi = self._phase1_phi[frame] if 0 <= frame < len(self._phase1_phi) else None
+            if phi is None or self._base_image is None:
+                if self._frame_actor is not None:
+                    try:
+                        self._viewer.remove_actor(self._frame_actor)
+                    except Exception:
+                        pass
+                    self._frame_actor = None
+                    self._frame_actor_scalar = ""
+            else:
+                t = self._frame_times[frame]
+                T_3d = self._compute_temperature(t).astype(np.float32)
+                self._base_image.point_data["temperature"] = T_3d.ravel(order="F")
+                self._base_image.point_data["phi"] = phi
+                # Smooth isosurface at phi = 0.5.  The combined SDF + time level-set
+                # forces the surface onto the CAD wall while keeping the free
+                # surface water-like.
+                surface = self._base_image.contour(
+                    isosurfaces=[0.5], scalars="phi", method="flying_edges"
+                )
+                if surface.n_points == 0:
+                    if self._frame_actor is not None:
+                        try:
+                            self._viewer.remove_actor(self._frame_actor)
+                        except Exception:
+                            pass
+                        self._frame_actor = None
+                        self._frame_actor_scalar = ""
+                else:
+                    # Contour does not carry temperature/SDF; sample them back.
+                    pts = np.asarray(surface.points, dtype=np.float64)
+                    surface.point_data["temperature"] = self._sample_scalar_at_points(
+                        pts, T_3d, order=1
+                    ).astype(np.float32)
+                    surface.point_data["sdf"] = self._sample_scalar_at_points(
+                        pts, self._sdf_d, order=1
+                    ).astype(np.float64)
+                    surface = self._finalize_surface(
+                        surface, active_scalars="temperature"
+                    )
+                    if self._frame_actor is None or self._frame_actor_scalar != "temperature":
+                        if self._frame_actor is not None:
+                            try:
+                                self._viewer.remove_actor(self._frame_actor)
+                            except Exception:
+                                pass
+                        self._frame_actor = self._viewer.add_mesh(
+                            surface,
+                            cmap=self._metal_cmap(),
+                            clim=(self._t_mold, self._t_pour),
+                            opacity=1.0,
+                            scalars="temperature",
+                            show_scalar_bar=True,
+                            scalar_bar_args={"title": "Sıcaklık (°C)"},
+                            name="flow_frame",
+                        )
+                        self._frame_actor_scalar = "temperature"
+                    else:
+                        self._frame_actor.mapper.dataset = surface
+
+            # Macro porosity is not shown during filling; remove any stale actor.
+            if self._pore_actor is not None:
+                try:
+                    self._viewer.remove_actor(self._pore_actor)
+                except Exception:
+                    pass
+                self._pore_actor = None
+        else:
+            # Phase 2: live reconstruction of the metal surface with macro-pore
+            # holes carved out, plus a separate purple pore_actor that grows as
+            # solid_time <= t advances.
+            s_idx = frame - self._n_fill
+            if (
+                self._filled_d is None
+                or self._pore_mask_d is None
+                or s_idx >= self._n_solid
+                or self._base_image is None
+            ):
+                return
+            t = self._frame_times[frame]
+
+            # Temperature field for this instant (cools from pour down to mold).
+            T_3d = self._compute_temperature(t)
+            T = self._extrapolate_metal_scalar(T_3d).astype(np.float32).ravel(order="F")
+            self._base_image.point_data["temperature"] = T
+
+            # Active pores: cells that are in the macro-pore mask and have already
+            # solidified (solid_time <= current time).  This makes pores appear
+            # one by one as the liquid path closes.
+            active_pore = self._pore_mask_d & (self._solid_time_d <= t)
+
+            # Feeder action: still-liquid risers suppress pores in their feeding
+            # range.  The riser's own metal level drops from the top as liquid is
+            # consumed, rather than the whole volume shrinking uniformly.
+            ft = self._fill_time_d
+            st = self._solid_time_d
+            metal = self._filled_d
+            riser = (self._grid_d == int(BodyType.RISER)) & metal
+            lf = self._riser_liquid_fraction(t, ft, st)
+            liquid_riser = riser & (lf > 0.5) & (ft <= t)
+            if liquid_riser.any() and self._dist_to_riser_d is not None:
+                feed_distance_mm = max(
+                    4.0 * getattr(self._result, "dominant_m_mm", 0.0), 50.0
+                )
+                spacing = np.asarray(self._base_image.spacing, dtype=np.float64)
+                liquid_riser_dist = ndimage.distance_transform_edt(
+                    ~liquid_riser, sampling=spacing
+                )
+                fed = (
+                    (liquid_riser_dist <= feed_distance_mm)
+                    & (self._grid_d == int(BodyType.PART))
+                    & (lf > 0.5)
+                    & (ft <= t)
+                )
+                active_pore = active_pore & ~fed
+
+            # P4 prototype: gravity-driven pore rise.  Pores are buoyant in the
+            # still-liquid metal and drift opposite to the gravity vector.
+            # The shift is sub-voxel and grows with time since filling ended.
+            dt_pore = max(0.0, t - self._max_fill_time)
+            rise_m = dt_pore * self.PORE_RISE_SPEED_M_S
+            if rise_m > 1e-6 and self._dx > 0.0:
+                rise_voxels = rise_m * 1000.0 / self._dx
+                shift = tuple(-rise_voxels * self._gravity[i] for i in range(3))
+                shifted = ndimage.shift(
+                    active_pore.astype(np.float64),
+                    shift,
+                    order=1,
+                    mode="constant",
+                    cval=0.0,
+                )
+                active_pore = shifted > 0.5
+
+            pore_smooth = ndimage.gaussian_filter(
+                active_pore.astype(np.float64), sigma=self.PHI_SIGMA, mode="constant", cval=0.0
+            ).astype(np.float32)
+
+            # Metal level-set: keep the full casting geometry (including solid
+            # feeders) so the surface never disappears.  The riser liquid fraction
+            # is used only for the active feed-path overlay and pore suppression.
+            metal_field = metal.astype(np.float64)
+            metal_field = np.where(active_pore, 0.0, metal_field)
+            phi_t = ndimage.gaussian_filter(
+                metal_field,
+                sigma=self.PHI_SIGMA,
+                mode="constant",
+                cval=0.0,
+            ).astype(np.float32)
+            self._base_image.point_data["phi"] = phi_t.ravel(order="F")
+
+            surface = self._base_image.contour(isosurfaces=[0.5], scalars="phi")
+            if surface.n_points == 0:
+                if self._frame_actor is not None:
+                    try:
+                        self._viewer.remove_actor(self._frame_actor)
+                    except Exception:
+                        pass
+                    self._frame_actor = None
+                    self._frame_actor_scalar = ""
+            else:
+                pts = np.asarray(surface.points, dtype=np.float64)
+                surface.point_data["temperature"] = self._sample_scalar_at_points(
+                    pts, T_3d, order=1
+                ).astype(np.float32)
+                surface.point_data["sdf"] = self._sample_scalar_at_points(
+                    pts, self._sdf_d, order=1
+                ).astype(np.float64)
+                surface = self._finalize_surface(surface, active_scalars="temperature")
+                if self._frame_actor is None or self._frame_actor_scalar != "temperature":
+                    if self._frame_actor is not None:
+                        try:
+                            self._viewer.remove_actor(self._frame_actor)
+                        except Exception:
+                            pass
+                    self._frame_actor = self._viewer.add_mesh(
+                        surface,
+                        cmap=self._metal_cmap(),
+                        clim=(self._t_mold, self._t_pour),
+                        opacity=1.0,
+                        scalars="temperature",
+                        show_scalar_bar=True,
+                        scalar_bar_args={"title": "Sıcaklık (°C)"},
+                        name="flow_frame",
+                    )
+                    self._frame_actor_scalar = "temperature"
+                else:
+                    self._frame_actor.mapper.dataset = surface
+
+            # Pore surface: contour the smoothed active-pore indicator at 0.5.
+            # Rendered in bright purple (#800080) with 0.9 opacity so deep cavities
+            # remain visible even behind the metal surface.
+            self._base_image.point_data["pore_phi"] = pore_smooth.ravel(order="F")
+            pore_surface = self._base_image.contour(isosurfaces=[0.5], scalars="pore_phi")
+            if pore_surface.n_points == 0:
+                if self._pore_actor is not None:
+                    try:
+                        self._viewer.remove_actor(self._pore_actor)
+                    except Exception:
+                        pass
+                    self._pore_actor = None
+            else:
+                pore_surface = self._finalize_surface(pore_surface, active_scalars="pore_phi")
+                pore_surface.set_active_scalars(None)
+                if self._pore_actor is None:
+                    self._pore_actor = self._viewer.add_mesh(
+                        pore_surface,
+                        color="#800080",
+                        opacity=0.9,
+                        show_scalar_bar=False,
+                        name="pore_actor",
+                    )
+                else:
+                    self._pore_actor.mapper.dataset = pore_surface
+
+            # Feeder action overlay: lines from each still-liquid riser to the
+            # hotspot it is feeding.  Line colour fades as the feeder solidifies.
+            feeder_poly = self._build_feeder_paths(t, ft, st, lf)
+            if feeder_poly is not None and feeder_poly.n_points > 0:
+                if self._feeder_actor is None:
+                    self._feeder_actor = self._viewer.add_mesh(
+                        feeder_poly,
+                        cmap="autumn",
+                        scalars="liquid_fraction",
+                        clim=(0.0, 1.0),
+                        opacity=0.85,
+                        render_lines_as_tubes=True,
+                        line_width=3,
+                        show_scalar_bar=False,
+                        name="feeder_paths",
+                    )
+                else:
+                    self._feeder_actor.mapper.dataset = feeder_poly
+            else:
+                if self._feeder_actor is not None:
+                    try:
+                        self._viewer.remove_actor(self._feeder_actor)
+                    except Exception:
+                        pass
+                    self._feeder_actor = None
+
+        # Optional red streamlines overlay.
+        if self._show_streamlines and self._tube_mesh is not None:
+            if self._streamline_actor is None:
+                self._streamline_actor = self._viewer.add_mesh(
+                    self._tube_mesh,
+                    color="red",
+                    opacity=1.0,
+                    show_scalar_bar=False,
+                    name="flow_streamlines",
+                )
+            else:
+                self._streamline_actor.mapper.dataset = self._tube_mesh
+
+            markers = self._marker_positions(self._current_time)
+            if markers is not None and markers.shape[0] > 0:
+                poly = pv.PolyData(markers)
+                if self._marker_actor is None:
+                    self._marker_actor = self._viewer.add_mesh(
+                        poly,
+                        render_points_as_spheres=True,
+                        point_size=self.MARKER_SIZE,
+                        color="red",
+                        show_scalar_bar=False,
+                        name="flow_markers",
+                    )
+                else:
+                    self._marker_actor.mapper.dataset = poly
+            else:
+                if self._marker_actor is not None:
+                    try:
+                        self._viewer.remove_actor(self._marker_actor)
+                    except Exception:
+                        pass
+                    self._marker_actor = None
+        else:
+            if self._streamline_actor is not None:
+                try:
+                    self._viewer.remove_actor(self._streamline_actor)
+                except Exception:
+                    pass
+                self._streamline_actor = None
+            if self._marker_actor is not None:
+                try:
+                    self._viewer.remove_actor(self._marker_actor)
+                except Exception:
+                    pass
+                self._marker_actor = None
+
+        self._viewer.render()
+        self.frameChanged.emit(self._current_frame, self._current_time, self._max_time)
+
+    def _riser_liquid_fraction(
+        self, t: float, ft: np.ndarray, st: np.ndarray
+    ) -> np.ndarray:
+        """Return a per-voxel liquid fraction for riser cells.
+
+        The liquid volume consumed by each riser is driven by the solidification
+        shrinkage of the part: as the part solidifies it demands liquid metal,
+        and the riser level drops from the top down by that volume.  Non-riser
+        cells are assigned 1.0 (treated as fully liquid metal).
+        """
+        lf = np.ones_like(ft, dtype=np.float64)
+        if self._grid_d is None or self._base_image is None:
+            return lf
+
+        metal = ft < self._sentinel
+        riser = (self._grid_d == int(BodyType.RISER)) & metal
+        if not riser.any():
+            return lf
+
+        g_norm = float(np.linalg.norm(self._gravity))
+        g_u = (
+            self._gravity / g_norm
+            if g_norm > 1e-12
+            else np.array([0.0, 0.0, -1.0], dtype=np.float64)
+        )
+
+        shape = ft.shape
+        indices = np.indices(shape, dtype=np.float64)
+        spacing = np.asarray(self._base_image.spacing, dtype=np.float64)
+        origin_c = np.asarray(self._base_image.origin, dtype=np.float64)
+        centers = origin_c[:, None, None, None] + (indices + 0.5) * spacing[
+            :, None, None, None
+        ]
+        # Vertical coordinate: larger value = higher against gravity.
+        proj = (centers * (-g_u[:, None, None, None])).sum(axis=0)
+        cell_volume_m3 = float(np.prod(spacing))
+
+        # Total shrinkage demand from the part up to time t.
+        part = (self._grid_d == int(BodyType.PART)) & metal
+        shrinkage_factor = float(getattr(self, "_shrinkage_factor", 0.03))
+        fed_volume_m3 = 0.0
+        if part.any() and shrinkage_factor > 0.0:
+            t_rel = (t - ft[part]) / np.maximum(st[part] - ft[part], 1e-12)
+            sf = np.clip(t_rel, 0.0, 1.0)
+            # Mask out cells that are not yet filled or have no solid time.
+            sf = np.where(np.isfinite(st[part]) & (ft[part] <= t), sf, 0.0)
+            fed_volume_m3 = shrinkage_factor * float(np.sum(sf)) * cell_volume_m3
+
+        labeled, n = ndimage.label(riser, structure=np.ones((3, 3, 3), dtype=np.int32))
+        riser_volumes = np.array(
+            [float(np.sum(labeled == i)) * cell_volume_m3 for i in range(1, n + 1)],
+            dtype=np.float64,
+        )
+        total_riser_volume_m3 = float(np.sum(riser_volumes))
+        for i in range(1, n + 1):
+            mask = labeled == i
+            z = proj[mask]
+            z_min = float(z.min())
+            z_max = float(z.max())
+            if z_max <= z_min:
+                continue
+            ft_comp = float(ft[mask].min())
+            st_comp = float(st[mask].max())
+            if t <= ft_comp:
+                continue
+            if t >= st_comp or (st_comp - ft_comp) <= 1e-12:
+                lf[mask] = 0.0
+                continue
+
+            comp_volume_m3 = float(mask.sum()) * cell_volume_m3
+            if total_riser_volume_m3 > 0.0:
+                share_m3 = fed_volume_m3 * (comp_volume_m3 / total_riser_volume_m3)
+            else:
+                share_m3 = 0.0
+            remaining_volume_m3 = max(0.0, comp_volume_m3 - share_m3)
+
+            # No liquid left -> fully solid for this riser.
+            if remaining_volume_m3 <= 0.0:
+                lf[mask] = 0.0
+                continue
+
+            z_arr = np.asarray(z, dtype=np.float64)
+            order = np.argsort(z_arr, kind="mergesort")
+            z_sorted = z_arr[order]
+            # Cumulative volume from the bottom (lowest z) upward.
+            cumvol = (np.arange(1, z_arr.size + 1, dtype=np.float64)) * cell_volume_m3
+            if remaining_volume_m3 >= comp_volume_m3:
+                continue
+            idx = int(np.searchsorted(cumvol, remaining_volume_m3, side="left"))
+            if idx == 0:
+                level = z_sorted[0]
+            elif idx >= len(z_sorted):
+                level = z_sorted[-1]
+            else:
+                dz = z_sorted[idx] - z_sorted[idx - 1]
+                frac = (remaining_volume_m3 - cumvol[idx - 1]) / cell_volume_m3
+                level = z_sorted[idx - 1] + dz * frac
+            lf[mask] = (z <= level).astype(np.float64)
+        return lf
+
+    def _build_feeder_paths(
+        self, t: float, ft: np.ndarray, st: np.ndarray, lf: np.ndarray
+    ) -> Optional[pv.PolyData]:
+        """Build tube/line geometry from each still-liquid riser to its hotspot."""
+        if self._result is None or not self._result.riser_results:
+            return None
+        metal = self._filled_d
+        if metal is None or not metal.any() or self._grid_d is None:
+            return None
+
+        riser = (self._grid_d == int(BodyType.RISER)) & metal
+        liquid_riser = riser & (lf > 0.5) & (ft <= t)
+        if not liquid_riser.any():
+            return None
+
+        labeled, n = ndimage.label(
+            liquid_riser, structure=np.ones((3, 3, 3), dtype=np.int32)
+        )
+        if n == 0:
+            return None
+
+        spacing = np.asarray(self._base_image.spacing, dtype=np.float64)
+        origin_c = np.asarray(self._base_image.origin, dtype=np.float64)
+        hotspots = self._result.hotspots
+        if not hotspots:
+            return None
+
+        points: List[np.ndarray] = []
+        lines: List[int] = []
+        scalars: List[float] = []
+        for i in range(1, n + 1):
+            pts = np.argwhere(labeled == i)
+            if pts.shape[0] == 0:
+                continue
+            centroid_vox = pts.mean(axis=0)
+            idx = tuple(np.round(centroid_vox).astype(int))
+            if not all(0 <= idx[k] < st.shape[k] for k in range(3)):
+                continue
+            if st[idx] <= t or ft[idx] > t:
+                continue
+            lf_val = float(lf[idx])
+            centroid_mm = origin_c + (centroid_vox + 0.5) * spacing
+            # Prefer the hotspot recorded by the riser design engine.
+            target_mm: Optional[np.ndarray] = None
+            if i - 1 < len(self._result.riser_results):
+                target_arr = self._result.riser_results[
+                    i - 1
+                ].nearest_hotspot_position_mm
+                if target_arr is not None and target_arr.size >= 3:
+                    target_mm = np.asarray(target_arr[:3], dtype=np.float64)
+            # Fallback to nearest hot spot.
+            if target_mm is None:
+                best = None
+                best_d2 = float("inf")
+                for hs in hotspots:
+                    pos = np.asarray(hs.position_mm, dtype=np.float64)
+                    d2 = float(np.sum((pos - centroid_mm) ** 2))
+                    if d2 < best_d2:
+                        best_d2 = d2
+                        best = pos
+                target_mm = best
+            if target_mm is None:
+                continue
+            base = len(points)
+            points.append(centroid_mm)
+            points.append(target_mm)
+            lines.extend([2, base, base + 1])
+            scalars.extend([lf_val, lf_val])
+
+        if not points:
+            return None
+        poly = pv.PolyData(
+            np.vstack(points), np.asarray(lines, dtype=np.int64)
+        )
+        poly["liquid_fraction"] = np.asarray(scalars, dtype=np.float32)
+        return poly
+
+    def _metal_cmap(self):
+        # Hot metal = red (high scalar), cold/solid = blue (low scalar).
+        return "coolwarm"
+
+    def frame_count(self) -> int:
+        return len(self._frame_times) if self._frame_times is not None else 0
+
+    def current_frame_index(self) -> int:
+        return self._current_frame
+
+    def line_count(self) -> int:
+        """Number of flow-path lines (streamlines)."""
+        if self._streamlines is None:
+            return 0
+        return int(self._streamlines.n_cells)
+
+    def particle_count(self) -> int:
+        """Kept for API compatibility; the new animator uses surface frames."""
+        return 0
+
+    def show_velocity_graph(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        """Open a popup with the Darcy velocity vs. fill-time graph."""
+        if self._result is None or self._result.flow_result is None:
+            return
+        dialog = FlowVelocityGraph(self._result, parent)
+        dialog.show()
+        # Keep a reference so the dialog isn't garbage-collected while open.
+        self._velocity_graph_dialog = dialog

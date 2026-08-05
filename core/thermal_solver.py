@@ -2,20 +2,38 @@
 
 Uses an implicit finite-volume discretisation of
 
-    dH/dt = ∇ · (k ∇T)
+    dH/dt = ∇ · (k ∇T) - ρ·cp · (v · ∇T)
 
 with H = ρ·cp·T + ρ·L·(1-fs) in the metal and H = ρ·cp·T in the mould.
 The latent-heat contribution is regularised as an apparent heat capacity
 within the mushy zone, giving a stable, second-order-in-space solution.
+
+The optional velocity field ``velocity_m_s`` is the Darcy filling velocity
+(hücre-bazlı 3B hız alanı).  It is treated explicitly as a convective
+(advective) term and is only active in metal voxels whose fill time has
+already elapsed, so the thermal solver is coupled to the flow solution.
 """
 
+
 from typing import Optional, Tuple
+
+import os
+import sys
 
 import numpy as np
 from scipy import ndimage, sparse
 from scipy.sparse import linalg as spla
 
 from core.materials import Alloy, MoldMaterial
+from core.types import BODY_METAL_TYPES, BodyType
+
+USE_CPP_THERMAL = (
+    os.environ.get("JOSECAST_USE_CPP_THERMAL", "1").lower() in ("1", "true", "yes")
+)
+if USE_CPP_THERMAL:
+    from core.cpp_bridge import JOSECAST_CORE
+else:
+    JOSECAST_CORE = None
 
 
 def _scheil_fs(
@@ -24,13 +42,18 @@ def _scheil_fs(
     t_solidus: float,
     partition_coeff: float,
 ) -> np.ndarray:
-    """Scheil solid fraction [0..1]."""
+    """Scheil solid fraction [0..1].
+
+    fs = 1 - ((T - T_solidus) / (T_liquidus - T_solidus))^(1 / (1 - k))
+    """
     fs = np.zeros_like(T)
     mask = (T <= t_liquidus) & (T >= t_solidus)
     denom = max(t_liquidus - t_solidus, 1.0)
+    # u is the solidified fraction of the temperature interval, 0 at liquidus, 1 at solidus
     u = np.clip((t_liquidus - T[mask]) / denom, 0.0, 1.0)
-    exponent = 1.0 / (max(partition_coeff, 1e-6) - 1.0)
-    fs[mask] = 1.0 - np.power(u, exponent)
+    v = 1.0 - u
+    exponent = 1.0 / max(1.0 - partition_coeff, 1e-6)
+    fs[mask] = 1.0 - np.power(v, exponent)
     fs[T < t_solidus] = 1.0
     return np.clip(fs, 0.0, 1.0)
 
@@ -49,10 +72,11 @@ def _dscheil_dT(
     denom = max(t_liquidus - t_solidus, 1.0)
     u = (t_liquidus - T[mask]) / denom
     u = np.clip(u, 1e-9, 1.0 - 1e-9)
+    v = 1.0 - u
     k = max(partition_coeff, 1e-6)
-    p = 1.0 / (k - 1.0)
-    d[mask] = p * np.power(u, p - 1.0) / denom
-    return np.clip(d, -1e6, 0.0)
+    p = 1.0 / (1.0 - k)
+    d[mask] = p * np.power(v, p - 1.0) / denom
+    return np.clip(d, 0.0, 1e6)
 
 
 def _cp_eff(
@@ -67,7 +91,7 @@ def _cp_eff(
         dT_mush = max(alloy.t_liquidus_c - alloy.t_solidus_c, 1.0)
         df = _dscheil_dT(T, alloy.t_liquidus_c, alloy.t_solidus_c, alloy.partition_coefficient)
         # Cap the latent contribution so the total latent over the mush equals L
-        cp[is_metal] += alloy.latent_heat_j_kg * np.clip(-df[is_metal], 0.0, 1.0 / dT_mush)
+        cp[is_metal] += alloy.latent_heat_j_kg * np.clip(df[is_metal], 0.0, 1.0 / dT_mush)
     return cp
 
 
@@ -80,24 +104,213 @@ def _downsample_grid(grid: np.ndarray, factor: int) -> np.ndarray:
     return ndimage.zoom(grid, (shape_c[0] / nx, shape_c[1] / ny, shape_c[2] / nz), order=0)
 
 
-def _upsample(field_c: np.ndarray, target_shape: Tuple[int, int, int]) -> np.ndarray:
-    """Trilinear upsample a scalar field to the original grid shape."""
+def _upsample(field_c: np.ndarray, target_shape: Tuple[int, int, int], order: int = 1) -> np.ndarray:
+    """Upsample a scalar field to the original grid shape.
+
+    Fields that may contain ``inf`` sentinel values (e.g. t_liq, t_sol,
+    fill_time) are upsampled with ``order=0`` (nearest neighbour) so the
+    sentinel does not leak into neighbouring cells.
+    """
     if field_c.shape == target_shape:
         return field_c
     return ndimage.zoom(
         field_c,
         (target_shape[0] / field_c.shape[0], target_shape[1] / field_c.shape[1], target_shape[2] / field_c.shape[2]),
-        order=1,
+        order=order,
     )
 
 
+def _alloy_to_dict(alloy: Alloy) -> dict:
+    return {
+        "rho_kg_m3": alloy.rho_kg_m3,
+        "cp_j_kgk": alloy.cp_j_kgk,
+        "k_w_mk": alloy.k_w_mk,
+        "latent_heat_j_kg": alloy.latent_heat_j_kg,
+        "t_liquidus_c": alloy.t_liquidus_c,
+        "t_solidus_c": alloy.t_solidus_c,
+        "t_pour_c": alloy.t_pour_c,
+        "partition_coefficient": alloy.partition_coefficient,
+        "shrinkage_factor": alloy.shrinkage_factor,
+        "dendrite_spacing_mm": alloy.dendrite_spacing_mm,
+        "micro_pore_limit_um": alloy.micro_pore_limit_um,
+        "macro_pore_limit_um": alloy.macro_pore_limit_um,
+        "gas_pore_baseline_um": alloy.gas_pore_baseline_um,
+        "pore_niyama_exponent": alloy.pore_niyama_exponent,
+        "feed_risk_exponent": alloy.feed_risk_exponent,
+        "gas_pore_time_factor": alloy.gas_pore_time_factor,
+        "gas_pore_niyama_factor": alloy.gas_pore_niyama_factor,
+        "critical_entrainment_velocity_m_s": alloy.critical_entrainment_velocity_m_s,
+        "pore_entrainment_exponent": alloy.pore_entrainment_exponent,
+        "pore_entrainment_factor": alloy.pore_entrainment_factor,
+        "niyama_macro": alloy.niyama_macro,
+        "niyama_shrinkage": alloy.niyama_shrinkage,
+        "niyama_star_scale": alloy.niyama_star_scale,
+        "pore_size_um_per_porosity_pct": alloy.pore_size_um_per_porosity_pct,
+        "pore_size_length_factor": alloy.pore_size_length_factor,
+        # Cast-iron graphite expansion model data
+        "carbon_equivalent": alloy.carbon_equivalent,
+        "graphite_expansion_fraction": alloy.graphite_expansion_fraction,
+        "inoculation_factor": alloy.inoculation_factor,
+    }
+
+
+def _mold_to_dict(mold: MoldMaterial) -> dict:
+    d = {
+        "k_w_mk": mold.k_w_mk,
+        "cp_j_kgk": mold.cp_j_kgk,
+        "rho_kg_m3": mold.rho_kg_m3,
+        "t0_c": mold.t0_c,
+        "mold_rigidity_factor": mold.mold_rigidity_factor,
+        "afs_grain_size": mold.afs_grain_size,
+        "moisture_percent": mold.moisture_percent,
+        "binder_percent": mold.binder_percent,
+        "compactability_percent": mold.compactability_percent,
+        "is_sand": 1.0 if getattr(mold, "is_sand", True) else 0.0,
+    }
+    # If the selected preset is a chill material, expose its properties
+    # explicitly so the C++ thermal solver does not hardcode steel values.
+    if getattr(mold, "mold_type", "") == "chill":
+        d["chill_k_w_mk"] = mold.k_w_mk
+        d["chill_cp_j_kgk"] = mold.cp_j_kgk
+        d["chill_rho_kg_m3"] = mold.rho_kg_m3
+    else:
+        d["chill_k_w_mk"] = 45.0
+        d["chill_cp_j_kgk"] = 460.0
+        d["chill_rho_kg_m3"] = 7850.0
+    return d
+
+
+def _solve_thermal_cpp(
+    grid: np.ndarray,
+    is_metal_fine: np.ndarray,
+    alloy: Alloy,
+    mold: MoldMaterial,
+    dx: float,
+    max_time_s: float,
+    downsample: int,
+    fill_time_s: Optional[np.ndarray],
+    velocity_m_s: Optional[np.ndarray],
+    gravity_vector: Tuple[float, float, float],
+    feed_velocity_m_s: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Wrap the C++ enthalpy solver with Python downsample/upsample."""
+    if JOSECAST_CORE is None:
+        raise RuntimeError("josecast_core C++ module is not available")
+
+    fine_shape = grid.shape
+    if downsample > 1:
+        grid_c = _downsample_grid(grid, downsample)
+        dx_c_mm = dx * downsample
+        if fill_time_s is not None:
+            fill_c = ndimage.zoom(
+                fill_time_s,
+                (
+                    grid_c.shape[0] / fill_time_s.shape[0],
+                    grid_c.shape[1] / fill_time_s.shape[1],
+                    grid_c.shape[2] / fill_time_s.shape[2],
+                ),
+                order=0,
+            )
+        else:
+            fill_c = None
+        if velocity_m_s is not None and velocity_m_s.ndim == 4:
+            ratios = (
+                grid_c.shape[0] / velocity_m_s.shape[1],
+                grid_c.shape[1] / velocity_m_s.shape[2],
+                grid_c.shape[2] / velocity_m_s.shape[3],
+            )
+            velocity_c = np.stack(
+                [ndimage.zoom(velocity_m_s[i], ratios, order=1) for i in range(3)],
+                axis=0,
+            )
+        else:
+            velocity_c = None
+    else:
+        grid_c = grid
+        dx_c_mm = dx
+        fill_c = fill_time_s
+        velocity_c = velocity_m_s
+
+    if fill_c is not None:
+        max_fill = float(np.nanmax(fill_c[np.isfinite(fill_c)])) if np.isfinite(fill_c).any() else 0.0
+        max_time_s = max(max_time_s, max_fill + max_time_s)
+
+    casting_metal_ids = [int(t) for t in BODY_METAL_TYPES]
+    is_metal_c = np.isin(grid_c, casting_metal_ids)
+    is_gating_c = is_metal_c & (grid_c != int(BodyType.PART))
+    chill_mask_c = grid_c == 11
+
+    is_metal_u8 = is_metal_c.astype(np.uint8, copy=False)
+    is_gating_u8 = is_gating_c.astype(np.uint8, copy=False)
+    is_chill_u8 = chill_mask_c.astype(np.uint8, copy=False)
+
+    if fill_c is not None:
+        fill_in = fill_c.astype(np.float64, copy=False)
+    else:
+        # C++ binding expects a 3-D array even when there is no fill-time data.
+        fill_in = np.zeros(grid_c.shape, dtype=np.float64)
+    if velocity_c is not None:
+        vel_in = velocity_c.astype(np.float64, copy=False)
+    else:
+        # C++ binding expects a 4-D (3, nz, ny, nx) velocity field.
+        vel_in = np.zeros((3,) + tuple(grid_c.shape), dtype=np.float64)
+
+    n_steps = 0  # let C++ use its default
+    T_c, fs_c, t_liq_c, t_sol_c, G_c, R_c, niyama_c = JOSECAST_CORE.solve_thermal(
+        is_metal_u8,
+        is_gating_u8,
+        is_chill_u8,
+        fill_in,
+        vel_in,
+        float(dx_c_mm),
+        float(max_time_s),
+        int(n_steps),
+        _alloy_to_dict(alloy),
+        _mold_to_dict(mold),
+        float(feed_velocity_m_s),
+        tuple(float(x) for x in gravity_vector),
+    )
+
+    T_fine = _upsample(T_c, fine_shape, order=1)
+    fs_fine = _upsample(fs_c, fine_shape, order=1)
+    G_fine = _upsample(G_c, fine_shape, order=1)
+    R_fine = _upsample(R_c, fine_shape, order=1)
+    niyama_fine = _upsample(niyama_c, fine_shape, order=1)
+    t_liq_fine = _upsample(t_liq_c, fine_shape, order=0)
+    t_sol_fine = _upsample(t_sol_c, fine_shape, order=0)
+
+    if fill_time_s is not None:
+        fill_time_fine = _upsample(fill_time_s, fine_shape, order=0)
+        fill_time_fine = np.where(is_metal_fine, fill_time_fine, 0.0)
+        with np.errstate(invalid="ignore"):
+            t_liq_fine = np.where(
+                is_metal_fine & np.isfinite(t_liq_fine) & np.isfinite(fill_time_fine),
+                t_liq_fine + fill_time_fine,
+                t_liq_fine,
+            )
+            t_sol_fine = np.where(
+                is_metal_fine & np.isfinite(t_sol_fine) & np.isfinite(fill_time_fine),
+                t_sol_fine + fill_time_fine,
+                t_sol_fine,
+            )
+
+    for arr in (niyama_fine, G_fine, R_fine, t_liq_fine, t_sol_fine, fs_fine):
+        arr[:] = np.where(is_metal_fine, arr, 0.0)
+
+    return T_fine, fs_fine, t_liq_fine, t_sol_fine, G_fine, R_fine, niyama_fine
+
+
 def _build_laplacian(k: np.ndarray, dx: float) -> sparse.csc_matrix:
-    """Build the symmetric finite-volume matrix A for ∇·(k∇T) with harmonic k at faces."""
+    """Build the symmetric finite-volume matrix A for ∇·(k∇T) with harmonic k at faces.
+
+    Grid shape is (nx, ny, nz).  Raveled index = x*(ny*nz) + y*nz + z, so the
+    stride in x is ny*nz, in y is nz, and in z is 1.
+    """
     nx, ny, nz = k.shape
     n = nx * ny * nz
     inv_dx2 = 1.0 / (dx * dx)
 
-    # Harmonic mean face conductivities
+    # Harmonic mean face conductivities: kx along x, ky along y, kz along z.
     kx = 2.0 * k[1:, :, :] * k[:-1, :, :] / (k[1:, :, :] + k[:-1, :, :] + 1e-12)
     ky = 2.0 * k[:, 1:, :] * k[:, :-1, :] / (k[:, 1:, :] + k[:, :-1, :] + 1e-12)
     kz = 2.0 * k[:, :, 1:] * k[:, :, :-1] / (k[:, :, 1:] + k[:, :, :-1] + 1e-12)
@@ -122,7 +335,8 @@ def _build_laplacian(k: np.ndarray, dx: float) -> sparse.csc_matrix:
     deg_z[:, :, :-1] += kz
     deg_z[:, :, 1:] += kz
 
-    off = ny * nz
+    stride_x = ny * nz
+    stride_y = nz
     diag_x = Dx.ravel() * inv_dx2
     diag_y = Dy.ravel() * inv_dx2
     diag_z = Dz.ravel() * inv_dx2
@@ -130,11 +344,63 @@ def _build_laplacian(k: np.ndarray, dx: float) -> sparse.csc_matrix:
 
     A = sparse.diags(
         [diag_x, diag_x, diag_y, diag_y, diag_z, diag_z, main],
-        offsets=[-off, off, -nz, nz, -1, 1, 0],
+        offsets=[-stride_x, stride_x, -stride_y, stride_y, -1, 1, 0],
         shape=(n, n),
         format="csc",
     )
     return A
+
+
+def _upwind_advection(
+    T: np.ndarray,
+    velocity: np.ndarray,
+    dx: float,
+    fill_c: Optional[np.ndarray],
+    sub_t: float,
+    is_metal: np.ndarray,
+    t_solidus: float = -np.inf,
+) -> np.ndarray:
+    """First-order upwind explicit advection of temperature.
+
+    ``velocity`` is (3, nx, ny, nz) with [x, y, z] components.  For each axis the
+    derivative is taken from the upwind side, which is stable for CFL <= 1.  The
+    result is masked to metal cells that have already been filled at time
+    ``sub_t`` and are still at least partly liquid (T > t_solidus).
+    """
+    if fill_c is not None:
+        active = (sub_t >= fill_c) & is_metal
+    else:
+        active = is_metal
+    active &= (T > t_solidus)
+    if not np.any(active):
+        return np.zeros_like(T)
+
+    # Pad with edge values so outflow boundaries use a one-sided difference.
+    Tz = np.pad(T, ((1, 1), (0, 0), (0, 0)), mode="edge")
+    Ty = np.pad(T, ((0, 0), (1, 1), (0, 0)), mode="edge")
+    Tx = np.pad(T, ((0, 0), (0, 0), (1, 1)), mode="edge")
+
+    # z-direction
+    dTdz = np.where(
+        velocity[0] >= 0,
+        (Tz[1:-1, :, :] - Tz[:-2, :, :]) / dx,
+        (Tz[2:, :, :] - Tz[1:-1, :, :]) / dx,
+    )
+    # y-direction
+    dTdy = np.where(
+        velocity[1] >= 0,
+        (Ty[:, 1:-1, :] - Ty[:, :-2, :]) / dx,
+        (Ty[:, 2:, :] - Ty[:, 1:-1, :]) / dx,
+    )
+    # x-direction
+    dTdx = np.where(
+        velocity[2] >= 0,
+        (Tx[:, :, 1:-1] - Tx[:, :, :-2]) / dx,
+        (Tx[:, :, 2:] - Tx[:, :, 1:-1]) / dx,
+    )
+
+    adv = velocity[0] * dTdz + velocity[1] * dTdy + velocity[2] * dTdx
+    return np.where(active, adv, 0.0)
 
 
 def solve_3d_thermal(
@@ -145,29 +411,89 @@ def solve_3d_thermal(
     max_time_s: float = 600.0,
     downsample: int = 2,
     progress_callback: Optional[callable] = None,
+    fill_time_s: Optional[np.ndarray] = None,
+    velocity_m_s: Optional[np.ndarray] = None,
+    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
+    feed_velocity_m_s: float = 0.005,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Implicit 3-D enthalpy thermal solver.
+    Implicit 3-D enthalpy thermal solver with optional Darcy-velocity advection.
+
+    If ``fill_time_s`` is supplied it is interpreted as the per-voxel metal
+    arrival time (s).  Solidification/liquidus times are shifted by this amount,
+    so late-filled regions start cooling later.
+
+    If ``velocity_m_s`` is supplied as a (3, nx, ny, nz) array with [x, y, z]
+    components, an explicit convective term ``-ρ·cp·(v·∇T)`` is added to the
+    enthalpy balance.  The term is masked to metal cells whose fill time has
+    already elapsed.
 
     Returns fine-grid arrays:
     T_final, fs_final, t_liquidus, t_solidus, G_at_ts, R_at_ts, niyama
     """
     fine_shape = grid.shape
+    is_metal_fine = np.isin(grid, [int(t) for t in BODY_METAL_TYPES])
+
+    if USE_CPP_THERMAL and JOSECAST_CORE is not None:
+        try:
+            return _solve_thermal_cpp(
+                grid, is_metal_fine, alloy, mold, dx, max_time_s,
+                downsample, fill_time_s, velocity_m_s, gravity_vector,
+                feed_velocity_m_s,
+            )
+        except Exception as exc:
+            print(
+                f"[Thermal] C++ imza/argüman hatası, Python fallback kullanılıyor: {exc}",
+                file=sys.stderr,
+            )
+
     if downsample > 1:
         grid_c = _downsample_grid(grid, downsample)
         dx_c_mm = dx * downsample
+        if fill_time_s is not None:
+            fill_c = ndimage.zoom(
+                fill_time_s,
+                (
+                    grid_c.shape[0] / fill_time_s.shape[0],
+                    grid_c.shape[1] / fill_time_s.shape[1],
+                    grid_c.shape[2] / fill_time_s.shape[2],
+                ),
+                order=0,
+            )
+        else:
+            fill_c = None
+        if velocity_m_s is not None and velocity_m_s.ndim == 4:
+            ratios = (
+                grid_c.shape[0] / velocity_m_s.shape[1],
+                grid_c.shape[1] / velocity_m_s.shape[2],
+                grid_c.shape[2] / velocity_m_s.shape[3],
+            )
+            velocity_c = np.stack(
+                [ndimage.zoom(velocity_m_s[i], ratios, order=1) for i in range(3)],
+                axis=0,
+            )
+        else:
+            velocity_c = None
     else:
         grid_c = grid
         dx_c_mm = dx
+        fill_c = fill_time_s
+        velocity_c = velocity_m_s
+
+    # Extend the simulation so even the last-filled metal has time to solidify.
+    if fill_c is not None:
+        max_fill = float(np.nanmax(fill_c[np.isfinite(fill_c)])) if np.isfinite(fill_c).any() else 0.0
+        max_time_s = max(max_time_s, max_fill + max_time_s)
 
     dx_m = dx_c_mm / 1000.0  # SI metres
     nx, ny, nz = grid_c.shape
     n = nx * ny * nz
 
-    # Casting metal: part + riser + ingate + runner + sprue + pouring basin.
-    # Chill (cooling sprue) and filter are NOT liquid metal and are handled below.
-    casting_metal_ids = [1, 3, 5, 6, 7, 15]
+    # Casting metal: all liquid-metal body types (PART, RISER, INGATE, RUNNER,
+    # SPRUE, SPRUE_THROAT, POURING_BASIN). Chill/filter are excluded.
+    casting_metal_ids = [int(t) for t in BODY_METAL_TYPES]
     is_metal_c = np.isin(grid_c, casting_metal_ids)
+    is_gating = is_metal_c & (grid_c != int(BodyType.PART))
     chill_mask_3d = grid_c == 11  # COOLING_SPRUE
 
     rho = np.where(is_metal_c, alloy.rho_kg_m3, mold.rho_kg_m3).astype(np.float64).ravel()
@@ -175,14 +501,20 @@ def solve_3d_thermal(
     T = np.where(is_metal_c, alloy.t_pour_c, mold.t0_c).astype(np.float64)
     T0 = float(mold.t0_c)
 
-    # Treat a cooling sprue as a steel/cast-iron chill insert at the mould temperature.
-    # It extracts heat like a high-conductivity metal but never melts.
+    # Treat a cooling sprue as a chill insert at the mould temperature.
+    # Use explicit chill material properties when available, otherwise steel.
     if np.any(chill_mask_3d):
-        rho_chill = 7850.0
-        k_chill = 45.0
-        cp_chill = 460.0
+        if getattr(mold, "mold_type", "") == "chill":
+            k_chill = float(mold.k_w_mk)
+            cp_chill = float(mold.cp_j_kgk)
+            rho_chill = float(mold.rho_kg_m3)
+        else:
+            k_chill = 45.0
+            cp_chill = 460.0
+            rho_chill = 7850.0
         rho[chill_mask_3d.ravel()] = rho_chill
         k[chill_mask_3d] = k_chill
+        # cp_chill is applied to cp_eff each time step (see loop below).
         T[chill_mask_3d] = T0
 
     # Boundary mask: fixed-temperature outer shell
@@ -194,16 +526,48 @@ def solve_3d_thermal(
     boundary[:, :, 0] = True
     boundary[:, :, -1] = True
     boundary_idx = np.flatnonzero(boundary.ravel())
-    boundary_penalty = 1e12
 
     # Build constant-in-time diffusion operator on the raveled grid
     A = _build_laplacian(k, dx_m)
     k = k.ravel()
 
+    # Dirichlet T=T0 on the outer shell: solve the reduced SPD system for the
+    # interior cells only.  Boundary columns move to the RHS, so the interior
+    # matrix stays symmetric and CG converges; the old row-replacement trick
+    # made the matrix non-symmetric and caused very expensive spsolve fallbacks.
+    A = A.tocsr()
+    interior_mask = ~boundary
+    interior_idx = np.flatnonzero(interior_mask.ravel())
+    A_ii = A[interior_idx][:, interior_idx]
+    A_ib = A[interior_idx][:, boundary_idx]
+    A_ib_sum = np.asarray(A_ib.sum(axis=1)).ravel().astype(np.float64)
+    del A, A_ib
+
     # Time stepping
-    n_steps = max(20, min(200, int(max_time_s / 3.0)))
-    dt = max_time_s / n_steps
+    n_steps_target = max(20, min(100, int(max_time_s / 3.0)))
+    dt_diff = max_time_s / n_steps_target
     t = 0.0
+    step = 0
+
+    # Advective CFL limit.  During filling the Darcy velocity field is used.
+    # After filling a small gravity-driven feed velocity is added so feeders/risers
+    # keep supplying hot metal to the part as they solidify (çekme / feeding).
+    g_vec = np.array(gravity_vector, dtype=np.float64)
+    g_norm = float(np.linalg.norm(g_vec))
+    g_unit = g_vec / g_norm if g_norm > 1e-9 else np.array([0.0, 0.0, -1.0])
+    v_feed = np.zeros((3, nx, ny, nz), dtype=np.float64)
+    if feed_velocity_m_s > 0.0:
+        for i in range(3):
+            v_feed[i, ...] = g_unit[i] * feed_velocity_m_s
+
+    if velocity_c is not None:
+        vmax = float(np.max(np.linalg.norm(velocity_c, axis=0))) if np.any(velocity_c) else 0.0
+        dt_adv = 0.3 * dx_m / max(vmax, 1e-6)
+    else:
+        vmax = 0.0
+        dt_adv = np.inf
+    dt_feed = 0.3 * dx_m / max(feed_velocity_m_s, 1e-6) if feed_velocity_m_s > 0.0 else np.inf
+    fill_end = max_fill if fill_c is not None and np.isfinite(max_fill) else 0.0
 
     t_liq = np.full((nx, ny, nz), np.inf, dtype=np.float64)
     t_sol = np.full((nx, ny, nz), np.inf, dtype=np.float64)
@@ -212,37 +576,91 @@ def solve_3d_thermal(
 
     Tl = alloy.t_liquidus_c
     Ts = alloy.t_solidus_c
-    report_interval = max(1, n_steps // 10)
+    report_interval = max(1, n_steps_target // 10)
 
-    for step in range(n_steps):
+    # Operator-split advection: up to this many explicit advection sub-cycles
+    # are performed inside each implicit diffusion step so the matrix solve is
+    # not repeated for the tiny advective CFL time step.
+    max_adv_subcycles = 200
+
+    while t < max_time_s:
+        # Pick a stable time step.  While filling, the explicit upwind
+        # advection sub-cycles must satisfy CFL <= 0.3; the diffusion step is
+        # limited to at most ``max_adv_subcycles`` of those sub-cycles.  After
+        # filling the normal diffusion time step is used.  The final step lands
+        # exactly on max_time_s.
+        if velocity_c is not None and t < fill_end:
+            dt = min(dt_diff, max_adv_subcycles * dt_adv)
+        else:
+            dt = dt_diff
+        if t + dt > max_time_s:
+            dt = max_time_s - t
+        if dt <= 0:
+            break
+
         T_old = T.copy()
-        cp_eff = _cp_eff(T_old, is_metal_c, alloy, mold).ravel()
+        cp_eff = _cp_eff(T_old, is_metal_c, alloy, mold)
         # Cooling sprue cp stays as a solid metal (no latent heat).
         if np.any(chill_mask_3d):
-            cp_eff[chill_mask_3d.ravel()] = cp_chill
-        C = rho * cp_eff
+            cp_eff[chill_mask_3d] = cp_chill
+        C = rho * cp_eff.ravel()
 
-        # (C I - dt A) T_new = C T_old
-        # Dirichlet on the outer shell is enforced by a large diagonal penalty
-        if len(boundary_idx):
-            C[boundary_idx] = boundary_penalty
-            b = C * T_old.ravel()
-            b[boundary_idx] = boundary_penalty * T0
-        else:
-            b = C * T_old.ravel()
-        M = -dt * A + sparse.diags([C], offsets=[0], format="csc")
+        # Explicit Darcy-velocity advection via first-order operator splitting.
+        # The temperature is advected with small CFL-limited sub-steps first,
+        # then that pre-advected field becomes the initial condition for the
+        # implicit diffusion solve over the same interval.
+        T_adv = T_old.copy()
 
-        # Use CG with a diagonal (Jacobi) preconditioner for speed on large grids
-        precond = sparse.diags(1.0 / (M.diagonal() + 1e-12), format="csc")
-        T_new, info = spla.cg(M, b, rtol=1e-7, atol=0.0, maxiter=300, M=precond)
-        if info == 0:
-            T_new = T_new.reshape((nx, ny, nz))
-        else:
-            # Fallback to a direct sparse solve if CG fails to converge
-            T_new = spla.spsolve(M, b).reshape((nx, ny, nz))
+        # During filling use the Darcy velocity field; after filling switch to
+        # a small gravity-aligned feed velocity so risers continue to supply
+        # (or draw) liquid metal while they solidify.
+        if (velocity_c is not None and t < fill_end) or (feed_velocity_m_s > 0.0 and t >= fill_end):
+            if velocity_c is not None and t < fill_end:
+                v_adv = velocity_c
+                adv_dt = min(dt, fill_end - t)
+                dt_adv_local = dt_adv
+            else:
+                v_adv = v_feed
+                adv_dt = dt
+                dt_adv_local = dt_feed
+            n_sub = max(1, int(np.ceil(adv_dt / dt_adv_local))) if np.isfinite(dt_adv_local) else 1
+            sub_dt = adv_dt / n_sub
+            for k in range(n_sub):
+                sub_t = t + (k + 0.5) * sub_dt
+                adv = _upwind_advection(T_adv, v_adv, dx_m, fill_c, sub_t, is_metal_c, t_solidus=Ts)
+                T_adv = T_adv - sub_dt * adv
+            # Clip to physical bounds after explicit advection.
+            T_adv = np.clip(T_adv, T0, alloy.t_pour_c)
+
+        T_adv_r = T_adv.ravel()
+        C_i = C[interior_idx]
+        b_i = C_i * T_adv_r[interior_idx] + dt * T0 * A_ib_sum
+
+        M_ii = -dt * A_ii + sparse.diags(C_i, format="csc")
+
+        # CG with a diagonal (Jacobi) preconditioner for the symmetric positive
+        # definite reduced system.  Keeping the matrix SPD avoids the expensive
+        # direct solves that occurred with the old non-symmetric row replacement.
+        precond = sparse.diags(1.0 / (M_ii.diagonal() + 1e-12), format="csc")
+        T_i, info = spla.cg(M_ii, b_i, rtol=1e-5, atol=0.0, maxiter=150, M=precond)
+        if info != 0:
+            # Do not fall back to a full direct solve on large grids; use the
+            # advected temperature field instead to keep the analysis moving.
+            T_i = T_adv_r[interior_idx].copy()
+
+        T_new = np.full(n, T0, dtype=np.float64)
+        T_new[interior_idx] = T_i
+        T_new = T_new.reshape((nx, ny, nz))
         # Guard against NaN/Inf from the linear solver before clipping/gradient.
         T_new = np.nan_to_num(T_new, nan=T0, posinf=alloy.t_pour_c, neginf=T0)
         T_new = np.clip(T_new, T0, alloy.t_pour_c)
+
+        # Do not allow the gating system to drop below the liquidus while the
+        # mould is still being filled; the runner/ingate must stay liquid until
+        # the pour is complete.  After fill_end it cools normally.
+        if t + dt <= fill_end:
+            gating_cold = is_gating & (T_new < Tl)
+            T_new[gating_cold] = Tl
 
         # Record solidification times and local G/R
         if is_metal_c.any():
@@ -257,16 +675,22 @@ def solve_3d_thermal(
             if np.any(mask_sol):
                 gz, gy, gx = np.gradient(T_new, dx_m)
                 G_cross = np.sqrt(gx * gx + gy * gy + gz * gz) / 1000.0  # K/mm
-                R_cross = np.abs((T_new - T_old) / dt)
+                # Enthalpy-based cooling rate: dH = cp*dT + L*dfs; R = |dH/dt| / cp_eff
+                # so latent heat release during solid-fraction change is explicit.
+                fs_old = _scheil_fs(T_old, Tl, Ts, alloy.partition_coefficient)
+                fs_new = _scheil_fs(T_new, Tl, Ts, alloy.partition_coefficient)
+                dH = alloy.cp_j_kgk * (T_new - T_old) + alloy.latent_heat_j_kg * (fs_new - fs_old)
+                R_cross = np.abs(dH[mask_sol]) / (dt * np.maximum(cp_eff[mask_sol], 1e-9))
                 t_sol[mask_sol] = t + dt * (Ts - T_old[mask_sol]) / (T_new[mask_sol] - T_old[mask_sol] + 1e-12)
                 G_at_ts[mask_sol] = G_cross[mask_sol]
-                R_at_ts[mask_sol] = R_cross[mask_sol]
+                R_at_ts[mask_sol] = R_cross
 
         T = T_new
         t += dt
+        step += 1
 
-        if progress_callback and (step + 1) % report_interval == 0:
-            progress_callback(int(20 + 40 * ((step + 1) / n_steps)))
+        if progress_callback and step % report_interval == 0:
+            progress_callback(int(20 + 40 * min(t / max_time_s, 1.0)))
 
         # Early stop once all metal has solidified
         if is_metal_c.any() and not np.isinf(t_sol[is_metal_c]).any():
@@ -283,15 +707,35 @@ def solve_3d_thermal(
     fs_c = _scheil_fs(T_c, Tl, Ts, alloy.partition_coefficient)
 
     # Upsample to fine grid
-    T_fine = _upsample(T_c, fine_shape)
-    fs_fine = _upsample(fs_c, fine_shape)
-    t_liq_fine = _upsample(t_liq, fine_shape)
-    t_sol_fine = _upsample(t_sol, fine_shape)
-    G_fine = _upsample(G_at_ts, fine_shape)
-    R_fine = _upsample(R_at_ts, fine_shape)
-    niyama_fine = _upsample(niyama_c, fine_shape)
+    T_fine = _upsample(T_c, fine_shape, order=1)
+    fs_fine = _upsample(fs_c, fine_shape, order=1)
+    # t_liq/t_sol may contain inf for cells that never crossed the relevant
+    # temperature; use order=0 (nearest-neighbour) upsampling so inf does not
+    # leak into neighbouring cells.
+    t_liq_fine = _upsample(t_liq, fine_shape, order=0)
+    t_sol_fine = _upsample(t_sol, fine_shape, order=0)
+    G_fine = _upsample(G_at_ts, fine_shape, order=1)
+    R_fine = _upsample(R_at_ts, fine_shape, order=1)
+    niyama_fine = _upsample(niyama_c, fine_shape, order=1)
 
-    is_metal_fine = np.isin(grid, [1, 3, 5, 6, 7])
+    is_metal_fine = np.isin(grid, casting_metal_ids)
+
+    # Shift liquidus/solidus times by the local metal arrival time.
+    if fill_c is not None:
+        fill_time_fine = _upsample(fill_c, fine_shape, order=0)
+        fill_time_fine = np.where(is_metal_fine, fill_time_fine, 0.0)
+        with np.errstate(invalid="ignore"):
+            t_liq_fine = np.where(
+                is_metal_fine & np.isfinite(t_liq_fine) & np.isfinite(fill_time_fine),
+                t_liq_fine + fill_time_fine,
+                t_liq_fine,
+            )
+            t_sol_fine = np.where(
+                is_metal_fine & np.isfinite(t_sol_fine) & np.isfinite(fill_time_fine),
+                t_sol_fine + fill_time_fine,
+                t_sol_fine,
+            )
+
     for arr in (niyama_fine, G_fine, R_fine, t_liq_fine, t_sol_fine, fs_fine):
         arr[:] = np.where(is_metal_fine, arr, 0.0)
 
