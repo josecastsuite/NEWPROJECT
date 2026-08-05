@@ -519,6 +519,38 @@ def _select_vent_cells(
     return vent
 
 
+def _select_lbm_outlet_cells(
+    grid: np.ndarray,
+    cavity: np.ndarray,
+    g: np.ndarray,
+    mold=None,
+) -> np.ndarray:
+    """Select air-escape cells for the LBM free-surface solver.
+
+    Sand molds are vented through the parting line / riser top, so the top
+    surface of the PART / RISER is a legitimate vent.  Ceramic or metal molds are
+    essentially closed boxes: displaced air can only leave through explicit vents,
+    risers, or the top of the pouring basin / sprue.  Using the part top as an
+    outlet in a closed mold would falsely suppress air-entrapment warnings.
+    """
+    is_sand = bool(getattr(mold, "is_sand", True))
+    if is_sand:
+        return _select_vent_cells(grid, cavity, g)
+
+    outlet = np.zeros_like(cavity, dtype=bool)
+    # Explicit vent / riser / exhaust bodies (always open to atmosphere).
+    for bt in (BodyType.RISER, BodyType.CURUFLUK):
+        mask = (grid == bt) & cavity
+        if mask.any():
+            outlet |= _find_boundary_cells_along(mask, g, side="up") & cavity
+
+    # If no explicit vent exists, the LBM grid boundary acts as the last-resort
+    # vent.  We deliberately do NOT mark the top of the sprue/pouring basin as a
+    # free outlet: it is the metal source, and forcing those cells to stay empty
+    # lets the metal drain out instead of filling the cavity.
+    return outlet
+
+
 def _build_laplace_matrix(
     cavity: np.ndarray,
     dirichlet: np.ndarray,
@@ -5467,6 +5499,12 @@ def solve_filling_flow(
     ).astype(np.float32)
     vmag_fine = np.linalg.norm(velocity, axis=0)
 
+    # Air entrapment placeholders; filled from LBM/VOF or from the fallback detector.
+    air_entrapment_fine = np.zeros_like(vmag_fine, dtype=np.float64)
+    trapped_air_volume_m3 = 0.0
+    air_entrapment_centroid_mm = np.array([], dtype=np.float64)
+    orig_dx_m = orig_dx / 1000.0
+
     # Source throat area for the *physical* pour point (sprue/pouring basin),
     # independent of the user's velocity reference section.  Used for the source
     # node in the gating graph and for the synthetic source-node label.
@@ -5586,7 +5624,7 @@ def solve_filling_flow(
                     else max(2.0, est_volume_m3 / Q_user * 4.0)
                 )
 
-            vof_outlet = _select_vent_cells(vof_grid, vof_cavity, g)
+            vof_outlet = _select_lbm_outlet_cells(vof_grid, vof_cavity, g, mold=mold)
 
             if use_cpp_lbm:
                 from core.cpp_bridge import JOSECAST_CORE
@@ -5778,8 +5816,52 @@ def solve_filling_flow(
                 if np.isfinite(max_fill_t) and max_fill_t > 0.0:
                     fill_time_s = max_fill_t
 
+        # Air entrapment from the LBM/VOF trap field: resample the coarse binary
+        # pocket mask to the fine grid and, for permeable molds (sand), let
+        # near-surface air escape through the mold parting line.
+        if vof_res.get("air_entrapment") is not None:
+            trap_c = np.asarray(vof_res["air_entrapment"], dtype=np.float64)
+            air_entrapment_fine = _resample_to_grid(
+                trap_c,
+                vof_origin,
+                vof_dx,
+                orig_grid.shape,
+                orig_origin,
+                orig_dx,
+                fill_value=0.0,
+                order=0,
+            )
+            air_entrapment_fine = np.clip(air_entrapment_fine, 0.0, 1.0)
+            air_entrapment_fine = np.where(fine_metal, air_entrapment_fine, 0.0)
+
+            # Permeability-aware correction: in sand molds some trapped air near
+            # the surface can vent through the mold parting line; in ceramic or
+            # metal molds the air stays trapped.
+            permeability_proxy = float(getattr(mold, "permeability_proxy", 1.0))
+            if fine_metal.any() and permeability_proxy > 1e-6:
+                dist_to_surface_mm = ndimage.distance_transform_edt(
+                    fine_metal, sampling=orig_dx
+                )
+                # vent_depth: sand ~22 mm, ceramic ~2 mm, metal ~0 mm.
+                vent_depth_mm = 2.0 + 20.0 * np.clip(permeability_proxy, 0.0, 1.0)
+                base_escape = 0.1 + 0.25 * np.clip(permeability_proxy, 0.0, 1.0)
+                escape_factor = base_escape + (
+                    np.clip(permeability_proxy, 0.0, 1.0) - base_escape
+                ) * np.exp(-dist_to_surface_mm / max(vent_depth_mm, 1e-3))
+                air_entrapment_fine = np.where(
+                    fine_metal,
+                    np.clip(air_entrapment_fine * (1.0 - escape_factor), 0.0, 1.0),
+                    0.0,
+                )
+
+            trapped_mask = air_entrapment_fine > 0.3
+            if trapped_mask.any():
+                trapped_air_volume_m3 = float(np.sum(trapped_mask)) * (orig_dx_m ** 3)
+                idx = np.argwhere(trapped_mask)
+                centroid_vox = idx.mean(axis=0)
+                air_entrapment_centroid_mm = orig_origin + centroid_vox * orig_dx
+
     # Post-process 3-D flow turbulence metrics (Re, turbulent intensity).
-    orig_dx_m = orig_dx / 1000.0
     if fine_metal.any():
         dt_m = ndimage.distance_transform_edt(fine_metal, sampling=orig_dx_m)
         D_h = 2.0 * dt_m
@@ -5993,4 +6075,7 @@ def solve_filling_flow(
         turbulence_intensity=turb_intensity.astype(np.float32),
         filter_recommendation=filter_recommendation,
         gate_flow_results=gate_flow_results,
+        air_entrapment=air_entrapment_fine,
+        trapped_air_volume_m3=trapped_air_volume_m3,
+        air_entrapment_centroid_mm=air_entrapment_centroid_mm,
     )
