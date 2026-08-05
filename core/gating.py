@@ -400,17 +400,25 @@ def _gating_area_design(
     Cd: float,
     gating_ratio: Tuple[float, float, float] = (1.0, 2.0, 1.0),
     n_ingates: int = 1,
+    V_crit: float = 0.9,
 ) -> Dict[str, float]:
-    """Wrap compute_gating from gating_calculator_tr.py; return cm² / mm."""
+    """Wrap compute_gating from gating_calculator.py; return cm² / mm."""
     if H_eff_m <= 0.0 or t_fill_s <= 0.0 or rho_kg_m3 <= 0.0:
         return {
             "As_cm2": 0.0,
             "Ar_total_cm2": 0.0,
             "Ag_total_cm2": 0.0,
             "Ag_each_cm2": 0.0,
+            "Vs_ms": 0.0,
+            "Vr_ms": 0.0,
+            "Vg_ms": 0.0,
             "Vc_ms": 0.0,
             "d_sprue_mm": 0.0,
             "d_ingate_each_mm": 0.0,
+            "choke": "unknown",
+            "system": "belirsiz",
+            "Pf": 0.0,
+            "H_eff_m": H_eff_m,
             "ratio": gating_ratio,
         }
 
@@ -422,6 +430,8 @@ def _gating_area_design(
         Cd=Cd,
         gating_ratio=gating_ratio,
         n_ingates=max(n_ingates, 1),
+        V_crit=V_crit,
+        is_eff_head=True,
     )
     conv = 1e4  # m² -> cm²
     return {
@@ -429,9 +439,16 @@ def _gating_area_design(
         "Ar_total_cm2": res["Ar_total_m2"] * conv,
         "Ag_total_cm2": res["Ag_total_m2"] * conv,
         "Ag_each_cm2": res["Ag_each_m2"] * conv,
+        "Vs_ms": float(res["Vs_ms"]),
+        "Vr_ms": float(res["Vr_ms"]),
+        "Vg_ms": float(res["Vg_ms"]),
         "Vc_ms": float(res["Vc_ms"]),
         "d_sprue_mm": res["d_sprue_m"] * 1000.0,
         "d_ingate_each_mm": res["d_ingate_m"] * 1000.0,
+        "choke": res.get("choke", "unknown"),
+        "system": res.get("system", "belirsiz"),
+        "Pf": float(res.get("Pf", 0.0)),
+        "H_eff_m": float(res.get("H_eff_m", H_eff_m)),
         "ratio": gating_ratio,
     }
 
@@ -444,6 +461,26 @@ def _default_gating_ratio(alloy_key: str) -> Tuple[float, float, float]:
     if "al" in key or "alum" in key:
         return (1.0, 2.0, 1.5)
     return (1.0, 2.0, 1.0)
+
+
+def _critical_velocity_m_s(alloy) -> float:
+    """Campbell critical entrainment (meniscus) velocity for the alloy (m/s).
+
+    Uses the alloy-specific value if available, otherwise a conservative 0.9 m/s
+    default (typical for steel). Aluminium-based alloys are usually limited to
+    ~0.5 m/s, cast iron ~1.2 m/s.
+    """
+    val = float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.0))
+    if val > 0.0:
+        return val
+    key = str(getattr(alloy, "key", "")).lower()
+    if "al" in key or "alum" in key:
+        return 0.5
+    if "gri" in key or "sfero" in key or "ggg" in key or "pik" in key or "dukt" in key:
+        return 1.2
+    if "mg" in key or "magne" in key:
+        return 0.3
+    return 0.9
 
 
 def _target_gate_velocity_m_s(alloy_key: str, wall_category: str = "orta cidarlı") -> float:
@@ -1045,8 +1082,9 @@ def analyze_gating(
     final_ratio = _auto_tune_gating_ratio(H_eff_m, base_ratio, target_v_gate, part_mass_kg)
     As_ratio, Ar_ratio, Ag_ratio = final_ratio
 
-    # Central design from gating_calculator_tr.py
+    # Central design from gating_calculator.py
     design_total_mass_kg = max(total_mass_kg, 0.1)
+    V_crit_m_s = _critical_velocity_m_s(alloy)
     design_res = compute_gating(
         W_kg=design_total_mass_kg,
         rho_kgm3=alloy.rho_kg_m3,
@@ -1055,18 +1093,19 @@ def analyze_gating(
         Cd=discharge_coeff,
         gating_ratio=final_ratio,
         n_ingates=max(n_ingates, 1),
+        V_crit=V_crit_m_s,
+        is_eff_head=True,
     )
     As_m2 = design_res["As_m2"]
     Ar_total_m2 = design_res["Ar_total_m2"]
     Ag_total_m2 = design_res["Ag_total_m2"]
     Ag_each_m2 = design_res["Ag_each_m2"]
-    Vc_ms = design_res["Vc_ms"]
     d_sprue_mm = design_res["d_sprue_m"] * 1000.0
     d_ingate_each_mm = design_res["d_ingate_m"] * 1000.0
 
-    v_sprue_design = Vc_ms
-    v_runner_design = Vc_ms * (As_ratio / Ar_ratio) if Ar_ratio > 0.0 else 0.0
-    v_gate_design = Vc_ms * (As_ratio / Ag_ratio) if Ag_ratio > 0.0 else 0.0
+    v_sprue_design = float(design_res["Vs_ms"])
+    v_runner_design = float(design_res["Vr_ms"])
+    v_gate_design = float(design_res["Vg_ms"])
     Q_design_m3_s = total_metal_volume_m3 / design_fill_time_s
 
     # Primary SectionFlow objects from the design
@@ -1093,13 +1132,16 @@ def analyze_gating(
     sprue_flow = section_flows["SPRUE_BASE"]
 
     # Gating system classification from the design
-    detected_system = _classify_by_design_velocities(v_sprue_design, v_runner_design, v_gate_design)
+    detected_system = str(design_res.get("system", _classify_by_design_velocities(v_sprue_design, v_runner_design, v_gate_design)))
+    choke_name = str(design_res.get("choke", "bilinmiyor"))
+    Pf = float(design_res.get("Pf", 0.0))
     recommended_system, _ = _recommend_gating_system(wall_cat)
     gating_system_reason = (
-        f"Tasarım gating sistemi: {detected_system}. Parça: {wall_cat}. "
+        f"Tasarım gating sistemi: {detected_system}. Choke: {choke_name}. "
+        f"Parça: {wall_cat}. "
         f"Hızlar (tasarım): sprue={v_sprue_design:.2f}, runner={v_runner_design:.2f}, gate={v_gate_design:.2f} m/s. "
-        f"Oran As:Ar:Ag = {As_ratio:.2f}:{Ar_ratio:.2f}:{Ag_ratio:.2f} "
-        f"(hedef gate hızı {target_v_gate:.2f} m/s)."
+        f"Oran As:Ar:Ag = {As_ratio:.2f}:{Ar_ratio:.2f}:{Ag_ratio:.2f}; "
+        f"Pf=Ag/As = {Pf:.2f} (kritik hız {V_crit_m_s:.2f} m/s)."
     )
 
     # Ingat quality
@@ -1177,7 +1219,7 @@ def analyze_gating(
         f"sprue taban={As_m2*1e4:.2f} cm², runner toplam={Ar_total_m2*1e4:.2f} cm², "
         f"gate toplam={Ag_total_m2*1e4:.2f} cm² (her biri={Ag_each_m2*1e4:.2f} cm²); "
         f"çaplar: sprue Ø={d_sprue_mm:.1f} mm, gate Ø={d_ingate_each_mm:.1f} mm; "
-        f"sprue hızı v_c={Vc_ms:.2f} m/s."
+        f"tasarım hızları: sprue={v_sprue_design:.2f}, runner={v_runner_design:.2f}, gate={v_gate_design:.2f} m/s."
     )
 
     result.recommendations.append(
@@ -1271,7 +1313,7 @@ def analyze_gating(
         design_gate_each_area_cm2=Ag_each_m2 * 1e4,
         design_sprue_diameter_mm=d_sprue_mm,
         design_gate_diameter_mm=d_ingate_each_mm,
-        design_choke_velocity_m_s=Vc_ms,
+        design_choke_velocity_m_s=float(design_res.get("Vc_ms", v_sprue_design)),
         design_gating_ratio=final_ratio,
         sprue_design_ok=_area_ok(actual_As_cm2, design_As_cm2),
         runner_design_ok=_area_ok(actual_Ar_total_cm2, design_Ar_total_cm2),
