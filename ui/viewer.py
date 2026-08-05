@@ -488,7 +488,7 @@ class Analyzer3DViewer(QtInteractor):
             centers.append(label_pos)
             d_str = f"{hs.dist_to_riser_mm:.0f}mm" if np.isfinite(hs.dist_to_riser_mm) else "inf"
             labels.append(
-                f"{status}\nM={hs.m_value_mm:.1f}mm | D={d_str} | N={hs.niyama_ensemble:.2f}"
+                f"{status}\nM={hs.m_value_mm/10.0:.2f}cm | D={d_str} | N={hs.niyama_ensemble:.2f}"
             )
 
         if centers:

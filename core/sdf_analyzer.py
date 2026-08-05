@@ -337,10 +337,13 @@ def compute_thermal_stress(
 
 def compute_chvorinov_t(M_field: np.ndarray, C: float) -> np.ndarray:
     """
-    Chvorinov solidification time: t_s = C * M^2  [s].
-    M is the local casting modulus (mm).
+    Chvorinov solidification time: t_s [s].
+        t_s = C [dk/cm²] * (M [mm] / 10.0)^2 * 60.0
+    C is the mould constant in minutes per square centimetre and M is the
+    local casting modulus in millimetres.
     """
-    return C * np.maximum(M_field, 0.0) ** 2
+    M_cm = np.maximum(M_field, 0.0) / 10.0
+    return C * M_cm ** 2 * 60.0
 
 
 def compute_niyama(
@@ -1220,7 +1223,7 @@ def find_hotspots(
         chvorinov_c = 1.0
 
     # Solidification time from shape-corrected modulus (Chvorinov)
-    t_solid = chvorinov_c * M_mod * M_mod
+    t_solid = compute_chvorinov_t(M_mod, chvorinov_c)
     t_solid = np.nan_to_num(t_solid, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Riser thermal attraction: a feeder is a heat reservoir, so it solidifies
@@ -1724,7 +1727,7 @@ def _path_darcy_and_directional(
         t_s_hot = float(t_sol[start_vox[0], start_vox[1], start_vox[2]])
     else:
         C = chvorinov_c_from_properties(alloy, mold)
-        t_s_hot = C * m_hot * m_hot
+        t_s_hot = float(compute_chvorinov_t(np.array([m_hot], dtype=float), C)[0])
 
     # Hydrostatic head from feeders above the hot spot (opposite to gravity).
     # Use the feeder voxel centroid instead of the highest voxel so a long/thin
@@ -3281,13 +3284,20 @@ def _build_recommendations(
             "daha yüksek olabilir; kritik bölgeler için besleyici eklenmesi önerilir."
         )
 
+    M_cm = result.dominant_m_mm / 10.0
+    t_solid_s = (
+        result.chvorinov_c * (M_cm ** 2) * 60.0
+        if result.chvorinov_c and result.dominant_m_mm > 0.0
+        else 0.0
+    )
     recs.append(
-        f"Malzeme: {alloy.name} | Kalıp: {mold.name} | Chvorinov C = {result.chvorinov_c:.4f} s/mm² | "
-        f"Baskın M = {result.dominant_m_mm:.2f} mm (t ≈ {result.wall_thickness_mm:.2f} mm) | "
+        f"Malzeme: {alloy.name} | Kalıp: {mold.name} | Chvorinov C = {result.chvorinov_c:.4f} dk/cm² | "
+        f"Baskın M = {M_cm:.2f} cm (t_s ≈ {t_solid_s:.1f} s / {t_solid_s/60.0:.2f} dk) | "
+        f"Duvar kalınlığı t_wall ≈ {result.wall_thickness_mm:.2f} mm | "
         f"Şekil faktörü SF = {result.shape_factor_global:.6f}"
     )
     recs.append(
-        f"Modül istatistikleri: ortalama M = {result.m_mean_mm:.2f} mm, std = {result.m_std_mm:.2f} mm, "
+        f"Modül istatistikleri: ortalama M = {result.m_mean_mm/10.0:.2f} cm, std = {result.m_std_mm/10.0:.2f} cm, "
         f"çarpıklık = {result.m_skewness:.2f}. "
         + ("Parça duvar kalınlığı dengesiz." if abs(result.m_skewness) > 1.0 else "Kalınlık dağılımı nispeten dengeli.")
     )

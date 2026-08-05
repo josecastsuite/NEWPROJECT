@@ -98,7 +98,7 @@ def _format_hotspot_table(result: AnalysisResult) -> str:
                 f"<tr>"
                 f"<td>{i}</td>"
                 f"<td>({pos})</td>"
-                f"<td>{hs.m_value_mm:.2f} ± {hs.m_uncertainty_mm:.2f}</td>"
+                f"<td>{hs.m_value_mm/10.0:.2f} ± {hs.m_uncertainty_mm/10.0:.2f}</td>"
                 f"<td>{hs.t_section_mm:.2f}</td>"
                 f"<td>{hs.dist_to_riser_mm:.1f}</td>"
                 f"<td>{hs.max_feeding_distance_mm:.1f}</td>"
@@ -502,7 +502,7 @@ def _render_html(result: AnalysisResult, screenshot_path: Optional[str] = None) 
     <div class="meta">
         Tarih: {datetime.now().strftime('%Y-%m-%d %H:%M')} |
         Alaşım: {result.alloy_name} | Kalıp: {result.mold_name} |
-        Chvorinov C: {result.chvorinov_c:.4f} s/mm² |
+        Chvorinov C: {result.chvorinov_c:.4f} dk/cm² |
         Voxel: {result.dx_mm:.3f} mm |
         Grid: {result.grid.shape[0]} x {result.grid.shape[1]} x {result.grid.shape[2]} |
         Metal voxel: {int(result.is_metal.sum())} |
@@ -519,10 +519,11 @@ def _render_html(result: AnalysisResult, screenshot_path: Optional[str] = None) 
         <tr><td>Sub-voxel SDF</td><td>Evet</td></tr>
         <tr><td>Grid boyutları</td><td>{result.grid.shape[0]} x {result.grid.shape[1]} x {result.grid.shape[2]}</td></tr>
         <tr><td>Metal voxel sayısı</td><td>{int(result.is_metal.sum())}</td></tr>
-        <tr><td>Baskın duvar kalınlığı modülü M (mm)</td><td>{result.dominant_m_mm:.2f}</td></tr>
-        <tr><td>Baskın duvar kalınlığı t (mm)</td><td>{result.wall_thickness_mm:.2f}</td></tr>
-        <tr><td>SDF ortalama M (mm)</td><td>{result.m_mean_mm:.2f}</td></tr>
-        <tr><td>SDF standart sapma (mm)</td><td>{result.m_std_mm:.2f}</td></tr>
+        <tr><td>Baskın modül M (cm)</td><td>{result.dominant_m_mm/10.0:.2f}</td></tr>
+        <tr><td>Baskın duvar kalınlığı t_wall (mm)</td><td>{result.wall_thickness_mm:.2f}</td></tr>
+        <tr><td>Baskın katılaşma süresi t_s (s)</td><td>{result.chvorinov_c * (result.dominant_m_mm/10.0)**2 * 60.0:.1f}</td></tr>
+        <tr><td>SDF ortalama M (cm)</td><td>{result.m_mean_mm/10.0:.2f}</td></tr>
+        <tr><td>SDF standart sapma (cm)</td><td>{result.m_std_mm/10.0:.2f}</td></tr>
         <tr><td>SDF çarpıklık</td><td>{result.m_skewness:.2f}</td></tr>
         <tr><td>Şekil faktörü V²/A³ (global)</td><td>{result.shape_factor_global:.6f}</td></tr>
         <tr><td>Boyut (mm)</td><td>{result.bbox_size_mm[0]:.1f} x {result.bbox_size_mm[1]:.1f} x {result.bbox_size_mm[2]:.1f}</td></tr>
@@ -535,7 +536,7 @@ def _render_html(result: AnalysisResult, screenshot_path: Optional[str] = None) 
     <p>Yeterli besleyici/çıkıcı ile çözülen hot spot'lar ekranda gösterilmez; aşağıda sadece çözülmemişler listelenir.</p>
     <table>
         <tr>
-            <th>#</th><th>Konum (mm)</th><th>M ± hata (mm)</th><th>t (mm)</th>
+            <th>#</th><th>Konum (mm)</th><th>M ± hata (cm)</th><th>t_wall (mm)</th>
             <th>Mesafe (mm)</th><th>Limit (mm)</th><th>Maliyet</th>
             <th>Niyama ens.</th><th>Darcy</th><th>Mean curv</th><th>SF</th><th>Heuver</th><th>Gözenek</th><th>Durum</th>
         </tr>
@@ -626,7 +627,7 @@ def _generate_report_fpdf2(
     pdf.cell(0, 10, "JoseCast Analyzer v8.0 - Geometrik Analiz Raporu", ln=True, align="C")
     pdf.set_font(font, "", 10)
     pdf.cell(0, 6, f"Tarih: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True, align="C")
-    pdf.cell(0, 6, f"Alaşım: {result.alloy_name} | Kalıp: {result.mold_name} | C={result.chvorinov_c:.4f}", ln=True, align="C")
+    pdf.cell(0, 6, f"Alaşım: {result.alloy_name} | Kalıp: {result.mold_name} | C={result.chvorinov_c:.4f} dk/cm²", ln=True, align="C")
     pdf.ln(4)
 
     if result.casting_params is not None:
@@ -697,8 +698,8 @@ def _generate_report_fpdf2(
             }.get(hs.pore_size_class, 0.0)
             if hs.pore_size_class and hs.pore_size_um >= class_thr:
                 pore = f" | Gozenek={hs.pore_size_um:.1f} um ({hs.pore_size_class})"
-            pdf.cell(0, 6, f"{i}. Konum=({pos}) mm | M={hs.m_value_mm:.2f} ± {hs.m_uncertainty_mm:.2f} mm | "
-                           f"t={hs.t_section_mm:.2f} mm | Besleme={hs.dist_to_riser_mm:.1f}/{hs.max_feeding_distance_mm:.1f} mm | "
+            pdf.cell(0, 6, f"{i}. Konum=({pos}) mm | M={hs.m_value_mm/10.0:.2f} ± {hs.m_uncertainty_mm/10.0:.2f} cm | "
+                           f"t_wall={hs.t_section_mm:.2f} mm | Besleme={hs.dist_to_riser_mm:.1f}/{hs.max_feeding_distance_mm:.1f} mm | "
                            f"Niyama={hs.niyama_ensemble:.2f} | Darcy={hs.darcy_resistance:.2f} | Heuver={'OK' if hs.heuvers_ok else 'FAIL'} | {status}{pore}", ln=True)
     else:
         pdf.cell(0, 6, "Tespit edilmedi.", ln=True)

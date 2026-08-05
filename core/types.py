@@ -439,7 +439,7 @@ class AnalysisResult:
     mold_key: str = "sand"
     alloy_name: str = "42CrMo4 (Çelik)"
     mold_name: str = "Kum Kalıp"
-    chvorinov_c: float = 2.8
+    chvorinov_c: float = 2.8  # Chvorinov mould constant in dk/cm²
     unit_scale: float = 1.0
     # section / histogram
     dominant_m_mm: float = 0.0

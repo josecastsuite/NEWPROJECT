@@ -1310,7 +1310,8 @@ def _fluidity_length_mm(v_metal_m_s, alloy, mold, t_stream_mm: float, fill_time_
     """Length a fluid metal stream of thickness t_stream can travel before freezing."""
     M_stream = max(t_stream_mm, 2.0) / 2.0
     C = chvorinov_c_from_properties(alloy, mold)
-    t_s_stream = C * (M_stream ** 2)
+    # C is in dk/cm^2, M_stream in mm -> t_s in seconds
+    t_s_stream = C * (M_stream / 10.0) ** 2 * 60.0
     superheat = max(alloy.t_pour_c - alloy.t_liquidus_c, 0.0)
     l_eff = alloy.latent_heat_j_kg + alloy.cp_j_kgk * superheat
     superheat_ratio = max(alloy.cp_j_kgk * superheat / l_eff, 0.1) if l_eff > 0 else 0.1
@@ -2267,7 +2268,8 @@ def analyze_gating(
     t_stream = max(ingate_thickness_mm, 2.0 * result.dominant_m_mm, 2.0)
     M_stream = t_stream / 2.0
     C = chvorinov_c_from_properties(alloy, mold)
-    t_s_stream = C * M_stream ** 2
+    # C is in dk/cm^2, M_stream in mm -> t_s in seconds
+    t_s_stream = C * (M_stream / 10.0) ** 2 * 60.0
     superheat = max(alloy.t_pour_c - alloy.t_liquidus_c, 0.0)
     l_eff = alloy.latent_heat_j_kg + alloy.cp_j_kgk * superheat
     superheat_ratio = max(alloy.cp_j_kgk * superheat / l_eff, 0.1) if l_eff > 0 else 0.1

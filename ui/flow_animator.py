@@ -185,7 +185,7 @@ class FlowAnimator(QtCore.QObject):
                 and getattr(result, "chvorinov_c", 0.0) > 0.0
             ):
                 sdf = np.maximum(np.asarray(result.sdf, dtype=np.float64), 0.1)
-                t_est = result.chvorinov_c * sdf * sdf
+                t_est = result.chvorinov_c * (sdf / 10.0) ** 2 * 60.0
                 # Never shorten an already-known solidification time.
                 known = np.where(np.isfinite(self._solid_time) & metal, self._solid_time, 0.0)
                 t_est = np.maximum(t_est, known + 1.0)

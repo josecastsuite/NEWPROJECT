@@ -1118,7 +1118,7 @@ class MainWindow(QtWidgets.QMainWindow):
             mold = make_effective_mold(get_mold(mold_key), casting_params)
             chvorinov_c = chvorinov_c_from_properties(alloy, mold)
             self.aiLog(
-                f"Alaşım: {alloy.name} | Kalıp: {mold.name} | C={chvorinov_c:.4f} s/mm² | "
+                f"Alaşım: {alloy.name} | Kalıp: {mold.name} | C={chvorinov_c:.4f} dk/cm² | "
                 f"Superheat={casting_params.superheat_c:.1f}°C",
                 "info",
             )
@@ -1213,7 +1213,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Geometry / location notes only; do not force area changes.
         if gr.ingate_on_thick_region:
             recs.append(
-                f"Not: giriş/kontakt bölgesi kalın kesimde (ortalama M={gr.ingate_avg_m_mm:.2f} mm)."
+                f"Not: giriş/kontakt bölgesi kalın kesimde (ortalama M={gr.ingate_avg_m_mm/10.0:.2f} cm)."
             )
         # Per-section velocity / Re / Fr report with reference target ranges.
         for key, sf in getattr(gr, "section_flows", {}).items():

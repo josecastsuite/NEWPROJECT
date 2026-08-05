@@ -30,7 +30,7 @@ class MoldMaterial:
     rho_kg_m3: float  # density (kg/m³)
     cp_j_kgk: float  # specific heat (J/kg·K)
     t0_c: float  # initial mould temp (°C)
-    # Chvorinov constant in s/mm² (empirical)
+    # Chvorinov constant in dk/cm² (minutes per square centimetre, empirical)
     chvorinov_c: float
     # Darcy / flow
     particle_size_mm: float = 0.25  # representative sand grain size
@@ -405,24 +405,27 @@ def get_material(key: str) -> Material:
 
 def chvorinov_c_from_properties(alloy: Alloy, mold: MoldMaterial) -> float:
     """
-    Compute Chvorinov constant C in s/mm^2 from physical properties.
-    C = (rho_m * L_eff / (T_m - T_0))^2 * (pi / (4 * k * rho * c))
-    L_eff includes the superheat that must also be removed:
-        L_eff = L + cp * (T_pour - T_liquidus)
-    Returns a value in s/mm^2.
+    Return the Chvorinov constant C in dk/cm^2 (minutes per square centimetre).
+
+    The materials database (mold.chvorinov_c) stores the empirical foundry
+    constant, which is the authoritative value.  If it is missing, a physics-
+    based estimate is computed from alloy/mould properties and converted to
+    dk/cm^2.
     """
+    # Authoritative empirical constant from the materials database.
+    empirical = getattr(mold, "chvorinov_c", 0.0) or 0.0
+    if empirical > 0.0:
+        return float(empirical)
+
     tm = (alloy.t_liquidus_c + alloy.t_solidus_c) / 2.0
     delta_t = max(tm - mold.t0_c, 1.0)
-    # Effective latent heat including superheat [J/kg]
     l_eff = alloy.latent_heat_j_kg + alloy.cp_j_kgk * max(
         alloy.t_pour_c - alloy.t_liquidus_c, 0.0
     )
-    # rho_m * L_eff / (T_m - T0)  [J/m^3 / K]
     numerator = alloy.rho_kg_m3 * l_eff / delta_t
-    # k * rho * c  [W/mK * kg/m3 * J/kgK = W*J/(m^4 K^2)]
     denom = mold.k_w_mk * mold.rho_kg_m3 * mold.cp_j_kgk
     if denom <= 0:
-        return mold.chvorinov_c
+        return 2.0
     c_si = (numerator ** 2) * (np.pi / (4.0 * denom))
-    # Convert s/m^2 -> s/mm^2
-    return float(c_si / 1e6)
+    # Convert s/m^2 -> dk/cm^2  (1 min = 60 s, 1 m^2 = 10^4 cm^2)
+    return float(c_si / (60.0 * 1e4))
