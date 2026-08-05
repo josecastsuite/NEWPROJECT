@@ -34,6 +34,8 @@ class CastingParameters:
     mold_binder_percent: float = 0.0
     mold_compactability_percent: float = 0.0
     mold_rigidity_factor: float = -1.0
+    # v9.5: effective metal head height (m). 0 = automatic from geometry.
+    h_eff_m: float = 0.0
 
     @property
     def superheat_c(self) -> float:

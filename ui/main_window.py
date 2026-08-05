@@ -57,26 +57,6 @@ def _escape_html(text: str) -> str:
     )
 
 
-class CheckListItem(QtWidgets.QWidget):
-    """Row in the checklist panel."""
-
-    def __init__(self, text: str, ok: bool, parent=None):
-        super().__init__(parent)
-        layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(4, 3, 4, 3)
-        layout.setSpacing(8)
-        icon = "●" if ok else "●"
-        icon_color = "#3B82F6" if ok else "#EF4444"
-        self.label = QtWidgets.QLabel(
-            f'<span style="color:{icon_color};font-weight:bold;font-size:12px">{icon}</span> '
-            f'<span style="color:#334155;font-weight:500;">{_escape_html(text)}</span>'
-        )
-        self.label.setWordWrap(True)
-        self.label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.MinimumExpanding)
-        self.label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.label)
-
-
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -464,28 +444,16 @@ class MainWindow(QtWidgets.QMainWindow):
             "0 = otomatik (tasarım debisi). >0 kullanıcı girişi; seçili sprue kesitinde geçerlidir. Program düzeltmez.",
         )
 
-        self.hs_min_size_spin = QtWidgets.QDoubleSpinBox()
-        self.hs_min_size_spin.setRange(0.0, 20.0)
-        self.hs_min_size_spin.setDecimals(1)
-        self.hs_min_size_spin.setValue(0.0)
-        self.hs_min_size_spin.setSingleStep(0.5)
-        self.hs_min_size_spin.setSpecialValueText("Otomatik")
+        self.h_eff_spin = QtWidgets.QDoubleSpinBox()
+        self.h_eff_spin.setRange(0.0, 10.0)
+        self.h_eff_spin.setDecimals(2)
+        self.h_eff_spin.setValue(0.0)
+        self.h_eff_spin.setSingleStep(0.05)
+        self.h_eff_spin.setSpecialValueText("Otomatik")
         _params_labeled(
-            self.hs_min_size_spin,
-            "Hot-spot min. boyut (mm):",
-            "0 = otomatik. Küçük hot-spot ceplerinin atılması için kullanılan eşik.",
-        )
-
-        self.hs_cluster_eps_spin = QtWidgets.QDoubleSpinBox()
-        self.hs_cluster_eps_spin.setRange(0.0, 100.0)
-        self.hs_cluster_eps_spin.setDecimals(1)
-        self.hs_cluster_eps_spin.setValue(0.0)
-        self.hs_cluster_eps_spin.setSingleStep(1.0)
-        self.hs_cluster_eps_spin.setSpecialValueText("Otomatik")
-        _params_labeled(
-            self.hs_cluster_eps_spin,
-            "Hot-spot küme mesafesi (mm):",
-            "0 = otomatik. DBSCAN ile yakın hot-spot'ların birleştirilme mesafesi.",
+            self.h_eff_spin,
+            "H_eff (m):",
+            "0 = otomatik. Etkin metal yüksekliği (m). Şimdilik bağlanmadı.",
         )
 
         left_layout.addWidget(params_group)
@@ -559,12 +527,6 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         right_layout.setSpacing(8)
         right_layout.setContentsMargins(10, 10, 10, 10)
-
-        check_group = QtWidgets.QGroupBox("Kontrol Listesi")
-        check_inner = QtWidgets.QVBoxLayout(check_group)
-        self.checklist_layout = QtWidgets.QVBoxLayout()
-        check_inner.addLayout(self.checklist_layout)
-        right_layout.addWidget(check_group)
 
         rec_group = QtWidgets.QGroupBox("Mühendis Önerileri")
         rec_inner = QtWidgets.QVBoxLayout(rec_group)
@@ -876,6 +838,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ingate_velocity_m_s=self.v_ingate_spin.value(),
             velocity_section_key=self.velocity_section_combo.currentData(),
             gravity_direction=gravity_direction,
+            h_eff_m=self.h_eff_spin.value(),
         )
 
     def _gravity_vector_from_ui(self) -> Tuple[float, float, float]:
@@ -973,7 +936,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.analyze_btn.setEnabled(False)
             self._analysis = None
 
-            self._clear_checklist()
             self.rec_text.clear()
             self._grid = None
             self._origin = None
@@ -1211,7 +1173,6 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self.export_btn.setEnabled(True)
             self.html_btn.setEnabled(True)
-            self._update_checklist()
             self._update_recommendations()
             # Post-analysis: all bodies are translucent so internal markers,
             # porosity, paths, hot-spots and flow/Niyama overlays are visible.
@@ -1314,204 +1275,9 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         return recs
 
-    def _clear_checklist(self):
-        while self.checklist_layout.count():
-            item = self.checklist_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
     def _update_checklist(self):
-        self._clear_checklist()
-        if self._analysis is None:
-            return
-
-        visible_hotspots = [hs for hs in self._analysis.hotspots if not hs.solved]
-        for hs in visible_hotspots:
-            status = "OK" if hs.feed_ok else "DARALMA/UZAK"
-            text = (
-                f"Hot spot M={hs.m_value_mm:.1f} mm, t={hs.t_section_mm:.1f} mm, "
-                f"mesafe {hs.dist_to_riser_mm:.1f} mm / limit {hs.max_feeding_distance_mm:.1f} mm, "
-                f"Niyama={hs.niyama_ensemble:.2f}"
-            )
-            self.checklist_layout.addWidget(CheckListItem(text, hs.feed_ok))
-        if any(hs.solved for hs in self._analysis.hotspots):
-            n_total = len(self._analysis.hotspots)
-            n_hidden = n_total - len(visible_hotspots)
-            note = QtWidgets.QLabel(
-                f"{n_hidden} adet hot spot yeterli besleyici/çıkıcı ile çözüldü; "
-                "sadece çözülmemişler listeleniyor."
-            )
-            note.setStyleSheet("color: #3B82F6; font-weight: 500;")
-            self.checklist_layout.addWidget(note)
-
-        for rr in self._analysis.riser_results:
-            eff_m = max(rr.effective_m_value_mm, rr.m_value_mm)
-            type_text = f" [{rr.feeder_type}]" if rr.feeder_type else ""
-            text = (
-                f"{rr.name}{type_text}: M={rr.m_value_mm / 10.0:.1f} / etkin {eff_m / 10.0:.1f} cm, "
-                f"V={rr.volume_cm3:.2f} cm³ (gerekli {rr.required_volume_cm3:.2f} cm³)"
-            )
-            self.checklist_layout.addWidget(CheckListItem(text, rr.large_enough and rr.volume_ratio_ok))
-
-        for rp in self._analysis.riser_proposals:
-            pos = f"({rp.placement_mm[0] / 10.0:.1f}, {rp.placement_mm[1] / 10.0:.1f}, {rp.placement_mm[2] / 10.0:.1f})"
-            if rp.infeasible:
-                text = (
-                    f"UYARI Hotspot #{rp.target_hotspot_index + 1}: besleyici/çıkıcı parçaya sığmıyor. "
-                    f"Mini exotermik besleyici veya çıkıcı (chill) önerilir, konum={pos} cm."
-                )
-                ok = False
-            elif rp.shape == "chill":
-                text = (
-                    f"ÖNERİ Hotspot #{rp.target_hotspot_index + 1}: çıkıcı (chill) ekle -> "
-                    f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, "
-                    f"V={rp.volume_cm3:.2f} cm³, konum={pos} cm"
-                )
-                ok = True
-            elif rp.exothermic:
-                text = (
-                    f"ÖNERİ Hotspot #{rp.target_hotspot_index + 1}: ekzotermik mini besleyici ekle -> "
-                    f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, "
-                    f"V={rp.volume_cm3:.2f} cm³, konum={pos} cm"
-                )
-                ok = True
-            else:
-                text = (
-                    f"ÖNERİ Hotspot #{rp.target_hotspot_index + 1}: {rp.shape} besleyici ekle -> "
-                    f"çap={rp.diameter_mm / 10.0:.1f} cm, yükseklik={rp.height_mm / 10.0:.1f} cm, "
-                    f"V={rp.volume_cm3:.2f} cm³, M={rp.m_required_mm / 10.0:.2f} cm, konum={pos} cm"
-                )
-                ok = True
-            self.checklist_layout.addWidget(CheckListItem(text, ok))
-
-        if self._analysis.gate_result:
-            gr = self._analysis.gate_result
-            section_names = {
-                "INGATE": "Meme",
-                "RUNNER": "Yolluk",
-                "SPRUE_THROAT": "D.Ağzı boğazı",
-                "SPRUE_BASE": "D.Ağzı tabanı",
-            }
-            self.checklist_layout.addWidget(
-                CheckListItem(
-                    f"Yolluk: {gr.runner_min_area_cm2:.2f} cm² (gerekli {gr.required_runner_area_cm2:.2f} cm²)",
-                    gr.runner_ok,
-                )
-            )
-            self.checklist_layout.addWidget(
-                CheckListItem(
-                    f"Döküm ağzı boğazı: {gr.sprue_throat_area_cm2:.2f} cm² (gerekli {gr.required_sprue_area_cm2:.2f} cm²)",
-                    gr.bernoulli_ok,
-                )
-            )
-            self.checklist_layout.addWidget(
-                CheckListItem(
-                    "Meme konumu (kalın bölgede olmamalı)",
-                    not gr.ingate_on_thick_region,
-                )
-            )
-            if gr.detected_gating_system:
-                self.checklist_layout.addWidget(
-                    CheckListItem(
-                        f"Sistem: {gr.detected_gating_system} | Önerilen: {gr.recommended_gating_system} | Cidar: {gr.wall_thickness_category}",
-                        gr.detected_gating_system == gr.recommended_gating_system,
-                    )
-                )
-            # v8.4: per-section velocity / Re / Fr checklist items with target ranges
-            for key, sf in getattr(gr, "section_flows", {}).items():
-                if sf.area_cm2 <= 0:
-                    continue
-                name = section_names.get(key, key)
-                if key == "INGATE" and gr.effective_gate_section.startswith("RUNNER"):
-                    name = "Yolluk (meme yok)"
-                target = ""
-                if sf.target_v_min_m_s > 0 and sf.target_v_max_m_s > 0:
-                    target = (
-                        f" hedef v={sf.target_v_min_m_s:.1f}-{sf.target_v_max_m_s:.1f}, "
-                        f"A={sf.target_area_min_cm2:.2f}-{sf.target_area_max_cm2:.2f}"
-                    )
-                ok = not sf.turbulent
-                if sf.target_v_min_m_s > 0 and sf.target_v_max_m_s > 0:
-                    ok = ok and (sf.target_v_min_m_s <= sf.velocity_m_s <= sf.target_v_max_m_s)
-                self.checklist_layout.addWidget(
-                    CheckListItem(
-                        f"{name}: v={sf.velocity_m_s:.2f}{target}",
-                        ok,
-                    )
-                )
-            if hasattr(gr, "velocity_fill_time_match_ok"):
-                velocity_ok = (
-                    gr.velocity_fill_time_match_ok
-                    and getattr(gr, "velocity_area_ok", True)
-                    and not gr.turbulent
-                )
-                vtext = (
-                    f"Seçili kesit: {section_names.get(getattr(gr, 'selected_section_key', 'INGATE'), 'Meme')} "
-                    f"v={gr.ingate_velocity_m_s:.2f} m/s, "
-                    f"doldurma {gr.ingate_fill_time_s:.2f}s, Q={gr.ingate_flow_rate_m3_s*1e3:.2f} L/s"
-                )
-                self.checklist_layout.addWidget(
-                    CheckListItem(vtext, velocity_ok)
-                )
-            # v8.5: Campbell fill time and theoretical area cross-checks
-            if gr.recommended_fill_time_s > 0:
-                fill_ok = abs(gr.recommended_fill_time_s - gr.ingate_fill_time_s) <= 0.2 * gr.recommended_fill_time_s
-                self.checklist_layout.addWidget(
-                    CheckListItem(
-                        f"Campbell tavsiye dolum süresi: {gr.recommended_fill_time_s:.2f} s; girilen: {gr.ingate_fill_time_s:.2f} s",
-                        fill_ok,
-                    )
-                )
-            if gr.design_sprue_base_area_cm2 > 0:
-                self.checklist_layout.addWidget(
-                    CheckListItem(
-                        f"Sprue taban: gerçek {gr.sprue_base_area_cm2:.2f} cm² / teorik {gr.design_sprue_base_area_cm2:.2f} cm²",
-                        gr.sprue_design_ok,
-                    )
-                )
-            if gr.design_runner_area_cm2 > 0:
-                self.checklist_layout.addWidget(
-                    CheckListItem(
-                        f"Yolluk: gerçek {gr.runner_min_area_cm2:.2f} cm² / teorik {gr.design_runner_area_cm2:.2f} cm²",
-                        gr.runner_design_ok,
-                    )
-                )
-            if gr.design_gate_total_area_cm2 > 0:
-                self.checklist_layout.addWidget(
-                    CheckListItem(
-                        f"Gate toplam: gerçek {gr.total_ingate_contact_area_cm2:.2f} cm² / teorik {gr.design_gate_total_area_cm2:.2f} cm²",
-                        gr.gate_design_ok,
-                    )
-                )
-
-        if self._analysis and self._analysis.flow_result:
-            fr = self._analysis.flow_result
-            self.checklist_layout.addWidget(
-                CheckListItem(
-                    f"3-B Akış: Q={fr.Q_m3_s*1e3:.2f} L/s, doldurma={fr.fill_time_s:.2f} s, meme temas v={fr.ingate_contact_velocity_m_s:.2f} m/s",
-                    True,
-                )
-            )
-            section_names = {
-                "SPRUE_THROAT": "D.ağzı boğazı",
-                "SPRUE_BASE": "D.ağzı tabanı",
-                "RUNNER": "Yolluk",
-                "DISTRIBUTOR": "Dağıtıcı",
-                "CURUFLUK": "Curufluk",
-                "INGATE": "Meme",
-                "FILTER": "Filtre",
-                "RISER": "Besleyici",
-            }
-            for key, val in fr.node_velocities.items():
-                if val <= 1e-9:
-                    continue
-                name = section_names.get(key, key)
-                self.checklist_layout.addWidget(
-                    CheckListItem(
-                        f"  {name}: v={val:.3f} m/s ({val*100:.1f} cm/s)",
-                        True,
-                    )
-                )
+        """Deprecated: the checklist panel was removed from the UI."""
+        pass
 
     def _update_recommendations(self):
         if self._analysis and self._analysis.recommendations:
