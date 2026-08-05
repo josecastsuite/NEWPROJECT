@@ -47,8 +47,8 @@ Yatay sagu + tabandan girisli kapali kutu (tavan saglam, tek cikis yok) geometri
 
 | Kalip | `air_entrapment` max | `trapped_air_volume_m3` | Yorum |
 |---|---|---|---|
-| Kum kalip (`silica_sand`) | 0.0 | 0.0 | Ust yuzey parting/vent kabul edildi, hava kacti. |
-| Seramik kalip (`ceramic`) | 0.84 | 1.25e-05 | Kapali cep hapsolmus hava olarak tespit edildi. |
+| Kum kalip (`silica_sand`) | 0.21 | 0.0 | Açık riser yok; hava büyük ölçüde hapsolmuş, yüzeysel kısım `permeability_proxy` ile kısmen kaçtı. |
+| Seramik kalip (`ceramic`) | 0.84 | 1.25e-05 | Açık riser yok; kapali cep hapsolmus hava olarak tespit edildi. |
 
 Bu, seramik/metal kalip kullanildiginda programin artik hava sikismasi gosterebildigini dogruluyor.
 
@@ -59,7 +59,8 @@ Bu, seramik/metal kalip kullanildiginda programin artik hava sikismasi gosterebi
 
 ## 4. Kalan Bilinen Davranislar
 
-- Kum kalip modunda **part ust yuzeyi** hala otomatik vent olarak kabul ediliyor. Bu yuzeysel hava cepleri icin kabul edilebilir, ama **kum icerisinde derin bir kapan kapi varsa** yine de hava sikismasi olabilir; gercek ventgovde `RISER`/`CURUFLUK` olarak tanimlanmalidir.
+- **Part/sprue/ingate/runner/curufluk ustu** hiçbir kalip tipinde otomatik vent olarak kabul edilmiyor. Vent sadece açık `RISER`/`FEEDER` üst yüzeyi veya özel VENT body'leri.
+- Kum kalıplarda yüzeysel hava kaçışı `permeability_proxy` ile LBM sonrası uygulanan bir düzeltme ile modellenir; bu, gerçek kum geçirgenliğine bağımlıdır.
 - Hava sikismasi haritasi, LBM/VOF cozucusunun gercekten calistigi durumlarda uretilir. "Hizli akis hesabi (animasyon yok)" seceneginde 3-B cozucu devre disi kalir, bu yuzden `air_entrapment` sifir olur.
 
 ## 5. Sonuc
