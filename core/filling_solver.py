@@ -510,13 +510,16 @@ def _select_vent_cells(
     cavity: np.ndarray,
     g: np.ndarray,
 ) -> np.ndarray:
-    """Select vent cells: top of PART / RISER along the -g (upstream) direction."""
-    part_or_riser = np.isin(grid, [BodyType.PART, BodyType.RISER]) & cavity
-    vent = _find_boundary_cells_along(part_or_riser, g, side="up") & cavity
-    if not vent.any():
-        # Use any cavity cell at the upstream (top) boundary.
-        vent = _find_boundary_cells_along(cavity, g, side="up") & cavity
-    return vent
+    """Select vent cells: top of an open RISER only.
+
+    Parça, meme, yolluk, sagu, döküm hunisi ve curufluk üst yüzeyleri hiçbir
+    kalıp tipinde otomatik vent sayılmaz. Kum kalıplarda yüzeysel hava kaçışı
+    `permeability_proxy` ile LBM sonrası düzeltilir, açık sınır olarak değil.
+    """
+    riser_mask = (grid == BodyType.RISER) & cavity
+    if not riser_mask.any():
+        return np.zeros_like(cavity, dtype=bool)
+    return _find_boundary_cells_along(riser_mask, g, side="up") & cavity
 
 
 def _select_lbm_outlet_cells(
@@ -525,19 +528,8 @@ def _select_lbm_outlet_cells(
     g: np.ndarray,
     mold=None,
 ) -> np.ndarray:
-    """Select LBM air-escape cells.
-
-    Meme, yolluk, sagu, döküm hunisi ve parça ASLA vent sayılmaz. Vent sadece
-    açık besleyici/riser (RISER) veya özel VENT body'lerinin üst yüzeyidir.
-    Kum kalıplarda yüzeysel hava kacisi LBM sonrası `permeability_proxy` ile
-    uygulanan bir düzeltme ile modellenir, LBM sınırı olarak değil.
-    """
-    outlet = np.zeros_like(cavity, dtype=bool)
-    # RISER = açık besleyici; üst yüzeyi atmosfere açık kabul edilir.
-    riser_mask = (grid == BodyType.RISER) & cavity
-    if riser_mask.any():
-        outlet |= _find_boundary_cells_along(riser_mask, g, side="up") & cavity
-    return outlet
+    """Select LBM air-escape cells (same physical rule as _select_vent_cells)."""
+    return _select_vent_cells(grid, cavity, g)
 
 
 def _build_laplace_matrix(
