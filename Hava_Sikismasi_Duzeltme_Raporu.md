@@ -16,9 +16,9 @@ Program seramik/metal kalip secildiginde **hava sikismasi riskini gostermiyordu*
 ### 2.1 `core/filling_solver.py` degisiklikleri
 
 - `_select_lbm_outlet_cells(...)` yardimci fonksiyonu eklendi:
-  - **Kum kalip** (`is_sand=True`): eski gibi PART/RISER ust yuzeyleri vent.
-  - **Seramik/metal/exothermic/investment** (`is_sand=False`): sadece `RISER` veya `CURUFLUK` gibi gercek acik govde ust yuzeyleri vent. Parca veya dokum ust yuzeyi hatali vent olarak kullanilmiyor.
-  - Dokum hunisi / sagu (sprue/pouring basin) ustune **serbest outlet** konmuyor; aksi halde sivi metal oradan bosalip kaliptaki bosluklar doldurulmuyordu.
+  - LBM outlet maskesi **her kalıp tipinde** sadece açık `RISER` (besleyici) üst yüzeyini vent kabul eder. `CURUFLUK`, parça, sagu, yolluk, meme ve döküm hunisi asla vent sayılmaz.
+  - Kum kalıplarda yüzeysel hava kaçışı, LBM sonrası `permeability_proxy` ile uygulanan bir düzeltme ile modellenir; parça üstü “açık sınır” olarak kullanılmaz.
+  - Dokum hunisi / sagu (sprue/pouring basin) ustune **serbest outlet** konmuyor; aksi halde sıvı metal oradan boşalıp kaliptaki boşluklar doldurulmuyordu.
 
 - LBM/VOF sonucundaki `air_entrapment` (trap) dizisi:
   - `order=0` (en yakin komsu) ile orijinal ince `orig_grid` izgarasina yeniden orneklendi.
