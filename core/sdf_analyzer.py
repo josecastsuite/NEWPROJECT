@@ -2350,7 +2350,9 @@ def analyze(
         mold = replace(mold, t0_c=casting_params.t_mold_c)
     chvorinov_c = chvorinov_c_from_properties(alloy, mold)
     gravity_vector = (
-        casting_params.gravity_vector
+        getattr(casting_params, "gravity_vector", None)
+        or getattr(casting_params, "gravity_direction", None)
+        or (0.0, 0.0, -1.0)
         if casting_params is not None
         else (0.0, 0.0, -1.0)
     )
@@ -2526,7 +2528,11 @@ def analyze(
         progress_callback=progress_callback,
         fill_time_s=fill_time_s,
         velocity_m_s=velocity_m_s,
-        gravity_vector=tuple(casting_params.gravity_vector)
+        gravity_vector=tuple(
+            getattr(casting_params, "gravity_vector", None)
+            or getattr(casting_params, "gravity_direction", None)
+            or (0.0, 0.0, -1.0)
+        )
         if casting_params is not None
         else (0.0, 0.0, -1.0),
     )

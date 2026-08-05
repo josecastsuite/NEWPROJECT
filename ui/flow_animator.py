@@ -326,7 +326,8 @@ class FlowAnimator(QtCore.QObject):
             self._t_mold = float(cp.t_mold_c)
             self._t_liq = float(cp.t_liquidus_c)
             self._t_sol = float(cp.t_solidus_c)
-            g = np.asarray(cp.gravity_vector, dtype=np.float64)
+            g_dir = getattr(cp, "gravity_vector", None) or getattr(cp, "gravity_direction", None) or (0.0, 0.0, -1.0)
+            g = np.asarray(g_dir, dtype=np.float64)
             norm = float(np.linalg.norm(g)) + 1e-9
             self._gravity = g / norm
             self._source_section_key = (
