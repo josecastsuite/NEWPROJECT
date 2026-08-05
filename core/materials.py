@@ -245,7 +245,7 @@ def _default_alloys() -> Dict[str, Alloy]:
             cp_j_kgk=460.0,
             viscosity_pa_s=0.005,
             shrinkage_factor=0.03,
-            critical_entrainment_velocity_m_s=1.0,
+            critical_entrainment_velocity_m_s=0.9,
         ),
         "AlSi7": Alloy(
             key="AlSi7",
