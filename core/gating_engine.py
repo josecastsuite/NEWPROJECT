@@ -129,26 +129,6 @@ class GatingDesign:
     reason: str = ""
 
 
-# Backwards-compatible velocity ranges used by the UI / reporter.
-_VELOCITY_RANGES: Dict[str, Dict[str, Tuple[float, float]]] = {
-    "basınçlı (pressurized)": {
-        "sprue": (0.8, 2.0),
-        "runner": (1.0, 2.5),
-        "gate": (2.0, 4.5),
-    },
-    "basınçsız (unpressurized)": {
-        "sprue": (1.0, 2.0),
-        "runner": (0.5, 1.2),
-        "gate": (0.2, 0.7),
-    },
-    "yarı basınçlı (semi-pressurized)": {
-        "sprue": (0.8, 1.5),
-        "runner": (0.5, 1.0),
-        "gate": (0.4, 1.0),
-    },
-}
-
-
 def _alloy_kind(key: str) -> str:
     k = (key or "").lower()
     if "gri pik" in k or "sfero" in k or "ggg" in k or "nodular" in k or "gray" in k or "pik" in k:
@@ -169,45 +149,38 @@ def _wall_class(thickness_mm: float) -> str:
 
 
 def _safe_gate_velocity_m_s(alloy_key: str, wall_class: str = "medium") -> float:
-    """Target (laminar / Campbell-like) gate velocity for the material + wall."""
-    kind = _alloy_kind(alloy_key)
-    if kind == "gray":
-        return {"thin": 2.5, "medium": 2.0, "thick": 1.5}.get(wall_class, 2.0)
-    if kind == "aluminum":
-        return {"thin": 0.5, "medium": 0.4, "thick": 0.3}.get(wall_class, 0.4)
-    if kind == "bronze":
-        return {"thin": 1.0, "medium": 0.8, "thick": 0.6}.get(wall_class, 0.8)
-    # steel
-    return {"thin": 0.7, "medium": 0.5, "thick": 0.4}.get(wall_class, 0.5)
+    """Target (laminar / Campbell-like) gate velocity derived from the alloy's
+    critical entrainment velocity and the wall thickness category."""
+    alloy = get_alloy(alloy_key)
+    v_crit = float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.5) or 0.5)
+    factor = {"thin": 0.90, "medium": 0.75, "thick": 0.60}.get(wall_class, 0.75)
+    return v_crit * factor
 
 
 def _max_gate_velocity_m_s(alloy_key: str) -> float:
-    kind = _alloy_kind(alloy_key)
-    if kind == "gray":
-        return 4.5
-    if kind == "aluminum":
-        return 0.6
-    if kind == "bronze":
-        return 1.2
-    return 0.85
+    """Absolute ceiling for gate/meniscus velocity: alloy critical entrainment speed."""
+    alloy = get_alloy(alloy_key)
+    return float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.5) or 0.5)
 
 
 def _max_runner_velocity_m_s(alloy_key: str) -> float:
-    # Runner is usually a bit faster than the gate in pressurized systems,
-    # but should never exceed the gate max by much.
-    return _max_gate_velocity_m_s(alloy_key) * 1.5
+    # Runner may run slightly faster than the gate in pressurized systems,
+    # but surface-turbulence-safe ceiling is tied to the alloy critical velocity.
+    return _max_gate_velocity_m_s(alloy_key) * 1.2
 
 
 def _section_velocity_limit(system: str, alloy_key: str, section: str) -> float:
-    """Material + system aware velocity ceiling for a gating section."""
-    sys_max = _VELOCITY_RANGES.get(system, _VELOCITY_RANGES["yarı basınçlı (semi-pressurized)"]).get(
-        section, (0.0, 2.0)
-    )[1]
+    """Material + system aware velocity ceiling for a gating section.
+
+    Uses the alloy-specific critical entrainment velocity as the physical ceiling.
+    """
+    alloy = get_alloy(alloy_key)
+    v_crit = float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.5) or 0.5)
     if section == "gate":
-        return min(sys_max, _max_gate_velocity_m_s(alloy_key))
+        return v_crit
     if section == "runner":
-        return min(sys_max, _max_runner_velocity_m_s(alloy_key))
-    return sys_max
+        return v_crit * 1.2
+    return v_crit * 1.5
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
