@@ -532,6 +532,116 @@ def _select_lbm_outlet_cells(
     return _select_vent_cells(grid, cavity, g)
 
 
+def _compute_air_entrapment_risk(
+    phi: np.ndarray,
+    fill_time: np.ndarray,
+    outlet_mask: np.ndarray,
+    grid: np.ndarray,
+    cavity_mask: np.ndarray,
+    dx_m: float,
+    rho_air: float = 1.2,
+    delta_p_pa: float = 20000.0,
+) -> Tuple[np.ndarray, float, np.ndarray]:
+    """Post-process air-entrapment risk (0-1) from an LBM/VOF free-surface solve.
+
+    Each connected component of empty (phi < 0.5) cavity cells is a potential
+    trapped-air pocket.  Risk is zero if the pocket touches the domain boundary
+    or an outlet whose geometric flow capacity can evacuate it before the metal
+    seals the pocket; otherwise risk is one.  Only outlets that physically
+    touch the pocket (6-neighbour) contribute to Q_max; distant vents are
+    ignored.
+    """
+    if (
+        phi.shape != fill_time.shape
+        or phi.shape != outlet_mask.shape
+        or phi.shape != grid.shape
+        or phi.shape != cavity_mask.shape
+    ):
+        raise ValueError("Shape mismatch in air-entrapment inputs")
+
+    shape = phi.shape
+    s6 = ndimage.generate_binary_structure(3, 1)
+
+    empty_mask = (phi < 0.5) & cavity_mask
+    metal_mask = (phi >= 0.5) & cavity_mask
+    if not empty_mask.any():
+        return (
+            np.zeros(shape, dtype=np.float32),
+            0.0,
+            np.array([], dtype=np.float64),
+        )
+
+    labels, n_comp = ndimage.label(empty_mask, structure=s6)
+    outlet_labels, n_outlets = ndimage.label(outlet_mask, structure=s6)
+
+    boundary_mask = np.zeros(shape, dtype=bool)
+    boundary_mask[0, :, :] = True
+    boundary_mask[-1, :, :] = True
+    boundary_mask[:, 0, :] = True
+    boundary_mask[:, -1, :] = True
+    boundary_mask[:, :, 0] = True
+    boundary_mask[:, :, -1] = True
+
+    sqrt_term = np.sqrt(2.0 * delta_p_pa / max(rho_air, 1e-12))
+    risk = np.zeros(shape, dtype=np.float64)
+
+    for comp_id in range(1, n_comp + 1):
+        comp = labels == comp_id
+        V_pocket = float(comp.sum()) * dx_m ** 3
+        if V_pocket <= 0.0:
+            continue
+
+        # Component open to the outside of the voxel domain.
+        if np.any(comp & boundary_mask):
+            continue
+
+        # Dilate by one 6-neighbour shell to detect touching outlets and metal.
+        dilated_comp = ndimage.binary_dilation(comp, structure=s6, iterations=1)
+        touching_outlet = dilated_comp & outlet_mask
+
+        Q_total = 0.0
+        if touching_outlet.any() and n_outlets > 0:
+            touching_ids = np.unique(outlet_labels[touching_outlet])
+            touching_ids = touching_ids[touching_ids > 0]
+            for out_id in touching_ids:
+                outlet_comp = outlet_labels == out_id
+                A_vent_m2 = float(outlet_comp.sum()) * dx_m * dx_m
+                body_vals = grid[outlet_comp]
+                if body_vals.size == 0:
+                    continue
+                most_common = int(np.bincount(body_vals.astype(np.int64)).argmax())
+                # Open riser / feeder: high discharge coefficient.
+                # Dedicated VENT bodies and other special vents: lower Cd.
+                cd = 0.8 if most_common == int(BodyType.RISER) else 0.4
+                Q_total += cd * A_vent_m2 * sqrt_term
+
+        # Local escape window: first metal contact until the pocket is sealed.
+        neighbor_metal = dilated_comp & metal_mask
+        t_window = 0.0
+        if neighbor_metal.any():
+            neighbor_times = fill_time[neighbor_metal]
+            finite_times = neighbor_times[np.isfinite(neighbor_times)]
+            if finite_times.size > 0:
+                t_first = float(np.min(finite_times))
+                t_trap = float(np.max(finite_times))
+                t_window = max(0.0, t_trap - t_first)
+
+        if Q_total <= 0.0 or t_window <= 0.0:
+            risk_val = 1.0
+        else:
+            V_escape = Q_total * t_window
+            risk_val = 1.0 - min(1.0, V_escape / max(V_pocket, 1e-18))
+            risk_val = float(np.clip(risk_val, 0.0, 1.0))
+        risk[comp] = risk_val
+
+    trapped_volume_m3 = float(np.sum(risk)) * dx_m ** 3
+    if trapped_volume_m3 > 0.0:
+        center_vox = np.array(ndimage.center_of_mass(risk), dtype=np.float64)
+    else:
+        center_vox = np.array([], dtype=np.float64)
+    return risk.astype(np.float32), trapped_volume_m3, center_vox
+
+
 def _build_laplace_matrix(
     cavity: np.ndarray,
     dirichlet: np.ndarray,
@@ -5797,13 +5907,26 @@ def solve_filling_flow(
                 if np.isfinite(max_fill_t) and max_fill_t > 0.0:
                     fill_time_s = max_fill_t
 
-        # Air entrapment from the LBM/VOF trap field: resample the coarse binary
-        # pocket mask to the fine grid and, for permeable molds (sand), let
-        # near-surface air escape through the mold parting line.
-        if vof_res.get("air_entrapment") is not None:
-            trap_c = np.asarray(vof_res["air_entrapment"], dtype=np.float64)
+        # Air entrapment: per-component vent-capacity risk score (0-1).
+        # Uses the LBM/VOF phi and fill_time fields plus the geometric outlet mask.
+        if (
+            vof_res is not None
+            and "phi" in vof_res
+            and "fill_time" in vof_res
+            and vof_outlet is not None
+        ):
+            risk_c, _, _ = _compute_air_entrapment_risk(
+                np.asarray(vof_res["phi"]),
+                np.asarray(vof_res["fill_time"]),
+                vof_outlet,
+                vof_grid,
+                vof_cavity,
+                float(vof_dx_m),
+                rho_air=1.2,
+                delta_p_pa=20000.0,
+            )
             air_entrapment_fine = _resample_to_grid(
-                trap_c,
+                risk_c,
                 vof_origin,
                 vof_dx,
                 orig_grid.shape,
@@ -5815,32 +5938,15 @@ def solve_filling_flow(
             air_entrapment_fine = np.clip(air_entrapment_fine, 0.0, 1.0)
             air_entrapment_fine = np.where(fine_metal, air_entrapment_fine, 0.0)
 
-            # Permeability-aware correction: in sand molds some trapped air near
-            # the surface can vent through the mold parting line; in ceramic or
-            # metal molds the air stays trapped.
-            permeability_proxy = float(getattr(mold, "permeability_proxy", 1.0))
-            if fine_metal.any() and permeability_proxy > 1e-6:
-                dist_to_surface_mm = ndimage.distance_transform_edt(
-                    fine_metal, sampling=orig_dx
+            if air_entrapment_fine.any():
+                trapped_air_volume_m3 = float(np.sum(air_entrapment_fine)) * (
+                    orig_dx_m ** 3
                 )
-                # vent_depth: sand ~22 mm, ceramic ~2 mm, metal ~0 mm.
-                vent_depth_mm = 2.0 + 20.0 * np.clip(permeability_proxy, 0.0, 1.0)
-                base_escape = 0.1 + 0.25 * np.clip(permeability_proxy, 0.0, 1.0)
-                escape_factor = base_escape + (
-                    np.clip(permeability_proxy, 0.0, 1.0) - base_escape
-                ) * np.exp(-dist_to_surface_mm / max(vent_depth_mm, 1e-3))
-                air_entrapment_fine = np.where(
-                    fine_metal,
-                    np.clip(air_entrapment_fine * (1.0 - escape_factor), 0.0, 1.0),
-                    0.0,
+                centroid_vox = np.array(
+                    ndimage.center_of_mass(air_entrapment_fine), dtype=np.float64
                 )
-
-            trapped_mask = air_entrapment_fine > 0.3
-            if trapped_mask.any():
-                trapped_air_volume_m3 = float(np.sum(trapped_mask)) * (orig_dx_m ** 3)
-                idx = np.argwhere(trapped_mask)
-                centroid_vox = idx.mean(axis=0)
-                air_entrapment_centroid_mm = orig_origin + centroid_vox * orig_dx
+                if centroid_vox.size == 3 and np.all(np.isfinite(centroid_vox)):
+                    air_entrapment_centroid_mm = orig_origin + centroid_vox * orig_dx
 
     # Post-process 3-D flow turbulence metrics (Re, turbulent intensity).
     if fine_metal.any():
