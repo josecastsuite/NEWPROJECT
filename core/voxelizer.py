@@ -177,6 +177,12 @@ def _classify_casting_bodies(
             return BodyType.SPRUE
         if any(k in n for k in ("besleyici", "riser", "feeder", "feed")):
             return BodyType.RISER
+        if any(k in n for k in ("chill", "sogutucu", "soğutucu", "bakir_sogutucu", "celik_sogutucu")):
+            return BodyType.CHILL
+        if any(k in n for k in ("sleeve", "yalanci", "yalancı", "isı_yal", "exo", "exothermic", "insulating")):
+            return BodyType.SLEEVE
+        if any(k in n for k in ("filtre", "filter", "foam")):
+            return BodyType.FILTER
         return None
 
     name_assigned: set = set()

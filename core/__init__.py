@@ -3,12 +3,14 @@
 from core.gating import analyze_gating, ingate_contact_area_and_mask
 from core.materials import (
     ALLOYS,
+    BODY_PRESETS,
     MATERIALS,
     MOLDS,
     Alloy,
     Material,
     MoldMaterial,
     get_alloy,
+    get_body_preset,
     get_material,
     get_mold,
 )
@@ -43,8 +45,10 @@ __all__ = [
     "ingate_contact_area_and_mask",
     "generate_report",
     "get_alloy",
+    "get_body_preset",
     "get_mold",
     "get_material",
+    "BODY_PRESETS",
     "Alloy",
     "MoldMaterial",
     "Material",

@@ -36,10 +36,26 @@ from scipy.sparse import linalg as spla
 from core.config import FlowConfig
 from core.gate_flow import solve_gate_flows
 from core.materials import MOLDS, MoldMaterial
-from core.types import Body, BodyType, FillingResult, GatingNode, GatingVelocityError
+from core.types import (
+    BODY_METAL_TYPES,
+    Body,
+    BodyType,
+    CHILL_BODY_TYPES,
+    FillingResult,
+    GatingNode,
+    GatingVelocityError,
+    SLEEVE_BODY_TYPES,
+)
 from core.voxelizer import build_voxel_grid, compute_face_fractions
 
 _FLOW_CFG = FlowConfig()
+
+# Body types that are not part of the metal/air cavity for air-entrapment.
+_CHILL_SLEEVE_TYPES = frozenset(int(t) for t in CHILL_BODY_TYPES + SLEEVE_BODY_TYPES)
+_NON_CAVITY_TYPES = frozenset([int(BodyType.CORE)]) | _CHILL_SLEEVE_TYPES
+# FILTER is an insert metal passes through, so it stays in the flow graph but is
+# never itself a trapped-air region.
+_AIR_SKIP_TYPES = frozenset([int(BodyType.FILTER)]) | _NON_CAVITY_TYPES
 
 
 def _downsample_grid(
@@ -255,8 +271,8 @@ def _flow_refined_grid(
 
 
 def _cavity_and_solid_masks(grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Return cavity (mold cavity incl. gating+part) and solid masks."""
-    cavity = grid != BodyType.EMPTY
+    """Return the flow cavity and solid (non-flow) masks."""
+    cavity = (grid != BodyType.EMPTY) & ~np.isin(grid, list(_NON_CAVITY_TYPES))
     solid = ~cavity
     return cavity, solid
 
@@ -562,8 +578,10 @@ def _compute_air_entrapment_risk(
     shape = phi.shape
     s6 = ndimage.generate_binary_structure(3, 1)
 
-    empty_mask = (phi < 0.5) & cavity_mask
-    metal_mask = (phi >= 0.5) & cavity_mask
+    # Air-entrapment domain: exclude filter / chill / sleeve / core inserts.
+    air_mask = cavity_mask & ~np.isin(grid, list(_AIR_SKIP_TYPES))
+    empty_mask = (phi < 0.5) & air_mask
+    metal_mask = (phi >= 0.5) & air_mask
     if not empty_mask.any():
         return (
             np.zeros(shape, dtype=np.float32),
@@ -572,7 +590,9 @@ def _compute_air_entrapment_risk(
         )
 
     labels, n_comp = ndimage.label(empty_mask, structure=s6)
-    outlet_labels, n_outlets = ndimage.label(outlet_mask, structure=s6)
+    # Outlets that sit on non-air regions (filter/chill/sleeve/core) are ignored.
+    effective_outlet_mask = outlet_mask & air_mask
+    outlet_labels, n_outlets = ndimage.label(effective_outlet_mask, structure=s6)
 
     boundary_mask = np.zeros(shape, dtype=bool)
     boundary_mask[0, :, :] = True
@@ -597,7 +617,7 @@ def _compute_air_entrapment_risk(
 
         # Dilate by one 6-neighbour shell to detect touching outlets and metal.
         dilated_comp = ndimage.binary_dilation(comp, structure=s6, iterations=1)
-        touching_outlet = dilated_comp & outlet_mask
+        touching_outlet = dilated_comp & effective_outlet_mask
 
         Q_total = 0.0
         if touching_outlet.any() and n_outlets > 0:
@@ -634,6 +654,8 @@ def _compute_air_entrapment_risk(
             risk_val = float(np.clip(risk_val, 0.0, 1.0))
         risk[comp] = risk_val
 
+    # Zero any residual risk on non-air cells.
+    risk = np.where(air_mask, risk, 0.0)
     trapped_volume_m3 = float(np.sum(risk)) * dx_m ** 3
     if trapped_volume_m3 > 0.0:
         center_vox = np.array(ndimage.center_of_mass(risk), dtype=np.float64)
@@ -677,16 +699,28 @@ def _apply_sand_permeability_correction(
     The damping factor from Dietert permeability P is applied with an
     exponential decay away from the cavity surface so deep closed pockets are
     not artificially lowered.
+
+    For non-sand real moulds the permeability-proxy is deliberately *not* used as
+    a substitute for venting.  Graphite moulds get a tiny optional relief because
+    the material can out-gas/breathe slightly; metal and ceramic stay unchanged.
     """
+    corrected = risk
     damping = _sand_permeability_damping(mold, casting_params)
-    if damping <= 0.0 or not cavity_mask.any():
-        return risk
-    dist_to_surface_mm = ndimage.distance_transform_edt(
-        cavity_mask, sampling=dx_mm
-    )
-    depth_mm = 5.0 + 25.0 * damping
-    escape_factor = damping * np.exp(-dist_to_surface_mm / max(depth_mm, 1e-3))
-    corrected = risk * (1.0 - escape_factor)
+    if damping > 0.0 and cavity_mask.any():
+        dist_to_surface_mm = ndimage.distance_transform_edt(
+            cavity_mask, sampling=dx_mm
+        )
+        depth_mm = 5.0 + 25.0 * damping
+        escape_factor = damping * np.exp(-dist_to_surface_mm / max(depth_mm, 1e-3))
+        corrected = risk * (1.0 - escape_factor)
+
+    # Optional graphite micro-relief for real (non-body-preset) moulds only.
+    if (
+        not bool(getattr(mold, "is_sand", False))
+        and getattr(mold, "mold_type", "") == "graphite"
+    ):
+        corrected = corrected * 0.935
+
     return np.clip(corrected, 0.0, 1.0)
 
 
@@ -1142,7 +1176,13 @@ def compute_air_entrapment_geofc(
 
     shape = grid.shape
     dx_m = float(dx_mm) / 1000.0
-    cavity_mask = (grid != int(BodyType.EMPTY)) & (grid != int(BodyType.CORE))
+    # CHILL / SLEEVE / CORE are solid inserts; the flow/collision graph goes
+    # around them.  FILTER is kept in the graph because metal passes through it.
+    cavity_mask = (grid != int(BodyType.EMPTY)) & ~np.isin(
+        grid, list(_NON_CAVITY_TYPES)
+    )
+    # Trapped-air region is the cavity minus the filter/chill/sleeve/core cells.
+    air_mask = cavity_mask & ~np.isin(grid, list(_AIR_SKIP_TYPES))
     if not cavity_mask.any():
         risk = np.zeros(orig_shape, dtype=np.float32)
         return risk, 0.0, np.array([], dtype=np.float64)
@@ -1239,12 +1279,12 @@ def compute_air_entrapment_geofc(
     # Noise tolerance: equal up to a small fraction of the total fill time.
     max_t = float(np.max(t_fill[finite_mask])) if finite_mask.any() else 1.0
     tol = max(1e-12, 1e-9 * max(1.0, max_t))
-    trapped = (t_fill > t_escape + tol) & cavity_mask
-    # Air-entrapment risk is reported on the whole cavity.  In some STEP
-    # assemblies the casting arms are labelled as RUNNER/DISTRIBUTOR by the
-    # heuristic voxelizer, so restricting to BodyType.PART would miss the real
-    # undercuts.  The inlet (SPRUE top) is still excluded by the front-arrival
-    # model.
+    trapped = (t_fill > t_escape + tol) & air_mask
+    # Air-entrapment risk is reported on the air region (cavity minus filter/
+    # chill/sleeve/core).  In some STEP assemblies the casting arms are labelled
+    # as RUNNER/DISTRIBUTOR by the heuristic voxelizer, so restricting to
+    # BodyType.PART would miss the real undercuts.  The inlet (SPRUE top) is
+    # still excluded by the front-arrival model.
     s6 = ndimage.generate_binary_structure(3, 1)
     s26 = ndimage.generate_binary_structure(3, 3)
     labels, n_comp = ndimage.label(trapped, structure=s26)
@@ -1384,7 +1424,7 @@ def compute_air_entrapment_geofc(
 
     if mold is not None and casting_params is not None:
         risk = _apply_sand_permeability_correction(
-            risk, cavity_mask, mold, casting_params, float(dx_mm)
+            risk, air_mask, mold, casting_params, float(dx_mm)
         )
 
     if grid is not orig_grid:
@@ -1436,8 +1476,8 @@ def _compute_ingate_entrainment_risk(
     if rho <= 0.0 or mu <= 0.0 or sigma <= 0.0 or v_crit <= 0.0:
         return risk.astype(np.float32)
 
-    # Local characteristic length: hydraulic diameter from cavity distance.
-    cavity = grid != BodyType.EMPTY
+    # Local characteristic length: hydraulic diameter from flow-cavity distance.
+    cavity = (grid != BodyType.EMPTY) & ~np.isin(grid, list(_NON_CAVITY_TYPES))
     dist_to_wall_m = ndimage.distance_transform_edt(cavity, sampling=dx_m)
     D = 2.0 * dist_to_wall_m
     D = np.where(D <= 0.0, dx_m, D)
@@ -5891,10 +5931,14 @@ def _effective_mold_from_bodies(
     from dataclasses import replace
 
     afs = moisture = binder = compact = 0.0
+    from core.materials import BODY_PRESETS
+
     for b in core_bodies.values():
         w = counts[b.index] / total
         if b.mold_preset and b.mold_preset in MOLDS:
             base = MOLDS[b.mold_preset]
+        elif b.mold_preset and b.mold_preset in BODY_PRESETS:
+            base = BODY_PRESETS[b.mold_preset]
         else:
             base = mold
         afs += w * (b.mold_afs_grain_size or base.afs_grain_size)
@@ -5940,8 +5984,8 @@ def _simple_hydraulic_filling_result(
     section_areas_m2 = section_areas_m2 or {}
     Q_m3_s = design_velocity_m_s * design_area_m2 if design_velocity_m_s > 0.0 and design_area_m2 > 0.0 else 0.0
 
-    # Total metal volume from the voxel grid (mm -> m).
-    is_metal = grid != int(BodyType.EMPTY)
+    # Total metal volume: only cells that are part of the liquid metal domain.
+    is_metal = np.isin(grid, list(BODY_METAL_TYPES))
     dx_m = dx / 1000.0
     V_metal_m3 = float(np.count_nonzero(is_metal)) * (dx_m ** 3)
     fill_time_s = V_metal_m3 / Q_m3_s if Q_m3_s > 1e-12 else 0.0
@@ -6252,7 +6296,7 @@ def solve_filling_flow(
     # dx*dx area on curved/staircase surfaces so Q = v * A uses the real area.
     # At very high resolution the 4x zoom would explode memory (>60 GB for 120 M
     # cells), so fall back to binary face areas (sub=1) on large grids.
-    is_metal_c = grid_c != BodyType.EMPTY
+    is_metal_c = cavity
     sub_frac = 4 if is_metal_c.size < 5_000_000 else 1
     face_fractions = compute_face_fractions(is_metal_c, sub=sub_frac)
     f_A_z, f_A_y, f_A_x = face_fractions
@@ -6466,7 +6510,9 @@ def solve_filling_flow(
             vof_grid, vof_origin, vof_dx = _downsample_grid(
                 grid_c, origin_c, dx_c, max_cells=lbm_vof_max_cells
             )
-            vof_cavity = vof_grid != BodyType.EMPTY
+            vof_cavity = (vof_grid != BodyType.EMPTY) & ~np.isin(
+                vof_grid, list(_NON_CAVITY_TYPES)
+            )
             vof_inlet, _ = _select_inlet_cells(
                 vof_grid, vof_cavity, g, physical_source_key
             )

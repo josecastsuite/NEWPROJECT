@@ -1,12 +1,13 @@
 """Alloy and mould material database for JoseCast v8.0.
 
-The actual material data lives in JSON files under ``data/materials/``:
+The actual material data lives in JSON files under ``core/materials_data/``:
 
-* ``data/materials/alloys.json`` – cast alloy physical properties.
-* ``data/materials/molds.json``  – mould / chill / sleeve properties.
+* ``alloys.json``      – cast alloy physical properties.
+* ``molds.json``       – real mould materials only (sand, metal, ceramic, ...).
+* ``body_presets.json`` – non-mould body inserts (chills, sleeves, filters).
 
 This module loads those JSON files at import time and exposes the same
-``ALLOYS``/``MOLDS`` dictionaries and helper functions as before.  If the JSON
+``ALLOYS``/``MOLDS``/``BODY_PRESETS`` dictionaries and helper functions.  If the JSON
 files are missing or malformed, a small built-in fallback is used so the
 program keeps running.
 """
@@ -227,6 +228,7 @@ class Alloy:
 
 ALLOYS: Dict[str, Alloy] = {}
 MOLDS: Dict[str, MoldMaterial] = {}
+BODY_PRESETS: Dict[str, MoldMaterial] = {}
 
 
 def _json_path(name: str) -> Path:
@@ -311,9 +313,10 @@ def _default_molds() -> Dict[str, MoldMaterial]:
 
 
 def _load_materials() -> None:
-    """Populate ALLOYS and MOLDS from JSON, with a tiny fallback."""
+    """Populate ALLOYS, MOLDS and BODY_PRESETS from JSON, with fallbacks."""
     ALLOYS.clear()
     MOLDS.clear()
+    BODY_PRESETS.clear()
 
     alloys_raw = _load_json_dict(_json_path("alloys.json"))
     if alloys_raw:
@@ -335,6 +338,14 @@ def _load_materials() -> None:
     if not MOLDS:
         MOLDS.update(_default_molds())
 
+    body_raw = _load_json_dict(_json_path("body_presets.json"))
+    if body_raw:
+        for k, v in body_raw.items():
+            try:
+                BODY_PRESETS[k] = MoldMaterial(**v)
+            except Exception as exc:
+                print(f"[MATERIALS] skipping invalid body preset {k}: {exc}")
+
 
 _load_materials()
 
@@ -346,15 +357,29 @@ def get_alloy(key: str) -> Alloy:
 
 
 def get_mold(key: str) -> MoldMaterial:
+    """Return a real mould material.  Unknown keys fall back to ``sand``."""
     if key in MOLDS:
         return MOLDS[key]
     return MOLDS.get("sand", next(iter(MOLDS.values())))
+
+
+def get_body_preset(key: str) -> Optional[MoldMaterial]:
+    """Return a non-mould body-insert preset (chill, sleeve, filter) or ``None``."""
+    return BODY_PRESETS.get(key)
 
 
 def save_molds(path: Optional[Path] = None) -> None:
     """Persist the current in-memory ``MOLDS`` dictionary back to JSON."""
     target = path or _json_path("molds.json")
     data = {key: asdict(mold) for key, mold in MOLDS.items()}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def save_body_presets(path: Optional[Path] = None) -> None:
+    """Persist the current in-memory ``BODY_PRESETS`` dictionary back to JSON."""
+    target = path or _json_path("body_presets.json")
+    data = {key: asdict(mold) for key, mold in BODY_PRESETS.items()}
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -372,6 +397,8 @@ def make_effective_mold(
         preset_key = getattr(body, "mold_preset", "")
         if preset_key and preset_key in MOLDS:
             base = MOLDS[preset_key]
+        elif preset_key and preset_key in BODY_PRESETS:
+            base = BODY_PRESETS[preset_key]
         afs = getattr(body, "mold_afs_grain_size", 0.0) or 0.0
         moisture = getattr(body, "mold_moisture_percent", 0.0) or 0.0
         binder = getattr(body, "mold_binder_percent", 0.0) or 0.0

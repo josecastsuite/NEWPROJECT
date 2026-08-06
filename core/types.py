@@ -64,6 +64,8 @@ class BodyType(IntEnum):
     SPRUE_THROAT = 17
     DISTRIBUTOR = 19
     CURUFLUK = 21
+    CHILL = 23
+    SLEEVE = 25
 
 
 BODY_TYPE_LABELS = {
@@ -79,6 +81,8 @@ BODY_TYPE_LABELS = {
     BodyType.SPRUE_THROAT: "D.AĞZI BOĞAZI",
     BodyType.DISTRIBUTOR: "DAĞITICI",
     BodyType.CURUFLUK: "CURUFLUK",
+    BodyType.CHILL: "SOĞUTUCU (CHILL)",
+    BodyType.SLEEVE: "YALANCI (SLEEVE)",
 }
 
 # Body types that contain liquid metal during pouring (part + gating + riser).
@@ -112,7 +116,10 @@ BODY_FEEDER_TYPES = [
 ]
 
 # Inserts that accelerate local cooling and must never be treated as feeders.
-CHILL_BODY_TYPES = [BodyType.COOLING_SPRUE]
+CHILL_BODY_TYPES = [BodyType.COOLING_SPRUE, BodyType.CHILL]
+
+# Insulating sleeves around risers; excluded from the metal domain.
+SLEEVE_BODY_TYPES = [BodyType.SLEEVE]
 
 
 class GatingVelocityError(RuntimeError):

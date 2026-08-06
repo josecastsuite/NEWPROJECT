@@ -45,6 +45,8 @@ BODY_TYPE_NAMES = {
     BodyType.SPRUE_THROAT: "D.AĞZI BOĞAZI",
     BodyType.DISTRIBUTOR: "DAĞITICI",
     BodyType.CURUFLUK: "CURUFLUK",
+    BodyType.CHILL: "SOĞUTUCU",
+    BodyType.SLEEVE: "YALANCI",
 }
 
 
