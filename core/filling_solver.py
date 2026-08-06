@@ -690,6 +690,178 @@ def _apply_sand_permeability_correction(
     return np.clip(corrected, 0.0, 1.0)
 
 
+def compute_geometric_air_entrapment(
+    grid: np.ndarray,
+    origin: np.ndarray,
+    dx_mm: float,
+    gravity_vector: Tuple[float, float, float] = (0.0, -1.0, 0.0),
+    mold: Any = None,
+    casting_params: Any = None,
+    max_cells: int = 150_000,
+) -> Tuple[np.ndarray, float, np.ndarray]:
+    """Detect trapped-air pockets from geometry alone, without LBM/VOF.
+
+    The casting cavity is treated as a height field along ``-g``.  Air can
+    escape through any outlet (top of a RISER/FEEDER/VENT) to which it has a
+    monotonically upward path through empty cells.  Empty cells that cannot
+    reach such an outlet are trapped; the risk is projected onto the adjacent
+    body cells (part/gating) so the viewer can render it as a point cloud.
+
+    Parameters
+    ----------
+    grid : np.ndarray[int]
+        Body-type voxel grid (BodyType.EMPTY = 0 is the cavity).
+    origin, dx_mm
+        Voxel grid origin (mm) and pitch (mm).
+    gravity_vector
+        Downward gravity direction.
+    mold, casting_params
+        Optional; used only for the sand-permeability near-surface correction.
+    max_cells
+        Downsample the grid to keep the priority flood fill fast.
+
+    Returns
+    -------
+    risk : np.ndarray[float32]
+        Per-voxel risk on body cells (0..1).
+    trapped_air_volume_m3 : float
+        Estimated volume of geometrically trapped air.
+    centroid_mm : np.ndarray
+        (3,) centroid of the risk field in mm, or empty array if none.
+    """
+    g = _gravity_unit(gravity_vector)
+    origin = np.asarray(origin, dtype=np.float64)
+    orig_grid = grid
+    orig_origin = origin.copy()
+    orig_dx_mm = float(dx_mm)
+    orig_shape = grid.shape
+
+    # Keep the solve fast: downsample to ~max_cells body cells.
+    if int(np.count_nonzero(grid != int(BodyType.EMPTY))) > max_cells:
+        grid, origin, dx_mm = _downsample_grid(grid, origin, dx_mm, max_cells=max_cells)
+
+    shape = grid.shape
+    dx_m = float(dx_mm) / 1000.0
+    empty = grid == int(BodyType.EMPTY)
+    body = ~empty
+
+    if not empty.any():
+        risk = np.zeros(orig_shape, dtype=np.float32)
+        return risk, 0.0, np.array([], dtype=np.float64)
+
+    proj = _projection_along(shape, origin, dx_mm, g)
+
+    # Vent bodies: RISER, and optional FEEDER/VENT enum values if they exist.
+    vent_body_types = {int(BodyType.RISER)}
+    for name in ("FEEDER", "VENT", "EXHAUST", "AIR_VENT"):
+        val = getattr(BodyType, name, None)
+        if val is not None:
+            vent_body_types.add(int(val))
+
+    vent_body = np.zeros(shape, dtype=bool)
+    for bt in vent_body_types:
+        vent_body |= grid == bt
+
+    s6 = ndimage.generate_binary_structure(3, 1)
+    outlet_empty = np.zeros(shape, dtype=bool)
+    if vent_body.any():
+        top_vent_body = _find_boundary_cells_along(vent_body, g, side="up")
+        if top_vent_body.any():
+            top_proj = np.where(top_vent_body, proj, -np.inf)
+            max_top_neighbor = ndimage.maximum_filter(
+                top_proj, footprint=s6, mode="nearest", cval=-np.inf
+            )
+            outlet_empty = (
+                empty
+                & np.isfinite(max_top_neighbor)
+                & (proj > max_top_neighbor - 1e-9)
+            )
+
+    # Priority flood fill from outlets, moving only to empty cells that are
+    # lower or at the same height (air can only drain upward).
+    can_escape = outlet_empty.copy()
+    if can_escape.any():
+        heap = []
+        for c in np.argwhere(can_escape):
+            heapq.heappush(heap, (-float(proj[tuple(c)]), (int(c[0]), int(c[1]), int(c[2]))))
+
+        while heap:
+            neg_h, c = heapq.heappop(heap)
+            h = -neg_h
+            cz, cy, cx = c
+            # 6-neighbour offsets
+            neighbors = []
+            if cz > 0:
+                neighbors.append((cz - 1, cy, cx))
+            if cz < shape[0] - 1:
+                neighbors.append((cz + 1, cy, cx))
+            if cy > 0:
+                neighbors.append((cz, cy - 1, cx))
+            if cy < shape[1] - 1:
+                neighbors.append((cz, cy + 1, cx))
+            if cx > 0:
+                neighbors.append((cz, cy, cx - 1))
+            if cx < shape[2] - 1:
+                neighbors.append((cz, cy, cx + 1))
+
+            for n in neighbors:
+                if can_escape[n]:
+                    continue
+                if not empty[n]:
+                    continue
+                if proj[n] > h + 1e-9:
+                    continue
+                can_escape[n] = True
+                heapq.heappush(heap, (-float(proj[n]), n))
+
+    trapped_empty = empty & ~can_escape
+
+    # Outside air above the domain boundary is not a casting defect; remove any
+    # trapped component that touches the outer boundary of the voxel grid.
+    boundary_mask = np.zeros(shape, dtype=bool)
+    boundary_mask[0, :, :] = True
+    boundary_mask[-1, :, :] = True
+    boundary_mask[:, 0, :] = True
+    boundary_mask[:, -1, :] = True
+    boundary_mask[:, :, 0] = True
+    boundary_mask[:, :, -1] = True
+    if trapped_empty.any():
+        trapped_labels, n_trapped = ndimage.label(trapped_empty, structure=s6)
+        for label_id in range(1, n_trapped + 1):
+            comp = trapped_labels == label_id
+            if np.any(ndimage.binary_dilation(comp, structure=s6) & boundary_mask):
+                trapped_empty[comp] = False
+
+    # Project trapped-empty cells onto adjacent body cells for rendering.
+    risk = ndimage.maximum_filter(trapped_empty.astype(np.float32), footprint=s6)
+    risk = np.where(body, risk, 0.0)
+
+    if mold is not None and casting_params is not None:
+        risk = _apply_sand_permeability_correction(
+            risk, body, mold, casting_params, float(dx_mm)
+        )
+
+    # Resample back to the original grid if we downsampled.
+    if grid is not orig_grid:
+        risk = _resample_to_grid(
+            risk, origin, dx_mm, orig_shape, orig_origin, orig_dx_mm, fill_value=0.0, order=0
+        )
+        trapped_empty = _resample_to_grid(
+            trapped_empty.astype(np.float32), origin, dx_mm, orig_shape, orig_origin, orig_dx_mm,
+            fill_value=0.0, order=0,
+        ) > 0.5
+
+    trapped_volume_m3 = float(np.count_nonzero(trapped_empty)) * ((orig_dx_mm / 1000.0) ** 3)
+    if trapped_empty.any():
+        coords = np.argwhere(trapped_empty)
+        centroid_mm = np.mean(coords, axis=0) * orig_dx_mm + orig_origin + orig_dx_mm / 2.0
+        centroid_mm = np.asarray(centroid_mm, dtype=np.float64)
+    else:
+        centroid_mm = np.array([], dtype=np.float64)
+
+    return risk.astype(np.float32), trapped_volume_m3, centroid_mm
+
+
 def _compute_ingate_entrainment_risk(
     velocity_magnitude: np.ndarray,
     grid: np.ndarray,

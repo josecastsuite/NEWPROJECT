@@ -2526,6 +2526,36 @@ def analyze(
             getattr(flow_result_for_thermal, "air_entrapment_centroid_mm", np.array([])),
             dtype=np.float64,
         )
+
+    # Geometric trapped-air fallback / complement: runs even when the 3-D LBM
+    # solver is disabled or misses closed pockets under overhangs.
+    use_geometric = (
+        flow_result_for_thermal is None
+        or flow_result_for_thermal.air_entrapment is None
+        or air_entrapment_field.size != grid.size
+        or float(air_entrapment_field.max()) < 0.05
+    )
+    if use_geometric:
+        from core.filling_solver import compute_geometric_air_entrapment
+
+        geo_risk, geo_vol, geo_cent = compute_geometric_air_entrapment(
+            grid,
+            origin_mm,
+            dx,
+            gravity_vector=tuple(g_unit),
+            mold=mold,
+            casting_params=casting_params,
+            max_cells=150_000,
+        )
+        if geo_risk.size == grid.size:
+            if air_entrapment_field.size != grid.size:
+                air_entrapment_field = np.asarray(geo_risk, dtype=np.float64)
+            else:
+                air_entrapment_field = np.maximum(air_entrapment_field, geo_risk)
+            trapped_air_volume_m3 = max(trapped_air_volume_m3, float(geo_vol))
+            if geo_cent.size == 3:
+                air_entrapment_centroid_mm = geo_cent
+
     temperature, solid_fraction, t_liq, t_s, G, cooling_rate, niyama = solve_3d_thermal(
         grid, alloy, mold, dx,
         max_time_s=thermal_max_time_s,
