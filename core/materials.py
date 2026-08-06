@@ -73,6 +73,7 @@ class Alloy:
     density_g_cm3: float = 0.0
     # Flow / feeding coefficients
     viscosity_pa_s: float = 0.003
+    surface_tension_n_m: float = 0.0
     particle_size_mm: float = 0.30
     # Feeding distance FD = feed_k1 * t_section (t_section = 2 * local modulus)
     # so feed_k1=4.5 gives the classic FD = 4.5 * wall_thickness for a plate.
@@ -156,6 +157,17 @@ class Alloy:
             self.carbon_equivalent = 0.0
         if self.niyama_star_scale <= 0.0:
             self.niyama_star_scale = self._niyama_star_scale()
+        if self.surface_tension_n_m <= 0.0:
+            family_defaults = {
+                "aluminum": 0.90,
+                "magnesium": 0.55,
+                "cast_iron": 1.40,
+                "steel": 1.70,
+                "copper": 1.15,
+                "superalloy": 1.75,
+            }
+            family = (self.material_family or "steel").lower().strip()
+            self.surface_tension_n_m = family_defaults.get(family, 1.50)
 
     def _niyama_star_scale(self) -> float:
         """Solve the Carlson curve so N=niyama_macro gives the macro size proxy."""

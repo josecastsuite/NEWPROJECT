@@ -642,6 +642,100 @@ def _compute_air_entrapment_risk(
     return risk.astype(np.float32), trapped_volume_m3, center_vox
 
 
+def _sand_permeability_damping(mold: Any, casting_params: Any) -> float:
+    """Compute a 0-1 surface-escape damping factor from AFS/permeability P.
+
+    User formulas:
+        AFS = 15.5 / d50        (d50 in mm)
+        P   = 300000 / AFS^1.5  (Dietert permeability number)
+    Larger P means the sand breathes more; the damping factor approaches 1.
+    For metal/ceramic molds or missing d50 the factor is 0.
+    """
+    is_sand = bool(getattr(mold, "is_sand", False))
+    if not is_sand:
+        return 0.0
+    d50 = float(getattr(casting_params, "mold_particle_size_mm", 0.0))
+    if d50 <= 0.0:
+        d50 = float(getattr(mold, "particle_size_mm", 0.0))
+    if d50 <= 0.0:
+        return 0.0
+    afs = 15.5 / d50
+    P = 300000.0 / (afs ** 1.5)
+    # Smooth saturation: P=500 -> ~0.63, P=1000 -> ~0.86, P>=2000 -> ~0.98
+    return float(np.clip(1.0 - np.exp(-P / 500.0), 0.0, 1.0))
+
+
+def _apply_sand_permeability_correction(
+    risk: np.ndarray,
+    cavity_mask: np.ndarray,
+    mold: Any,
+    casting_params: Any,
+    dx_mm: float,
+) -> np.ndarray:
+    """Reduce near-surface air-entrapment risk in permeable sand molds.
+
+    The damping factor from Dietert permeability P is applied with an
+    exponential decay away from the cavity surface so deep closed pockets are
+    not artificially lowered.
+    """
+    damping = _sand_permeability_damping(mold, casting_params)
+    if damping <= 0.0 or not cavity_mask.any():
+        return risk
+    dist_to_surface_mm = ndimage.distance_transform_edt(
+        cavity_mask, sampling=dx_mm
+    )
+    depth_mm = 5.0 + 25.0 * damping
+    escape_factor = damping * np.exp(-dist_to_surface_mm / max(depth_mm, 1e-3))
+    corrected = risk * (1.0 - escape_factor)
+    return np.clip(corrected, 0.0, 1.0)
+
+
+def _compute_ingate_entrainment_risk(
+    velocity_magnitude: np.ndarray,
+    grid: np.ndarray,
+    alloy: Any,
+    dx_m: float,
+) -> np.ndarray:
+    """We/Oh-based surface-turbulence entrainment risk at INGATE cells only.
+
+    Only gate cells with v > v_crit are considered.  We and Oh are evaluated
+    with the local hydraulic diameter D ~ 2 * (distance to cavity wall).
+    """
+    risk = np.zeros_like(velocity_magnitude, dtype=np.float64)
+    ingate_mask = grid == BodyType.INGATE
+    if not ingate_mask.any():
+        return risk.astype(np.float32)
+
+    rho = float(getattr(alloy, "rho_kg_m3", 7000.0))
+    mu = float(getattr(alloy, "viscosity_pa_s", 0.006))
+    sigma = float(getattr(alloy, "surface_tension_n_m", 1.5))
+    v_crit = float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.5))
+    if rho <= 0.0 or mu <= 0.0 or sigma <= 0.0 or v_crit <= 0.0:
+        return risk.astype(np.float32)
+
+    # Local characteristic length: hydraulic diameter from cavity distance.
+    cavity = grid != BodyType.EMPTY
+    dist_to_wall_m = ndimage.distance_transform_edt(cavity, sampling=dx_m)
+    D = 2.0 * dist_to_wall_m
+    D = np.where(D <= 0.0, dx_m, D)
+
+    v = np.asarray(velocity_magnitude, dtype=np.float64)
+    v = np.where(ingate_mask & (v > v_crit), v, 0.0)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        We = rho * v * v * D / sigma
+        Oh = mu / np.sqrt(rho * sigma * D)
+
+    We_crit = 10.0
+    Oh_crit = 0.2
+    we_excess = np.maximum(We / We_crit - 1.0, 0.0)
+    oh_factor = np.clip(1.0 - Oh / Oh_crit, 0.0, 1.0)
+    v_factor = np.clip((v - v_crit) / max(v_crit, 1e-9), 0.0, 1.0)
+    entrainment = np.clip(we_excess * oh_factor * v_factor, 0.0, 1.0)
+
+    return np.where(ingate_mask, entrainment, 0.0).astype(np.float32)
+
+
 def _build_laplace_matrix(
     cavity: np.ndarray,
     dirichlet: np.ndarray,
@@ -5937,6 +6031,25 @@ def solve_filling_flow(
             )
             air_entrapment_fine = np.clip(air_entrapment_fine, 0.0, 1.0)
             air_entrapment_fine = np.where(fine_metal, air_entrapment_fine, 0.0)
+
+            # Stage 2: sand AFS/permeability correction (near-surface only).
+            if mold is not None:
+                air_entrapment_fine = _apply_sand_permeability_correction(
+                    air_entrapment_fine,
+                    fine_metal,
+                    mold,
+                    casting_params,
+                    float(orig_dx),
+                )
+
+            # Stage 4: INGATE We/Oh surface-entrainment risk.
+            entrainment_risk = _compute_ingate_entrainment_risk(
+                vmag_fine,
+                orig_grid,
+                alloy,
+                float(orig_dx_m),
+            )
+            air_entrapment_fine = np.maximum(air_entrapment_fine, entrainment_risk)
 
             if air_entrapment_fine.any():
                 trapped_air_volume_m3 = float(np.sum(air_entrapment_fine)) * (
