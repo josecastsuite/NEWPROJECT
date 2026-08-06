@@ -894,13 +894,18 @@ def _build_velocity_field(
     if not cavity_mask.any():
         return v_field
 
+    # Compute a characteristic cavity velocity as a safe default.
+    if fill_time_s > 1e-12 and Q_m3_s > 1e-12:
+        v_cavity = float(cavity_mask.sum()) * (dx_m ** 3)
+        l_char = max(v_cavity ** (1.0 / 3.0), 3.0 * dx_m)
+        v_default = max(Q_m3_s / max(l_char * l_char, 1e-12), 0.1)
+    elif fill_time_s > 1e-12:
+        v_default = 1.0
+    else:
+        v_default = 0.5
+
     if gating_nodes and bodies is not None and body_index is not None and body_index.shape == shape:
         name_to_bidx = {b.name: i for i, b in enumerate(bodies)}
-        part_bidx = None
-        for i, b in enumerate(bodies):
-            if b.body_type == BodyType.PART:
-                part_bidx = i
-                break
 
         for node in gating_nodes:
             v = float(getattr(node, "max_velocity_m_s", 0.0))
@@ -909,43 +914,39 @@ def _build_velocity_field(
             if v < 1e-12:
                 continue
             try:
-                _, down_name = _split_arrow(node.name)
-                _, down_type = _split_arrow(node.body_type)
+                up_name, down_name = _split_arrow(node.name)
+                up_type, down_type = _split_arrow(node.body_type)
             except Exception:
                 continue
 
-            mask = np.zeros(shape, dtype=bool)
-            if down_name in name_to_bidx:
-                bidx = name_to_bidx[down_name]
-                if 0 <= bidx < len(bodies):
-                    mask = body_index == bidx
-            elif down_name in ("Parça", "PART") or down_type in ("Parça", "PART"):
-                if part_bidx is not None:
-                    mask = body_index == part_bidx
-            elif down_type:
-                body_type_val = None
-                try:
-                    body_type_val = getattr(BodyType, down_type, None)
-                except Exception:
-                    pass
-                if body_type_val is not None:
-                    mask = grid == int(body_type_val)
-            mask &= cavity_mask
-            if mask.any():
-                v_field[mask] = np.maximum(v_field[mask], v)
+            for target_name, target_type in ((up_name, up_type), (down_name, down_type)):
+                mask = np.zeros(shape, dtype=bool)
+                if target_name in name_to_bidx:
+                    bidx = name_to_bidx[target_name]
+                    if 0 <= bidx < len(bodies):
+                        mask = body_index == bidx
+                if not mask.any() and target_type:
+                    if target_type in ("Parça", "PART"):
+                        mask = grid == int(BodyType.PART)
+                    else:
+                        body_type_val = getattr(BodyType, target_type, None)
+                        if body_type_val is not None:
+                            mask = grid == int(body_type_val)
+                mask &= cavity_mask
+                if mask.any():
+                    v_field[mask] = np.maximum(v_field[mask], v)
 
+    # Any body/cell that did not receive a velocity gets the characteristic value.
     if v_field[cavity_mask].max() < 1e-12:
-        if fill_time_s > 1e-12 and Q_m3_s > 1e-12:
-            v_cavity = float(cavity_mask.sum()) * (dx_m ** 3)
-            l_char = max(v_cavity ** (1.0 / 3.0), 3.0 * dx_m)
-            a_est = max(l_char * l_char, 1e-12)
-            v_field[cavity_mask] = max(Q_m3_s / a_est, 1e-6)
-        elif fill_time_s > 1e-12:
-            v_field[cavity_mask] = 1.0
-        else:
-            v_field[cavity_mask] = 0.1
-
-    v_field[cavity_mask] = np.maximum(v_field[cavity_mask], 1e-6)
+        v_field[cavity_mask] = v_default
+    else:
+        # Also fill bodies that are entirely unassigned using the default.
+        for i, b in enumerate(bodies if bodies else []):
+            bmask = cavity_mask & (body_index == i) & (v_field <= 1e-12)
+            if bmask.any():
+                v_field[bmask] = v_default
+    # Final clamp: zero velocity is physically meaningless and creates infinite times.
+    v_field[cavity_mask] = np.maximum(v_field[cavity_mask], 0.01)
     return v_field
 
 
@@ -1056,11 +1057,7 @@ def _escape_time_maxmin(
         heapq.heappush(heap, (-float(t_escape[z, y, x]), int(z), int(y), int(x)))
 
     offsets = [
-        (dz, dy, dx_off)
-        for dz in (-1, 0, 1)
-        for dy in (-1, 0, 1)
-        for dx_off in (-1, 0, 1)
-        if not (dz == 0 and dy == 0 and dx_off == 0)
+        (-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)
     ]
 
     while heap:
@@ -1181,9 +1178,10 @@ def compute_air_entrapment_geofc(
         )
         inlet_mask[idx] = True
 
-    outlet_mask = _select_lbm_outlet_cells(grid, cavity_mask, g, mold)
-    if outlet_mask.any():
-        outlet_mask = _top_cells_of_mask(outlet_mask, proj)
+    # Vent mask for physical vent capacity (Q_max).  Keep only real risers/vents.
+    vent_mask = _select_lbm_outlet_cells(grid, cavity_mask, g, mold)
+    if vent_mask.any():
+        vent_mask = _top_cells_of_mask(vent_mask, proj)
 
     v_field = _build_velocity_field(
         grid,
@@ -1204,19 +1202,60 @@ def compute_air_entrapment_geofc(
             if max_t > 1e-12 and not np.isinf(max_t):
                 t_fill[finite_mask] *= fill_time_s / max_t
 
-    t_escape = _escape_time_maxmin(t_fill, cavity_mask, outlet_mask)
-    if not outlet_mask.any():
+    # Outlet seeds for the max-min escape time are the physically open vents
+    # and the pour cup / sprue top.  Closed pockets can have the highest t_fill,
+    # so we must NOT seed on t_fill maxima.  Source/vent body cells are treated
+    # as open (t_fill = fill_time_s) in the escape graph because the empty space
+    # above the metal in the sprue/riser remains connected to atmosphere.
+    finite_mask = cavity_mask & np.isfinite(t_fill)
+    outlet_mask = np.zeros(shape, dtype=bool)
+    if vent_mask.any():
+        outlet_mask |= vent_mask
+    for key in ("SPRUE", "POURING_BASIN"):
+        btype = getattr(BodyType, key, None)
+        if btype is not None:
+            mask = (grid == int(btype)) & cavity_mask
+            if mask.any():
+                outlet_mask |= _top_cells_of_mask(mask, proj)
+    # Last resort: a single open cell at the highest projection of the cavity.
+    if not outlet_mask.any() and finite_mask.any():
+        idx = np.unravel_index(np.argmax(np.where(finite_mask, proj, -np.inf)), shape)
+        outlet_mask = np.zeros(shape, dtype=bool)
+        outlet_mask[idx] = True
+
+    t_fill_escape = t_fill.copy()
+    open_body_mask = np.zeros(shape, dtype=bool)
+    for key in ("SPRUE", "POURING_BASIN", "RISER", "FEEDER", "VENT", "EXHAUST", "AIR_VENT"):
+        btype = getattr(BodyType, key, None)
+        if btype is not None:
+            open_body_mask |= (grid == int(btype)) & cavity_mask
+    t_fill_escape[open_body_mask] = fill_time_s
+
+    if outlet_mask.any():
+        t_escape = _escape_time_maxmin(t_fill_escape, cavity_mask, outlet_mask)
+    else:
         t_escape = np.zeros(shape, dtype=np.float64)
 
-    tol = 1e-12
+    # Noise tolerance: equal up to a small fraction of the total fill time.
+    max_t = float(np.max(t_fill[finite_mask])) if finite_mask.any() else 1.0
+    tol = max(1e-12, 1e-9 * max(1.0, max_t))
     trapped = (t_fill > t_escape + tol) & cavity_mask
-    # Air-entrapment risk belongs to the casting cavity (PART); gating-system
-    # cells are swept by incoming metal and should not be reported as pockets.
-    part_mask = grid == int(BodyType.PART)
-    if part_mask.any():
-        trapped &= part_mask
+    # Air-entrapment risk is reported on the whole cavity.  In some STEP
+    # assemblies the casting arms are labelled as RUNNER/DISTRIBUTOR by the
+    # heuristic voxelizer, so restricting to BodyType.PART would miss the real
+    # undercuts.  The inlet (SPRUE top) is still excluded by the front-arrival
+    # model.
     s6 = ndimage.generate_binary_structure(3, 1)
-    labels, n_comp = ndimage.label(trapped, structure=s6)
+    s26 = ndimage.generate_binary_structure(3, 3)
+    labels, n_comp = ndimage.label(trapped, structure=s26)
+    # Drop tiny noise pockets (sub-voxel / single-voxel artefacts).
+    min_cells = max(20, int(1e-7 / max(dx_m ** 3, 1e-18)))
+    if n_comp > 0:
+        sizes = ndimage.sum(trapped, labels, index=np.arange(1, n_comp + 1))
+        for i, npx in enumerate(sizes.tolist()):
+            if npx < min_cells:
+                trapped[labels == (i + 1)] = False
+        labels, n_comp = ndimage.label(trapped, structure=s26)
     risk = np.zeros(shape, dtype=np.float64)
 
     sqrt_term = np.sqrt(2.0 * delta_p_pa / max(rho_air, 1e-12))
@@ -1243,7 +1282,7 @@ def compute_air_entrapment_geofc(
             continue
         diff = np.abs(t2[valid] - t1[valid])
         dt_max = max(dt_max, float(np.max(diff)))
-    throat_tol = max(1e-9, 0.8 * dt_max)
+    throat_tol = max(1e-12, 1e-3 * max(1.0, max_t))
 
     riser_like = {int(BodyType.RISER)}
     for name in ("FEEDER",):
@@ -1262,7 +1301,8 @@ def compute_air_entrapment_geofc(
         if n_cells == 0:
             continue
         v_pocket = n_cells * (dx_m ** 3)
-        t_seal = float(np.max(t_escape[comp]))
+        comp_t = t_escape[comp]
+        t_seal = float(np.min(comp_t)) if comp_t.size else 0.0
         if np.isinf(t_seal) or np.isnan(t_seal) or t_seal < 0.0:
             t_seal = 0.0
 
@@ -1270,47 +1310,77 @@ def compute_air_entrapment_geofc(
             risk[comp] = 1.0
             continue
 
+        # Geometric vent-lock rule.  The pocket is safe only if the sealing throat
+        # opens into an outside air region connected to a real vent.  The throat
+        # is the narrow saddle where t_fill and t_escape both equal the bottleneck
+        # value.  We then check whether the outside component that the throat
+        # touches contains an open vent; otherwise Q_max = 0 and risk = 1.
         dilated = ndimage.binary_dilation(comp, structure=s6, iterations=1) & cavity_mask
-        border = dilated & ~comp
-        throat = np.zeros(shape, dtype=bool)
-        if border.any():
-            near_seal = (
-                (t_escape >= t_seal - throat_tol)
-                & (t_escape <= t_seal + throat_tol)
-                & (t_fill >= t_seal - throat_tol)
-                & (t_fill <= t_seal + throat_tol)
-            )
-            throat = border & near_seal
-        if not throat.any():
-            throat = border & outlet_mask
-        if not throat.any() and border.any():
-            border_t = t_escape[border]
-            best = float(np.max(border_t))
-            throat = border & (t_escape >= best - throat_tol)
+        outside = cavity_mask & ~comp
+        border = dilated & outside
+        near_seal = (
+            border
+            & (t_escape >= t_seal - throat_tol)
+            & (t_escape <= t_seal + throat_tol)
+            & (t_fill >= t_seal - throat_tol)
+            & (t_fill <= t_seal + throat_tol)
+        )
+        throat = near_seal
 
-        if throat.any():
-            a_throat = float(throat.sum()) * voxel_area_m2
-            body_vals = grid[throat]
-            if body_vals.size:
-                most_common = int(np.bincount(body_vals.astype(np.int64)).argmax())
-                if most_common in riser_like:
-                    cd = cd_riser
-                elif most_common in vent_like:
-                    cd = cd_vent
-                else:
-                    cd = cd_default
+        if not throat.any():
+            risk[comp] = 1.0
+            continue
+
+        outside_labels, n_out = ndimage.label(outside, structure=s6)
+        connected_vent = np.zeros(shape, dtype=bool)
+        if n_out > 0:
+            vent_out_labels = set(outside_labels[vent_mask & outside].tolist())
+            throat_labels = outside_labels[throat & outside]
+            keep_labels = set(throat_labels.tolist()) & vent_out_labels
+            for lbl in keep_labels:
+                connected_vent |= outside_labels == lbl
+
+        vented_throat = throat & ndimage.binary_dilation(connected_vent, structure=s6)
+        if not vented_throat.any():
+            risk[comp] = 1.0
+            continue
+
+        a_throat = float(vented_throat.sum()) * voxel_area_m2
+        a_vent = float((connected_vent & vent_mask).sum()) * voxel_area_m2
+        a_eff = min(a_throat, a_vent) if a_vent > 0.0 else a_throat
+        vent_body_vals = grid[vent_mask & connected_vent]
+        if vent_body_vals.size:
+            most_common = int(np.bincount(vent_body_vals.astype(np.int64)).argmax())
+            if most_common in riser_like:
+                cd = cd_riser
+            elif most_common in vent_like:
+                cd = cd_vent
             else:
                 cd = cd_default
-            q_max = cd * a_throat * sqrt_term
         else:
-            q_max = 0.0
+            cd = cd_default
+        q_max = cd * a_eff * sqrt_term
 
-        if q_max <= 0.0 or t_seal <= 0.0:
+        # Air escape window: the time from the start of fill until the throat
+        # seals.  During this interval the pocket is open to the vent through the
+        # throat; once sealed the remaining air is trapped.
+        t_window = max(0.0, t_seal)
+        if q_max <= 0.0 or t_window <= 0.0:
             risk_val = 1.0
         else:
-            risk_val = 1.0 - min(1.0, (q_max * t_seal) / max(v_pocket, 1e-18))
+            risk_val = 1.0 - min(1.0, (q_max * t_window) / max(v_pocket, 1e-18))
             risk_val = float(np.clip(risk_val, 0.0, 1.0))
-        risk[comp] = risk_val
+
+        # Localize risk inside the pocket: deepest cells (largest t_fill - t_escape)
+        # are the last to be reached by air, so they are the most likely to trap.
+        comp_depth = (t_fill - t_escape)[comp]
+        comp_depth = np.clip(comp_depth, 0.0, None)
+        max_depth = float(np.max(comp_depth)) if comp_depth.size else 1.0
+        if max_depth > 1e-12:
+            depth_scale = comp_depth / max_depth
+        else:
+            depth_scale = 1.0
+        risk[comp] = risk_val * depth_scale
 
     if mold is not None and casting_params is not None:
         risk = _apply_sand_permeability_correction(

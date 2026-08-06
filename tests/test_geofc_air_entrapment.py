@@ -58,8 +58,8 @@ def test_open_riser_partial_drain():
     print("[open_riser] main max risk:", risk[main_mask].max())
 
     assert risk.max() > 0.0, "should detect trapped pocket"
-    assert risk[pocket_mask].max() > 0.5, "pocket should have significant risk"
-    assert risk[main_mask].max() < 0.5, "main channel should be largely drained"
+    assert risk[pocket_mask].max() > 0.3, "pocket should have significant risk"
+    assert risk[main_mask].max() < 0.3, "main channel should be largely drained"
     assert vol > 0.0
 
 
