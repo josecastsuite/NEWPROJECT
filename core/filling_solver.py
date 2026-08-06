@@ -862,6 +862,487 @@ def compute_geometric_air_entrapment(
     return risk.astype(np.float32), trapped_volume_m3, centroid_mm
 
 
+def _split_arrow(s: str) -> Tuple[str, str]:
+    """Split 'up → down' or 'up -> down' into (up, down)."""
+    s = (
+        s.strip()
+        .replace(" -> ", "→")
+        .replace(" ->", "→")
+        .replace("-> ", "→")
+        .replace("->", "→")
+        .replace(" → ", "→")
+        .replace(" →", "→")
+        .replace("→ ", "→")
+    )
+    parts = s.split("→")
+    return parts[0].strip(), (parts[1].strip() if len(parts) > 1 else "")
+
+
+def _build_velocity_field(
+    grid: np.ndarray,
+    cavity_mask: np.ndarray,
+    gating_nodes: Optional[List[GatingNode]],
+    bodies: Optional[List[Body]],
+    body_index: Optional[np.ndarray],
+    fill_time_s: float,
+    Q_m3_s: float,
+    dx_m: float,
+) -> np.ndarray:
+    """Estimate per-voxel metal front velocity (m/s) from gating nodes."""
+    shape = grid.shape
+    v_field = np.zeros(shape, dtype=np.float64)
+    if not cavity_mask.any():
+        return v_field
+
+    if gating_nodes and bodies is not None and body_index is not None and body_index.shape == shape:
+        name_to_bidx = {b.name: i for i, b in enumerate(bodies)}
+        part_bidx = None
+        for i, b in enumerate(bodies):
+            if b.body_type == BodyType.PART:
+                part_bidx = i
+                break
+
+        for node in gating_nodes:
+            v = float(getattr(node, "max_velocity_m_s", 0.0))
+            if v < 1e-12:
+                v = float(getattr(node, "velocity_m_s", 0.0))
+            if v < 1e-12:
+                continue
+            try:
+                _, down_name = _split_arrow(node.name)
+                _, down_type = _split_arrow(node.body_type)
+            except Exception:
+                continue
+
+            mask = np.zeros(shape, dtype=bool)
+            if down_name in name_to_bidx:
+                bidx = name_to_bidx[down_name]
+                if 0 <= bidx < len(bodies):
+                    mask = body_index == bidx
+            elif down_name in ("Parça", "PART") or down_type in ("Parça", "PART"):
+                if part_bidx is not None:
+                    mask = body_index == part_bidx
+            elif down_type:
+                body_type_val = None
+                try:
+                    body_type_val = getattr(BodyType, down_type, None)
+                except Exception:
+                    pass
+                if body_type_val is not None:
+                    mask = grid == int(body_type_val)
+            mask &= cavity_mask
+            if mask.any():
+                v_field[mask] = np.maximum(v_field[mask], v)
+
+    if v_field[cavity_mask].max() < 1e-12:
+        if fill_time_s > 1e-12 and Q_m3_s > 1e-12:
+            v_cavity = float(cavity_mask.sum()) * (dx_m ** 3)
+            l_char = max(v_cavity ** (1.0 / 3.0), 3.0 * dx_m)
+            a_est = max(l_char * l_char, 1e-12)
+            v_field[cavity_mask] = max(Q_m3_s / a_est, 1e-6)
+        elif fill_time_s > 1e-12:
+            v_field[cavity_mask] = 1.0
+        else:
+            v_field[cavity_mask] = 0.1
+
+    v_field[cavity_mask] = np.maximum(v_field[cavity_mask], 1e-6)
+    return v_field
+
+
+def _weighted_time_field(
+    cavity_mask: np.ndarray,
+    inlet_mask: np.ndarray,
+    v_field: np.ndarray,
+    dx_m: float,
+) -> np.ndarray:
+    """Dijkstra front-arrival time (s) from inlet using per-cell velocity."""
+    shape = cavity_mask.shape
+    node_id = np.full(shape, -1, dtype=np.int64)
+    n_nodes = int(cavity_mask.sum())
+    if n_nodes == 0:
+        return np.full(shape, np.inf, dtype=np.float64)
+    node_id[cavity_mask] = np.arange(n_nodes, dtype=np.int64)
+
+    v_nodes = v_field[cavity_mask]
+    rows: List[np.ndarray] = []
+    cols: List[np.ndarray] = []
+    data: List[np.ndarray] = []
+
+    for dz in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dx_off in (-1, 0, 1):
+                if dz == 0 and dy == 0 and dx_off == 0:
+                    continue
+                if not (
+                    dz > 0
+                    or (dz == 0 and dy > 0)
+                    or (dz == 0 and dy == 0 and dx_off > 0)
+                ):
+                    continue
+                if dz >= 0:
+                    sz = slice(0, shape[0] - dz)
+                    dz_s = slice(dz, shape[0])
+                else:
+                    sz = slice(-dz, shape[0])
+                    dz_s = slice(0, shape[0] + dz)
+                if dy >= 0:
+                    sy = slice(0, shape[1] - dy)
+                    dy_s = slice(dy, shape[1])
+                else:
+                    sy = slice(-dy, shape[1])
+                    dy_s = slice(0, shape[1] + dy)
+                if dx_off >= 0:
+                    sx = slice(0, shape[2] - dx_off)
+                    dx_s = slice(dx_off, shape[2])
+                else:
+                    sx = slice(-dx_off, shape[2])
+                    dx_s = slice(0, shape[2] + dx_off)
+
+                src = node_id[sz, sy, sx]
+                dst = node_id[dz_s, dy_s, dx_s]
+                valid = (src >= 0) & (dst >= 0)
+                if not valid.any():
+                    continue
+                src_nodes = src[valid]
+                dst_nodes = dst[valid]
+                dist = float(np.linalg.norm([dz, dy, dx_off])) * dx_m
+                v_avg = np.maximum((v_nodes[src_nodes] + v_nodes[dst_nodes]) * 0.5, 1e-6)
+                w = dist / v_avg
+                rows.append(src_nodes)
+                cols.append(dst_nodes)
+                data.append(w)
+
+    if rows:
+        graph = csr_matrix(
+            (np.concatenate(data), (np.concatenate(rows), np.concatenate(cols))),
+            shape=(n_nodes, n_nodes),
+        )
+    else:
+        graph = csr_matrix((n_nodes, n_nodes))
+
+    inlet_nodes = node_id[inlet_mask]
+    inlet_nodes = inlet_nodes[inlet_nodes >= 0]
+    t_fill = np.full(shape, np.inf, dtype=np.float64)
+    if inlet_nodes.size > 0:
+        dists = csgraph.dijkstra(
+            graph, indices=inlet_nodes, directed=False, return_predecessors=False
+        )
+        t_fill[cavity_mask] = np.min(dists, axis=0)
+    return t_fill
+
+
+def _escape_time_maxmin(
+    t_fill: np.ndarray,
+    cavity_mask: np.ndarray,
+    outlet_mask: np.ndarray,
+) -> np.ndarray:
+    """Latest time air can still escape to an outlet through unfilled cells.
+
+    Propagates the maximum bottleneck (max-min path value) from outlets.
+    ``T_escape[c]`` is the latest t such that a path c → outlet exists with all
+    cells on the path having ``t_fill >= t``.
+    """
+    shape = t_fill.shape
+    t_escape = np.full(shape, -np.inf, dtype=np.float64)
+    if not cavity_mask.any() or not outlet_mask.any():
+        return t_escape
+
+    t_outlet = t_fill.copy()
+    t_outlet[~outlet_mask] = np.inf
+    t_escape[outlet_mask] = t_outlet[outlet_mask]
+
+    heap = []
+    for z, y, x in np.argwhere(outlet_mask):
+        heapq.heappush(heap, (-float(t_escape[z, y, x]), int(z), int(y), int(x)))
+
+    offsets = [
+        (dz, dy, dx_off)
+        for dz in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+        for dx_off in (-1, 0, 1)
+        if not (dz == 0 and dy == 0 and dx_off == 0)
+    ]
+
+    while heap:
+        neg_t, z, y, x = heapq.heappop(heap)
+        t = -neg_t
+        if t < t_escape[z, y, x] - 1e-15:
+            continue
+        for dz, dy, dx_off in offsets:
+            nz = z + dz
+            ny = y + dy
+            nx = x + dx_off
+            if (
+                nz < 0
+                or ny < 0
+                or nx < 0
+                or nz >= shape[0]
+                or ny >= shape[1]
+                or nx >= shape[2]
+            ):
+                continue
+            if not cavity_mask[nz, ny, nx]:
+                continue
+            new_t = min(t, t_fill[nz, ny, nx])
+            if new_t > t_escape[nz, ny, nx]:
+                t_escape[nz, ny, nx] = new_t
+                heapq.heappush(heap, (-float(new_t), nz, ny, nx))
+
+    return t_escape
+
+
+def compute_air_entrapment_geofc(
+    grid: np.ndarray,
+    origin: np.ndarray,
+    dx_mm: float,
+    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
+    mold: Any = None,
+    casting_params: Any = None,
+    bodies: Optional[List[Body]] = None,
+    body_index: Optional[np.ndarray] = None,
+    gating_nodes: Optional[List[GatingNode]] = None,
+    fill_time_s: float = 0.0,
+    Q_m3_s: float = 0.0,
+    alloy: Any = None,
+    max_cells: int = 150_000,
+    delta_p_pa: float = 20000.0,
+    rho_air: float = 1.2,
+    cd_riser: float = 0.8,
+    cd_vent: float = 0.4,
+    cd_default: float = 0.4,
+) -> Tuple[np.ndarray, float, np.ndarray]:
+    """GeoFC – Geometric Front-Collision trapped-air detector.
+
+    Models the metal front arrival time (``T_metal``) and the latest time air
+    can escape to an open riser (``T_escape``).  A cavity cell is trapped when
+    the metal reaches it after its escape path is already sealed.  For each
+    trapped pocket the throat area at the sealing bottleneck sets ``Q_max``,
+    and the vent capacity is compared to the pocket volume over the escape
+    window:
+
+        risk = 1 - min(1, Q_max * T_escape / V_pocket)
+
+    Risk is written on the cavity cells (PART / INGATE / RUNNER / ...) so the
+    viewer can render it as a point cloud.  Only physically touching paths are
+    used; no nearest-distance magic.
+    """
+    _ = alloy  # reserved for future chemistry-dependent gas solubility
+    g = _gravity_unit(gravity_vector)
+    origin = np.asarray(origin, dtype=np.float64)
+    orig_grid = grid
+    orig_origin = origin.copy()
+    orig_dx_mm = float(dx_mm)
+    orig_shape = grid.shape
+
+    cavity_for_downsample = (grid != int(BodyType.EMPTY)) & (grid != int(BodyType.CORE))
+    if int(np.count_nonzero(cavity_for_downsample)) > max_cells:
+        grid, origin, dx_mm = _downsample_grid(
+            grid, origin, dx_mm, max_cells=max_cells
+        )
+        if body_index is not None and body_index.shape == orig_shape:
+            zoom = tuple(grid.shape[i] / orig_shape[i] for i in range(3))
+            body_index = ndimage.zoom(body_index, zoom, order=0, mode="nearest")
+
+    shape = grid.shape
+    dx_m = float(dx_mm) / 1000.0
+    cavity_mask = (grid != int(BodyType.EMPTY)) & (grid != int(BodyType.CORE))
+    if not cavity_mask.any():
+        risk = np.zeros(orig_shape, dtype=np.float32)
+        return risk, 0.0, np.array([], dtype=np.float64)
+
+    def _top_cells_of_mask(mask: np.ndarray, g_proj: np.ndarray) -> np.ndarray:
+        """Return the cell(s) of ``mask`` with maximum projection along -g."""
+        if not mask.any():
+            return np.zeros_like(mask, dtype=bool)
+        limit = float(g_proj[mask].max())
+        return mask & (g_proj >= limit - 1e-9)
+
+    proj = _projection_along(shape, np.zeros(3), 1.0, g)
+
+    inlet_mask = np.zeros(shape, dtype=bool)
+    for key in (
+        "SPRUE",
+        "POURING_BASIN",
+        "SPRUE_THROAT",
+        "RUNNER",
+        "DISTRIBUTOR",
+        "CURUFLUK",
+        "FILTER",
+    ):
+        btype = getattr(BodyType, key, None)
+        if btype is not None:
+            candidate = (grid == int(btype)) & cavity_mask
+            if candidate.any():
+                inlet_mask = _top_cells_of_mask(candidate, proj)
+                break
+    if not inlet_mask.any():
+        idx = np.unravel_index(
+            np.argmax(np.where(cavity_mask, proj, -np.inf)), shape
+        )
+        inlet_mask[idx] = True
+
+    outlet_mask = _select_lbm_outlet_cells(grid, cavity_mask, g, mold)
+    if outlet_mask.any():
+        outlet_mask = _top_cells_of_mask(outlet_mask, proj)
+
+    v_field = _build_velocity_field(
+        grid,
+        cavity_mask,
+        gating_nodes,
+        bodies,
+        body_index,
+        fill_time_s,
+        Q_m3_s,
+        dx_m,
+    )
+    t_fill = _weighted_time_field(cavity_mask, inlet_mask, v_field, dx_m)
+
+    if fill_time_s > 1e-12:
+        finite_mask = cavity_mask & np.isfinite(t_fill)
+        if finite_mask.any():
+            max_t = float(np.max(t_fill[finite_mask]))
+            if max_t > 1e-12 and not np.isinf(max_t):
+                t_fill[finite_mask] *= fill_time_s / max_t
+
+    t_escape = _escape_time_maxmin(t_fill, cavity_mask, outlet_mask)
+    if not outlet_mask.any():
+        t_escape = np.zeros(shape, dtype=np.float64)
+
+    tol = 1e-12
+    trapped = (t_fill > t_escape + tol) & cavity_mask
+    # Air-entrapment risk belongs to the casting cavity (PART); gating-system
+    # cells are swept by incoming metal and should not be reported as pockets.
+    part_mask = grid == int(BodyType.PART)
+    if part_mask.any():
+        trapped &= part_mask
+    s6 = ndimage.generate_binary_structure(3, 1)
+    labels, n_comp = ndimage.label(trapped, structure=s6)
+    risk = np.zeros(shape, dtype=np.float64)
+
+    sqrt_term = np.sqrt(2.0 * delta_p_pa / max(rho_air, 1e-12))
+    voxel_area_m2 = dx_m * dx_m
+
+    dt_max = 0.0
+    finite_t = np.isfinite(t_fill)
+    for axis in (0, 1, 2):
+        if shape[axis] < 2:
+            continue
+        sl = [slice(None)] * 3
+        sl_next = [slice(None)] * 3
+        sl[axis] = slice(0, shape[axis] - 1)
+        sl_next[axis] = slice(1, shape[axis])
+        t1 = t_fill[tuple(sl)]
+        t2 = t_fill[tuple(sl_next)]
+        valid = (
+            cavity_mask[tuple(sl)]
+            & cavity_mask[tuple(sl_next)]
+            & finite_t[tuple(sl)]
+            & finite_t[tuple(sl_next)]
+        )
+        if not valid.any():
+            continue
+        diff = np.abs(t2[valid] - t1[valid])
+        dt_max = max(dt_max, float(np.max(diff)))
+    throat_tol = max(1e-9, 0.8 * dt_max)
+
+    riser_like = {int(BodyType.RISER)}
+    for name in ("FEEDER",):
+        val = getattr(BodyType, name, None)
+        if val is not None:
+            riser_like.add(int(val))
+    vent_like = set()
+    for name in ("VENT", "EXHAUST", "AIR_VENT"):
+        val = getattr(BodyType, name, None)
+        if val is not None:
+            vent_like.add(int(val))
+
+    for label_id in range(1, n_comp + 1):
+        comp = labels == label_id
+        n_cells = int(comp.sum())
+        if n_cells == 0:
+            continue
+        v_pocket = n_cells * (dx_m ** 3)
+        t_seal = float(np.max(t_escape[comp]))
+        if np.isinf(t_seal) or np.isnan(t_seal) or t_seal < 0.0:
+            t_seal = 0.0
+
+        if t_seal <= 0.0:
+            risk[comp] = 1.0
+            continue
+
+        dilated = ndimage.binary_dilation(comp, structure=s6, iterations=1) & cavity_mask
+        border = dilated & ~comp
+        throat = np.zeros(shape, dtype=bool)
+        if border.any():
+            near_seal = (
+                (t_escape >= t_seal - throat_tol)
+                & (t_escape <= t_seal + throat_tol)
+                & (t_fill >= t_seal - throat_tol)
+                & (t_fill <= t_seal + throat_tol)
+            )
+            throat = border & near_seal
+        if not throat.any():
+            throat = border & outlet_mask
+        if not throat.any() and border.any():
+            border_t = t_escape[border]
+            best = float(np.max(border_t))
+            throat = border & (t_escape >= best - throat_tol)
+
+        if throat.any():
+            a_throat = float(throat.sum()) * voxel_area_m2
+            body_vals = grid[throat]
+            if body_vals.size:
+                most_common = int(np.bincount(body_vals.astype(np.int64)).argmax())
+                if most_common in riser_like:
+                    cd = cd_riser
+                elif most_common in vent_like:
+                    cd = cd_vent
+                else:
+                    cd = cd_default
+            else:
+                cd = cd_default
+            q_max = cd * a_throat * sqrt_term
+        else:
+            q_max = 0.0
+
+        if q_max <= 0.0 or t_seal <= 0.0:
+            risk_val = 1.0
+        else:
+            risk_val = 1.0 - min(1.0, (q_max * t_seal) / max(v_pocket, 1e-18))
+            risk_val = float(np.clip(risk_val, 0.0, 1.0))
+        risk[comp] = risk_val
+
+    if mold is not None and casting_params is not None:
+        risk = _apply_sand_permeability_correction(
+            risk, cavity_mask, mold, casting_params, float(dx_mm)
+        )
+
+    if grid is not orig_grid:
+        risk = _resample_to_grid(
+            risk,
+            origin,
+            dx_mm,
+            orig_shape,
+            orig_origin,
+            orig_dx_mm,
+            fill_value=0.0,
+            order=1,
+        )
+
+    dx_out_m = orig_dx_mm / 1000.0
+    trapped_volume_m3 = float(np.sum(risk)) * (dx_out_m ** 3)
+    if risk.sum() > 0.0:
+        coords = np.argwhere(risk > 0.0)
+        weights = risk[risk > 0.0]
+        centroid_vox = np.average(coords, axis=0, weights=weights)
+        centroid_mm = centroid_vox * orig_dx_mm + orig_origin + orig_dx_mm / 2.0
+        centroid_mm = np.asarray(centroid_mm, dtype=np.float64)
+    else:
+        centroid_mm = np.array([], dtype=np.float64)
+
+    return risk.astype(np.float32), trapped_volume_m3, centroid_mm
+
+
 def _compute_ingate_entrainment_risk(
     velocity_magnitude: np.ndarray,
     grid: np.ndarray,

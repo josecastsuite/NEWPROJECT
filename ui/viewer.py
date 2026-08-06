@@ -1262,14 +1262,14 @@ class Analyzer3DViewer(QtInteractor):
         if part.n_cells == 0:
             return
 
-        cells = part.threshold(0.3, scalars="air_entrapment", all_scalars=True)
+        cells = part.threshold(0.05, scalars="air_entrapment", all_scalars=True)
         if cells.n_cells == 0:
             return
 
         vmax = max(float(np.percentile(cells["air_entrapment"], 99)), 0.5)
-        if vmax <= 0.3:
+        if vmax <= 0.05:
             vmax = 1.0
-        clim = [0.3, vmax]
+        clim = [0.05, vmax]
 
         self._air_entrapment_actor = self.add_mesh(
             cells,

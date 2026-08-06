@@ -2536,15 +2536,25 @@ def analyze(
         or float(air_entrapment_field.max()) < 0.05
     )
     if use_geometric:
-        from core.filling_solver import compute_geometric_air_entrapment
+        from core.filling_solver import compute_air_entrapment_geofc
 
-        geo_risk, geo_vol, geo_cent = compute_geometric_air_entrapment(
+        gating_nodes = getattr(flow_result_for_thermal, "gating_nodes", None)
+        geo_fill_time_s = float(getattr(flow_result_for_thermal, "fill_time_s", 0.0) or 0.0)
+        Q_m3_s = float(getattr(flow_result_for_thermal, "Q_m3_s", 0.0) or 0.0)
+
+        geo_risk, geo_vol, geo_cent = compute_air_entrapment_geofc(
             grid,
             origin_mm,
             dx,
             gravity_vector=tuple(g_unit),
             mold=mold,
             casting_params=casting_params,
+            bodies=bodies,
+            body_index=body_index,
+            gating_nodes=gating_nodes,
+            fill_time_s=geo_fill_time_s,
+            Q_m3_s=Q_m3_s,
+            alloy=alloy,
             max_cells=150_000,
         )
         if geo_risk.size == grid.size:
