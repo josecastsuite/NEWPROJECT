@@ -1243,7 +1243,8 @@ class Analyzer3DViewer(QtInteractor):
             self._remove_scalar_bar("Kalıp erozyonu riski")
 
     def show_air_entrapment(self, result: Optional[AnalysisResult]):
-        """Heatmap of trapped-air pockets detected by the LBM/VOF free-surface solver."""
+        """Isosurface cloud of trapped-air pockets, colored from blue (low)
+        to red (high) risk."""
         if self._air_entrapment_actor is not None:
             self.remove_actor(self._air_entrapment_actor)
             self._air_entrapment_actor = None
@@ -1262,20 +1263,20 @@ class Analyzer3DViewer(QtInteractor):
         if part.n_cells == 0:
             return
 
-        cells = part.threshold(0.05, scalars="air_entrapment", all_scalars=True)
-        if cells.n_cells == 0:
+        # Low-permeability isosurface thresholds so even small pockets appear.
+        iso_values = [0.05, 0.25, 0.5, 0.75, 0.95]
+        iso = part.contour(iso_values, scalars="air_entrapment")
+        if iso.n_points == 0:
             return
 
-        vmax = max(float(np.percentile(cells["air_entrapment"], 99)), 0.5)
-        if vmax <= 0.05:
-            vmax = 1.0
-        clim = [0.05, vmax]
+        # Full [0, 1] scale: blue = az risk, red = riskli.
+        clim = [0.0, 1.0]
 
         self._air_entrapment_actor = self.add_mesh(
-            cells,
+            iso,
             scalars="air_entrapment",
-            cmap="cool",
-            opacity=0.85,
+            cmap="coolwarm",
+            opacity=0.65,
             clim=clim,
             show_scalar_bar=True,
             scalar_bar_args=_scalar_bar_args("Hava sıkışması", (0.02, 0.02), clim=clim),
