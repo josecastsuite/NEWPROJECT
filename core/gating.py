@@ -1451,175 +1451,53 @@ def _smart_gating_design(
 
     oxidation = _oxidation_risk(alloy)
     t_stream_mm = max(ingate_thickness_mm, 2.0 * t_mean_mm, 2.0)
-    L_fluid_mm = _fluidity_length_mm(V_gate, alloy, mold, t_stream_mm, t_fill_s)
-    cold_shut_risk = max(0.0, flow_path_mm - L_fluid_mm) / max(L_fluid_mm, 1.0)
 
-    def _engine_system_scores():
-        inp = GatingEngineInput(
-            total_metal_volume_m3=0.0,
-            total_mass_kg=0.0,
-            alloy_key=alloy.key,
-        )
-        part_mask = result.grid == BodyType.PART
-        t_min = fingerprint["t_min_mm"]
-        t_max = fingerprint["t_max_mm"]
-        sv = (
-            result.part_surface_area_mm2 / result.part_volume_mm3
-            if result.part_volume_mm3 > 0.0
-            else 0.0
-        )
-        D_bulk = 2.0 * t_mean_mm
-        slenderness = flow_path_mm / max(D_bulk, 1.0)
-        head_ratio = (H_eff_m * 1000.0) / max(flow_path_mm, 1.0)
-        thickness_var = t_max / max(t_min, 1.0)
-        pore_risk_max = 0.0
-        if result.risk.size and part_mask.any():
-            pore_risk_max = float(result.risk[part_mask].max())
-        features = {
-            "t_avg": t_mean_mm,
-            "t_min": t_min,
-            "t_max": t_max,
-            "surface_to_volume_ratio": sv,
-            "slenderness": slenderness,
-            "flow_ratio": flow_ratio,
-            "head_ratio": head_ratio,
-            "hotspot_count": float(len(getattr(result, "hotspots", []) or [])),
-            "max_hotspot_m_mm": max([h.m_value_mm for h in result.hotspots] or [0.0]),
-            "pore_risk_max": pore_risk_max,
-            "thickness_var": thickness_var,
-        }
-        _, scores, _ = _score_systems(inp, features)
-        return scores
+    def _canonical_gating_ratio(system_name: str) -> Tuple[float, float, float]:
+        if "basınçlı" in system_name and "yarı" not in system_name:
+            return (1.0, 0.9, 0.8)
+        if "basınçsız" in system_name:
+            return (1.0, 2.0, 2.0)
+        return (1.0, 1.2, 1.0)
 
-    engine_scores = _engine_system_scores()
+    system_name = getattr(design, "gating_system", None) or "yarı basınçlı (semi-pressurized)"
+    ratio = getattr(design, "gating_ratio", None)
+    if ratio is None:
+        ratio = _canonical_gating_ratio(system_name)
 
-    def _re(area_m2: float, v_m_s: float) -> float:
-        D = max(math.sqrt(4.0 * area_m2 / math.pi), 1e-6)
-        return rho * v_m_s * D / max(alloy.viscosity_pa_s, 1e-6)
+    res = compute_gating(
+        W_kg=total_mass_kg,
+        rho_kgm3=rho,
+        H_m=H_eff_m,
+        t_fill_s=t_fill_s,
+        Cd=Cd,
+        gating_ratio=ratio,
+        n_ingates=max(n_ingates, 1),
+        V_crit=Vcrit,
+        is_eff_head=True,
+    )
+
+    As = float(res["As_m2"])
+    Ar = float(res["Ar_total_m2"])
+    Ag = float(res["Ag_total_m2"])
+    Vs = float(res["Vs_ms"])
+    Vr = float(res["Vr_ms"])
+    Vg = float(res["Vg_ms"])
+    system = str(res.get("system", system_name))
+    Pf = float(res["Pf"])
+    Vc_eff = float(res["Vc_ms"])
+
+    if Q <= 0.0 or H_eff_m <= 0.0:
+        Vg = max(V_choke * 0.5, 0.1)
+        Vs = Vg
+        Vr = Vg
+        As = Ar = Ag = 0.0
 
     runner_erosion_limit = _mold_runner_erosion_limit_m_s(mold)
+    if Vr > runner_erosion_limit > 0.0 and Q > 0.0:
+        Ar = Q / runner_erosion_limit
+        Vr = runner_erosion_limit
 
-    def base_score(As: float, Ar: float, Ag: float, Vs: float, Vr: float, Vg: float, system: str) -> float:
-        s = 0.0
-        if Vg > Vcrit:
-            s += 1e6
-        if Vs > Vcrit * 1.5:
-            s += 1e6
-        if Vr > Vcrit * 1.2:
-            s += 1e6
-        s += oxidation * 30.0 * max(0.0, Vs - Vcrit * 0.9) / max(Vcrit, 0.1)
-        s += oxidation * 30.0 * max(0.0, Vr - Vcrit * 0.9) / max(Vcrit, 0.1)
-        s += 50.0 * max(0.0, Vr - runner_erosion_limit) / max(runner_erosion_limit, 0.1)
-        s += 20.0 * max(0.0, _re(As, Vs) - 20000.0) / 20000.0
-        s += 20.0 * max(0.0, _re(Ar, Vr) - 20000.0) / 20000.0
-        s += 20.0 * max(0.0, _re(Ag, Vg) - 20000.0) / 20000.0
-        s += 40.0 * cold_shut_risk
-        ref = Q / max(V_gate, 1e-6)
-        s += 12.0 * max(0.0, (As + Ar + Ag) / max(ref, 1e-9) - 1.0)
-        s += (100.0 - engine_scores.get(system, 50.0)) * 0.5
-        return s
-
-    candidates = []
-    if V_gate > 0 and Q > 0:
-        # Pressurized: gate is the choke, Vg highest.
-        for pf in np.linspace(0.30, 0.95, 20):
-            Vg = V_gate
-            Vs = Vg * pf
-            r_run = pf + (1.0 - pf) * 0.55
-            Vr = Vg * pf / r_run
-            Vs = min(Vs, Vcrit * 1.5, V_choke)
-            Vr = min(Vr, Vcrit * 1.2, V_choke)
-            if not (Vs > 0 and Vr > Vs and Vg > Vr):
-                continue
-            As = Q / Vs
-            Ar = Q / Vr
-            Ag = Q / Vg
-            Pf = Ag / As
-            system = "basınçlı (pressurized)"
-            score = base_score(As, Ar, Ag, Vs, Vr, Vg, system)
-            candidates.append(
-                {"As": As, "Ar": Ar, "Ag": Ag, "Vs": Vs, "Vr": Vr, "Vg": Vg, "system": system, "Pf": Pf, "score": score}
-            )
-
-        # Unpressurized: sprue is the choke, Vs highest.
-        for pf in np.linspace(1.05, 2.5, 20):
-            Vs = min(V_gate * pf, V_choke)
-            Vg = Vs / pf
-            r_run = 1.0 + (pf - 1.0) * 0.5
-            Vr = Vs / r_run
-            Vs = min(Vs, Vcrit * 1.5)
-            Vr = min(Vr, Vcrit * 1.2)
-            if not (Vg > 0 and Vr > Vg and Vs > Vr):
-                continue
-            As = Q / Vs
-            Ar = Q / Vr
-            Ag = Q / Vg
-            Pf = Ag / As
-            system = "basınçsız (unpressurized)"
-            score = base_score(As, Ar, Ag, Vs, Vr, Vg, system)
-            candidates.append(
-                {"As": As, "Ar": Ar, "Ag": Ag, "Vs": Vs, "Vr": Vr, "Vg": Vg, "system": system, "Pf": Pf, "score": score}
-            )
-
-        # Semi-pressurized: runner is the choke, Vr highest.
-        for rs in np.linspace(1.1, 2.0, 6):
-            for rg in np.linspace(1.1, 2.0, 6):
-                Vr = min(V_gate * 1.05, V_choke)
-                Vs = Vr / rs
-                Vg = Vr / rg
-                Vs = min(Vs, Vcrit * 1.5, V_choke)
-                Vg = min(Vg, Vcrit, V_choke)
-                if Vr <= 0 or not (max(Vs, Vg) < Vr):
-                    continue
-                As = Q / Vs
-                Ar = Q / Vr
-                Ag = Q / Vg
-                Pf = Ag / As
-                system = "yarı basınçlı (semi-pressurized)"
-                score = base_score(As, Ar, Ag, Vs, Vr, Vg, system)
-                candidates.append(
-                    {"As": As, "Ar": Ar, "Ag": Ag, "Vs": Vs, "Vr": Vr, "Vg": Vg, "system": system, "Pf": Pf, "score": score}
-                )
-
-    if not candidates:
-        # Fallback equal-area semi.
-        Vg = max(V_gate, 0.1)
-        Vs = Vg * 0.6
-        Vr = Vg * 0.8
-        As = Q / max(Vs, 0.01)
-        Ar = Q / max(Vr, 0.01)
-        Ag = Q / max(Vg, 0.01)
-        best = {"As": As, "Ar": Ar, "Ag": Ag, "Vs": Vs, "Vr": Vr, "Vg": Vg, "system": "yarı basınçlı (semi-pressurized)", "Pf": 1.0, "score": 0.0}
-    else:
-        best = min(candidates, key=lambda c: c["score"])
-
-    # Auto-correction
-    if best["Vr"] > runner_erosion_limit:
-        best["Ar"] = Q / runner_erosion_limit
-        best["Vr"] = runner_erosion_limit
-
-    for area_key, vel_key in (("As", "Vs"), ("Ar", "Vr"), ("Ag", "Vg")):
-        area = best[area_key]
-        v = best[vel_key]
-        Re = _re(area, v)
-        if Re > 20000.0:
-            factor = (Re / 20000.0) ** 2
-            best[area_key] = area * factor
-            best[vel_key] = v / factor
-
-    if best["Vg"] > Vcrit:
-        factor = best["Vg"] / (Vcrit * 0.95)
-        best["Ag"] *= factor
-        best["Vg"] = Vcrit * 0.95
-
-    As = best["As"]
-    Ar = best["Ar"]
-    Ag = best["Ag"]
-    Vs = best["Vs"]
-    Vr = best["Vr"]
-    Vg = best["Vg"]
-    system = best["system"]
-    Pf = best["Pf"]
+    V_gate = Vg
 
     Ag_each = Ag / max(n_ingates, 1)
     d_sprue_mm = 1000.0 * math.sqrt(4.0 * max(As, 0.0) / math.pi)
@@ -1661,7 +1539,7 @@ def _smart_gating_design(
         "v_runner_design": Vr,
         "v_gate_design": Vg,
         "v_sprue_bernoulli": v_s_bernoulli,
-        "v_choke_m_s": V_choke,
+        "v_choke_m_s": Vc_eff,
         "Q_design_m3_s": Q,
         "d_sprue_mm": d_sprue_mm,
         "d_ingate_each_mm": d_ingate_each_mm,

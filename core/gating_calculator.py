@@ -89,37 +89,172 @@ def compute_gating(
     Cd: float = 0.8,
     gating_ratio: Tuple[float, float, float] = (1.0, 2.0, 2.0),
     n_ingates: int = 2,
+    V_crit: float = 0.9,
+    is_eff_head: bool = False,
 ):
-    """Exact gating area / diameter calculation from gating_calculator_tr.py."""
+    """Compute gating areas from Q=vA with dynamic choke detection.
+
+    Choke is the smallest ratio section. Areas are derived from the choke area
+    using Bernoulli/Cd, then gate velocity is capped at V_crit while preserving
+    the area ratio.
+    """
     As_ratio, Ar_ratio, Ag_ratio = gating_ratio
 
-    # Choke velocity at sprue base
-    Vc = math.sqrt(2 * G * H_m)  # m/s
+    # Effective head: compute once, then clamp.
+    H_eff = H_m if is_eff_head else effective_head(H_m, W_kg)
+    H_eff = float(max(0.02, min(H_eff, 0.60)))
 
-    # Choke / sprue base area
-    As = W_kg / (rho_kgm3 * Cd * t_fill_s * Vc)  # m²
+    if W_kg <= 0.0 or rho_kgm3 <= 0.0 or t_fill_s <= 0.0:
+        return {
+            "As_m2": 0.0,
+            "Ar_total_m2": 0.0,
+            "Ag_total_m2": 0.0,
+            "Ag_each_m2": 0.0,
+            "Vc_ms": 0.0,
+            "Vs_ms": 0.0,
+            "Vr_ms": 0.0,
+            "Vg_ms": 0.0,
+            "d_sprue_m": 0.0,
+            "d_ingate_m": 0.0,
+            "choke": "unknown",
+            "system": "belirsiz",
+            "Pf": 0.0,
+            "H_eff_m": H_eff,
+        }
 
-    # Runner and gate areas from ratio
-    Ar_total = As * (Ar_ratio / As_ratio)
-    Ag_total = As * (Ag_ratio / As_ratio)
-    Ag_each = Ag_total / max(n_ingates, 1)
+    # Flow rate from mass, density and fill time.
+    Q = W_kg / (rho_kgm3 * t_fill_s)  # m³/s
+
+    # Bernoulli velocity at the choke (Cd-corrected).
+    Vc_ber = math.sqrt(2.0 * G * H_eff) if H_eff > 0.0 else 0.0
+    Vc_eff = Cd * Vc_ber
+
+    # Identify the choke: smallest ratio value.
+    ratios = {
+        "sprue": float(As_ratio),
+        "runner": float(Ar_ratio),
+        "gate": float(Ag_ratio),
+    }
+    choke = min(ratios, key=ratios.get)
+    choke_ratio = ratios[choke]
+
+    if Vc_eff <= 0.0 or choke_ratio <= 0.0:
+        return {
+            "As_m2": 0.0,
+            "Ar_total_m2": 0.0,
+            "Ag_total_m2": 0.0,
+            "Ag_each_m2": 0.0,
+            "Vc_ms": 0.0,
+            "Vs_ms": 0.0,
+            "Vr_ms": 0.0,
+            "Vg_ms": 0.0,
+            "d_sprue_m": 0.0,
+            "d_ingate_m": 0.0,
+            "choke": "unknown",
+            "system": "belirsiz",
+            "Pf": 0.0,
+            "H_eff_m": H_eff,
+        }
+
+    # Choke area required to pass Q at Vc_eff.
+    A_choke = Q / Vc_eff  # m²
+
+    # Derive As, Ar, Ag from the choke area and ratios.
+    if choke == "sprue":
+        As = A_choke
+        Ar = As * (Ar_ratio / As_ratio) if As_ratio > 0.0 else 0.0
+        Ag = As * (Ag_ratio / As_ratio) if As_ratio > 0.0 else 0.0
+    elif choke == "runner":
+        Ar = A_choke
+        As = Ar * (As_ratio / Ar_ratio) if Ar_ratio > 0.0 else 0.0
+        Ag = Ar * (Ag_ratio / Ar_ratio) if Ar_ratio > 0.0 else 0.0
+    else:  # choke == "gate"
+        Ag = A_choke
+        As = Ag * (As_ratio / Ag_ratio) if Ag_ratio > 0.0 else 0.0
+        Ar = Ag * (Ar_ratio / Ag_ratio) if Ag_ratio > 0.0 else 0.0
+
+    # Actual velocities for the ratio-derived areas.
+    def _vel(area: float) -> float:
+        return Q / area if area > 1e-12 else 0.0
+
+    Vs = _vel(As)
+    Vr = _vel(Ar)
+    Vg = _vel(Ag)
+
+    # Campbell critical-velocity lock: gate velocity must never exceed V_crit.
+    if Vg > V_crit * 1.02 and V_crit > 0.0:
+        scale = Vg / V_crit
+        As *= scale
+        Ar *= scale
+        Ag *= scale
+        Vs = _vel(As)
+        Vr = _vel(Ar)
+        Vg = _vel(Ag)
+
+    # Clamp each area to physically possible manufacturing limits.
+    As_cm2 = max(0.5, min(As * 1e4, 80.0))
+    Ar_cm2 = max(0.5, min(Ar * 1e4, 80.0))
+    Ag_cm2 = max(0.5, min(Ag * 1e4, 80.0))
+    As = As_cm2 * 1e-4
+    Ar = Ar_cm2 * 1e-4
+    Ag = Ag_cm2 * 1e-4
+
+    Vs = _vel(As)
+    Vr = _vel(Ar)
+    Vg = _vel(Ag)
+
+    # Re-evaluate critical velocity after clamp.
+    if Vg > V_crit * 1.02 and V_crit > 0.0:
+        Ag = Q / V_crit
+        scale = Ag / (Ag_cm2 * 1e-4) if (Ag_cm2 * 1e-4) > 1e-12 else 1.0
+        As *= scale
+        Ar *= scale
+        Vs = _vel(As)
+        Vr = _vel(Ar)
+        Vg = _vel(Ag)
+
+    # Final safety clamp so no section grows beyond manufacturing limits.
+    As = max(0.5 * 1e-4, min(As, 80.0 * 1e-4))
+    Ar = max(0.5 * 1e-4, min(Ar, 80.0 * 1e-4))
+    Ag = max(0.5 * 1e-4, min(Ag, 80.0 * 1e-4))
+    Vs = _vel(As)
+    Vr = _vel(Ar)
+    Vg = _vel(Ag)
+
+    # System classification from the actual Ag/As ratio (Pf).
+    Pf = Ag / As if As > 1e-12 else 0.0
+    Pf_clamped = max(0.6, min(Pf, 1.8))
+    if Pf_clamped < 0.9:
+        system = "basınçlı (pressurized)"
+    elif Pf_clamped > 1.3:
+        system = "basınçsız (unpressurized)"
+    else:
+        system = "yarı basınçlı (semi-pressurized)"
 
     def area_to_diameter(area_m2: float) -> float:
         if area_m2 <= 0.0:
             return 0.0
-        return math.sqrt(4 * area_m2 / math.pi)
+        return math.sqrt(4.0 * area_m2 / math.pi)
 
+    Ag_each = Ag / max(n_ingates, 1)
     d_sprue_m = area_to_diameter(As)
     d_ingate_m = area_to_diameter(Ag_each)
 
     return {
         "As_m2": As,
-        "Ar_total_m2": Ar_total,
-        "Ag_total_m2": Ag_total,
+        "Ar_total_m2": Ar,
+        "Ag_total_m2": Ag,
         "Ag_each_m2": Ag_each,
-        "Vc_ms": Vc,
+        "Vc_ms": Vc_eff,
+        "Vs_ms": Vs,
+        "Vr_ms": Vr,
+        "Vg_ms": Vg,
         "d_sprue_m": d_sprue_m,
         "d_ingate_m": d_ingate_m,
+        "choke": choke,
+        "system": system,
+        "Pf": Pf,
+        "H_eff_m": H_eff,
     }
 
 
