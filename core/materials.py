@@ -446,17 +446,18 @@ def chvorinov_c_from_properties(alloy: Alloy, mold: MoldMaterial) -> float:
     """
     Return the Chvorinov constant C in dk/cm^2 (minutes per square centimetre).
 
-    The materials database (mold.chvorinov_c) stores the empirical foundry
-    constant, which is the authoritative value.  If it is missing, a physics-
-    based estimate is computed from alloy/mould properties and converted to
-    dk/cm^2.
-    """
-    # Authoritative empirical constant from the materials database.
-    empirical = getattr(mold, "chvorinov_c", 0.0) or 0.0
-    if empirical > 0.0:
-        return float(empirical)
+    Computed from alloy and mould thermal properties:
 
+        C = [ (rho_m * L_eff) / ((T_m - T_0) * sqrt(pi * k_s * rho_s * c_s)) ]^2
+
+    with L_eff = L + cp_m * max(T_pour - T_liq, 0).  The old ampirik
+    ``mold.chvorinov_c`` override is removed so every mould type genuinely
+    changes solidification time, Niyama and porosity.
+    """
     tm = (alloy.t_liquidus_c + alloy.t_solidus_c) / 2.0
+    # If the mould is hotter than the metal, solidification is physically
+    # impossible; clamp to a tiny driving force so the user sees an enormous,
+    # clearly-invalid time instead of division by zero.
     delta_t = max(tm - mold.t0_c, 1.0)
     l_eff = alloy.latent_heat_j_kg + alloy.cp_j_kgk * max(
         alloy.t_pour_c - alloy.t_liquidus_c, 0.0

@@ -1,0 +1,26 @@
+[
+  {
+    "mold": "sand",
+    "mold_temp_c": 25.0,
+    "B": 3.4984648986023803,
+    "risk_max": 0.686061900039517,
+    "risk_mean": 0.010880215955682837,
+    "screenshot": "/home/ubuntu/NEWPROJECT/NEWPROJECT-main/validation/results/porosity_mold/porosity_sand_25C.png"
+  },
+  {
+    "mold": "metal_mold",
+    "mold_temp_c": 25.0,
+    "B": 0.023376062329957967,
+    "risk_max": 0.5743436245393403,
+    "risk_mean": 0.006141547338853362,
+    "screenshot": "/home/ubuntu/NEWPROJECT/NEWPROJECT-main/validation/results/porosity_mold/porosity_metal_mold_25C.png"
+  },
+  {
+    "mold": "ceramic",
+    "mold_temp_c": 900.0,
+    "B": 10.392687419276141,
+    "risk_max": 0.7886736044280561,
+    "risk_mean": 0.014695680390268627,
+    "screenshot": "/home/ubuntu/NEWPROJECT/NEWPROJECT-main/validation/results/porosity_mold/porosity_ceramic_900C.png"
+  }
+]

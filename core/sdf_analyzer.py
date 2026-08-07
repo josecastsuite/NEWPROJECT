@@ -1220,7 +1220,10 @@ def find_hotspots(
     if feeder_mask is None:
         feeder_mask = riser_mask if riser_mask is not None else np.zeros_like(is_metal)
     if chvorinov_c is None or chvorinov_c <= 0:
-        chvorinov_c = 1.0
+        raise ValueError(
+            "find_hotspots requires a positive chvorinov_c. "
+            "Compute it with chvorinov_c_from_properties(alloy, mold)."
+        )
 
     # Solidification time from shape-corrected modulus (Chvorinov)
     t_solid = compute_chvorinov_t(M_mod, chvorinov_c)
