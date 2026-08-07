@@ -59,6 +59,32 @@ def _escape_html(text: str) -> str:
     )
 
 
+class AnalyzeThread(QtCore.QThread):
+    """Run the heavy analyze() call in a background thread."""
+
+    progress = QtCore.pyqtSignal(int)
+    finished = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, parent, analyze_fn, args, kwargs):
+        super().__init__(parent)
+        self._analyze_fn = analyze_fn
+        self._args = args
+        self._kwargs = kwargs
+        self._kwargs["progress_callback"] = self.progress.emit
+
+    def run(self):
+        try:
+            result = self._analyze_fn(*self._args, **self._kwargs)
+            self.finished.emit(result)
+        except Exception as exc:
+            import traceback
+            self.error.emit(f"{exc}\n{traceback.format_exc()}")
+
+    def __del__(self):
+        self.wait(100)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -889,7 +915,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_progress(self, value: int):
         self.progress.setValue(value)
-        QtCore.QCoreApplication.processEvents()
 
     def _add_body_row(self, body: Body):
         """Add a body row with a dynamic, body-type aware property panel."""
@@ -1120,7 +1145,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_label.setText("Titan motoru çalışıyor, 2-3 dk sürebilir...")
             self.aiLog("AŞAMA 2/6: SDF + Chvorinov + eğrilik + iskelet hesaplanıyor...", "info")
             self.progress.setValue(0)
-            t0 = time.time()
+            self._analysis_t0 = time.time()
+            self.analyze_btn.setEnabled(False)
 
             alloy_key = self.alloy_combo.currentData()
             mold_key = self._current_mold_key()
@@ -1139,82 +1165,103 @@ class MainWindow(QtWidgets.QMainWindow):
                 "info",
             )
 
-            self._analysis = analyze(
-                self._bodies,
-                self._grid,
-                self._body_index,
-                self._origin,
-                self._dx,
-                alloy_key=alloy_key,
-                mold_key=mold_key,
-                base_res=160,
-                max_res=max_res,
-                refine_local=refine_local,
-                sub_voxel=sub_voxel,
-                thermal_max_time_s=thermal_max_time_s,
-                thermal_downsample=3,
-                casting_params=casting_params,
-                progress_callback=self._set_progress,
-                user_section_areas_cm2=(
-                    {self._user_section_key: self._user_section_area_cm2}
-                    if self._user_section_area_cm2 > 0.0
-                    else None
+            self._pending_casting_params = casting_params
+            self._analysis_thread = AnalyzeThread(
+                self,
+                analyze,
+                (self._bodies, self._grid, self._body_index, self._origin, self._dx),
+                dict(
+                    alloy_key=alloy_key,
+                    mold_key=mold_key,
+                    base_res=160,
+                    max_res=max_res,
+                    refine_local=refine_local,
+                    sub_voxel=sub_voxel,
+                    thermal_max_time_s=thermal_max_time_s,
+                    thermal_downsample=3,
+                    casting_params=casting_params,
+                    user_section_areas_cm2=(
+                        {self._user_section_key: self._user_section_area_cm2}
+                        if self._user_section_area_cm2 > 0.0
+                        else None
+                    ),
                 ),
             )
-            self._analysis.casting_params = casting_params
-            self._update_porosity_filter_labels(get_alloy(alloy_key))
-
-            gate_result = self._analysis.gate_result
-            if gate_result:
-                self._analysis.recommendations.extend(
-                    self._gating_recommendations(gate_result)
-                )
-
-            elapsed = time.time() - t0
-            self.aiLog(f"AŞAMA 6/6: Analiz tamamlandı ({elapsed:.1f} sn)", "ok")
-
-            self.progress.setValue(100)
-            n_visible = sum(1 for hs in self._analysis.hotspots if not hs.solved)
-            self.status_label.setText(
-                f"Analiz tamamlandı ({elapsed:.1f} sn). {n_visible}/{len(self._analysis.hotspots)} hot spot görünür."
-            )
-            self.export_btn.setEnabled(True)
-            self.html_btn.setEnabled(True)
-            self._update_recommendations()
-            # Post-analysis: all bodies are translucent so internal markers,
-            # porosity, paths, hot-spots and flow/Niyama overlays are visible.
-            self.viewer.show_bodies(self._bodies, reset_camera=True, analysis_mode=True)
-            self.viewer.set_gating_data(self._bodies, self._body_index, self._origin, self._dx)
-            if self.risk_toggle.isChecked():
-                self.viewer.show_risk(self._analysis)
-            if self.porosity_toggle.isChecked():
-                noise, mp, size_filter = self._porosity_cloud_params()
-                self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
-            if self.niyama_toggle.isChecked():
-                self.viewer.show_niyama_isosurfaces(self._analysis)
-            if self.mold_wall_toggle.isChecked():
-                self.viewer.toggle_mold_wall_movement(self._analysis, True)
-            if self.cold_shot_toggle.isChecked():
-                self.viewer.toggle_cold_shot_risk(self._analysis, True)
-            if self.erosion_toggle.isChecked():
-                self.viewer.toggle_erosion_risk(self._analysis, True)
-            if self.air_entrapment_toggle.isChecked():
-                self.viewer.toggle_air_entrapment(self._analysis, True)
-            if self.path_toggle.isChecked():
-                self.viewer.show_feeding_paths(self._analysis)
-            if self.local_toggle.isChecked():
-                self.viewer.show_local_regions(self._analysis, self.slice_field.currentData())
-            self.viewer.show_hotspots(self._analysis)
-            self.viewer.show_flow_node_labels(self._analysis)
-            self._update_flow_controls()
-            if self.flow_anim_toggle.isChecked() and self._analysis.flow_result is not None:
-                self.viewer.toggle_flow_animation(self._analysis, True)
+            self._analysis_thread.progress.connect(self._set_progress)
+            self._analysis_thread.finished.connect(self._on_analysis_finished)
+            self._analysis_thread.error.connect(self._on_analysis_error)
+            self._analysis_thread.finished.connect(self._analysis_thread.deleteLater)
+            self._analysis_thread.error.connect(self._analysis_thread.deleteLater)
+            self._analysis_thread.start()
         except Exception as e:
             import traceback
             self.aiLog(f"Analiz hatası: {e}", "crit")
             QtWidgets.QMessageBox.critical(
                 self, "Analiz Hatası", f"{e}\n{traceback.format_exc()}"
             )
+            self.analyze_btn.setEnabled(True)
+
+    def _on_analysis_finished(self, analysis):
+        casting_params = getattr(self, "_pending_casting_params", None)
+        analysis.casting_params = casting_params
+        self._analysis = analysis
+        alloy = analysis.alloy if hasattr(analysis, "alloy") else None
+        if alloy is None and casting_params is not None:
+            alloy = get_alloy(casting_params.alloy_key)
+        self._update_porosity_filter_labels(alloy)
+
+        gate_result = self._analysis.gate_result
+        if gate_result:
+            self._analysis.recommendations.extend(
+                self._gating_recommendations(gate_result)
+            )
+
+        elapsed = time.time() - getattr(self, "_analysis_t0", time.time())
+        self.aiLog(f"AŞAMA 6/6: Analiz tamamlandı ({elapsed:.1f} sn)", "ok")
+
+        self.progress.setValue(100)
+        n_visible = sum(1 for hs in self._analysis.hotspots if not hs.solved)
+        self.status_label.setText(
+            f"Analiz tamamlandı ({elapsed:.1f} sn). {n_visible}/{len(self._analysis.hotspots)} hot spot görünür."
+        )
+        self.analyze_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
+        self.html_btn.setEnabled(True)
+        self._update_recommendations()
+        # Post-analysis: all bodies are translucent so internal markers,
+        # porosity, paths, hot-spots and flow/Niyama overlays are visible.
+        self.viewer.show_bodies(self._bodies, reset_camera=True, analysis_mode=True)
+        self.viewer.set_gating_data(self._bodies, self._body_index, self._origin, self._dx)
+        if self.risk_toggle.isChecked():
+            self.viewer.show_risk(self._analysis)
+        if self.porosity_toggle.isChecked():
+            noise, mp, size_filter = self._porosity_cloud_params()
+            self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
+        if self.niyama_toggle.isChecked():
+            self.viewer.show_niyama_isosurfaces(self._analysis)
+        if self.mold_wall_toggle.isChecked():
+            self.viewer.toggle_mold_wall_movement(self._analysis, True)
+        if self.cold_shot_toggle.isChecked():
+            self.viewer.toggle_cold_shot_risk(self._analysis, True)
+        if self.erosion_toggle.isChecked():
+            self.viewer.toggle_erosion_risk(self._analysis, True)
+        if self.air_entrapment_toggle.isChecked():
+            self.viewer.toggle_air_entrapment(self._analysis, True)
+        if self.path_toggle.isChecked():
+            self.viewer.show_feeding_paths(self._analysis)
+        if self.local_toggle.isChecked():
+            self.viewer.show_local_regions(self._analysis, self.slice_field.currentData())
+        self.viewer.show_hotspots(self._analysis)
+        self.viewer.show_flow_node_labels(self._analysis)
+        self._update_flow_controls()
+        if self.flow_anim_toggle.isChecked() and self._analysis.flow_result is not None:
+            self.viewer.toggle_flow_animation(self._analysis, True)
+
+    def _on_analysis_error(self, msg):
+        import traceback
+        self.aiLog(f"Analiz hatası: {msg}", "crit")
+        QtWidgets.QMessageBox.critical(self, "Analiz Hatası", msg)
+        self.analyze_btn.setEnabled(True)
 
     def _gating_recommendations(self, gr) -> List[str]:
         if gr is None:

@@ -10,6 +10,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace nb = nanobind;
 
 namespace josecast {
@@ -213,6 +217,9 @@ public:
         fill_time_.assign(n_, std::numeric_limits<double>::infinity());
         trapped_time_.assign(n_, std::numeric_limits<double>::infinity());
 
+        #ifdef _OPENMP
+        omp_set_num_threads(omp_get_max_threads());
+        #endif
         // Inflow lattice velocity and a slight density head to drive the flow.
         double u_in_lb = inflow_velocity_ * dt_ / dx_;
         double u2_in = u_in_lb * u_in_lb;
@@ -289,6 +296,9 @@ public:
     double filled_fraction() const {
         if (cavity_cells_ == 0) return 0.0;
         size_t filled = 0;
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) reduction(+:filled)
+        #endif
         for (size_t i = 0; i < n_; ++i) {
             // Inlet/source (2) and cavity (0) cells must fill; vents (3) stay empty.
             if (flags_[i] != 1 && flags_[i] != 3 && phi_[i] >= 0.5) ++filled;
@@ -301,6 +311,9 @@ public:
 
     void get_velocity_magnitude(std::vector<double>* out) const {
         out->resize(n_);
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t i = 0; i < n_; ++i) {
             double u = ux_[i], v = uy_[i], w = uz_[i];
             (*out)[i] = std::sqrt(u * u + v * v + w * w);
@@ -309,6 +322,9 @@ public:
 
     void get_velocity(std::vector<double>* out) const {
         out->resize(3 * n_);
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t i = 0; i < n_; ++i) {
             (*out)[0 * n_ + i] = ux_[i];
             (*out)[1 * n_ + i] = uy_[i];
@@ -322,6 +338,9 @@ public:
 
     void get_entrapment(std::vector<double>* out) const {
         out->resize(n_);
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t i = 0; i < n_; ++i) {
             (*out)[i] = (trapped_time_[i] < std::numeric_limits<double>::infinity() / 2.0) ? 1.0 : 0.0;
         }
@@ -329,6 +348,9 @@ public:
 
     double total_entrapped_volume() const {
         double vol = 0.0;
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) reduction(+:vol)
+        #endif
         for (size_t i = 0; i < n_; ++i) {
             if (trapped_time_[i] < std::numeric_limits<double>::infinity() / 2.0) {
                 vol += (1.0 - phi_[i]);
@@ -497,6 +519,9 @@ private:
     }
 
     void compute_macroscopic() {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t idx = 0; idx < fluid_list_.size(); ++idx) {
             size_t i = fluid_list_[idx];
             double r = 0.0, px = 0.0, py = 0.0, pz = 0.0;
@@ -544,6 +569,9 @@ private:
 
     void collide_and_stream() {
         // 1. Collision (BGK) with Guo forcing and Smagorinsky eddy viscosity.
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t idx = 0; idx < fluid_list_.size(); ++idx) {
             size_t i = fluid_list_[idx];
             if (flags_[i] == 1) {
@@ -656,9 +684,15 @@ private:
         // would enter a solid cell are returned to the source cell in the
         // opposite direction.  Distributions that leave the domain are discarded;
         // for outlet cells this is the correct open-boundary outflow.
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t i = 0; i < n_; ++i) {
             for (int q = 0; q < Q; ++q) f_[i * Q + q] = 0.0;
         }
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t idx = 0; idx < fluid_list_.size(); ++idx) {
             size_t s = fluid_list_[idx];
             int x = static_cast<int>(s / (ny_ * nz_));
@@ -690,6 +724,9 @@ private:
         }
 
         // 4. Enforce boundary conditions on post-streamed f.
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t idx = 0; idx < fluid_list_.size(); ++idx) {
             size_t i = fluid_list_[idx];
             if (flags_[i] == 1) {
@@ -750,6 +787,9 @@ private:
         };
 
         // X faces.
+        #ifdef _OPENMP
+        #pragma omp parallel for collapse(2) schedule(static)
+        #endif
         for (int x = 1; x < nx_; ++x) {
             for (int y = 0; y < ny_; ++y) {
                 for (int z = 0; z < nz_; ++z) {
@@ -760,11 +800,23 @@ private:
                     double amount;
                     if (uface > 0.0) {
                         amount = uface * phi_[ia];
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ia] -= amount;
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ib] += amount;
                     } else if (uface < 0.0) {
                         amount = -uface * phi_[ib];
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ib] -= amount;
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ia] += amount;
                     }
                 }
@@ -772,6 +824,9 @@ private:
         }
 
         // Y faces.
+        #ifdef _OPENMP
+        #pragma omp parallel for collapse(2) schedule(static)
+        #endif
         for (int x = 0; x < nx_; ++x) {
             for (int y = 1; y < ny_; ++y) {
                 for (int z = 0; z < nz_; ++z) {
@@ -782,11 +837,23 @@ private:
                     double amount;
                     if (vface > 0.0) {
                         amount = vface * phi_[ia];
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ia] -= amount;
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ib] += amount;
                     } else if (vface < 0.0) {
                         amount = -vface * phi_[ib];
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ib] -= amount;
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ia] += amount;
                     }
                 }
@@ -794,6 +861,9 @@ private:
         }
 
         // Z faces.
+        #ifdef _OPENMP
+        #pragma omp parallel for collapse(2) schedule(static)
+        #endif
         for (int x = 0; x < nx_; ++x) {
             for (int y = 0; y < ny_; ++y) {
                 for (int z = 1; z < nz_; ++z) {
@@ -804,11 +874,23 @@ private:
                     double amount;
                     if (wface > 0.0) {
                         amount = wface * phi_[ia];
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ia] -= amount;
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ib] += amount;
                     } else if (wface < 0.0) {
                         amount = -wface * phi_[ib];
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ib] -= amount;
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ia] += amount;
                     }
                 }
@@ -824,6 +906,9 @@ private:
         if (u_in_lb > 1.0) u_in_lb = 1.0;
         if (u_in_lb < 0.01) u_in_lb = 0.01;
 
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t i = 0; i < n_; ++i) {
             if (flags_[i] == 1 || flags_[i] == 3) continue;
             if (phi_[i] < 0.5 && flags_[i] != 2) continue;
@@ -882,8 +967,10 @@ private:
                 if (in_cell(sx, sy, sz, nx_, ny_, nz_)) {
                     size_t j = cidx(sx, sy, sz, ny_, nz_);
                     if (flags_[j] != 1 && flags_[j] != 3) {
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[j] += u_in_lb * best_dot;
-                        if (phi_new_[j] > 1.0) phi_new_[j] = 1.0;
                     }
                 }
             }
@@ -896,6 +983,9 @@ private:
         // turbulence fields.
         if (has_inlet_dist_) {
             double threshold = (static_cast<double>(current_step_) + 1.0) * u_in_lb;
+            #ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+            #endif
             for (size_t i = 0; i < n_; ++i) {
                 if (flags_[i] == 1 || flags_[i] == 3) continue;
                 if (inlet_distance_[i] >= 0.0 && inlet_distance_[i] <= threshold) {
@@ -904,6 +994,9 @@ private:
             }
         }
 
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t i = 0; i < n_; ++i) {
             if (flags_[i] == 1) {
                 phi_new_[i] = 0.0;
@@ -916,6 +1009,9 @@ private:
     }
 
     void update_fill_times() {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t i = 0; i < n_; ++i) {
             if (flags_[i] != 1 && phi_[i] >= 0.5 && fill_time_[i] > t_) {
                 fill_time_[i] = t_;

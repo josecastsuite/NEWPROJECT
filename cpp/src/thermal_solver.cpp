@@ -21,6 +21,10 @@
 #include <string>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace nb = nanobind;
 
 namespace josecast {
@@ -365,6 +369,9 @@ nb::tuple solve_thermal(
 
             for (int s = 0; s < n_sub; ++s) {
                 double sub_t = t + (s + 0.5) * sub_dt;
+                #ifdef _OPENMP
+                #pragma omp parallel for schedule(static)
+                #endif
                 for (size_t i = 0; i < n; ++i) {
                     if (!metal[i] || T_adv[i] <= Ts) { T_tmp[i] = T_adv[i]; continue; }
                     if (fill_ptr && sub_t < fill_ptr[i]) { T_tmp[i] = T_adv[i]; continue; }
@@ -397,6 +404,9 @@ nb::tuple solve_thermal(
                     double adv = vx * dTdx + vy * dTdy + vz * dTdz;
                     T_tmp[i] = T_adv[i] - sub_dt * adv;
                 }
+                #ifdef _OPENMP
+                #pragma omp parallel for schedule(static)
+                #endif
                 for (size_t i = 0; i < n; ++i)
                     T_adv[i] = std::max(T0, std::min(Tp, T_tmp[i]));
             }
@@ -405,6 +415,9 @@ nb::tuple solve_thermal(
         // ---- implicit diffusion ----
         const double dT_mush = std::max(Tl - Ts, 1.0);
         const double df_cap = 1.0 / dT_mush;
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t i = 0; i < n; ++i) {
             double cp = cp0[i];
             if (metal[i] && L > 0.0) {
@@ -445,12 +458,18 @@ nb::tuple solve_thermal(
             for (int r = 0; r < n_int; ++r) x[r] = T_adv[int_to_full[r]];
         }
 
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t i = 0; i < n; ++i) T_new[i] = T0; // boundary default
         for (int r = 0; r < n_int; ++r) {
             int fi = int_to_full[r];
             T_new[fi] = x[r];
         }
 
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t i = 0; i < n; ++i) {
             if (!std::isfinite(T_new[i])) T_new[i] = T0;
             T_new[i] = std::max(T0, std::min(Tp, T_new[i]));
@@ -458,6 +477,9 @@ nb::tuple solve_thermal(
 
         // keep gating liquid while the mould is still being filled
         if (t + dt <= fill_end) {
+            #ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+            #endif
             for (size_t i = 0; i < n; ++i) {
                 if (gating[i] && metal[i] && T_new[i] < Tp)
                     T_new[i] = Tp;
@@ -465,6 +487,9 @@ nb::tuple solve_thermal(
         }
 
         // ---- record solidification crossings ----
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t i = 0; i < n; ++i) {
             if (!metal[i]) continue;
             double T_old_i = T[i];
@@ -523,8 +548,11 @@ nb::tuple solve_thermal(
         // early stop once all metal has solidified
         if (n_int > 0) {
             bool all_sol = true;
+            #ifdef _OPENMP
+            #pragma omp parallel for schedule(static) reduction(&:all_sol)
+            #endif
             for (size_t i = 0; i < n; ++i) {
-                if (metal[i] && std::isinf(t_sol[i])) { all_sol = false; break; }
+                if (metal[i] && std::isinf(t_sol[i])) { all_sol = false; }
             }
             if (all_sol) break;
         }
@@ -532,6 +560,9 @@ nb::tuple solve_thermal(
 
     // ---- final Niyama and solid fraction ----
     std::vector<double> niyama(n, 0.0);
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (size_t i = 0; i < n; ++i) {
         fs_final[i] = scheil_fs(T[i], Tl, Ts, k_part);
         if (metal[i] && R_at_ts[i] > 1e-12 && std::isfinite(G_at_ts[i])) {
@@ -674,6 +705,9 @@ nb::tuple compute_porosity(
 
     // find max modulus over the part for m_rel
     double m_max = 1.0;
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) reduction(max:m_max)
+    #endif
     for (size_t i = 0; i < n; ++i) {
         if (part_ptr[i] && std::isfinite(M_ptr[i]) && M_ptr[i] > m_max) m_max = M_ptr[i];
     }
@@ -681,6 +715,9 @@ nb::tuple compute_porosity(
     std::vector<double> pore_size_um(n), pore_size_mm(n), shrinkage_um(n), gp_pct(n), mold_movement_um(n);
     std::vector<uint8_t> macro_mask(n), micro_mask(n), fine_mask(n);
 
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (size_t i = 0; i < n; ++i) {
         bool part = part_ptr[i];
         double ny = ny_ptr[i];
