@@ -6817,6 +6817,12 @@ def solve_filling_flow(
                 )
 
             vof_outlet = _select_lbm_outlet_cells(vof_grid, vof_cavity, g, mold=mold)
+            # Critical: the source (inlet) cells must never be treated as vents.
+            # In gravity casting the top of the sprue/pouring basin is where metal
+            # enters; if the open-surface detector marks the same cells as outlets
+            # the C++ LBM overwrites the inlet flag and the pour never starts,
+            # giving filled_frac=0.0000.
+            vof_outlet = vof_outlet & ~vof_inlet
 
             if use_cpp_lbm:
                 from core.cpp_bridge import JOSECAST_CORE

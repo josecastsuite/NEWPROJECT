@@ -153,9 +153,17 @@ public:
                 flags_[i] = 0; // fluid/gas cavity
             }
         }
+        // Inlet and outlet masks may overlap (e.g. the open top of the sprue
+        // throat is both where metal enters and where the open-surface detector
+        // places a vent).  The inlet condition must win: a source cell cannot
+        // also be an outlet, otherwise the pour is never initialised and
+        // filled_frac stays at 0.
         for (size_t i = 0; i < n_; ++i) {
-            if (inlet_mask[i]) flags_[i] = 2;
-            if (outlet_mask[i]) flags_[i] = 3;
+            if (inlet_mask[i]) {
+                flags_[i] = 2;
+            } else if (outlet_mask[i]) {
+                flags_[i] = 3;
+            }
         }
 
         // If the caller did not supply a target velocity and/or inlet-distance
