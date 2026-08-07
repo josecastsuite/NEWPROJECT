@@ -841,6 +841,11 @@ class MainWindow(QtWidgets.QMainWindow):
             gravity_direction=gravity_direction,
             h_eff_m=self.h_eff_spin.value(),
             fast_flow=self.fast_flow_chk.isChecked(),
+            mold_afs_grain_size=self.mold_afs_spin.value(),
+            mold_moisture_percent=self.mold_moisture_spin.value(),
+            mold_binder_percent=self.mold_binder_spin.value(),
+            mold_compactability_percent=self.mold_compactability_spin.value(),
+            mold_rigidity_factor=self.mold_rigidity_spin.value(),
         )
 
     def _gravity_vector_from_ui(self) -> Tuple[float, float, float]:

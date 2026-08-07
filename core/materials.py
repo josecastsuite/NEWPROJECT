@@ -384,12 +384,75 @@ def save_body_presets(path: Optional[Path] = None) -> None:
     target.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def _effective_sand_properties(
+    base: MoldMaterial,
+    afs: float,
+    moisture: float,
+    binder: float,
+    compact: float,
+    t_pour_c: float,
+    t0_c: float,
+) -> Dict[str, float]:
+    """
+    Return corrected rho, cp and k for green sand from user-entered parameters.
+
+    The correction is intentionally simple and physically directed:
+    * Moisture and binder increase the heat capacity (water cp is large; water
+      evaporation adds an effective latent-heat term).
+    * Higher compactability means fewer voids -> density and conductivity rise.
+    * Higher AFS (finer grains) means more inter-granular contact -> conductivity
+      rises; coarse grains lower it.
+    """
+    # Reference state embedded in the material preset.
+    COMPACT_REF = 45.0
+    AFS_REF = 50.0
+    CP_WATER = 4184.0
+    CP_BINDER = 1000.0
+    L_VAP_WATER = 2.26e6  # J/kg
+
+    m = max(moisture / 100.0, 0.0)
+    b = max(binder / 100.0, 0.0)
+    s = max(1.0 - m - b, 0.0)
+
+    # Density: compacted sand is denser; added water/binder fill pores.
+    rho = base.rho_kg_m3 * (1.0 + 0.005 * (compact - COMPACT_REF)) * (1.0 + 0.01 * (moisture + binder))
+    rho = float(np.clip(rho, 500.0, 2500.0))
+
+    # Specific heat: mixture + vaporisation enthalpy spread over the useful ΔT.
+    delta_t = max(t_pour_c - t0_c, 50.0)
+    cp = s * base.cp_j_kgk + m * CP_WATER + b * CP_BINDER + m * L_VAP_WATER / delta_t
+    cp = float(np.clip(cp, 500.0, 5000.0))
+
+    # Conductivity: density/compaction dominates; moisture bridges grains;
+    # fine grains (high AFS) increase contact area.
+    density_factor = rho / base.rho_kg_m3
+    moisture_factor = 1.0 + 0.05 * moisture
+    afs_factor = 1.0 + 0.002 * (afs - AFS_REF)
+    k = base.k_w_mk * density_factor * moisture_factor * afs_factor
+    k = float(np.clip(k, 0.05, 20.0))
+
+    # d50 from AFS so the air-entrapment module sees the same grain size.
+    d50 = 15.5 / max(afs, 1.0)
+
+    return {
+        "rho_kg_m3": rho,
+        "cp_j_kgk": cp,
+        "k_w_mk": k,
+        "particle_size_mm": d50,
+    }
+
+
 def make_effective_mold(
     mold: MoldMaterial,
     casting_params: Optional[object] = None,
     body: Optional[object] = None,
 ) -> MoldMaterial:
-    """Return a copy of ``mold`` with GUI / per-body overrides applied."""
+    """Return a copy of ``mold`` with GUI / per-body overrides applied.
+
+    For sand moulds the moisture, binder, compactability and AFS values are
+    converted into corrected thermal properties (rho, cp, k) before the
+    Chvorinov / thermal solver sees them.
+    """
     # Use a per-CORE preset if the body provides one.
     base = mold
     overrides: Dict[str, float] = {}
@@ -427,6 +490,20 @@ def make_effective_mold(
         rigidity = getattr(casting_params, "mold_rigidity_factor", -1.0)
         if rigidity >= 0.0:
             overrides["mold_rigidity_factor"] = rigidity
+
+    # For real sand moulds, derive thermal properties from the user parameters.
+    # If the user did not override a value, the preset default is used.
+    if base.is_sand:
+        afs = overrides.get("afs_grain_size") or base.afs_grain_size
+        moisture = overrides.get("moisture_percent") or base.moisture_percent
+        binder = overrides.get("binder_percent") or base.binder_percent
+        compact = overrides.get("compactability_percent") or base.compactability_percent
+        t_pour_c = float(getattr(casting_params, "t_pour_c", 1500.0) or 1500.0)
+        t0_c = float(getattr(casting_params, "t_mold_c", base.t0_c) or base.t0_c)
+        thermal_overrides = _effective_sand_properties(
+            base, afs, moisture, binder, compact, t_pour_c, t0_c
+        )
+        overrides.update(thermal_overrides)
 
     if overrides:
         return replace(base, **overrides)
