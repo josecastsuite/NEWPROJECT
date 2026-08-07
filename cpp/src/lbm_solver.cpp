@@ -1,5 +1,7 @@
 #include "josecast/lbm_solver.h"
 
+#include <cstddef>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -299,7 +301,7 @@ public:
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static) reduction(+:filled)
         #endif
-        for (size_t i = 0; i < n_; ++i) {
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             // Inlet/source (2) and cavity (0) cells must fill; vents (3) stay empty.
             if (flags_[i] != 1 && flags_[i] != 3 && phi_[i] >= 0.5) ++filled;
         }
@@ -314,7 +316,7 @@ public:
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
         #endif
-        for (size_t i = 0; i < n_; ++i) {
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             double u = ux_[i], v = uy_[i], w = uz_[i];
             (*out)[i] = std::sqrt(u * u + v * v + w * w);
         }
@@ -325,7 +327,7 @@ public:
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
         #endif
-        for (size_t i = 0; i < n_; ++i) {
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             (*out)[0 * n_ + i] = ux_[i];
             (*out)[1 * n_ + i] = uy_[i];
             (*out)[2 * n_ + i] = uz_[i];
@@ -341,7 +343,7 @@ public:
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
         #endif
-        for (size_t i = 0; i < n_; ++i) {
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             (*out)[i] = (trapped_time_[i] < std::numeric_limits<double>::infinity() / 2.0) ? 1.0 : 0.0;
         }
     }
@@ -351,7 +353,7 @@ public:
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static) reduction(+:vol)
         #endif
-        for (size_t i = 0; i < n_; ++i) {
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             if (trapped_time_[i] < std::numeric_limits<double>::infinity() / 2.0) {
                 vol += (1.0 - phi_[i]);
             }
@@ -522,7 +524,7 @@ private:
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
         #endif
-        for (size_t idx = 0; idx < fluid_list_.size(); ++idx) {
+        for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(fluid_list_.size()); ++idx) {
             size_t i = fluid_list_[idx];
             double r = 0.0, px = 0.0, py = 0.0, pz = 0.0;
             const double* fp = &f_[i * Q];
@@ -572,7 +574,7 @@ private:
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
         #endif
-        for (size_t idx = 0; idx < fluid_list_.size(); ++idx) {
+        for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(fluid_list_.size()); ++idx) {
             size_t i = fluid_list_[idx];
             if (flags_[i] == 1) {
                 for (int q = 0; q < Q; ++q) f_new_[i * Q + q] = feq(q, 1.0, 0.0, 0.0, 0.0);
@@ -687,13 +689,13 @@ private:
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
         #endif
-        for (size_t i = 0; i < n_; ++i) {
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             for (int q = 0; q < Q; ++q) f_[i * Q + q] = 0.0;
         }
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
         #endif
-        for (size_t idx = 0; idx < fluid_list_.size(); ++idx) {
+        for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(fluid_list_.size()); ++idx) {
             size_t s = fluid_list_[idx];
             int x = static_cast<int>(s / (ny_ * nz_));
             int yz = static_cast<int>(s % (ny_ * nz_));
@@ -727,7 +729,7 @@ private:
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
         #endif
-        for (size_t idx = 0; idx < fluid_list_.size(); ++idx) {
+        for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(fluid_list_.size()); ++idx) {
             size_t i = fluid_list_[idx];
             if (flags_[i] == 1) {
                 // Solid wall: no-slip equilibrium.
@@ -909,7 +911,7 @@ private:
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
         #endif
-        for (size_t i = 0; i < n_; ++i) {
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             if (flags_[i] == 1 || flags_[i] == 3) continue;
             if (phi_[i] < 0.5 && flags_[i] != 2) continue;
             int x = static_cast<int>(i / (ny_ * nz_));
@@ -986,7 +988,7 @@ private:
             #ifdef _OPENMP
             #pragma omp parallel for schedule(static)
             #endif
-            for (size_t i = 0; i < n_; ++i) {
+            for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
                 if (flags_[i] == 1 || flags_[i] == 3) continue;
                 if (inlet_distance_[i] >= 0.0 && inlet_distance_[i] <= threshold) {
                     phi_new_[i] = std::max(phi_new_[i], 1.0);
@@ -997,7 +999,7 @@ private:
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
         #endif
-        for (size_t i = 0; i < n_; ++i) {
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             if (flags_[i] == 1) {
                 phi_new_[i] = 0.0;
             } else {
@@ -1012,7 +1014,7 @@ private:
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
         #endif
-        for (size_t i = 0; i < n_; ++i) {
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             if (flags_[i] != 1 && phi_[i] >= 0.5 && fill_time_[i] > t_) {
                 fill_time_[i] = t_;
             }

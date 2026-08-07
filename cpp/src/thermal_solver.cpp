@@ -372,7 +372,7 @@ nb::tuple solve_thermal(
                 #ifdef _OPENMP
                 #pragma omp parallel for schedule(static)
                 #endif
-                for (size_t i = 0; i < n; ++i) {
+                for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
                     if (!metal[i] || T_adv[i] <= Ts) { T_tmp[i] = T_adv[i]; continue; }
                     if (fill_ptr && sub_t < fill_ptr[i]) { T_tmp[i] = T_adv[i]; continue; }
 
@@ -407,7 +407,7 @@ nb::tuple solve_thermal(
                 #ifdef _OPENMP
                 #pragma omp parallel for schedule(static)
                 #endif
-                for (size_t i = 0; i < n; ++i)
+                for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i)
                     T_adv[i] = std::max(T0, std::min(Tp, T_tmp[i]));
             }
         }
@@ -418,7 +418,7 @@ nb::tuple solve_thermal(
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
         #endif
-        for (size_t i = 0; i < n; ++i) {
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
             double cp = cp0[i];
             if (metal[i] && L > 0.0) {
                 double df = dscheil_dT(T_adv[i], Tl, Ts, k_part);
@@ -461,7 +461,7 @@ nb::tuple solve_thermal(
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
         #endif
-        for (size_t i = 0; i < n; ++i) T_new[i] = T0; // boundary default
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) T_new[i] = T0; // boundary default
         for (int r = 0; r < n_int; ++r) {
             int fi = int_to_full[r];
             T_new[fi] = x[r];
@@ -470,7 +470,7 @@ nb::tuple solve_thermal(
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
         #endif
-        for (size_t i = 0; i < n; ++i) {
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
             if (!std::isfinite(T_new[i])) T_new[i] = T0;
             T_new[i] = std::max(T0, std::min(Tp, T_new[i]));
         }
@@ -480,7 +480,7 @@ nb::tuple solve_thermal(
             #ifdef _OPENMP
             #pragma omp parallel for schedule(static)
             #endif
-            for (size_t i = 0; i < n; ++i) {
+            for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
                 if (gating[i] && metal[i] && T_new[i] < Tp)
                     T_new[i] = Tp;
             }
@@ -490,7 +490,7 @@ nb::tuple solve_thermal(
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
         #endif
-        for (size_t i = 0; i < n; ++i) {
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
             if (!metal[i]) continue;
             double T_old_i = T[i];
             double T_new_i = T_new[i];
@@ -551,7 +551,7 @@ nb::tuple solve_thermal(
             #ifdef _OPENMP
             #pragma omp parallel for schedule(static) reduction(&:all_sol)
             #endif
-            for (size_t i = 0; i < n; ++i) {
+            for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
                 if (metal[i] && std::isinf(t_sol[i])) { all_sol = false; }
             }
             if (all_sol) break;
@@ -563,7 +563,7 @@ nb::tuple solve_thermal(
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
-    for (size_t i = 0; i < n; ++i) {
+    for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
         fs_final[i] = scheil_fs(T[i], Tl, Ts, k_part);
         if (metal[i] && R_at_ts[i] > 1e-12 && std::isfinite(G_at_ts[i])) {
             niyama[i] = G_at_ts[i] / std::sqrt(R_at_ts[i]);
@@ -708,7 +708,7 @@ nb::tuple compute_porosity(
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static) reduction(max:m_max)
     #endif
-    for (size_t i = 0; i < n; ++i) {
+    for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
         if (part_ptr[i] && std::isfinite(M_ptr[i]) && M_ptr[i] > m_max) m_max = M_ptr[i];
     }
 
@@ -718,7 +718,7 @@ nb::tuple compute_porosity(
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
-    for (size_t i = 0; i < n; ++i) {
+    for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
         bool part = part_ptr[i];
         double ny = ny_ptr[i];
         bool valid = part && std::isfinite(ny) && ny > 0.0;
