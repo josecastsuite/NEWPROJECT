@@ -620,6 +620,9 @@ def _compute_air_entrapment_risk(
     rho_air: float = 1.2,
     delta_p_pa: float = 20000.0,
     gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
+    mold: Any = None,
+    casting_params: Any = None,
+    alloy: Any = None,
 ) -> Tuple[np.ndarray, float, np.ndarray]:
     """Post-process air-entrapment risk (0-1) from an LBM/VOF free-surface solve.
 
@@ -646,6 +649,17 @@ def _compute_air_entrapment_risk(
     s6 = ndimage.generate_binary_structure(3, 1)
     g = _gravity_unit(gravity_vector)
     proj = _projection_along(shape, np.zeros(3, dtype=np.float64), dx_m, g)
+
+    # Temperatures for green-sand moisture flash-evaporation.
+    t_pour_c = float(
+        getattr(alloy, "t_pour_c", 0.0)
+        or getattr(casting_params, "t_pour_c", 1500.0)
+        or 1500.0
+    )
+    t0_c = float(
+        getattr(casting_params, "t_mold_c", getattr(mold, "t0_c", 25.0) or 25.0)
+        or 25.0
+    )
 
     # Air-entrapment domain: exclude filter / chill / sleeve / core inserts.
     air_mask = cavity_mask & ~np.isin(grid, list(_AIR_SKIP_TYPES))
@@ -721,11 +735,18 @@ def _compute_air_entrapment_risk(
         t_window = max(0.0, t_trap - t_first)
         t_seal = t_trap
 
+        # Add the steam volume generated from green-sand moisture: the vent must
+        # evacuate both air and steam before the pocket seals.
+        V_steam = _moisture_steam_volume(
+            comp, grid, cavity_mask, dx_m, mold, t_window, t_pour_c, t0_c
+        )
+        V_pocket_total = V_pocket + V_steam
+
         if Q_total <= 0.0 or t_window <= 0.0:
             risk_val = 1.0
         else:
             V_escape = Q_total * t_window
-            risk_val = 1.0 - min(1.0, V_escape / max(V_pocket, 1e-18))
+            risk_val = 1.0 - min(1.0, V_escape / max(V_pocket_total, 1e-18))
             risk_val = float(np.clip(risk_val, 0.0, 1.0))
 
         # Project the risk onto the ceiling of the metal surface that seals
@@ -806,6 +827,74 @@ def _apply_sand_permeability_correction(
         corrected = corrected * 0.935
 
     return np.clip(corrected, 0.0, 1.0)
+
+
+def _moisture_steam_volume(
+    pocket_mask: np.ndarray,
+    grid: np.ndarray,
+    cavity_mask: np.ndarray,
+    dx_m: float,
+    mold: Any,
+    t_contact_s: float,
+    t_pour_c: float,
+    t0_c: float,
+) -> float:
+    """
+    Estimate the extra gas volume (m³) produced by flash evaporation of green-sand
+    moisture at the pocket/mould interface.
+
+    The water in the sand surface layer that is heated by the molten metal during
+    the time the pocket is open turns into steam.  This steam must also escape
+    through the vent path; if it cannot, it contributes to the trapped-air risk.
+    """
+    if not bool(getattr(mold, "is_sand", False)):
+        return 0.0
+    moisture = float(getattr(mold, "moisture_percent", 0.0) or 0.0)
+    if moisture <= 0.0 or t_contact_s <= 0.0 or dx_m <= 0.0:
+        return 0.0
+
+    rho_s = float(getattr(mold, "rho_kg_m3", 1600.0))
+    cp_s = float(getattr(mold, "cp_j_kgk", 1170.0))
+    k_s = float(getattr(mold, "k_w_mk", 0.58))
+    L_vap = 2.26e6  # J/kg water
+    R_v = 461.5     # J/(kg K)
+    T_boil = 373.15 # K
+    P_amb = 101325.0 # Pa
+
+    s6 = ndimage.generate_binary_structure(3, 1)
+    dilated = ndimage.binary_dilation(pocket_mask, structure=s6, iterations=1)
+    # The mould material is the empty region outside the cavity (grid == EMPTY).
+    # For a sand mould those are the sand cells; inserts (CORE/CHILL/SLEEVE) stay
+    # in the grid and must not be counted as sand.
+    mold_mask = (grid == int(BodyType.EMPTY)) & ~cavity_mask
+    sand_contact = dilated & mold_mask
+    if not sand_contact.any():
+        return 0.0
+
+    A_sand_m2 = float(np.count_nonzero(sand_contact)) * dx_m * dx_m
+
+    # Thermal diffusion depth into the sand during the contact time.
+    alpha_m2_s = k_s / max(rho_s * cp_s, 1e-12)
+    delta_m = np.sqrt(alpha_m2_s * t_contact_s)
+    # Grid resolution limits us to the adjacent sand voxel; use up to 3 voxels.
+    layer_depth_m = float(np.clip(delta_m, dx_m, 3.0 * dx_m))
+
+    # Water mass in the heated sand layer.
+    w = moisture / 100.0
+    m_water_kg = A_sand_m2 * layer_depth_m * rho_s * w
+
+    # Fraction of that water that can flash-evaporate with the available heat.
+    # Heat-transfer coefficient approximated by conduction across the layer.
+    h_w_m2k = k_s / max(layer_depth_m, 1e-6)
+    delta_T = max(t_pour_c - 100.0, 50.0)
+    E_per_m2 = layer_depth_m * rho_s * (cp_s * (100.0 - t0_c) + w * L_vap)
+    t_boil_s = E_per_m2 / max(h_w_m2k * delta_T, 1e-12)
+    f_evap = min(1.0, t_contact_s / max(t_boil_s, 1e-12))
+    m_evap_kg = m_water_kg * f_evap
+
+    # Steam volume at 100 °C / 1 atm (ideal gas).
+    V_steam_m3 = m_evap_kg * R_v * T_boil / P_amb
+    return float(max(V_steam_m3, 0.0))
 
 
 def compute_geometric_air_entrapment(
@@ -1255,7 +1344,17 @@ def compute_air_entrapment_geofc(
     viewer can render it as a point cloud.  Only physically touching paths are
     used; no nearest-distance magic.
     """
-    _ = alloy  # reserved for future chemistry-dependent gas solubility
+    # Temperatures for green-sand moisture flash-evaporation.
+    t_pour_c = float(
+        getattr(alloy, "t_pour_c", 0.0)
+        or getattr(casting_params, "t_pour_c", 1500.0)
+        or 1500.0
+    )
+    t0_c = float(
+        getattr(casting_params, "t_mold_c", getattr(mold, "t0_c", 25.0) or 25.0)
+        or 25.0
+    )
+
     g = _gravity_unit(gravity_vector)
     origin = np.asarray(origin, dtype=np.float64)
     orig_grid = grid
@@ -1460,7 +1559,14 @@ def compute_air_entrapment_geofc(
         else:
             pocket = comp & (t_fill > t_seal)
         v_pocket = float(pocket.sum()) * (dx_m ** 3)
-        trapped_air_volume_m3 += v_pocket
+
+        # Green-sand moisture produces additional steam that must also escape.
+        t_window = max(0.0, t_seal)
+        V_steam = _moisture_steam_volume(
+            pocket, grid, cavity_mask, dx_m, mold, t_window, t_pour_c, t0_c
+        )
+        v_pocket_total = v_pocket + V_steam
+        trapped_air_volume_m3 += v_pocket_total
         pocket_volume[pocket] = 1.0
 
         # Metal that has already reached the pocket boundary by the seal time.
@@ -1536,7 +1642,7 @@ def compute_air_entrapment_geofc(
         if q_max <= 0.0 or t_window <= 0.0:
             risk_val = 1.0
         else:
-            risk_val = 1.0 - min(1.0, (q_max * t_window) / max(v_pocket, 1e-18))
+            risk_val = 1.0 - min(1.0, (q_max * t_window) / max(v_pocket_total, 1e-18))
             risk_val = float(np.clip(risk_val, 0.0, 1.0))
 
         # Do not smear risk into the air volume; paint only the ceiling surface.
@@ -6917,6 +7023,9 @@ def solve_filling_flow(
                 float(vof_dx_m),
                 rho_air=1.2,
                 delta_p_pa=20000.0,
+                mold=mold,
+                casting_params=casting_params,
+                alloy=alloy,
             )
             air_entrapment_fine = _resample_to_grid(
                 risk_c,
