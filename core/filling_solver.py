@@ -619,6 +619,7 @@ def _compute_air_entrapment_risk(
     dx_m: float,
     rho_air: float = 1.2,
     delta_p_pa: float = 20000.0,
+    gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
 ) -> Tuple[np.ndarray, float, np.ndarray]:
     """Post-process air-entrapment risk (0-1) from an LBM/VOF free-surface solve.
 
@@ -628,6 +629,10 @@ def _compute_air_entrapment_risk(
     seals the pocket; otherwise risk is one.  Only outlets that physically
     touch the pocket (6-neighbour) contribute to Q_max; distant vents are
     ignored.
+
+    Crucially, the risk is **written on the metal ceiling that seals the air
+    pocket**, not on the air volume itself, so the viewer can render true surface
+    clouds (bubbling points) instead of a volumetric red haze.
     """
     if (
         phi.shape != fill_time.shape
@@ -639,6 +644,8 @@ def _compute_air_entrapment_risk(
 
     shape = phi.shape
     s6 = ndimage.generate_binary_structure(3, 1)
+    g = _gravity_unit(gravity_vector)
+    proj = _projection_along(shape, np.zeros(3, dtype=np.float64), dx_m, g)
 
     # Air-entrapment domain: exclude filter / chill / sleeve / core inserts.
     air_mask = cavity_mask & ~np.isin(grid, list(_AIR_SKIP_TYPES))
@@ -666,6 +673,7 @@ def _compute_air_entrapment_risk(
 
     sqrt_term = np.sqrt(2.0 * delta_p_pa / max(rho_air, 1e-12))
     risk = np.zeros(shape, dtype=np.float64)
+    pocket_volume = np.zeros(shape, dtype=np.float32)
 
     for comp_id in range(1, n_comp + 1):
         comp = labels == comp_id
@@ -676,6 +684,8 @@ def _compute_air_entrapment_risk(
         # Component open to the outside of the voxel domain.
         if np.any(comp & boundary_mask):
             continue
+
+        pocket_volume[comp] = 1.0
 
         # Dilate by one 6-neighbour shell to detect touching outlets and metal.
         dilated_comp = ndimage.binary_dilation(comp, structure=s6, iterations=1)
@@ -699,14 +709,17 @@ def _compute_air_entrapment_risk(
 
         # Local escape window: first metal contact until the pocket is sealed.
         neighbor_metal = dilated_comp & metal_mask
-        t_window = 0.0
-        if neighbor_metal.any():
-            neighbor_times = fill_time[neighbor_metal]
-            finite_times = neighbor_times[np.isfinite(neighbor_times)]
-            if finite_times.size > 0:
-                t_first = float(np.min(finite_times))
-                t_trap = float(np.max(finite_times))
-                t_window = max(0.0, t_trap - t_first)
+        if not neighbor_metal.any():
+            continue
+
+        neighbor_times = fill_time[neighbor_metal]
+        finite_times = neighbor_times[np.isfinite(neighbor_times)]
+        if finite_times.size == 0:
+            continue
+        t_first = float(np.min(finite_times))
+        t_trap = float(np.max(finite_times))
+        t_window = max(0.0, t_trap - t_first)
+        t_seal = t_trap
 
         if Q_total <= 0.0 or t_window <= 0.0:
             risk_val = 1.0
@@ -714,13 +727,22 @@ def _compute_air_entrapment_risk(
             V_escape = Q_total * t_window
             risk_val = 1.0 - min(1.0, V_escape / max(V_pocket, 1e-18))
             risk_val = float(np.clip(risk_val, 0.0, 1.0))
-        risk[comp] = risk_val
+
+        # Project the risk onto the ceiling of the metal surface that seals
+        # the pocket at the moment of entrapment.
+        seal_surface = neighbor_metal & (fill_time <= t_seal + 1e-9)
+        if not seal_surface.any():
+            seal_surface = neighbor_metal
+        proj_surface = proj[seal_surface]
+        ceiling_threshold = float(np.percentile(proj_surface, 80.0))
+        ceiling = seal_surface & (proj >= ceiling_threshold - 1e-9)
+        risk[ceiling] = risk_val
 
     # Zero any residual risk on non-air cells.
     risk = np.where(air_mask, risk, 0.0)
-    trapped_volume_m3 = float(np.sum(risk)) * dx_m ** 3
+    trapped_volume_m3 = float(np.sum(pocket_volume)) * dx_m ** 3
     if trapped_volume_m3 > 0.0:
-        center_vox = np.array(ndimage.center_of_mass(risk), dtype=np.float64)
+        center_vox = np.array(ndimage.center_of_mass(pocket_volume), dtype=np.float64)
     else:
         center_vox = np.array([], dtype=np.float64)
     return risk.astype(np.float32), trapped_volume_m3, center_vox
@@ -1052,7 +1074,13 @@ def _weighted_time_field(
     v_field: np.ndarray,
     dx_m: float,
 ) -> np.ndarray:
-    """Dijkstra front-arrival time (s) from inlet using per-cell velocity."""
+    """Dijkstra front-arrival time (s) from all inlets using per-cell velocity.
+
+    Uses a single virtual source connected to every inlet node with zero cost,
+    so the sparse Dijkstra call needs only one source index regardless of how
+    many inlet cells exist.  This avoids the O(n_inlets * n_nodes) memory blow-up
+    that made high-resolution analyses hang.
+    """
     shape = cavity_mask.shape
     node_id = np.full(shape, -1, dtype=np.int64)
     n_nodes = int(cavity_mask.sum())
@@ -1110,21 +1138,29 @@ def _weighted_time_field(
                 data.append(w)
 
     if rows:
-        graph = csr_matrix(
-            (np.concatenate(data), (np.concatenate(rows), np.concatenate(cols))),
-            shape=(n_nodes, n_nodes),
-        )
+        rows_arr = np.concatenate(rows)
+        cols_arr = np.concatenate(cols)
+        data_arr = np.concatenate(data)
     else:
-        graph = csr_matrix((n_nodes, n_nodes))
+        rows_arr = cols_arr = data_arr = np.empty(0, dtype=np.float64)
 
     inlet_nodes = node_id[inlet_mask]
     inlet_nodes = inlet_nodes[inlet_nodes >= 0]
     t_fill = np.full(shape, np.inf, dtype=np.float64)
     if inlet_nodes.size > 0:
-        dists = csgraph.dijkstra(
-            graph, indices=inlet_nodes, directed=False, return_predecessors=False
+        # Virtual source node n_nodes reaches every inlet with zero cost.
+        source_rows = np.full(inlet_nodes.size, n_nodes, dtype=np.int64)
+        source_data = np.zeros(inlet_nodes.size, dtype=np.float64)
+        rows_arr = np.concatenate([rows_arr, source_rows, inlet_nodes])
+        cols_arr = np.concatenate([cols_arr, inlet_nodes, source_rows])
+        data_arr = np.concatenate([data_arr, source_data, source_data])
+        graph = csr_matrix(
+            (data_arr, (rows_arr, cols_arr)), shape=(n_nodes + 1, n_nodes + 1)
         )
-        t_fill[cavity_mask] = np.min(dists, axis=0)
+        dists = csgraph.dijkstra(
+            graph, indices=[n_nodes], directed=False, return_predecessors=False
+        )
+        t_fill[cavity_mask] = dists[0, :n_nodes]
     return t_fill
 
 
@@ -1402,20 +1438,45 @@ def compute_air_entrapment_geofc(
         if val is not None:
             vent_like.add(int(val))
 
+    trapped_air_volume_m3 = 0.0
+    pocket_volume = np.zeros(shape, dtype=np.float32)
     for label_id in range(1, n_comp + 1):
         comp = labels == label_id
         n_cells = int(comp.sum())
         if n_cells == 0:
             continue
-        v_pocket = n_cells * (dx_m ** 3)
         comp_t = t_escape[comp]
         t_seal = float(np.min(comp_t)) if comp_t.size else 0.0
         if np.isinf(t_seal) or np.isnan(t_seal) or t_seal < 0.0:
             t_seal = 0.0
 
+        # Still-air pocket at the moment the throat seals.  Risk is written on the
+        # metal ceiling that closes the pocket, not on the air volume itself.
         if t_seal <= 0.0:
-            risk[comp] = 1.0
+            # No connected outlet: the pocket is closed from the start.  Seal at
+            # the last cells to be filled so the risk appears on the real ceiling.
+            t_seal = float(np.max(t_fill[comp]))
+            pocket = comp & (t_fill >= t_seal - throat_tol) & (t_fill <= t_seal)
+        else:
+            pocket = comp & (t_fill > t_seal)
+        v_pocket = float(pocket.sum()) * (dx_m ** 3)
+        trapped_air_volume_m3 += v_pocket
+        pocket_volume[pocket] = 1.0
+
+        # Metal that has already reached the pocket boundary by the seal time.
+        metal_at_seal = air_mask & (t_fill <= t_seal)
+        seal_surface = ndimage.binary_dilation(pocket, structure=s6, iterations=1) & metal_at_seal
+        if not seal_surface.any():
+            # Degenerate early seal: fall back to any metal neighbour.
+            seal_surface = ndimage.binary_dilation(comp, structure=s6, iterations=1) & air_mask & ~comp
+        if not seal_surface.any():
             continue
+
+        # Air rises, so the hazard is concentrated on the ceiling of the
+        # sealing surface (top percentile of projection along -g).
+        proj_surface = proj[seal_surface]
+        ceiling_threshold = float(np.percentile(proj_surface, 80.0))
+        ceiling = seal_surface & (proj >= ceiling_threshold - 1e-9)
 
         # Geometric vent-lock rule.  The pocket is safe only if the sealing throat
         # opens into an outside air region connected to a real vent.  The throat
@@ -1435,7 +1496,7 @@ def compute_air_entrapment_geofc(
         throat = near_seal
 
         if not throat.any():
-            risk[comp] = 1.0
+            risk[ceiling] = 1.0
             continue
 
         outside_labels, n_out = ndimage.label(outside, structure=s6)
@@ -1449,7 +1510,7 @@ def compute_air_entrapment_geofc(
 
         vented_throat = throat & ndimage.binary_dilation(connected_vent, structure=s6)
         if not vented_throat.any():
-            risk[comp] = 1.0
+            risk[ceiling] = 1.0
             continue
 
         a_throat = float(vented_throat.sum()) * voxel_area_m2
@@ -1478,16 +1539,8 @@ def compute_air_entrapment_geofc(
             risk_val = 1.0 - min(1.0, (q_max * t_window) / max(v_pocket, 1e-18))
             risk_val = float(np.clip(risk_val, 0.0, 1.0))
 
-        # Localize risk inside the pocket: deepest cells (largest t_fill - t_escape)
-        # are the last to be reached by air, so they are the most likely to trap.
-        comp_depth = (t_fill - t_escape)[comp]
-        comp_depth = np.clip(comp_depth, 0.0, None)
-        max_depth = float(np.max(comp_depth)) if comp_depth.size else 1.0
-        if max_depth > 1e-12:
-            depth_scale = comp_depth / max_depth
-        else:
-            depth_scale = 1.0
-        risk[comp] = risk_val * depth_scale
+        # Do not smear risk into the air volume; paint only the ceiling surface.
+        risk[ceiling] = risk_val
 
     if mold is not None and casting_params is not None:
         risk = _apply_sand_permeability_correction(
@@ -1505,9 +1558,19 @@ def compute_air_entrapment_geofc(
             fill_value=0.0,
             order=1,
         )
+        pocket_volume = _resample_to_grid(
+            pocket_volume,
+            origin,
+            dx_mm,
+            orig_shape,
+            orig_origin,
+            orig_dx_mm,
+            fill_value=0.0,
+            order=0,
+        )
 
     dx_out_m = orig_dx_mm / 1000.0
-    trapped_volume_m3 = float(np.sum(risk)) * (dx_out_m ** 3)
+    trapped_volume_m3 = float(np.sum(pocket_volume > 0.5)) * (dx_out_m ** 3)
     if risk.sum() > 0.0:
         coords = np.argwhere(risk > 0.0)
         weights = risk[risk > 0.0]

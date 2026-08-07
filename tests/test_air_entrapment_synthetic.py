@@ -5,8 +5,12 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from scipy import ndimage
 from core.filling_solver import _compute_air_entrapment_risk
 from core.types import BodyType
+
+
+s6 = ndimage.generate_binary_structure(3, 1)
 
 
 def _make_base(shape=(24, 24, 24), dx_m=0.001):
@@ -47,11 +51,15 @@ def test_closed_pocket_no_vent():
         phi, fill_time, outlet_mask, grid, cavity, 0.001
     )
 
-    pocket_risk = risk[pocket]
-    print("[test_closed_pocket_no_vent] pocket risk values:", np.unique(pocket_risk))
+    # Risk is now written on the metal ceiling that seals the pocket, not inside
+    # the empty pocket, because air entrapment is a surface/interface defect.
+    metal = phi >= 0.5
+    surface = ndimage.binary_dilation(pocket, structure=s6, iterations=1) & metal
+    surface_risk = risk[surface]
+    print("[test_closed_pocket_no_vent] surface risk values:", np.unique(surface_risk))
     print("[test_closed_pocket_no_vent] trapped_volume_m3:", trapped_volume)
-    assert pocket_risk.size > 0
-    assert np.allclose(pocket_risk, 1.0), f"closed pocket risk should be 1.0, got {pocket_risk}"
+    assert surface_risk.size > 0
+    assert surface_risk.max() > 0.99, f"closed pocket ceiling risk should be ~1.0, got {surface_risk.max()}"
     assert trapped_volume > 0.0
 
 
@@ -81,11 +89,13 @@ def test_left_pocket_far_right_riser():
         phi, fill_time, outlet_mask, grid, cavity, 0.001
     )
 
-    pocket_risk = risk[pocket]
-    print("[test_left_pocket_far_right_riser] pocket risk values:", np.unique(pocket_risk))
+    metal = phi >= 0.5
+    surface = ndimage.binary_dilation(pocket, structure=s6, iterations=1) & metal
+    surface_risk = risk[surface]
+    print("[test_left_pocket_far_right_riser] surface risk values:", np.unique(surface_risk))
     print("[test_left_pocket_far_right_riser] trapped_volume_m3:", trapped_volume)
-    assert pocket_risk.size > 0
-    assert np.allclose(pocket_risk, 1.0), f"geometric lock should keep risk 1.0, got {pocket_risk}"
+    assert surface_risk.size > 0
+    assert surface_risk.max() > 0.99, f"geometric lock should keep ceiling risk ~1.0, got {surface_risk.max()}"
     assert trapped_volume > 0.0
 
 
@@ -120,11 +130,13 @@ def test_open_vent_reduces_risk():
         phi, fill_time, outlet_mask, grid, cavity, 0.001
     )
 
-    comp_risk = risk[air_component]
-    print("[test_open_vent_reduces_risk] pocket+vent risk values:", np.unique(comp_risk))
+    metal = phi >= 0.5
+    surface = ndimage.binary_dilation(air_component, structure=s6, iterations=1) & metal
+    surface_risk = risk[surface]
+    print("[test_open_vent_reduces_risk] pocket+vent surface risk values:", np.unique(surface_risk))
     print("[test_open_vent_reduces_risk] trapped_volume_m3:", trapped_volume)
-    assert comp_risk.size > 0
-    assert comp_risk.max() < 1.0, f"open vent should reduce risk below 1.0, got max={comp_risk.max()}"
+    assert surface_risk.size > 0
+    assert surface_risk.max() < 1.0, f"open vent should reduce ceiling risk below 1.0, got max={surface_risk.max()}"
     assert trapped_volume >= 0.0
 
 
