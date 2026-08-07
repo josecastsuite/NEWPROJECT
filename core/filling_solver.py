@@ -263,6 +263,8 @@ def _flow_refined_grid(
             gravity_vector=gvec,
             conservative=False,
             progress_callback=None,
+            max_dim=max_dim,
+            auto_refine=True,
         )
         return grid, origin, dx
     except Exception as exc:

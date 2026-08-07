@@ -1983,11 +1983,15 @@ def _refine_region(
         return None
 
     target_dim = max(32, int(max_size / dx_fine))
+    # Local refinement is intentionally small; do not auto-refine past the
+    # caller's local memory budget.
     grid, _, origin, dx, _ = build_voxel_grid(
         cropped_bodies,
         target_dim=target_dim,
         progress_callback=progress_callback,
         conservative=False,
+        max_dim=max_local_dim,
+        auto_refine=False,
     )
     is_metal = np.isin(grid, BODY_METAL_TYPES)
     sdf = compute_sdf(is_metal, dx)

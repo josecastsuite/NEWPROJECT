@@ -540,6 +540,8 @@ def build_voxel_grid(
     fix_mesh: bool = True,
     gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
     conservative: bool = True,
+    max_dim: int = 600,
+    auto_refine: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, List[Body]]:
     """
     Build a global voxel grid.
@@ -547,7 +549,7 @@ def build_voxel_grid(
     The grid is padded with a 4-voxel empty border to avoid boundary clipping
     of SDF/gradient calculations.  The resolution is automatically increased if
     the chosen voxel size exceeds one third of the minimum wall thickness
-    (Nyquist criterion for thin-wall feeding paths).
+    (Nyquist criterion for thin-wall feeding paths), up to ``max_dim``.
 
     If every body is still ``BodyType.PART`` (typical for a raw STEP import),
     a heuristic classifier is run first to distinguish casting, riser, sprue,
@@ -617,10 +619,26 @@ def build_voxel_grid(
         t_min = 2.0 * dx * max(1.0, min_ridge)
         if dx > t_min / 3.0:
             required_dim = int(np.ceil(np.max(bbox_size) / (t_min / 3.0)))
+            if auto_refine and required_dim > target_dim and max_dim > target_dim:
+                new_target = int(min(required_dim, max_dim))
+                warnings.warn(
+                    f"İnce cidar tespit edildi: çözünürlük {target_dim} -> "
+                    f"{new_target} yükseltiliyor (t_min/3 = {t_min/3.0:.3f} mm)."
+                )
+                return build_voxel_grid(
+                    bodies,
+                    target_dim=new_target,
+                    progress_callback=progress_callback,
+                    fix_mesh=False,  # meshes are already repaired/classified
+                    gravity_vector=gravity_vector,
+                    conservative=conservative,
+                    max_dim=max_dim,
+                    auto_refine=False,
+                )
             warnings.warn(
                 f"Voxel pitch {dx:.3f} mm > t_min/3 ({t_min/3.0:.3f} mm). "
                 f"İnce cidarlar için önerilen çözünürlük {required_dim}, "
-                f"mevcut hedef {target_dim}. 26-komşuluk ve muhafazakar "
+                f"mevcut hedef {target_dim}, üst sınır {max_dim}. 26-komşuluk ve muhafazakar "
                 f"vokselleştirme bağlantıyı korumaya yardımcı olur."
             )
 
@@ -693,7 +711,14 @@ def build_part_grid(
         part_dim = int(round(max_size / 0.05))
         part_dim = max(60, min(part_dim, max_dim))
 
-    return build_voxel_grid(all_bodies, target_dim=part_dim, progress_callback=None, conservative=False)
+    return build_voxel_grid(
+        all_bodies,
+        target_dim=part_dim,
+        progress_callback=None,
+        conservative=False,
+        max_dim=max_dim,
+        auto_refine=True,
+    )
 
 
 def compute_face_fractions(is_metal: np.ndarray, sub: int = 4) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

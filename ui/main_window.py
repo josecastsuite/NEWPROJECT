@@ -1205,9 +1205,14 @@ class MainWindow(QtWidgets.QMainWindow):
         casting_params = getattr(self, "_pending_casting_params", None)
         analysis.casting_params = casting_params
         self._analysis = analysis
-        alloy = analysis.alloy if hasattr(analysis, "alloy") else None
-        if alloy is None and casting_params is not None:
-            alloy = get_alloy(casting_params.alloy_key)
+        # Use the alloy key carried by the analysis result; the UI combo is the
+        # final fallback in case an older result is loaded without one.
+        alloy_key = getattr(analysis, "alloy_key", None)
+        if not alloy_key and casting_params is not None:
+            alloy_key = getattr(casting_params, "alloy_key", None)
+        if not alloy_key:
+            alloy_key = self.alloy_combo.currentData()
+        alloy = get_alloy(alloy_key) if alloy_key else None
         self._update_porosity_filter_labels(alloy)
 
         gate_result = self._analysis.gate_result
