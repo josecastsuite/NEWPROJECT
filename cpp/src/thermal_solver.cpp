@@ -547,14 +547,14 @@ nb::tuple solve_thermal(
 
         // early stop once all metal has solidified
         if (n_int > 0) {
-            bool all_sol = true;
+            int unsolved = 0;
             #ifdef _OPENMP
-            #pragma omp parallel for schedule(static) reduction(&:all_sol)
+            #pragma omp parallel for schedule(static) reduction(+:unsolved)
             #endif
             for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
-                if (metal[i] && std::isinf(t_sol[i])) { all_sol = false; }
+                if (metal[i] && std::isinf(t_sol[i])) { ++unsolved; }
             }
-            if (all_sol) break;
+            if (unsolved == 0) break;
         }
     }
 
@@ -703,11 +703,8 @@ nb::tuple compute_porosity(
     const double *darcy_ptr = has_darcy ? darcy_factor.data() : nullptr;
     const double *fs_ptr = has_fs ? solid_fraction.data() : nullptr;
 
-    // find max modulus over the part for m_rel
+    // find max modulus over the part for m_rel (sequential; avoids OpenMP 2.0 max reduction).
     double m_max = 1.0;
-    #ifdef _OPENMP
-    #pragma omp parallel for schedule(static) reduction(max:m_max)
-    #endif
     for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
         if (part_ptr[i] && std::isfinite(M_ptr[i]) && M_ptr[i] > m_max) m_max = M_ptr[i];
     }

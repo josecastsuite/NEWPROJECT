@@ -297,7 +297,7 @@ public:
 
     double filled_fraction() const {
         if (cavity_cells_ == 0) return 0.0;
-        size_t filled = 0;
+        ptrdiff_t filled = 0;
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static) reduction(+:filled)
         #endif
@@ -790,7 +790,7 @@ private:
 
         // X faces.
         #ifdef _OPENMP
-        #pragma omp parallel for collapse(2) schedule(static)
+        #pragma omp parallel for schedule(static)
         #endif
         for (int x = 1; x < nx_; ++x) {
             for (int y = 0; y < ny_; ++y) {
@@ -827,7 +827,7 @@ private:
 
         // Y faces.
         #ifdef _OPENMP
-        #pragma omp parallel for collapse(2) schedule(static)
+        #pragma omp parallel for schedule(static)
         #endif
         for (int x = 0; x < nx_; ++x) {
             for (int y = 1; y < ny_; ++y) {
@@ -864,7 +864,7 @@ private:
 
         // Z faces.
         #ifdef _OPENMP
-        #pragma omp parallel for collapse(2) schedule(static)
+        #pragma omp parallel for schedule(static)
         #endif
         for (int x = 0; x < nx_; ++x) {
             for (int y = 0; y < ny_; ++y) {
