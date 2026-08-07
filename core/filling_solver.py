@@ -464,6 +464,68 @@ def _find_boundary_cells_along(
     return out
 
 
+def _open_surface_mask(
+    grid: np.ndarray,
+    cavity: np.ndarray,
+    g: np.ndarray,
+    side: str = "up",
+) -> np.ndarray:
+    """Return cavity cells whose face-neighbour in the requested vertical
+    direction is EMPTY or outside the domain.
+
+    side='up'   -> direction -g (air can escape upward).
+    side='down' -> direction +g (metal can enter from below).
+    Only the single steepest face-neighbour is checked, so diagonal leakage
+    through a solid corner is not allowed.  CORE / CHILL / SLEEVE above a
+    cell do not count as an open surface.
+    """
+    shape = grid.shape
+    out = np.zeros(shape, dtype=bool)
+    if not cavity.any():
+        return out
+    g = _gravity_unit(tuple(g))
+    # Pick the face offset that best aligns with the requested direction.
+    if side == "up":
+        target = -g
+    else:
+        target = g
+    abs_t = np.abs(target)
+    if abs_t.max() < 1e-12:
+        return out
+    axis = int(np.argmax(abs_t))
+    sign = int(np.sign(target[axis]))
+    if sign == 0:
+        sign = 1
+    offset = [0, 0, 0]
+    offset[axis] = sign
+    di, dj, dk = offset
+
+    rolled_cavity = np.roll(cavity, (-di, -dj, -dk), axis=(0, 1, 2))
+    rolled_grid = np.roll(grid, (-di, -dj, -dk), axis=(0, 1, 2))
+    if di > 0:
+        rolled_cavity[-di:, :, :] = False
+        rolled_grid[-di:, :, :] = -1
+    elif di < 0:
+        rolled_cavity[: abs(di), :, :] = False
+        rolled_grid[: abs(di), :, :] = -1
+    if dj > 0:
+        rolled_cavity[:, -dj:, :] = False
+        rolled_grid[:, -dj:, :] = -1
+    elif dj < 0:
+        rolled_cavity[:, : abs(dj), :] = False
+        rolled_grid[:, : abs(dj), :] = -1
+    if dk > 0:
+        rolled_cavity[:, :, -dk:] = False
+        rolled_grid[:, :, -dk:] = -1
+    elif dk < 0:
+        rolled_cavity[:, :, : abs(dk)] = False
+        rolled_grid[:, :, : abs(dk)] = -1
+
+    neighbor_outside = ~rolled_cavity
+    neighbor_empty = (rolled_grid == int(BodyType.EMPTY)) | (rolled_grid == -1)
+    return cavity & neighbor_outside & neighbor_empty
+
+
 def _select_inlet_cells(
     grid: np.ndarray,
     cavity: np.ndarray,
@@ -526,16 +588,16 @@ def _select_vent_cells(
     cavity: np.ndarray,
     g: np.ndarray,
 ) -> np.ndarray:
-    """Select vent cells: top of an open RISER only.
-
-    Parça, meme, yolluk, sagu, döküm hunisi ve curufluk üst yüzeyleri hiçbir
-    kalıp tipinde otomatik vent sayılmaz. Kum kalıplarda yüzeysel hava kaçışı
-    `permeability_proxy` ile LBM sonrası düzeltilir, açık sınır olarak değil.
+    """Select vent cells: real RISER/FEEDER/VENT tops plus the open cavity
+    top free surface.  The top free surface is the natural air-escape path in
+    gravity casting when the mold cope/parting is open to atmosphere.
     """
     riser_mask = (grid == BodyType.RISER) & cavity
-    if not riser_mask.any():
-        return np.zeros_like(cavity, dtype=bool)
-    return _find_boundary_cells_along(riser_mask, g, side="up") & cavity
+    riser_top = np.zeros_like(cavity, dtype=bool)
+    if riser_mask.any():
+        riser_top = _find_boundary_cells_along(riser_mask, g, side="up") & cavity
+    top_surface = _open_surface_mask(grid, cavity, g, side="up")
+    return riser_top | top_surface
 
 
 def _select_lbm_outlet_cells(
@@ -1165,7 +1227,9 @@ def compute_air_entrapment_geofc(
     orig_dx_mm = float(dx_mm)
     orig_shape = grid.shape
 
-    cavity_for_downsample = (grid != int(BodyType.EMPTY)) & (grid != int(BodyType.CORE))
+    cavity_for_downsample = (grid != int(BodyType.EMPTY)) & ~np.isin(
+        grid, list(_NON_CAVITY_TYPES)
+    )
     if int(np.count_nonzero(cavity_for_downsample)) > max_cells:
         grid, origin, dx_mm = _downsample_grid(
             grid, origin, dx_mm, max_cells=max_cells
@@ -1197,6 +1261,8 @@ def compute_air_entrapment_geofc(
     proj = _projection_along(shape, np.zeros(3), 1.0, g)
 
     inlet_mask = np.zeros(shape, dtype=bool)
+    # Metal first enters the cavity from the bottom of the gating path
+    # (sprue/runner base, ingate exit, filter exit).
     for key in (
         "SPRUE",
         "POURING_BASIN",
@@ -1210,11 +1276,15 @@ def compute_air_entrapment_geofc(
         if btype is not None:
             candidate = (grid == int(btype)) & cavity_mask
             if candidate.any():
-                inlet_mask = _top_cells_of_mask(candidate, proj)
-                break
+                inlet_mask = _find_boundary_cells_along(candidate, g, side="down") & cavity_mask
+                if inlet_mask.any():
+                    break
+    if not inlet_mask.any():
+        # No gating geometry: assume metal accumulates at the bottom free surface.
+        inlet_mask = _open_surface_mask(grid, cavity_mask, g, side="down")
     if not inlet_mask.any():
         idx = np.unravel_index(
-            np.argmax(np.where(cavity_mask, proj, -np.inf)), shape
+            np.argmin(np.where(cavity_mask, proj, np.inf)), shape
         )
         inlet_mask[idx] = True
 
@@ -1257,19 +1327,16 @@ def compute_air_entrapment_geofc(
             mask = (grid == int(btype)) & cavity_mask
             if mask.any():
                 outlet_mask |= _top_cells_of_mask(mask, proj)
-    # Last resort: a single open cell at the highest projection of the cavity.
     if not outlet_mask.any() and finite_mask.any():
-        idx = np.unravel_index(np.argmax(np.where(finite_mask, proj, -np.inf)), shape)
-        outlet_mask = np.zeros(shape, dtype=bool)
-        outlet_mask[idx] = True
+        # Use the open top free surface as the air-escape boundary.
+        outlet_mask = _open_surface_mask(grid, cavity_mask, g, side="up")
+    # No artificial last-resort outlet: a cavity with no real vent or open
+    # surface is fully closed, so t_escape stays zero and everything traps.
 
     t_fill_escape = t_fill.copy()
-    open_body_mask = np.zeros(shape, dtype=bool)
-    for key in ("SPRUE", "POURING_BASIN", "RISER", "FEEDER", "VENT", "EXHAUST", "AIR_VENT"):
-        btype = getattr(BodyType, key, None)
-        if btype is not None:
-            open_body_mask |= (grid == int(btype)) & cavity_mask
-    t_fill_escape[open_body_mask] = fill_time_s
+    # Outlet cells (sprue/riser tops, open free surface) stay connected to
+    # atmosphere until the end of fill, so they act as t=fill_time_s open ends.
+    t_fill_escape[outlet_mask] = fill_time_s
 
     if outlet_mask.any():
         t_escape = _escape_time_maxmin(t_fill_escape, cavity_mask, outlet_mask)

@@ -20,6 +20,7 @@ def _channel_with_pocket():
 
     The pocket is a large chamber connected to the main channel by a single
     one-voxel throat so the vent capacity can not fully evacuate it.
+    A CORE roof closes the cope so the only real vent is the riser top.
     """
     # (x, y, z) axes; x is the primary flow direction.
     shape = (40, 22, 20)
@@ -34,8 +35,15 @@ def _channel_with_pocket():
     grid[20, 7, 10] = int(BodyType.PART)  # single-cell throat
     # Sprue/source at low x.
     grid[1:5, 8:13, 7:15] = int(BodyType.SPRUE)
-    # Riser at high x, open to atmosphere.
-    grid[36:39, 8:13, 7:15] = int(BodyType.RISER)
+    # Riser at high x, extended through the cope so it stays open.
+    grid[36:39, 8:13, 7:17] = int(BodyType.RISER)
+    # Cope roof (CORE) directly above the cavity; leave the riser area open.
+    grid[1:5, 8:13, 15] = int(BodyType.CORE)
+    grid[4:36, 8:13, 15] = int(BodyType.CORE)
+    grid[12:30, 2:7, 17] = int(BodyType.CORE)
+    # Close the cope above the separating wall / throat so air cannot leak upward.
+    grid[12:30, 7, 11:18] = int(BodyType.CORE)
+    grid[36:39, 8:13, 17] = int(BodyType.EMPTY)  # keep riser open
     return grid
 
 
@@ -65,8 +73,11 @@ def test_open_riser_partial_drain():
 
 def test_closed_pocket_no_vent():
     grid = _channel_with_pocket()
-    # Replace the riser with part metal so there is no vent.
+    # Remove gating so there is no vent; the inlet will be the bottom open surface.
     grid[grid == int(BodyType.RISER)] = int(BodyType.PART)
+    grid[grid == int(BodyType.SPRUE)] = int(BodyType.PART)
+    # Close the small cope opening left for the riser top.
+    grid[36:39, 8:13, 17] = int(BodyType.CORE)
     risk, vol, cent = compute_air_entrapment_geofc(
         grid,
         np.zeros(3),

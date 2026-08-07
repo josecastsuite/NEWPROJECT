@@ -1243,8 +1243,12 @@ class Analyzer3DViewer(QtInteractor):
             self._remove_scalar_bar("Kalıp erozyonu riski")
 
     def show_air_entrapment(self, result: Optional[AnalysisResult]):
-        """Isosurface cloud of trapped-air pockets, colored from blue (low)
-        to red (high) risk."""
+        """Render trapped-air risk as a translucent coloured point cloud.
+
+        Each metal voxel with non-zero risk becomes a coloured sphere; the
+        colour goes from blue (az riskli) through white to red (cok riskli).
+        This gives a true cloud-like volume instead of blocky isosurfaces.
+        """
         if self._air_entrapment_actor is not None:
             self.remove_actor(self._air_entrapment_actor)
             self._air_entrapment_actor = None
@@ -1257,30 +1261,54 @@ class Analyzer3DViewer(QtInteractor):
             return
 
         grid = self._make_grid(result, result.air_entrapment, "air_entrapment")
-        part = self._part_only(grid)
-        if part.n_cells == 0:
-            part = self._metal_only(grid)
-        if part.n_cells == 0:
+        pts = np.asarray(grid.points)
+        is_metal = grid["is_metal"]
+        air = grid["air_entrapment"]
+        min_risk = 0.02
+        mask = (is_metal >= 0.5) & (air >= min_risk)
+        if not mask.any():
             return
 
-        # Low-permeability isosurface thresholds so even small pockets appear.
-        iso_values = [0.05, 0.25, 0.5, 0.75, 0.95]
-        iso = part.contour(iso_values, scalars="air_entrapment")
-        if iso.n_points == 0:
-            return
+        selected = pts[mask]
+        values = air[mask]
 
-        # Full [0, 1] scale: blue = az risk, red = riskli.
-        clim = [0.0, 1.0]
+        # Tiny random jitter breaks the regular voxel lattice so the cloud
+        # looks organic instead of a foam/filter lattice.
+        if self._dx_mm > 0.0:
+            rng = np.random.default_rng(0)
+            jitter = (rng.random(selected.shape) - 0.5) * self._dx_mm * 0.5
+            selected = selected + jitter
 
-        self._air_entrapment_actor = self.add_mesh(
-            iso,
-            scalars="air_entrapment",
-            cmap="coolwarm",
-            opacity=0.65,
-            clim=clim,
+        cloud = pv.PolyData(selected)
+        cloud["air"] = values
+
+        lut = pv.LookupTable(cmap="coolwarm", scalar_range=(0.0, 1.0))
+        lut.annotations = {0.0: "az riskli", 0.5: "riskli", 1.0: "çok riskli"}
+
+        # Larger physical pitch -> larger screen points so coarse clouds still overlap.
+        point_size = max(4, min(10, int(round(self._dx_mm * 2.0))))
+
+        self._air_entrapment_actor = self.add_points(
+            cloud,
+            scalars="air",
+            cmap=lut,
+            clim=[0.0, 1.0],
+            render_points_as_spheres=True,
+            point_size=point_size,
+            opacity=0.55,
             show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Hava sıkışması", (0.02, 0.02), clim=clim),
-            smooth_shading=True,
+            scalar_bar_args={
+                "title": "Hava sıkışması",
+                "n_labels": 0,
+                "vertical": False,
+                "position_x": 0.20,
+                "position_y": 0.02,
+                "width": 0.60,
+                "height": 0.08,
+                "title_font_size": 10,
+                "label_font_size": 8,
+                "color": "#334155",
+            },
         )
 
         if result.air_entrapment_centroid_mm is not None and result.air_entrapment_centroid_mm.size == 3:
