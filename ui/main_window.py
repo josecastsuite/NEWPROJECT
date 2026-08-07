@@ -1365,11 +1365,12 @@ class MainWindow(QtWidgets.QMainWindow):
             noise, mp, size_filter = self._porosity_cloud_params()
             self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
 
-    def _porosity_cloud_params(self) -> Tuple[float, int, str]:
+    def _porosity_cloud_params(self) -> Tuple[float, Optional[int], str]:
         noise_percent = self.porosity_noise_slider.value() / 100.0  # 0.00 .. 100.00
-        max_points = 5000
+        # max_points is now computed dynamically from part volume and GPU VRAM in the viewer.
+        max_points = None
         size_filter = str(self.porosity_size_filter.currentData() or "all")
-        return float(noise_percent), int(max_points), size_filter
+        return float(noise_percent), max_points, size_filter
 
     def _update_porosity_filter_labels(self, alloy) -> None:
         """Set class combo labels from the alloy's physical micron limits."""

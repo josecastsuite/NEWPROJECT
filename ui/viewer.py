@@ -1,5 +1,8 @@
 """PyVistaQt 3D viewer wrapper for JoseCast Analyzer v8.x."""
 
+import os
+import shutil
+import subprocess
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -82,6 +85,79 @@ BODY_OPACITY_POST = {
     BodyType.DISTRIBUTOR: 0.35,
     BodyType.CURUFLUK: 0.35,
 }
+
+_DEFAULT_GPU_VRAM_MB = 4096  # GTX 1050 Ti gibi kartlar için güvenli varsayılan
+_HARD_POINTS_CAP = 150_000
+_BASE_POINTS = 5_000
+_LOG_COEFF = 30_000
+_POINTS_PER_VRAM_MB = 12.5
+
+
+def _gpu_vram_mb() -> int:
+    """Try to detect total VRAM from nvidia-smi; fall back to env/default."""
+    env = os.environ.get("JOSECAST_GPU_VRAM_MB")
+    if env:
+        try:
+            return max(1024, int(env))
+        except ValueError:
+            pass
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi:
+        try:
+            out = subprocess.check_output(
+                [nvidia_smi, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            first = out.strip().splitlines()[0]
+            return max(1024, int(float(first)))
+        except Exception:
+            pass
+    return _DEFAULT_GPU_VRAM_MB
+
+
+def _dynamic_max_points(volume_m3: float, vram_mb: Optional[int] = None) -> int:
+    """Point-budget that grows log with part volume and is capped by VRAM."""
+    if vram_mb is None:
+        vram_mb = _gpu_vram_mb()
+    volume_term = np.log10(1.0 + max(volume_m3, 0.0) * 10000.0)
+    dynamic = int(_BASE_POINTS + _LOG_COEFF * volume_term)
+    vram_cap = max(_BASE_POINTS, int(vram_mb * _POINTS_PER_VRAM_MB))
+    hard_cap = min(_HARD_POINTS_CAP, vram_cap)
+    return int(max(_BASE_POINTS, min(dynamic, hard_cap)))
+
+
+def _weighted_sample_cloud(cloud: pv.PolyData, target: int, scalar_name: str) -> pv.PolyData:
+    """Return a smaller cloud biased toward high scalar values.
+
+    If ``target`` is not smaller than ``cloud.n_points`` the original is returned.
+    """
+    n = cloud.n_points
+    if n <= target:
+        return cloud
+    if scalar_name in cloud.point_data:
+        weights = np.asarray(cloud.point_data[scalar_name], dtype=np.float64)
+    else:
+        weights = np.ones(n, dtype=np.float64)
+    weights = np.clip(weights, 0.0, None)
+    finite = np.isfinite(weights)
+    if not finite.any() or weights[finite].sum() <= 0.0:
+        probs = None
+    else:
+        weights = np.where(finite, weights, 0.0)
+        # Add a small floor so zero-risk voxels still have a chance to be seen.
+        weights = weights + weights[weights > 0.0].mean() * 0.05
+        probs = weights / weights.sum()
+    rng = np.random.default_rng(0)
+    idx = rng.choice(n, target, replace=False, p=probs)
+    points = cloud.points[idx]
+    sampled = pv.PolyData(points)
+    for name in cloud.array_names:
+        arr = np.asarray(cloud.point_data[name])
+        if arr.shape[0] == n:
+            sampled.point_data[name] = arr[idx]
+    return sampled
 
 
 def _scalar_bar_args(title: str, pos: Tuple[float, float], clim: Optional[Tuple[float, float]] = None) -> dict:
@@ -540,7 +616,7 @@ class Analyzer3DViewer(QtInteractor):
         self,
         result: Optional[AnalysisResult],
         noise_percent: float = 100.0,
-        max_points: int = 5000,
+        max_points: Optional[int] = None,
         pore_size_filter: Optional[str] = None,
     ):
         """Porosity point cloud colored by estimated pore size.
@@ -647,15 +723,13 @@ class Analyzer3DViewer(QtInteractor):
         except Exception:
             cloud = high.cell_centers()
 
-        if cloud.n_points > max_points:
-            idx = np.random.choice(cloud.n_points, max_points, replace=False)
-            points = cloud.points[idx]
-            if scalar_name in cloud.point_data:
-                vals = np.asarray(cloud.point_data[scalar_name])[idx]
-                cloud = pv.PolyData(points)
-                cloud.point_data[scalar_name] = vals
-            else:
-                cloud = pv.PolyData(points)
+        # Decide how many points we can afford: volume-driven log budget capped by VRAM.
+        if max_points is None:
+            part_volume_m3 = float(getattr(result, "part_volume_mm3", 0.0)) / 1e9
+            target = _dynamic_max_points(part_volume_m3)
+        else:
+            target = int(max_points)
+        cloud = _weighted_sample_cloud(cloud, target, scalar_name)
 
         # Porozite noktalarını parça dışına taşanları sil: sadece parça yüzeyi
         # içinde kalan noktaları tut.
@@ -1095,7 +1169,7 @@ class Analyzer3DViewer(QtInteractor):
                 self.remove_actor(self._hotspot_label_actor)
                 self._hotspot_label_actor = None
 
-    def toggle_porosity(self, result: AnalysisResult, checked: bool, noise_percent: float = 3.0, max_points: int = 5000, pore_size_filter: Optional[str] = None):
+    def toggle_porosity(self, result: AnalysisResult, checked: bool, noise_percent: float = 3.0, max_points: Optional[int] = None, pore_size_filter: Optional[str] = None):
         if checked:
             self.show_porosity_cloud(result, noise_percent=noise_percent, max_points=max_points, pore_size_filter=pore_size_filter)
         else:
@@ -1242,7 +1316,11 @@ class Analyzer3DViewer(QtInteractor):
                 self._erosion_actor = None
             self._remove_scalar_bar("Kalıp erozyonu riski")
 
-    def show_air_entrapment(self, result: Optional[AnalysisResult]):
+    def show_air_entrapment(
+        self,
+        result: Optional[AnalysisResult],
+        max_points: Optional[int] = None,
+    ):
         """Render trapped-air risk as a translucent coloured point cloud.
 
         Each metal voxel with non-zero risk becomes a coloured sphere; the
@@ -1281,6 +1359,15 @@ class Analyzer3DViewer(QtInteractor):
 
         cloud = pv.PolyData(selected)
         cloud["air"] = values
+
+        # Volume/VRAM aware budget + risk-weighted sampling so large parts still
+        # show the highest-risk air bubbles even with a modest GPU.
+        if max_points is None:
+            part_volume_m3 = float(getattr(result, "part_volume_mm3", 0.0)) / 1e9
+            target = _dynamic_max_points(part_volume_m3)
+        else:
+            target = int(max_points)
+        cloud = _weighted_sample_cloud(cloud, target, "air")
 
         lut = pv.LookupTable(cmap="coolwarm", scalar_range=(0.0, 1.0))
         lut.annotations = {0.0: "az riskli", 0.5: "riskli", 1.0: "çok riskli"}
