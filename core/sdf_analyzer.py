@@ -774,174 +774,253 @@ def compute_cold_shot_risk(
 
     Returns ``(cold_shot_risk, last_fill_point_mm)``.  ``last_fill_point_mm`` is
     an empty array when no valid fill data exists.
+
+    All large per-voxel intermediates are allocated from a ``VoxelArena`` and
+    computed in-place, so Windows does not need to hand out a fresh 526 MiB
+    contiguous block for every ``np.where`` / ``np.clip`` call.
     """
     if fill_time is None or fill_time.size == 0:
         return (
-            np.zeros_like(part_mask, dtype=np.float64),
+            np.zeros(part_mask.shape, dtype=np.float64),
             np.array([], dtype=np.float64),
         )
 
-    part_mask = part_mask.astype(bool)
+    shape = part_mask.shape
+    n = part_mask.size
+
+    # Convert boolean inputs once; these are 1 byte/voxel, not the memory hog.
+    part_mask = part_mask.astype(bool, copy=False)
     ft = np.asarray(fill_time, dtype=np.float64)
-    # Sentinel values in flow_result.fill_time mark unfilled cells.
     valid_fill = part_mask & (ft < 1.0e6) & np.isfinite(ft) & (ft >= 0.0)
-
-    # fill_delay_factor: 0 at the first-filled cells, 1 at the last-filled cells.
-    fill_delay_factor = np.zeros_like(ft, dtype=np.float64)
-    if valid_fill.any():
-        t_max = float(np.max(ft[valid_fill]))
-        if t_max > 0.0:
-            fill_delay_factor[valid_fill] = ft[valid_fill] / t_max
-    fill_delay_factor = np.clip(fill_delay_factor, 0.0, 1.0)
-
-    # low_velocity_factor: 1 when the front is essentially stopped,
-    # 0 when it is above the material-specific critical velocity.
-    v_mag = (
-        np.asarray(velocity_magnitude, dtype=np.float64)
-        if velocity_magnitude is not None
-        else np.zeros_like(part_mask, dtype=np.float64)
-    )
-    v_threshold = float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.5))
-    if v_threshold <= 1e-9:
-        v_threshold = 0.5
-
-    # If the per-voxel Darcy velocity is not populated in the part, estimate the
-    # local front speed from the fill time progression: the front is fastest at
-    # the beginning of filling and slows as it reaches remote/late-fill regions.
-    # This is a conservative, geometry-aware proxy for the metal front velocity.
-    if not np.any((v_mag > 1e-9) & part_mask):
-        v_front = np.where(
-            part_mask,
-            v_threshold * (1.0 - fill_delay_factor),
-            0.0,
-        )
-        v_local = v_front
-    else:
-        v_local = v_mag
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        low_velocity_factor = np.where(
-            part_mask,
-            1.0 - np.clip(v_local / v_threshold, 0.0, 1.0),
-            0.0,
-        )
-    low_velocity_factor = np.clip(np.nan_to_num(low_velocity_factor, nan=0.0), 0.0, 1.0)
-
-    # temperature_factor: 0 when the metal reaching the cell is still hotter
-    # than T_liquidus + 30 °C, rising linearly to 1 at/below T_solidus.
-    t_liq_c = float(alloy.t_liquidus_c)
-    t_sol_c = float(alloy.t_solidus_c)
-    T_high = t_liq_c + 30.0
-    T_low = t_sol_c
-
-    # Prefer the actual per-voxel liquidus/solidus times from the thermal solver.
-    # They are already shifted by the local metal arrival time.  Cold shuts form
-    # at the surface of the advancing front, not at the bulk centre, so the
-    # surface temperature is evaluated at a subsurface depth equal to 25 % of
-    # the local modulus (≈ 12.5 % of the wall thickness).  The solidification
-    # time at that depth scales quadratically with the depth.
-    T_meet = np.full_like(ft, t_pour_c, dtype=np.float64)
-    if t_liq is not None and t_liq.size == ft.size and np.any(np.isfinite(t_liq)):
-        t_liq_arr = np.asarray(t_liq, dtype=np.float64)
-        t_sol_arr = np.asarray(t_solid, dtype=np.float64)
-        fin = (
-            part_mask
-            & np.isfinite(t_liq_arr)
-            & np.isfinite(t_sol_arr)
-            & (t_liq_arr > 1e-6)
-            & (t_sol_arr > t_liq_arr)
+    if not valid_fill.any():
+        return (
+            np.zeros(part_mask.shape, dtype=np.float64),
+            np.array([], dtype=np.float64),
         )
 
-        # Surface-near solidification times (t ∝ depth^2, depth = 0.25 * M_mod).
-        surface_scale = 0.25 * 0.25
-        t_liq_surf = np.where(fin, t_liq_arr * surface_scale, np.inf)
-        t_sol_surf = np.where(fin, t_sol_arr * surface_scale, np.inf)
+    t_max = float(np.max(ft[valid_fill]))
 
-        # Time at which the surface reaches T_liquidus + 30 during the initial
-        # superheat removal (T_pour -> T_liquidus over [0, t_liq_surf]).
-        with np.errstate(divide="ignore", invalid="ignore"):
-            t_super = np.where(
-                fin & (t_pour_c > t_liq_c) & (T_high < t_pour_c),
-                t_liq_surf * (t_pour_c - T_high) / (t_pour_c - t_liq_c),
-                0.0,
-            )
-            t_super = np.clip(t_super, 0.0, np.maximum(t_liq_surf, 0.0))
-
-        # segment 1: initial superheat removal (T_pour -> T_liquidus)
-        m1 = fin & (ft < t_liq_surf) & (t_liq_surf > 1e-9)
-        T_meet = np.where(
-            m1,
-            t_pour_c - (t_pour_c - t_liq_c) * (ft / np.maximum(t_liq_surf, 1e-9)),
-            T_meet,
+    # Reserve virtual address space for the scratch arrays used below.  The OS
+    # only commits physical pages when the arrays are written, and every large
+    # temporary is carved from this one contiguous block.
+    reserve_options = [n * 80, n * 56, n * 40, n * 28]
+    reserve_options = [max(int(r), 1 << 30) for r in reserve_options]
+    arena = None
+    last_err = None
+    for reserve_bytes in reserve_options:
+        try:
+            arena = VoxelArena(reserve_bytes)
+            break
+        except MemoryError as exc:
+            last_err = exc
+            continue
+    if arena is None:
+        raise MemoryError(
+            f"compute_cold_shot_risk: could not reserve any VoxelArena "
+            f"(tried up to {reserve_options[0] / (1024 ** 3):.2f} GiB): {last_err}"
         )
 
-        # segment 2: solidifying through the mushy zone (T_liquidus -> T_solidus)
-        with np.errstate(invalid="ignore"):
-            denom_ts = np.where(fin, np.maximum(t_sol_surf - t_liq_surf, 1e-9), 1.0)
-        m2 = fin & (ft >= t_liq_surf) & (ft < t_sol_surf) & (t_liq_surf < t_sol_surf)
-        T_meet = np.where(
-            m2,
-            t_liq_c - (t_liq_c - t_sol_c) * ((ft - t_liq_surf) / denom_ts),
-            T_meet,
-        )
+    # Final float64 result in its own mmap so it survives arena cleanup.
+    out_bytes = n * np.dtype(np.float64).itemsize
+    out_mmap = mmap.mmap(-1, out_bytes, access=mmap.ACCESS_WRITE)
+    out = np.frombuffer(out_mmap, dtype=np.float64, count=n).reshape(shape)
+    out.fill(0.0)
 
-        # segment 3: already below T_solidus at the surface when the front arrives
-        m3 = fin & (ft >= t_sol_surf)
-        T_meet = np.where(m3, t_sol_c, T_meet)
-    else:
-        # Fallback: Chvorinov-based local cooling rate using the local modulus.
-        with np.errstate(divide="ignore", invalid="ignore"):
-            cooling_rate = np.where(
-                part_mask & (t_solid > 1e-9),
-                (t_pour_c - t_sol_c) / t_solid,
-                1e-3,
-            )
-        T_meet = t_pour_c - ft * cooling_rate
+    try:
+        with arena:
+            # Scratch float32 arrays; names map to the logical variables below.
+            fill_delay = arena.alloc(shape, np.float32, name="fill_delay")
+            v_local = arena.alloc(shape, np.float32, name="v_local")
+            low_vel = arena.alloc(shape, np.float32, name="low_vel")
+            T_meet = arena.alloc(shape, np.float32, name="T_meet")
+            t_liq_surf = arena.alloc(shape, np.float32, name="t_liq_surf")
+            t_sol_surf = arena.alloc(shape, np.float32, name="t_sol_surf")
+            t_super = arena.alloc(shape, np.float32, name="t_super")
+            tmp = arena.alloc(shape, np.float32, name="tmp")
+            thin = arena.alloc(shape, np.float32, name="thin")
 
-    T_meet = np.clip(T_meet, t_mold_c, t_pour_c)
+            # ---------- fill_delay_factor ----------
+            fill_delay.fill(0.0)
+            if t_max > 0.0:
+                np.divide(ft, t_max, out=tmp)
+                np.copyto(fill_delay, tmp, where=valid_fill, casting="unsafe")
+            np.clip(fill_delay, 0.0, 1.0, out=fill_delay)
 
-    if T_high <= T_low:
-        T_high = t_liq_c + 0.01
-        T_low = t_sol_c
-    denom = T_high - T_low
-    with np.errstate(divide="ignore", invalid="ignore"):
-        temperature_factor = np.where(
-            part_mask,
-            np.clip((T_high - T_meet) / denom, 0.0, 1.0),
-            0.0,
-        )
-    temperature_factor = np.clip(np.nan_to_num(temperature_factor, nan=0.0), 0.0, 1.0)
+            # ---------- low_velocity_factor ----------
+            v_threshold = float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.5))
+            if v_threshold <= 1e-9:
+                v_threshold = 0.5
 
-    # thin_section_factor: smaller local modulus -> thinner section -> higher risk.
-    m_mod_safe = np.where(part_mask, np.asarray(M_mod, dtype=np.float64), np.inf)
-    finite_m = m_mod_safe[np.isfinite(m_mod_safe) & (m_mod_safe > 0.0)]
-    m_ref = float(np.percentile(finite_m, 10)) if finite_m.size > 0 else float(dx)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        thin_section_factor = np.clip(
-            m_ref / np.maximum(m_mod_safe, m_ref),
-            0.0,
-            1.0,
-        )
-    thin_section_factor = np.where(part_mask, thin_section_factor, 0.0)
+            if velocity_magnitude is not None and velocity_magnitude.size == n:
+                np.copyto(v_local, velocity_magnitude, casting="unsafe")
+            else:
+                v_local.fill(0.0)
 
-    cold_shot_risk = (
-        temperature_factor
-        * fill_delay_factor
-        * low_velocity_factor
-        * thin_section_factor
-    )
-    cold_shot_risk = np.clip(np.nan_to_num(cold_shot_risk, nan=0.0), 0.0, 1.0)
+            has_velocity = np.any((v_local > 1e-9) & part_mask)
+            if not has_velocity:
+                # v_local = v_threshold * (1 - fill_delay) on the part, 0 outside.
+                np.subtract(1.0, fill_delay, out=v_local)
+                np.multiply(v_local, v_threshold, out=v_local)
+                np.copyto(v_local, 0.0, where=~part_mask)
 
-    # last fill point: coordinate of the latest-filled part voxel.
-    last_fill_point_mm = np.array([], dtype=np.float64)
-    if valid_fill.any():
-        masked = np.where(valid_fill, ft, -1.0)
-        flat_idx = int(np.argmax(masked))
+            np.divide(v_local, v_threshold, out=low_vel)
+            np.clip(low_vel, 0.0, 1.0, out=low_vel)
+            np.subtract(1.0, low_vel, out=low_vel)
+            np.copyto(low_vel, 0.0, where=~part_mask)
+            np.nan_to_num(low_vel, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            np.clip(low_vel, 0.0, 1.0, out=low_vel)
+
+            # ---------- temperature_factor ----------
+            t_liq_c = float(alloy.t_liquidus_c)
+            t_sol_c = float(alloy.t_solidus_c)
+            T_high = t_liq_c + 30.0
+            T_low = t_sol_c
+
+            T_meet.fill(float(t_pour_c))
+
+            if t_liq is not None and t_liq.size == n and np.any(np.isfinite(t_liq)):
+                # fin = part_mask & isfinite(t_liq) & isfinite(t_solid) & (t_liq > 1e-6) & (t_solid > t_liq)
+                fin = arena.alloc(shape, bool, name="fin")
+                np.isfinite(t_liq, out=fin)
+                np.logical_and(fin, part_mask, out=fin)
+                tmp_bool = arena.alloc(shape, bool, name="tmp_bool")
+                np.isfinite(t_solid, out=tmp_bool)
+                np.logical_and(fin, tmp_bool, out=fin)
+                np.greater(t_liq, 1e-6, out=tmp_bool)
+                np.logical_and(fin, tmp_bool, out=fin)
+                np.greater(t_solid, t_liq, out=tmp_bool)
+                np.logical_and(fin, tmp_bool, out=fin)
+
+                surface_scale = np.float32(0.25 * 0.25)
+                # t_liq_surf = fin ? t_liq * surface_scale : inf
+                t_liq_surf.fill(np.float32(np.inf))
+                np.multiply(t_liq, surface_scale, out=t_liq_surf, where=fin)
+                t_sol_surf.fill(np.float32(np.inf))
+                np.multiply(t_solid, surface_scale, out=t_sol_surf, where=fin)
+
+                # t_super = clip( fin&(cond) ? t_liq_surf * k : 0 , 0, t_liq_surf)
+                k_super = 0.0
+                if t_pour_c > t_liq_c and (t_pour_c - t_liq_c) > 1e-12:
+                    k_super = (t_pour_c - T_high) / (t_pour_c - t_liq_c)
+                t_super.fill(0.0)
+                if k_super != 0.0:
+                    np.multiply(t_liq_surf, k_super, out=t_super, where=fin)
+                    np.clip(t_super, 0.0, t_liq_surf, out=t_super)
+
+                # segment 1
+                # tmp = t_pour_c - (t_pour_c - t_liq_c) * (ft / max(t_liq_surf, 1e-9))
+                tmp.fill(0.0)
+                np.maximum(t_liq_surf, 1e-9, out=tmp)
+                np.divide(ft, tmp, out=tmp, casting="unsafe")
+                np.multiply(tmp, np.float32(t_pour_c - t_liq_c), out=tmp)
+                np.subtract(np.float32(t_pour_c), tmp, out=tmp)
+                m1 = arena.alloc(shape, bool, name="m1")
+                np.less(ft, t_liq_surf, out=m1)
+                np.logical_and(m1, fin, out=m1)
+                np.greater(t_liq_surf, 1e-9, out=tmp_bool)
+                np.logical_and(m1, tmp_bool, out=m1)
+                np.copyto(T_meet, tmp, where=m1, casting="unsafe")
+
+                # segment 2
+                # denom_ts = fin ? max(t_sol_surf - t_liq_surf, 1e-9) : 1.0
+                denom_ts = arena.alloc(shape, np.float32, name="denom_ts")
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    np.subtract(t_sol_surf, t_liq_surf, out=denom_ts)
+                    np.maximum(denom_ts, 1e-9, out=denom_ts)
+                    np.copyto(denom_ts, 1.0, where=~fin)
+                    # tmp = t_liq_c - (t_liq_c - t_sol_c) * ((ft - t_liq_surf) / denom_ts)
+                    np.subtract(ft, t_liq_surf, out=tmp, casting="unsafe")
+                    np.divide(tmp, denom_ts, out=tmp)
+                    np.multiply(tmp, np.float32(t_liq_c - t_sol_c), out=tmp)
+                    np.subtract(np.float32(t_liq_c), tmp, out=tmp)
+                m2 = arena.alloc(shape, bool, name="m2")
+                np.greater_equal(ft, t_liq_surf, out=m2)
+                np.logical_and(m2, fin, out=m2)
+                np.less(ft, t_sol_surf, out=tmp_bool)
+                np.logical_and(m2, tmp_bool, out=m2)
+                np.less(t_liq_surf, t_sol_surf, out=tmp_bool)
+                np.logical_and(m2, tmp_bool, out=m2)
+                np.copyto(T_meet, tmp, where=m2, casting="unsafe")
+
+                # segment 3
+                m3 = arena.alloc(shape, bool, name="m3")
+                np.greater_equal(ft, t_sol_surf, out=m3)
+                np.logical_and(m3, fin, out=m3)
+                np.copyto(T_meet, np.float32(t_sol_c), where=m3)
+
+                # Release the per-voxel liquidus branch temporaries early.
+                arena.free("fin")
+                arena.free("tmp_bool")
+                arena.free("m1")
+                arena.free("m2")
+                arena.free("m3")
+                arena.free("denom_ts")
+            else:
+                # Fallback: cooling_rate = part_mask & (t_solid > 1e-9) ? (t_pour - t_sol)/t_solid : 1e-3
+                tmp.fill(1e-3)
+                np.subtract(np.float32(t_pour_c), np.float32(t_sol_c), out=t_liq_surf)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    np.divide(t_liq_surf, t_solid, out=t_liq_surf, casting="unsafe")
+                    np.copyto(tmp, t_liq_surf, where=part_mask & (t_solid > 1e-9), casting="unsafe")
+                    np.multiply(ft, tmp, out=tmp, casting="unsafe")
+                    np.subtract(np.float32(t_pour_c), tmp, out=T_meet)
+
+            np.clip(T_meet, np.float32(t_mold_c), np.float32(t_pour_c), out=T_meet)
+
+            if T_high <= T_low:
+                T_high = t_liq_c + 0.01
+                T_low = t_sol_c
+            denom = float(T_high - T_low)
+
+            # temperature_factor = clip((T_high - T_meet) / denom, 0, 1) on part, 0 outside.
+            # Reuse T_meet as temperature_factor scratch.
+            np.subtract(np.float32(T_high), T_meet, out=T_meet)
+            np.divide(T_meet, np.float32(denom), out=T_meet)
+            np.clip(T_meet, 0.0, 1.0, out=T_meet)
+            np.copyto(T_meet, 0.0, where=~part_mask)
+            np.nan_to_num(T_meet, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            np.clip(T_meet, 0.0, 1.0, out=T_meet)
+            temperature_factor = T_meet
+
+            # ---------- thin_section_factor ----------
+            # thin = part_mask ? M_mod : inf, then clip(m_ref / max(thin, m_ref), 0, 1), then 0 outside.
+            thin.fill(np.float32(np.inf))
+            np.copyto(thin, M_mod, where=part_mask, casting="unsafe")
+            finite_m = thin[np.isfinite(thin) & (thin > 0.0)]
+            m_ref = float(np.percentile(finite_m, 10)) if finite_m.size > 0 else float(dx)
+            np.maximum(thin, np.float32(m_ref), out=thin)
+            np.divide(np.float32(m_ref), thin, out=thin)
+            np.clip(thin, 0.0, 1.0, out=thin)
+            np.copyto(thin, 0.0, where=~part_mask)
+
+            # ---------- cold_shot_risk ----------
+            # Reuse v_local as the output scratch: temperature_factor * fill_delay * low_vel * thin.
+            np.multiply(temperature_factor, fill_delay, out=v_local)
+            np.multiply(v_local, low_vel, out=v_local)
+            np.multiply(v_local, thin, out=v_local)
+            np.nan_to_num(v_local, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            np.clip(v_local, 0.0, 1.0, out=v_local)
+
+            np.copyto(out, v_local, casting="unsafe")
+    except Exception:
+        arena.close()
+        raise
+
+    # last fill point: find the flat index of a maximum fill_time inside valid_fill.
+    t_max = float(np.max(ft[valid_fill]))
+    argmax_mask = valid_fill & (ft >= t_max - 1e-12)
+    flat_indices = np.flatnonzero(argmax_mask)
+    if flat_indices.size > 0:
+        flat_idx = int(flat_indices[0])
         idx = np.unravel_index(flat_idx, ft.shape)
-        point = np.asarray(origin_mm, dtype=np.float64) + np.array(idx, dtype=np.float64) * float(dx)
-        last_fill_point_mm = point
+        last_fill_point_mm = (
+            np.asarray(origin_mm, dtype=np.float64)
+            + np.asarray(idx, dtype=np.float64) * float(dx)
+        )
+    else:
+        last_fill_point_mm = np.array([], dtype=np.float64)
 
-    return cold_shot_risk, last_fill_point_mm
+    return out, last_fill_point_mm
 
 
 def compute_erosion_risk(
