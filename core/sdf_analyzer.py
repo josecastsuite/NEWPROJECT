@@ -1,6 +1,7 @@
 """SDF-based geometric + pseudo-thermal casting analyzer - JoseCast v8.0."""
 
 import math
+import mmap
 import os
 import sys
 import time
@@ -30,6 +31,7 @@ from core.materials import (
 )
 from core.riser_designer import propose_risers
 from core.thermal_solver import _alloy_to_dict, _dscheil_dT, solve_3d_thermal
+from core.voxel_arena import VoxelArena
 from core.voxelizer import build_part_grid
 
 
@@ -994,110 +996,224 @@ def directional_feed_efficiency(
     travel time from the nearest feeder is subtracted from the feeder's available
     solidification time.  A riser that is reached late, or after the voxel has
     already started to solidify, cannot feed effectively.
+
+    This implementation uses a single anonymous ``mmap`` arena: all large
+    float32 intermediates are carved from a contiguous block of *virtual*
+    address space; the OS only commits physical pages when the arrays are
+    actually written.  The final float64 result is placed in a separate mmap so
+    that the returned array remains valid after the arena is released.
     """
     if t_s is None or not feeder_mask.any():
-        return np.ones_like(part_mask, dtype=np.float64)
+        out = np.ones(part_mask.shape, dtype=np.float64)
+        return out
 
-    # Work in float32 to halve the per-array footprint and perform all
-    # intermediate operations in-place, so no 500+ MiB temporary arrays are
-    # requested from the OS.
-    t_safe = np.array(t_s, dtype=np.float32, copy=True)
-    finite_vals = t_safe[np.isfinite(t_safe)]
-    t_fill = np.float32(finite_vals.max() if finite_vals.size > 0 else 0.0)
-    np.nan_to_num(t_safe, nan=t_fill, posinf=np.float32(0.0), neginf=np.float32(0.0), copy=False)
+    n = part_mask.size
+    shape = part_mask.shape
+    nx, ny, nz = shape
 
-    dx_f = np.float32(dx)
-    gz, gy, gx = np.gradient(t_safe, dx_f)
-    grad = np.empty(t_safe.shape + (3,), dtype=np.float32)
-    grad[..., 0] = gz
-    grad[..., 1] = gy
-    grad[..., 2] = gx
-    del gz, gy, gx
-
-    grad_mag = np.linalg.norm(grad, axis=-1)
-    mask_grad = grad_mag > 1e-12
-    np.divide(grad, grad_mag[..., None], out=grad, where=mask_grad[..., None])
-    np.multiply(grad, mask_grad[..., None], out=grad)
-
-    # Nearest feeder voxel for each voxel (feeder_mask True are features => pass inverted)
-    nearest = ndimage.distance_transform_edt(
-        ~feeder_mask, return_distances=False, return_indices=True
-    )
-    if nearest.dtype != np.int32:
-        nearest = nearest.astype(np.int32, copy=False)
-    indices = np.indices(part_mask.shape, dtype=np.int32)
-    diff = np.empty(nearest.shape, dtype=np.float32)
-    np.subtract(nearest, indices, out=diff, casting="unsafe")
-    diff *= dx_f
-    del indices
-
-    diff_norm = np.linalg.norm(diff, axis=0)
-    mask_diff = diff_norm > 1e-9
-    np.divide(diff, diff_norm[None, ...], out=diff, where=mask_diff[None, ...])
-    np.multiply(diff, mask_diff[None, ...], out=diff)
-    diff_dir = np.moveaxis(diff, 0, -1)
-
-    # Thermal alignment: if the riser is in the direction of the solidification
-    # front (+grad t_s), alignment is positive and feeding is more effective.
-    thermal_alignment = np.einsum("...i,...i->...", diff_dir, grad)
-    np.multiply(thermal_alignment, mask_grad, out=thermal_alignment)
-    del grad
-
-    # Gravity alignment: the riser should be above the voxel (opposite to gravity)
-    # so shrinkage voids migrate upward and the feeder can supply liquid metal.
-    g = np.asarray(gravity_vector, dtype=np.float32)
-    g_norm = np.linalg.norm(g) + np.float32(1e-12)
-    g = g / g_norm
-    gravity_alignment = np.einsum("...i,i->...", diff_dir, -g)
-    del diff_dir, g
-
-    # Combine thermal and gravity effects.  Thermal gradient dominates feeding
-    # direction in casting; gravity is a secondary but real modifier (Niyama-based
-    # feeding-distance literature typically gives thermal gradient ~70% weight).
-    np.multiply(thermal_alignment, np.float32(0.7), out=thermal_alignment)
-    np.multiply(gravity_alignment, np.float32(0.3), out=gravity_alignment)
-    np.add(thermal_alignment, gravity_alignment, out=thermal_alignment)
-    del gravity_alignment, diff, diff_norm, mask_diff
-    alignment = thermal_alignment
-
-    np.clip(alignment, np.float32(0.0), np.float32(1.0), out=alignment)
-    np.multiply(alignment, np.float32(max_reduction), out=alignment)
-    reduction = alignment
-
-    nearest_t_feeder = np.nan_to_num(
-        t_safe[tuple(nearest)], nan=np.float32(0.0), posinf=np.float32(0.0), neginf=np.float32(0.0)
-    )
-    t_feeder = nearest_t_feeder
-    if fill_time is not None and fill_time.size == t_safe.size:
-        fill_time_f = np.array(fill_time, dtype=np.float32, copy=True)
-        fill_feeder = np.nan_to_num(
-            fill_time_f[tuple(nearest)], nan=np.float32(0.0), posinf=np.float32(0.0), neginf=np.float32(0.0)
+    # Reserve 3x the expected peak working set in virtual address space.
+    # If Windows cannot back that much page-file space, fall back to smaller
+    # multiples until the smallest feasible arena is found.
+    reserve_options = [n * 180, n * 128, n * 96, n * 64]
+    reserve_options = [max(int(r), 1 << 30) for r in reserve_options]
+    arena = None
+    last_err = None
+    for reserve_bytes in reserve_options:
+        try:
+            arena = VoxelArena(reserve_bytes)
+            break
+        except MemoryError as exc:
+            last_err = exc
+            continue
+    if arena is None:
+        raise MemoryError(
+            f"directional_feed_efficiency: could not reserve any VoxelArena "
+            f"(tried up to {reserve_options[0] / (1024 ** 3):.2f} GiB): {last_err}"
         )
-        # Metal reaching the voxel later has had more time to cool in the feeder.
-        np.subtract(fill_time_f, fill_feeder, out=fill_time_f)
-        np.maximum(fill_time_f, np.float32(0.0), out=fill_time_f)
-        np.subtract(t_feeder, fill_time_f, out=t_feeder)
-        np.maximum(t_feeder, np.float32(0.0), out=t_feeder)
-        del fill_time_f, fill_feeder
 
-    np.maximum(t_safe, np.float32(1e-9), out=t_safe)
-    np.divide(t_feeder, t_safe, out=t_feeder)
-    np.clip(t_feeder, np.float32(0.0), np.float32(1.0), out=t_feeder)
-    time_factor = t_feeder
-    del t_safe, nearest, nearest_t_feeder
-
-    np.multiply(reduction, time_factor, out=reduction)
-    np.subtract(np.float32(1.0), reduction, out=reduction)
-    np.clip(reduction, np.float32(min_eff), np.float32(1.0), out=reduction)
-    efficiency = reduction
-    del time_factor, t_feeder, mask_grad
-
-    # Final float64 result required by the C++ porosity path; allocate only
-    # after the large float32 intermediates have been released.
-    out = np.empty(part_mask.shape, dtype=np.float64)
+    # Final float64 output lives in its own mmap so it survives arena cleanup.
+    out_bytes = n * np.dtype(np.float64).itemsize
+    out_mmap = mmap.mmap(-1, out_bytes, access=mmap.ACCESS_WRITE)
+    out = np.frombuffer(out_mmap, dtype=np.float64, count=n).reshape(shape)
     out.fill(1.0)
-    np.copyto(out, efficiency, where=part_mask)
+
+    try:
+        with arena:
+            dx_f = np.float32(dx)
+
+            # t_safe
+            t_safe = arena.alloc(shape, np.float32, name="t_safe")
+            np.copyto(t_safe, t_s, casting="unsafe")
+            finite_vals = t_safe[np.isfinite(t_safe)]
+            t_fill = np.float32(finite_vals.max() if finite_vals.size > 0 else 0.0)
+            np.nan_to_num(t_safe, nan=t_fill, posinf=0.0, neginf=0.0, copy=False)
+
+            # grad and |grad| in the arena; compute gradient in-place.
+            grad = arena.alloc(shape + (3,), np.float32, name="grad")
+            _in_place_gradient_3d(t_safe, dx_f, grad)
+
+            grad_mag = arena.alloc(shape, np.float32, name="grad_mag")
+            tmp = arena.alloc(shape, np.float32, name="tmp")
+            np.multiply(grad[..., 0], grad[..., 0], out=grad_mag)
+            np.multiply(grad[..., 1], grad[..., 1], out=tmp)
+            np.add(grad_mag, tmp, out=grad_mag)
+            np.multiply(grad[..., 2], grad[..., 2], out=tmp)
+            np.add(grad_mag, tmp, out=grad_mag)
+            np.sqrt(grad_mag, out=grad_mag)
+
+            mask_grad = arena.alloc(shape, bool, name="mask_grad")
+            np.greater(grad_mag, 1e-12, out=mask_grad)
+            np.divide(grad, grad_mag[..., None], out=grad, where=mask_grad[..., None])
+
+            # Nearest feeder voxel indices (3, nx, ny, nz).
+            nearest = arena.alloc((3,) + shape, np.int32, name="nearest")
+            ndimage.distance_transform_edt(
+                ~feeder_mask, return_distances=False, return_indices=True, indices=nearest
+            )
+
+            # diff = (nearest - index_grid) * dx.
+            diff = arena.alloc((3,) + shape, np.float32, name="diff")
+            x = np.arange(nx, dtype=np.float32)
+            y = np.arange(ny, dtype=np.float32)
+            z = np.arange(nz, dtype=np.float32)
+            np.subtract(nearest[0], x[:, None, None], out=diff[0])
+            np.subtract(nearest[1], y[None, :, None], out=diff[1])
+            np.subtract(nearest[2], z[None, None, :], out=diff[2])
+            np.multiply(diff, dx_f, out=diff)
+
+            diff_norm = arena.alloc(shape, np.float32, name="diff_norm")
+            np.multiply(diff[0], diff[0], out=diff_norm)
+            np.multiply(diff[1], diff[1], out=tmp)
+            np.add(diff_norm, tmp, out=diff_norm)
+            np.multiply(diff[2], diff[2], out=tmp)
+            np.add(diff_norm, tmp, out=diff_norm)
+            np.sqrt(diff_norm, out=diff_norm)
+
+            mask_diff = arena.alloc(shape, bool, name="mask_diff")
+            np.greater(diff_norm, 1e-9, out=mask_diff)
+            np.divide(diff, diff_norm[None, ...], out=diff, where=mask_diff[None, ...])
+            diff_dir = np.moveaxis(diff, 0, -1)
+
+            # Thermal alignment.
+            thermal_alignment = arena.alloc(shape, np.float32, name="thermal_alignment")
+            np.einsum("...i,...i->...", diff_dir, grad, out=thermal_alignment)
+            np.multiply(thermal_alignment, mask_grad, out=thermal_alignment)
+            arena.free("grad")
+
+            # Gravity alignment.
+            gravity_alignment = arena.alloc(shape, np.float32, name="gravity_alignment")
+            g = np.asarray(gravity_vector, dtype=np.float32)
+            g_norm = np.linalg.norm(g) + np.float32(1e-12)
+            g = g / g_norm
+            np.einsum("...i,i->...", diff_dir, -g, out=gravity_alignment)
+            arena.free("diff")
+            arena.free("diff_norm")
+            arena.free("mask_diff")
+            arena.free("mask_grad")
+            arena.free("tmp")
+
+            # Combine and form reduction factor.
+            np.multiply(thermal_alignment, np.float32(0.7), out=thermal_alignment)
+            np.multiply(gravity_alignment, np.float32(0.3), out=gravity_alignment)
+            np.add(thermal_alignment, gravity_alignment, out=thermal_alignment)
+            arena.free("gravity_alignment")
+            alignment = thermal_alignment
+
+            np.clip(alignment, np.float32(0.0), np.float32(1.0), out=alignment)
+            np.multiply(alignment, np.float32(max_reduction), out=alignment)
+            reduction = alignment
+
+            # Flat index of nearest voxel for np.take (avoids advanced-indexing copy).
+            flat_idx = arena.alloc(shape, np.int64, name="flat_idx")
+            np.multiply(nearest[2], ny, out=flat_idx)
+            np.add(flat_idx, nearest[1], out=flat_idx)
+            np.multiply(flat_idx, nx, out=flat_idx)
+            np.add(flat_idx, nearest[0], out=flat_idx)
+            arena.free("nearest")
+
+            # t_feeder at nearest feeder voxel.
+            t_feeder = arena.alloc(shape, np.float32, name="t_feeder")
+            np.take(t_safe, flat_idx, out=t_feeder)
+            np.nan_to_num(t_feeder, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if fill_time is not None and fill_time.size == n:
+                fill_time_f = arena.alloc(shape, np.float32, name="fill_time_f")
+                np.copyto(fill_time_f, fill_time, casting="unsafe")
+                np.nan_to_num(fill_time_f, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+                fill_feeder = arena.alloc(shape, np.float32, name="fill_feeder")
+                np.take(fill_time_f, flat_idx, out=fill_feeder)
+                np.nan_to_num(fill_feeder, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+                # Travel time = fill_time - fill_feeder, clamped to >= 0.
+                np.subtract(fill_time_f, fill_feeder, out=fill_time_f)
+                np.maximum(fill_time_f, np.float32(0.0), out=fill_time_f)
+                np.subtract(t_feeder, fill_time_f, out=t_feeder)
+                np.maximum(t_feeder, np.float32(0.0), out=t_feeder)
+                arena.free("fill_time_f")
+                arena.free("fill_feeder")
+
+            arena.free("flat_idx")
+
+            # time_factor = clamp(t_feeder / max(t_safe, 1e-9), 0, 1).
+            np.maximum(t_safe, np.float32(1e-9), out=t_safe)
+            np.divide(t_feeder, t_safe, out=t_feeder)
+            np.clip(t_feeder, np.float32(0.0), np.float32(1.0), out=t_feeder)
+            time_factor = t_feeder
+            arena.free("t_safe")
+
+            # efficiency = clamp(1 - reduction * time_factor, min_eff, 1).
+            np.multiply(reduction, time_factor, out=reduction)
+            np.subtract(np.float32(1.0), reduction, out=reduction)
+            np.clip(reduction, np.float32(min_eff), np.float32(1.0), out=reduction)
+            efficiency = reduction
+
+            np.copyto(out, efficiency, where=part_mask)
+    except Exception:
+        arena.close()
+        raise
+
     return out
+
+
+def _in_place_gradient_3d(t_safe: np.ndarray, dx: float, grad: np.ndarray) -> None:
+    """Compute a first-order gradient into the pre-allocated ``grad`` array.
+
+    ``grad[..., i]`` receives the derivative along axis ``i`` using central
+    differences in the interior and one-sided differences at the boundaries.
+    """
+    nx, ny, nz = t_safe.shape
+    rdx = 1.0 / float(dx)
+    half_rdx = 0.5 * rdx
+
+    if nx > 1:
+        # interior
+        if nx > 2:
+            np.subtract(t_safe[2:], t_safe[:-2], out=grad[1:-1, :, :, 0])
+            np.multiply(grad[1:-1, :, :, 0], half_rdx, out=grad[1:-1, :, :, 0])
+        # first and last
+        np.subtract(t_safe[1:2], t_safe[0:1], out=grad[0:1, :, :, 0])
+        np.multiply(grad[0:1, :, :, 0], rdx, out=grad[0:1, :, :, 0])
+        np.subtract(t_safe[-1:], t_safe[-2:-1], out=grad[-1:, :, :, 0])
+        np.multiply(grad[-1:, :, :, 0], rdx, out=grad[-1:, :, :, 0])
+
+    if ny > 1:
+        if ny > 2:
+            np.subtract(t_safe[:, 2:], t_safe[:, :-2], out=grad[:, 1:-1, :, 1])
+            np.multiply(grad[:, 1:-1, :, 1], half_rdx, out=grad[:, 1:-1, :, 1])
+        np.subtract(t_safe[:, 1:2], t_safe[:, 0:1], out=grad[:, 0:1, :, 1])
+        np.multiply(grad[:, 0:1, :, 1], rdx, out=grad[:, 0:1, :, 1])
+        np.subtract(t_safe[:, -1:], t_safe[:, -2:-1], out=grad[:, -1:, :, 1])
+        np.multiply(grad[:, -1:, :, 1], rdx, out=grad[:, -1:, :, 1])
+
+    if nz > 1:
+        if nz > 2:
+            np.subtract(t_safe[:, :, 2:], t_safe[:, :, :-2], out=grad[:, :, 1:-1, 2])
+            np.multiply(grad[:, :, 1:-1, 2], half_rdx, out=grad[:, :, 1:-1, 2])
+        np.subtract(t_safe[:, :, 1:2], t_safe[:, :, 0:1], out=grad[:, :, 0:1, 2])
+        np.multiply(grad[:, :, 0:1, 2], rdx, out=grad[:, :, 0:1, 2])
+        np.subtract(t_safe[:, :, -1:], t_safe[:, :, -2:-1], out=grad[:, :, -1:, 2])
+        np.multiply(grad[:, :, -1:, 2], rdx, out=grad[:, :, -1:, 2])
 
 
 def _pore_size_class(
