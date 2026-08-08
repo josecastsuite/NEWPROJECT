@@ -11,6 +11,11 @@ import numpy as np
 import pyvista as pv
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+try:
+    import psutil
+except Exception:  # pragma: no cover
+    psutil = None  # type: ignore
+
 from core import (
     MAX_RES,
     ALLOYS,
@@ -24,6 +29,7 @@ from core import (
     get_mold,
     load_step,
 )
+from core.voxelizer import _global_bbox
 from core.materials import chvorinov_c_from_properties, make_effective_mold
 from core.types import Body, BodyType, CastingParameters
 from ui.body_row_widget import BodyRowWidget, FEEDER_TYPE_NAMES
@@ -1089,6 +1095,40 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"{body.name} - {dialog.section_key}: A = {self._user_section_area_cm2:.4f} cm²", "ok"
                 )
 
+    def _memory_aware_max_dim(self, requested_dim: int) -> int:
+        """Limit max_dim to a grid size that fits within available RAM.
+
+        Uses ~200 bytes/cell for the full analysis pipeline.  A 3x safety
+        factor is already implied by the per-cell budget; here we reserve
+        25 % of available memory to leave headroom for the OS / VTK / Qt.
+        """
+        min_dim = 120
+        if not self._bodies:
+            return max(requested_dim, min_dim)
+
+        try:
+            bbox_min, bbox_max = _global_bbox(self._bodies)
+        except Exception:
+            return max(requested_dim, min_dim)
+        bbox_size = bbox_max - bbox_min
+        bbox_volume = float(np.prod(bbox_size))
+        max_size = float(np.max(bbox_size))
+        if bbox_volume <= 0 or max_size <= 0:
+            return max(requested_dim, min_dim)
+
+        if psutil is not None:
+            available = psutil.virtual_memory().available
+            # reserve 25 % and budget 200 bytes/cell for the full pipeline
+            max_cells = int(available * 0.25 / 200.0)
+        else:
+            # conservative fallback: ~30 M cells on machines without psutil
+            max_cells = 30_000_000
+
+        max_dim = int(max_size * (max_cells / bbox_volume) ** (1.0 / 3.0))
+        # also never exceed MAX_RES
+        max_dim = min(max(max_dim, min_dim), MAX_RES)
+        return max(requested_dim, max_dim) if requested_dim < max_dim else max_dim
+
     def on_voxelize(self):
         if not self._bodies:
             return
@@ -1097,12 +1137,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_label.setText("Voxelizasyon yapılıyor...")
             self.aiLog("AŞAMA 1/6: STEP'den çoklu body voxel grid oluşturuluyor...", "info")
             self._set_progress(10)
-            target_dim = self.res_spin.value()
+            requested_dim = self.res_spin.value()
+            memory_max_dim = self._memory_aware_max_dim(requested_dim)
+            if memory_max_dim < requested_dim:
+                self.aiLog(
+                    f"Bellek sınırı: hedef çözünürlük {requested_dim} -> {memory_max_dim} "
+                    f"(güvenli maksimum)",
+                    "warn",
+                )
+            target_dim = min(requested_dim, memory_max_dim)
             grid, body_index, origin, dx, bodies = build_voxel_grid(
                 self._bodies,
                 target_dim=target_dim,
                 progress_callback=self._set_progress,
                 gravity_vector=self._gravity_vector_from_ui(),
+                max_dim=memory_max_dim,
             )
             self._grid = grid
             self._body_index = body_index
