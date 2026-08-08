@@ -8,7 +8,33 @@ import numpy as np
 import trimesh
 from scipy import ndimage
 
-from core.types import Body, BodyType, BODY_METAL_TYPES
+from core.types import Body, BodyType, BODY_METAL_TYPES, CHILL_BODY_TYPES
+
+
+def _body_priority(body_type: int) -> int:
+    """Priority for overlapping voxels. Higher value wins."""
+    # Must stay in sync with cpp/src/voxelizer.cpp body_priority().
+    if body_type in (int(BodyType.CORE),):
+        return 3
+    if body_type in (int(BodyType.FILTER),):
+        return 4
+    if body_type in (int(t) for t in CHILL_BODY_TYPES):
+        return 5
+    if body_type in (
+        int(BodyType.RISER),
+        int(BodyType.INGATE),
+        int(BodyType.RUNNER),
+        int(BodyType.SPRUE),
+        int(BodyType.POURING_BASIN),
+        int(BodyType.SPRUE_THROAT),
+        int(BodyType.DISTRIBUTOR),
+        int(BodyType.CURUFLUK),
+        int(BodyType.SLEEVE),
+    ):
+        return 2
+    if body_type == int(BodyType.PART):
+        return 1
+    return 0
 
 
 def _maybe_cpp_bridge():
@@ -179,8 +205,9 @@ def _classify_casting_bodies(
             return BodyType.RISER
         if any(k in n for k in ("chill", "sogutucu", "soğutucu", "bakir_sogutucu", "celik_sogutucu")):
             return BodyType.CHILL
+        # Sleeve/yalanci bodies are feeder cavities; treat them as risers.
         if any(k in n for k in ("sleeve", "yalanci", "yalancı", "isı_yal", "exo", "exothermic", "insulating")):
-            return BodyType.SLEEVE
+            return BodyType.RISER
         if any(k in n for k in ("filtre", "filter", "foam")):
             return BodyType.FILTER
         return None
@@ -372,6 +399,7 @@ def _voxelize_at_dim(
     origin = bbox_min - margin * dx
     grid = np.zeros(grid_shape, dtype=np.int16)
     body_index = np.full(grid_shape, -1, dtype=np.int32)
+    priority_grid = np.zeros(grid_shape, dtype=np.int8)
 
     repaired_bodies: List[Body] = []
     for idx, body in enumerate(bodies):
@@ -459,9 +487,13 @@ def _voxelize_at_dim(
             # corner/edge contacts are preserved in the flow grid.
             mask = ndimage.binary_dilation(mask, structure=np.ones((3, 3, 3), dtype=bool))
 
-        # Later body wins on overlap
-        grid[i0:i1, j0:j1, k0:k1][mask] = int(body.body_type)
-        body_index[i0:i1, j0:j1, k0:k1][mask] = idx
+        # Priority-aware overlap resolution (synced with cpp/src/voxelizer.cpp).
+        new_priority = _body_priority(int(body.body_type))
+        sub_priority = priority_grid[i0:i1, j0:j1, k0:k1]
+        overwrite = mask & (new_priority >= sub_priority)
+        grid[i0:i1, j0:j1, k0:k1][overwrite] = int(body.body_type)
+        body_index[i0:i1, j0:j1, k0:k1][overwrite] = idx
+        sub_priority[overwrite] = new_priority
 
         repaired_bodies.append(body)
 
@@ -722,7 +754,7 @@ def build_part_grid(
 
 
 def compute_face_fractions(is_metal: np.ndarray, sub: int = 4) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return FAVOR-style fractional face areas for the three grid axes.
+    """Return FAVOR-style fractional face areas for the x, y and z axes.
 
     Each returned array has one more element along its corresponding axis
     than ``is_metal``; its values are in ``[0, 1]``.  The fraction is the
@@ -732,20 +764,24 @@ def compute_face_fractions(is_metal: np.ndarray, sub: int = 4) -> Tuple[np.ndarr
     that makes plain dx*dx face areas wrong on curved/amorphous geometry.
     """
     if sub <= 1:
-        nz, ny, nx = is_metal.shape
-        return np.ones((nz + 1, ny, nx)), np.ones((nz, ny + 1, nx)), np.ones((nz, ny, nx + 1))
+        nx, ny, nz = is_metal.shape
+        return (
+            np.ones((nx + 1, ny, nz)),
+            np.ones((nx, ny + 1, nz)),
+            np.ones((nx, ny, nz + 1)),
+        )
 
     zoom = float(sub)
     fine = ndimage.zoom(is_metal.astype(np.float64), zoom, order=1, mode="nearest")
     fine = np.clip(fine, 0.0, 1.0)
 
-    Nz, Ny, Nx = fine.shape
-    nz, ny, nx = Nz // sub, Ny // sub, Nx // sub
-    fine = fine[: nz * sub, : ny * sub, : nx * sub]
+    Nx, Ny, Nz = fine.shape
+    nx, ny, nz = Nx // sub, Ny // sub, Nz // sub
+    fine = fine[: nx * sub, : ny * sub, : nz * sub]
 
-    # z-faces (axis 0) -- the face between coarse cell (k-1) and (k) is index k.
-    left = np.zeros((nz + 1, ny * sub, nx * sub), dtype=np.float64)
-    right = np.zeros((nz + 1, ny * sub, nx * sub), dtype=np.float64)
+    # x-faces (axis 0) -- the face between coarse cell (i-1) and (i) is index i.
+    left = np.zeros((nx + 1, ny * sub, nz * sub), dtype=np.float64)
+    right = np.zeros((nx + 1, ny * sub, nz * sub), dtype=np.float64)
     left[0] = 0.0
     left[1:-1] = fine[sub - 1 : -1 : sub]
     left[-1] = fine[-1]
@@ -753,11 +789,11 @@ def compute_face_fractions(is_metal: np.ndarray, sub: int = 4) -> Tuple[np.ndarr
     right[1:-1] = fine[sub::sub]
     right[-1] = 0.0
     face = np.minimum(left, right)
-    f_z = face.reshape(nz + 1, ny, sub, nx, sub).mean(axis=(2, 4))
+    f_x = face.reshape(nx + 1, ny, sub, nz, sub).mean(axis=(2, 4))
 
     # y-faces (axis 1)
-    left = np.zeros((nz * sub, ny + 1, nx * sub), dtype=np.float64)
-    right = np.zeros((nz * sub, ny + 1, nx * sub), dtype=np.float64)
+    left = np.zeros((nx * sub, ny + 1, nz * sub), dtype=np.float64)
+    right = np.zeros((nx * sub, ny + 1, nz * sub), dtype=np.float64)
     left[:, 0, :] = 0.0
     left[:, 1:-1, :] = fine[:, sub - 1 : -1 : sub, :]
     left[:, -1, :] = fine[:, -1, :]
@@ -765,11 +801,11 @@ def compute_face_fractions(is_metal: np.ndarray, sub: int = 4) -> Tuple[np.ndarr
     right[:, 1:-1, :] = fine[:, sub::sub, :]
     right[:, -1, :] = 0.0
     face = np.minimum(left, right)
-    f_y = face.reshape(nz, sub, ny + 1, nx, sub).mean(axis=(1, 4))
+    f_y = face.reshape(nx, sub, ny + 1, nz, sub).mean(axis=(1, 4))
 
-    # x-faces (axis 2)
-    left = np.zeros((nz * sub, ny * sub, nx + 1), dtype=np.float64)
-    right = np.zeros((nz * sub, ny * sub, nx + 1), dtype=np.float64)
+    # z-faces (axis 2)
+    left = np.zeros((nx * sub, ny * sub, nz + 1), dtype=np.float64)
+    right = np.zeros((nx * sub, ny * sub, nz + 1), dtype=np.float64)
     left[:, :, 0] = 0.0
     left[:, :, 1:-1] = fine[:, :, sub - 1 : -1 : sub]
     left[:, :, -1] = fine[:, :, -1]
@@ -777,12 +813,12 @@ def compute_face_fractions(is_metal: np.ndarray, sub: int = 4) -> Tuple[np.ndarr
     right[:, :, 1:-1] = fine[:, :, sub::sub]
     right[:, :, -1] = 0.0
     face = np.minimum(left, right)
-    f_x = face.reshape(nz, sub, ny, sub, nx + 1).mean(axis=(1, 3))
+    f_z = face.reshape(nx, sub, ny, sub, nz + 1).mean(axis=(1, 3))
 
     # Avoid zero fractions on interior faces between two metal cells due to
     # clipping/sampling; the minimum of two nearly-1 values should stay 1.
     eps = 1e-3
-    f_z[1:-1] = np.where(f_z[1:-1] < eps, 0.0, f_z[1:-1])
+    f_x[1:-1] = np.where(f_x[1:-1] < eps, 0.0, f_x[1:-1])
     f_y[:, 1:-1, :] = np.where(f_y[:, 1:-1, :] < eps, 0.0, f_y[:, 1:-1, :])
-    f_x[:, :, 1:-1] = np.where(f_x[:, :, 1:-1] < eps, 0.0, f_x[:, :, 1:-1])
-    return f_z, f_y, f_x
+    f_z[:, :, 1:-1] = np.where(f_z[:, :, 1:-1] < eps, 0.0, f_z[:, :, 1:-1])
+    return f_x, f_y, f_z

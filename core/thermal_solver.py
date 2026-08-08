@@ -252,7 +252,7 @@ def _solve_thermal_cpp(
     if velocity_c is not None:
         vel_in = velocity_c.astype(np.float64, copy=False)
     else:
-        # C++ binding expects a 4-D (3, nz, ny, nx) velocity field.
+        # C++ binding expects a 4-D (3, nx, ny, nz) velocity field.
         vel_in = np.zeros((3,) + tuple(grid_c.shape), dtype=np.float64)
 
     n_steps = 0  # let C++ use its default

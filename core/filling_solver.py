@@ -44,15 +44,15 @@ from core.types import (
     FillingResult,
     GatingNode,
     GatingVelocityError,
-    SLEEVE_BODY_TYPES,
 )
 from core.voxelizer import build_voxel_grid, compute_face_fractions
 
 _FLOW_CFG = FlowConfig()
 
 # Body types that are not part of the metal/air cavity for air-entrapment.
-_CHILL_SLEEVE_TYPES = frozenset(int(t) for t in CHILL_BODY_TYPES + SLEEVE_BODY_TYPES)
-_NON_CAVITY_TYPES = frozenset([int(BodyType.CORE)]) | _CHILL_SLEEVE_TYPES
+# SLEEVE is treated as a feeder metal cavity, so it is NOT excluded.
+_CHILL_TYPES = frozenset(int(t) for t in CHILL_BODY_TYPES)
+_NON_CAVITY_TYPES = frozenset([int(BodyType.CORE)]) | _CHILL_TYPES
 # FILTER is an insert metal passes through, so it stays in the flow graph but is
 # never itself a trapped-air region.
 _AIR_SKIP_TYPES = frozenset([int(BodyType.FILTER)]) | _NON_CAVITY_TYPES
@@ -107,47 +107,47 @@ def _geodesic_distance_field(
     if n_nodes == 0:
         return np.full(shape, np.inf, dtype=np.float64)
     node_id[cavity_mask] = np.arange(n_nodes, dtype=np.int64)
-    nz, ny, nx = shape
+    nx, ny, nz = shape
 
     src_list: List[np.ndarray] = []
     dst_list: List[np.ndarray] = []
     w_list: List[np.ndarray] = []
     # 13 unique neighbour offsets; csr_graph below is undirected.
-    for dz in (-1, 0, 1):
+    for dx in (-1, 0, 1):
         for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dz == 0 and dy == 0 and dx == 0:
+            for dz in (-1, 0, 1):
+                if dx == 0 and dy == 0 and dz == 0:
                     continue
                 if not (
-                    dz > 0 or (dz == 0 and dy > 0) or (dz == 0 and dy == 0 and dx > 0)
+                    dx > 0 or (dx == 0 and dy > 0) or (dx == 0 and dy == 0 and dz > 0)
                 ):
                     continue
-                if dz >= 0:
-                    sz = slice(0, nz - dz)
-                    dz_s = slice(dz, nz)
-                else:
-                    sz = slice(-dz, nz)
-                    dz_s = slice(0, nz + dz)
-                if dy >= 0:
-                    sy = slice(0, ny - dy)
-                    dy_s = slice(dy, ny)
-                else:
-                    sy = slice(-dy, ny)
-                    dy_s = slice(0, ny + dy)
                 if dx >= 0:
                     sx = slice(0, nx - dx)
                     dx_s = slice(dx, nx)
                 else:
                     sx = slice(-dx, nx)
                     dx_s = slice(0, nx + dx)
-                src = node_id[sz, sy, sx]
-                dst = node_id[dz_s, dy_s, dx_s]
+                if dy >= 0:
+                    sy = slice(0, ny - dy)
+                    dy_s = slice(dy, ny)
+                else:
+                    sy = slice(-dy, ny)
+                    dy_s = slice(0, ny + dy)
+                if dz >= 0:
+                    sz = slice(0, nz - dz)
+                    dz_s = slice(dz, nz)
+                else:
+                    sz = slice(-dz, nz)
+                    dz_s = slice(0, nz + dz)
+                src = node_id[sx, sy, sz]
+                dst = node_id[dx_s, dy_s, dz_s]
                 valid = (src >= 0) & (dst >= 0)
                 if not valid.any():
                     continue
                 src_list.append(src[valid])
                 dst_list.append(dst[valid])
-                weight = float(np.linalg.norm([dz, dy, dx]))
+                weight = float(np.linalg.norm([dx, dy, dz]))
                 w_list.append(np.full(valid.sum(), weight, dtype=np.float64))
 
     if src_list:
@@ -295,16 +295,16 @@ def _resample_to_grid(
     physical coordinates of the destination cell centres are mapped back to the
     source index frame and ``map_coordinates`` is used.
     """
-    nz, ny, nx = dst_shape
-    zc = dst_origin[0] + (np.arange(nz) + 0.5) * dst_dx
+    nx, ny, nz = dst_shape
+    xc = dst_origin[0] + (np.arange(nx) + 0.5) * dst_dx
     yc = dst_origin[1] + (np.arange(ny) + 0.5) * dst_dx
-    xc = dst_origin[2] + (np.arange(nx) + 0.5) * dst_dx
-    zz, yy, xx = np.meshgrid(zc, yc, xc, indexing="ij")
+    zc = dst_origin[2] + (np.arange(nz) + 0.5) * dst_dx
+    xx, yy, zz = np.meshgrid(xc, yc, zc, indexing="ij")
     coords = np.stack(
         [
-            (zz - src_origin[0]) / src_dx - 0.5,
+            (xx - src_origin[0]) / src_dx - 0.5,
             (yy - src_origin[1]) / src_dx - 0.5,
-            (xx - src_origin[2]) / src_dx - 0.5,
+            (zz - src_origin[2]) / src_dx - 0.5,
         ],
         axis=0,
     )
@@ -663,7 +663,7 @@ def _compute_air_entrapment_risk(
         or 25.0
     )
 
-    # Air-entrapment domain: exclude filter / chill / sleeve / core inserts.
+    # Air-entrapment domain: exclude filter / chill / core inserts.
     air_mask = cavity_mask & ~np.isin(grid, list(_AIR_SKIP_TYPES))
     empty_mask = (phi < 0.5) & air_mask
     metal_mask = (phi >= 0.5) & air_mask
@@ -1377,12 +1377,13 @@ def compute_air_entrapment_geofc(
 
     shape = grid.shape
     dx_m = float(dx_mm) / 1000.0
-    # CHILL / SLEEVE / CORE are solid inserts; the flow/collision graph goes
-    # around them.  FILTER is kept in the graph because metal passes through it.
+    # CHILL / COOLING_SPRUE / CORE are solid inserts; the flow/collision graph goes
+    # around them.  SLEEVE is a feeder cavity and stays in the graph.
+    # FILTER is kept in the graph because metal passes through it.
     cavity_mask = (grid != int(BodyType.EMPTY)) & ~np.isin(
         grid, list(_NON_CAVITY_TYPES)
     )
-    # Trapped-air region is the cavity minus the filter/chill/sleeve/core cells.
+    # Trapped-air region is the cavity minus the filter/chill/core cells.
     air_mask = cavity_mask & ~np.isin(grid, list(_AIR_SKIP_TYPES))
     if not cavity_mask.any():
         risk = np.zeros(orig_shape, dtype=np.float32)
@@ -1772,12 +1773,12 @@ def _build_laplace_matrix(
     dx2 = float(dx) * float(dx)
 
     if face_fractions is None:
-        nz, ny, nx = cavity.shape
-        f_A_z = np.ones((nz + 1, ny, nx), dtype=np.float64)
-        f_A_y = np.ones((nz, ny + 1, nx), dtype=np.float64)
-        f_A_x = np.ones((nz, ny, nx + 1), dtype=np.float64)
+        nx, ny, nz = cavity.shape
+        f_A_x = np.ones((nx + 1, ny, nz), dtype=np.float64)
+        f_A_y = np.ones((nx, ny + 1, nz), dtype=np.float64)
+        f_A_z = np.ones((nx, ny, nz + 1), dtype=np.float64)
     else:
-        f_A_z, f_A_y, f_A_x = face_fractions
+        f_A_x, f_A_y, f_A_z = face_fractions
 
     def _add_faces(cur_flat, nb_flat, cur_dir, nb_dir, cur_val, nb_val, K_face):
         valid = (cur_flat >= 0) & (nb_flat >= 0)
@@ -1820,12 +1821,12 @@ def _build_laplace_matrix(
             np.add.at(diag, n, wb)
             np.add.at(rhs, n, -wb * cv[c_d_nb_nd])
 
-    # z-faces (axis 0) -- interior face indices 1..nz-1 of f_A_z
-    Kz = 2.0 * K[:-1] * K[1:] / (K[:-1] + K[1:]) * f_A_z[1:-1]
+    # x-faces (axis 0) -- interior face indices 1..nx-1 of f_A_x
+    Kx = 2.0 * K[:-1] * K[1:] / (K[:-1] + K[1:]) * f_A_x[1:-1]
     _add_faces(
         flat_idx[:-1], flat_idx[1:],
         dirichlet[:-1], dirichlet[1:],
-        dirichlet_value[:-1], dirichlet_value[1:], Kz,
+        dirichlet_value[:-1], dirichlet_value[1:], Kx,
     )
     # y-faces (axis 1)
     Ky = 2.0 * K[:, :-1] * K[:, 1:] / (K[:, :-1] + K[:, 1:]) * f_A_y[:, 1:-1, :]
@@ -1834,12 +1835,12 @@ def _build_laplace_matrix(
         dirichlet[:, :-1], dirichlet[:, 1:],
         dirichlet_value[:, :-1], dirichlet_value[:, 1:], Ky,
     )
-    # x-faces (axis 2)
-    Kx = 2.0 * K[:, :, :-1] * K[:, :, 1:] / (K[:, :, :-1] + K[:, :, 1:]) * f_A_x[:, :, 1:-1]
+    # z-faces (axis 2)
+    Kz = 2.0 * K[:, :, :-1] * K[:, :, 1:] / (K[:, :, :-1] + K[:, :, 1:]) * f_A_z[:, :, 1:-1]
     _add_faces(
         flat_idx[:, :, :-1], flat_idx[:, :, 1:],
         dirichlet[:, :, :-1], dirichlet[:, :, 1:],
-        dirichlet_value[:, :, :-1], dirichlet_value[:, :, 1:], Kx,
+        dirichlet_value[:, :, :-1], dirichlet_value[:, :, 1:], Kz,
     )
 
     unknown = np.arange(n_unknowns, dtype=np.int32)
@@ -2006,21 +2007,21 @@ def _face_velocities(
     """
     mu = max(float(viscosity_pa_s), 1e-9)
     if permeability is None:
-        Kz = Ky = Kx = 1.0 / mu
+        Kx = Ky = Kz = 1.0 / mu
     else:
         K = np.maximum(permeability, 1e-18) / mu
-        Kz = 2.0 * K[:-1] * K[1:] / (K[:-1] + K[1:])
+        Kx = 2.0 * K[:-1] * K[1:] / (K[:-1] + K[1:])
         Ky = 2.0 * K[:, :-1] * K[:, 1:] / (K[:, :-1] + K[:, 1:])
-        Kx = 2.0 * K[:, :, :-1] * K[:, :, 1:] / (K[:, :, :-1] + K[:, :, 1:])
+        Kz = 2.0 * K[:, :, :-1] * K[:, :, 1:] / (K[:, :, :-1] + K[:, :, 1:])
 
     u = np.zeros((p.shape[0] + 1, p.shape[1], p.shape[2]), dtype=np.float64)
     v = np.zeros((p.shape[0], p.shape[1] + 1, p.shape[2]), dtype=np.float64)
     w = np.zeros((p.shape[0], p.shape[1], p.shape[2] + 1), dtype=np.float64)
 
     # interior faces
-    u[1:-1, :, :] = -Kz * (p[1:] - p[:-1]) / dx
+    u[1:-1, :, :] = -Kx * (p[1:] - p[:-1]) / dx
     v[:, 1:-1, :] = -Ky * (p[:, 1:] - p[:, :-1]) / dx
-    w[:, :, 1:-1] = -Kx * (p[:, :, 1:] - p[:, :, :-1]) / dx
+    w[:, :, 1:-1] = -Kz * (p[:, :, 1:] - p[:, :, :-1]) / dx
 
     u_valid = np.zeros(u.shape, dtype=bool)
     u_valid[1:-1, :, :] = cavity[:-1] & cavity[1:]
@@ -2056,20 +2057,20 @@ def _inlet_face_area_m2(
 ) -> float:
     """Real open area (m²) of the faces separating the source mask from the rest of the cavity."""
     if face_fractions is None:
-        nz, ny, nx = cavity.shape
-        f_A_z = np.ones((nz + 1, ny, nx), dtype=np.float64)
-        f_A_y = np.ones((nz, ny + 1, nx), dtype=np.float64)
-        f_A_x = np.ones((nz, ny, nx + 1), dtype=np.float64)
+        nx, ny, nz = cavity.shape
+        f_A_x = np.ones((nx + 1, ny, nz), dtype=np.float64)
+        f_A_y = np.ones((nx, ny + 1, nz), dtype=np.float64)
+        f_A_z = np.ones((nx, ny, nz + 1), dtype=np.float64)
     else:
-        f_A_z, f_A_y, f_A_x = face_fractions
+        f_A_x, f_A_y, f_A_z = face_fractions
     area = dx * dx
     A = 0.0
 
-    # z-faces (axis 0)
+    # x-faces (axis 0)
     left = source[:-1] & ~source[1:] & cavity[1:]
     right = source[1:] & ~source[:-1] & cavity[:-1]
-    a_z = f_A_z[1:-1] * area
-    A += float(a_z[left | right].sum())
+    a_x = f_A_x[1:-1] * area
+    A += float(a_x[left | right].sum())
 
     # y-faces (axis 1)
     down = source[:, :-1] & ~source[:, 1:] & cavity[:, 1:]
@@ -2077,11 +2078,11 @@ def _inlet_face_area_m2(
     a_y = f_A_y[:, 1:-1, :] * area
     A += float(a_y[down | up].sum())
 
-    # x-faces (axis 2)
+    # z-faces (axis 2)
     back = source[:, :, :-1] & ~source[:, :, 1:] & cavity[:, :, 1:]
     front = source[:, :, 1:] & ~source[:, :, :-1] & cavity[:, :, :-1]
-    a_x = f_A_x[:, :, 1:-1] * area
-    A += float(a_x[back | front].sum())
+    a_z = f_A_z[:, :, 1:-1] * area
+    A += float(a_z[back | front].sum())
 
     return A
 
@@ -3569,22 +3570,22 @@ def _inlet_flux_m3_s(
     to the volumetric flow rate on curved/staircase geometry.
     """
     if face_fractions is None:
-        nz, ny, nx = cavity.shape
-        f_A_z = np.ones((nz + 1, ny, nx), dtype=np.float64)
-        f_A_y = np.ones((nz, ny + 1, nx), dtype=np.float64)
-        f_A_x = np.ones((nz, ny, nx + 1), dtype=np.float64)
+        nx, ny, nz = cavity.shape
+        f_A_x = np.ones((nx + 1, ny, nz), dtype=np.float64)
+        f_A_y = np.ones((nx, ny + 1, nz), dtype=np.float64)
+        f_A_z = np.ones((nx, ny, nz + 1), dtype=np.float64)
     else:
-        f_A_z, f_A_y, f_A_x = face_fractions
+        f_A_x, f_A_y, f_A_z = face_fractions
     area = dx * dx
     flux = 0.0
 
-    # z-faces (axis 0) -- face k is between cells k-1 and k
+    # x-faces (axis 0) -- face i is between cells i-1 and i
     left_source = source[:-1] & ~source[1:] & cavity[1:]
     right_source = source[1:] & ~source[:-1] & cavity[:-1]
-    uz = u[1:-1]
-    a_z = f_A_z[1:-1] * area
-    flux += float((uz * a_z)[left_source].sum())
-    flux -= float((uz * a_z)[right_source].sum())
+    ux = u[1:-1]
+    a_x = f_A_x[1:-1] * area
+    flux += float((ux * a_x)[left_source].sum())
+    flux -= float((ux * a_x)[right_source].sum())
 
     # y-faces (axis 1)
     down_source = source[:, :-1] & ~source[:, 1:] & cavity[:, 1:]
@@ -3594,13 +3595,13 @@ def _inlet_flux_m3_s(
     flux += float((vy * a_y)[down_source].sum())
     flux -= float((vy * a_y)[up_source].sum())
 
-    # x-faces (axis 2)
+    # z-faces (axis 2)
     back_source = source[:, :, :-1] & ~source[:, :, 1:] & cavity[:, :, 1:]
     front_source = source[:, :, 1:] & ~source[:, :, :-1] & cavity[:, :, :-1]
-    wx = w[:, :, 1:-1]
-    a_x = f_A_x[:, :, 1:-1] * area
-    flux += float((wx * a_x)[back_source].sum())
-    flux -= float((wx * a_x)[front_source].sum())
+    wz = w[:, :, 1:-1]
+    a_z = f_A_z[:, :, 1:-1] * area
+    flux += float((wz * a_z)[back_source].sum())
+    flux -= float((wz * a_z)[front_source].sum())
 
     return flux
 
@@ -5474,12 +5475,12 @@ def _gating_node_velocities(
     area_face = dx_m * dx_m
 
     if face_fractions is None:
-        nz, ny, nx = grid.shape
-        f_A_z = np.ones((nz + 1, ny, nx), dtype=np.float64)
-        f_A_y = np.ones((nz, ny + 1, nx), dtype=np.float64)
-        f_A_x = np.ones((nz, ny, nx + 1), dtype=np.float64)
+        nx, ny, nz = grid.shape
+        f_A_x = np.ones((nx + 1, ny, nz), dtype=np.float64)
+        f_A_y = np.ones((nx, ny + 1, nz), dtype=np.float64)
+        f_A_z = np.ones((nx, ny, nz + 1), dtype=np.float64)
     else:
-        f_A_z, f_A_y, f_A_x = face_fractions
+        f_A_x, f_A_y, f_A_z = face_fractions
 
     g_u = np.asarray(g, dtype=np.float64)
     if np.linalg.norm(g_u) > 1e-12:
@@ -5864,7 +5865,7 @@ def _gating_node_velocities(
                         v0 = u_m_s[ni_idx, gj_j, gk_k]
                         v1 = v_m_s[ni_idx, gj_j, gk_k]
                         v2 = w_m_s[ni_idx, gj_j, gk_k]
-                        f_A_face = f_A_z[ni_idx, gj_j, gk_k]
+                        f_A_face = f_A_x[ni_idx, gj_j, gk_k]
                     elif dj == 1:
                         v0 = u_m_s[gi_i, nj_idx, gk_k]
                         v1 = v_m_s[gi_i, nj_idx, gk_k]
@@ -5874,7 +5875,7 @@ def _gating_node_velocities(
                         v0 = u_m_s[gi_i, gj_j, nk_idx]
                         v1 = v_m_s[gi_i, gj_j, nk_idx]
                         v2 = w_m_s[gi_i, gj_j, nk_idx]
-                        f_A_face = f_A_x[gi_i, gj_j, nk_idx]
+                        f_A_face = f_A_z[gi_i, gj_j, nk_idx]
                     v = np.stack([v0, v1, v2], axis=0).astype(np.float64, copy=False)
                 else:
                     v_ref = velocity_m_s[:, gi_i, gj_j, gk_k]
@@ -6537,7 +6538,7 @@ def solve_filling_flow(
     is_metal_c = cavity
     sub_frac = 4 if is_metal_c.size < 5_000_000 else 1
     face_fractions = compute_face_fractions(is_metal_c, sub=sub_frac)
-    f_A_z, f_A_y, f_A_x = face_fractions
+    f_A_x, f_A_y, f_A_z = face_fractions
 
     # Real source throat area (for reporting / validation only).
     source_real_area_m2 = _inlet_face_area_m2(inlet_cells, cavity, dx_m, face_fractions)

@@ -16,6 +16,8 @@ namespace {
 // Body-type priority for overlapping voxels.  Higher priority bodies win so
 // that embedded inserts (chills, filters, cores) are not overwritten by the
 // surrounding part or gating metal.
+// SLEEVE (25) is treated as a feeder metal cavity, so it shares the same
+// priority as RISER and other gating bodies.
 int body_priority(int32_t body_type) {
     switch (body_type) {
         case 1:  return 1; // PART
@@ -27,9 +29,11 @@ int body_priority(int32_t body_type) {
         case 17: return 2; // SPRUE_THROAT
         case 19: return 2; // DISTRIBUTOR
         case 21: return 2; // CURUFLUK
+        case 25: return 2; // SLEEVE (feeder, same priority as RISER/gating)
         case 9:  return 3; // CORE
         case 13: return 4; // FILTER
-        case 11: return 5; // COOLING_SPRUE
+        case 11: return 5; // COOLING_SPRUE (chill insert)
+        case 23: return 5; // CHILL (chill insert)
         default: return 0;
     }
 }

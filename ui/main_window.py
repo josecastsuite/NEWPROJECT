@@ -46,7 +46,6 @@ BODY_TYPE_NAMES = {
     BodyType.DISTRIBUTOR: "DAĞITICI",
     BodyType.CURUFLUK: "CURUFLUK",
     BodyType.CHILL: "SOĞUTUCU",
-    BodyType.SLEEVE: "YALANCI",
 }
 
 

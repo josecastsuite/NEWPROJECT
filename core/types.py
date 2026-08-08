@@ -82,12 +82,12 @@ BODY_TYPE_LABELS = {
     BodyType.DISTRIBUTOR: "DAĞITICI",
     BodyType.CURUFLUK: "CURUFLUK",
     BodyType.CHILL: "SOĞUTUCU (CHILL)",
-    BodyType.SLEEVE: "YALANCI (SLEEVE)",
 }
 
 # Body types that contain liquid metal during pouring (part + gating + riser).
-# CORE, FILTER and COOLING_SPRUE are not part of the liquid metal domain: the
-# latter is a chill insert and should be treated as a heat sink, not as metal.
+# SLEEVE is retained as a feeder metal cavity for backwards compatibility.
+# CORE, FILTER and COOLING_SPRUE are not part of the liquid metal domain:
+# the latter is a chill insert and should be treated as a heat sink, not as metal.
 BODY_CASTING_METAL_TYPES = [
     BodyType.PART,
     BodyType.RISER,
@@ -98,6 +98,7 @@ BODY_CASTING_METAL_TYPES = [
     BodyType.POURING_BASIN,
     BodyType.DISTRIBUTOR,
     BodyType.CURUFLUK,
+    BodyType.SLEEVE,
 ]
 
 # Backwards-compatible alias; cooling sprue and filter are excluded from
@@ -113,13 +114,12 @@ BODY_FEEDER_TYPES = [
     BodyType.SPRUE_THROAT,
     BodyType.POURING_BASIN,
     BodyType.DISTRIBUTOR,
+    BodyType.SLEEVE,  # backwards-compatible feeder cavity
 ]
 
 # Inserts that accelerate local cooling and must never be treated as feeders.
+# COOLING_SPRUE is a chill insert, not a gating sprue.
 CHILL_BODY_TYPES = [BodyType.COOLING_SPRUE, BodyType.CHILL]
-
-# Insulating sleeves around risers; excluded from the metal domain.
-SLEEVE_BODY_TYPES = [BodyType.SLEEVE]
 
 
 class GatingVelocityError(RuntimeError):
@@ -291,7 +291,7 @@ class FillingResult:
     inlet_area_m2: float = 0.0
     fill_time_s: float = 0.0
     velocity_magnitude: Optional[np.ndarray] = None
-    velocity: Optional[np.ndarray] = None  # (3, nz, ny, nx) vector field (m/s)
+    velocity: Optional[np.ndarray] = None  # (3, nx, ny, nz) vector field (m/s)
     fill_time: Optional[np.ndarray] = None
     solver_grid: Optional[np.ndarray] = None
     solver_dx_mm: float = 0.0

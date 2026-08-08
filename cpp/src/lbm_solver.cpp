@@ -90,13 +90,19 @@ public:
     {
         n_ = static_cast<size_t>(nx_) * ny_ * nz_;
 
-        // Preserve the physical gravity magnitude; only normalize the direction.
+        // The UI passes a normalized gravity direction vector.  LBM needs the
+        // physical magnitude of standard gravity (9.81 m/s^2).
         double gnorm = std::sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
-        if (gnorm < 1e-12) gnorm = 9.81;
-        g_mag_ = gnorm;
-        gx_ = g[0] / gnorm;
-        gy_ = g[1] / gnorm;
-        gz_ = g[2] / gnorm;
+        if (gnorm < 1e-12) {
+            gx_ = 0.0;
+            gy_ = 0.0;
+            gz_ = -1.0;
+        } else {
+            gx_ = g[0] / gnorm;
+            gy_ = g[1] / gnorm;
+            gz_ = g[2] / gnorm;
+        }
+        g_mag_ = 9.81;
 
         // Time step: keep the lattice velocity below cfl_target_ for stability.
         double v = std::max(inflow_velocity_, 1e-6);
@@ -146,8 +152,10 @@ public:
         for (size_t i = 0; i < n_; ++i) {
             uint8_t val = grid[i];
             // grid values: 0 = solid mold/outside, 9 = sand core (solid obstacle),
-            // everything else (1..N, excluding 9) is the casting cavity.
-            if (val == 0 || val == 9) {
+            // 11 = cooling sprue (chill insert), 23 = chill insert.
+            // All of these are solid obstacles; everything else (including SLEEVE=25,
+            // which is a feeder metal cavity) is the fluid/gas cavity.
+            if (val == 0 || val == 9 || val == 11 || val == 23) {
                 flags_[i] = 1; // solid
             } else {
                 flags_[i] = 0; // fluid/gas cavity
