@@ -1061,7 +1061,7 @@ def directional_feed_efficiency(
     part_mask: np.ndarray,
     dx: float,
     min_eff: float = 0.05,
-    max_reduction: float = 0.85,
+    max_reduction: float = 0.95,
     gravity_vector: Tuple[float, float, float] = (0.0, 0.0, -1.0),
     fill_time: Optional[np.ndarray] = None,
 ) -> np.ndarray:
@@ -1074,6 +1074,13 @@ def directional_feed_efficiency(
     effectively because shrinkage voids migrate upward.  Where no gradient
     exists (uniform) the factor is neutral (0.5).  Far from any feeder the
     factor remains ~1.0.
+
+    The feeder solidification time is taken from the hottest voxel inside a
+    small 3x3x3 neighbourhood around the nearest feeder voxel, because the
+    riser core (not the thin neck/contact face) is the actual liquid reservoir
+    that feeds shrinkage.  A well-aligned, liquid-rich feeder can therefore
+    reduce the remaining shrinkage risk by up to ``max_reduction`` (default
+    95 %, leaving the usual 5 % micro/gas residual).
 
     If ``fill_time`` (per-voxel metal arrival time, s) is provided, the metal
     travel time from the nearest feeder is subtracted from the feeder's available
@@ -1214,10 +1221,19 @@ def directional_feed_efficiency(
             np.add(flat_idx, nearest[0], out=flat_idx)
             arena.free("nearest")
 
-            # t_feeder at nearest feeder voxel.
+            # t_feeder: use the hottest voxel in a 3x3x3 neighbourhood around
+            # the nearest feeder voxel.  The riser core stays liquid longest; the
+            # thin neck or contact face cools faster and would underestimate the
+            # available feeding time if sampled directly.
+            t_feeder_core = arena.alloc(shape, np.float32, name="t_feeder_core")
+            t_feeder_core.fill(np.float32(-np.inf))
+            np.copyto(t_feeder_core, t_safe, where=feeder_mask)
+            ndimage.maximum_filter(t_feeder_core, size=3, mode="nearest", output=t_feeder_core)
+
             t_feeder = arena.alloc(shape, np.float32, name="t_feeder")
-            np.take(t_safe, flat_idx, out=t_feeder)
+            np.take(t_feeder_core, flat_idx, out=t_feeder)
             np.nan_to_num(t_feeder, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            arena.free("t_feeder_core")
 
             if fill_time is not None and fill_time.size == n:
                 fill_time_f = arena.alloc(shape, np.float32, name="fill_time_f")
