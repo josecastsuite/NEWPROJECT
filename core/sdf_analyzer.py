@@ -998,65 +998,106 @@ def directional_feed_efficiency(
     if t_s is None or not feeder_mask.any():
         return np.ones_like(part_mask, dtype=np.float64)
 
-    # Replace NaN/Inf in t_s so gradients are finite.  Use the largest finite
-    # solidification time for NaN cells; infinities are explicitly clamped to 0.
-    finite_vals = t_s[np.isfinite(t_s)]
-    t_fill = float(finite_vals.max()) if finite_vals.size > 0 else 0.0
-    t_safe = np.nan_to_num(t_s, nan=t_fill, posinf=0.0, neginf=0.0)
+    # Work in float32 to halve the per-array footprint and perform all
+    # intermediate operations in-place, so no 500+ MiB temporary arrays are
+    # requested from the OS.
+    t_safe = np.array(t_s, dtype=np.float32, copy=True)
+    finite_vals = t_safe[np.isfinite(t_safe)]
+    t_fill = np.float32(finite_vals.max() if finite_vals.size > 0 else 0.0)
+    np.nan_to_num(t_safe, nan=t_fill, posinf=np.float32(0.0), neginf=np.float32(0.0), copy=False)
 
-    gz, gy, gx = np.gradient(t_safe, dx)
-    grad = np.stack([gz, gy, gx], axis=-1)
+    dx_f = np.float32(dx)
+    gz, gy, gx = np.gradient(t_safe, dx_f)
+    grad = np.empty(t_safe.shape + (3,), dtype=np.float32)
+    grad[..., 0] = gz
+    grad[..., 1] = gy
+    grad[..., 2] = gx
+    del gz, gy, gx
+
     grad_mag = np.linalg.norm(grad, axis=-1)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        grad_dir = np.where(grad_mag[..., None] > 1e-12, grad / grad_mag[..., None], 0.0)
+    mask_grad = grad_mag > 1e-12
+    np.divide(grad, grad_mag[..., None], out=grad, where=mask_grad[..., None])
+    np.multiply(grad, mask_grad[..., None], out=grad)
 
     # Nearest feeder voxel for each voxel (feeder_mask True are features => pass inverted)
-    _, nearest = ndimage.distance_transform_edt(~feeder_mask, return_indices=True)
-    indices = np.indices(part_mask.shape)  # shape (3, *grid)
-    diff = (nearest - indices) * dx  # vector from voxel to nearest feeder, shape (3, *grid)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        diff_norm = np.linalg.norm(diff, axis=0)
-        diff_dir = np.where(diff_norm[None, ...] > 1e-9, diff / diff_norm[None, ...], 0.0)
-    # grad_dir has channel last; bring diff_dir to same shape.
-    diff_dir = np.moveaxis(diff_dir, 0, -1)
+    nearest = ndimage.distance_transform_edt(
+        ~feeder_mask, return_distances=False, return_indices=True
+    )
+    if nearest.dtype != np.int32:
+        nearest = nearest.astype(np.int32, copy=False)
+    indices = np.indices(part_mask.shape, dtype=np.int32)
+    diff = np.empty(nearest.shape, dtype=np.float32)
+    np.subtract(nearest, indices, out=diff, casting="unsafe")
+    diff *= dx_f
+    del indices
+
+    diff_norm = np.linalg.norm(diff, axis=0)
+    mask_diff = diff_norm > 1e-9
+    np.divide(diff, diff_norm[None, ...], out=diff, where=mask_diff[None, ...])
+    np.multiply(diff, mask_diff[None, ...], out=diff)
+    diff_dir = np.moveaxis(diff, 0, -1)
 
     # Thermal alignment: if the riser is in the direction of the solidification
     # front (+grad t_s), alignment is positive and feeding is more effective.
-    thermal_alignment = np.einsum("...i,...i->...", diff_dir, grad_dir)
-    thermal_alignment = np.where(grad_mag > 1e-12, thermal_alignment, 0.0)
+    thermal_alignment = np.einsum("...i,...i->...", diff_dir, grad)
+    np.multiply(thermal_alignment, mask_grad, out=thermal_alignment)
+    del grad
 
     # Gravity alignment: the riser should be above the voxel (opposite to gravity)
     # so shrinkage voids migrate upward and the feeder can supply liquid metal.
-    g = np.asarray(gravity_vector, dtype=np.float64)
-    g_norm = float(np.linalg.norm(g)) + 1e-12
+    g = np.asarray(gravity_vector, dtype=np.float32)
+    g_norm = np.linalg.norm(g) + np.float32(1e-12)
     g = g / g_norm
     gravity_alignment = np.einsum("...i,i->...", diff_dir, -g)
+    del diff_dir, g
 
     # Combine thermal and gravity effects.  Thermal gradient dominates feeding
     # direction in casting; gravity is a secondary but real modifier (Niyama-based
     # feeding-distance literature typically gives thermal gradient ~70% weight).
-    alignment = 0.7 * thermal_alignment + 0.3 * gravity_alignment
-    alignment = np.clip(alignment, 0.0, 1.0)
+    np.multiply(thermal_alignment, np.float32(0.7), out=thermal_alignment)
+    np.multiply(gravity_alignment, np.float32(0.3), out=gravity_alignment)
+    np.add(thermal_alignment, gravity_alignment, out=thermal_alignment)
+    del gravity_alignment, diff, diff_norm, mask_diff
+    alignment = thermal_alignment
 
-    # Strong alignment -> strong shrinkage reduction, but never zero (real life baseline).
-    # Additionally, if the feeder solidifies before the part voxel it cannot feed it,
-    # so the risk reduction is weakened.  Use the *nearest* feeder voxel (not the
-    # best feeder everywhere), and subtract the metal travel time from that feeder.
-    reduction = max_reduction * alignment
-    nearest_t_feeder = np.nan_to_num(t_safe[tuple(nearest)], nan=0.0, posinf=0.0, neginf=0.0)
+    np.clip(alignment, np.float32(0.0), np.float32(1.0), out=alignment)
+    np.multiply(alignment, np.float32(max_reduction), out=alignment)
+    reduction = alignment
+
+    nearest_t_feeder = np.nan_to_num(
+        t_safe[tuple(nearest)], nan=np.float32(0.0), posinf=np.float32(0.0), neginf=np.float32(0.0)
+    )
     t_feeder = nearest_t_feeder
     if fill_time is not None and fill_time.size == t_safe.size:
-        fill_feeder = np.nan_to_num(fill_time[tuple(nearest)], nan=0.0, posinf=0.0, neginf=0.0)
+        fill_time_f = np.array(fill_time, dtype=np.float32, copy=True)
+        fill_feeder = np.nan_to_num(
+            fill_time_f[tuple(nearest)], nan=np.float32(0.0), posinf=np.float32(0.0), neginf=np.float32(0.0)
+        )
         # Metal reaching the voxel later has had more time to cool in the feeder.
-        travel_time = np.maximum(np.nan_to_num(fill_time, nan=0.0, posinf=0.0, neginf=0.0) - fill_feeder, 0.0)
-        t_feeder = np.maximum(t_feeder - travel_time, 0.0)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        time_factor = np.clip(t_feeder / np.maximum(t_safe, 1e-9), 0.0, 1.0)
-    reduction = reduction * time_factor
+        np.subtract(fill_time_f, fill_feeder, out=fill_time_f)
+        np.maximum(fill_time_f, np.float32(0.0), out=fill_time_f)
+        np.subtract(t_feeder, fill_time_f, out=t_feeder)
+        np.maximum(t_feeder, np.float32(0.0), out=t_feeder)
+        del fill_time_f, fill_feeder
 
-    efficiency = 1.0 - reduction
-    efficiency = np.clip(efficiency, min_eff, 1.0)
-    return np.where(part_mask, efficiency, 1.0)
+    np.maximum(t_safe, np.float32(1e-9), out=t_safe)
+    np.divide(t_feeder, t_safe, out=t_feeder)
+    np.clip(t_feeder, np.float32(0.0), np.float32(1.0), out=t_feeder)
+    time_factor = t_feeder
+    del t_safe, nearest, nearest_t_feeder
+
+    np.multiply(reduction, time_factor, out=reduction)
+    np.subtract(np.float32(1.0), reduction, out=reduction)
+    np.clip(reduction, np.float32(min_eff), np.float32(1.0), out=reduction)
+    efficiency = reduction
+    del time_factor, t_feeder, mask_grad
+
+    # Final float64 result required by the C++ porosity path; allocate only
+    # after the large float32 intermediates have been released.
+    out = np.empty(part_mask.shape, dtype=np.float64)
+    out.fill(1.0)
+    np.copyto(out, efficiency, where=part_mask)
+    return out
 
 
 def _pore_size_class(
