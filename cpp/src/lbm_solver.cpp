@@ -1,4 +1,5 @@
 #include "josecast/lbm_solver.h"
+#include "josecast/arena.hpp"
 
 #include <cstddef>
 
@@ -8,6 +9,8 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <memory_resource>
 #include <queue>
 #include <utility>
 #include <vector>
@@ -83,12 +86,22 @@ public:
                double smagorinsky,
                const double* target_velocity = nullptr,
                const double* inlet_distance = nullptr)
-        : nx_(nx), ny_(ny), nz_(nz), dx_(dx), rho0_(rho),
+        : nx_(nx), ny_(ny), nz_(nz),
+          n_(static_cast<size_t>(nx) * ny * nz),
+          dx_(dx), rho0_(rho),
           nu_phys_(nu), inflow_velocity_(inflow_velocity),
           t_max_(t_max), max_steps_(max_steps),
-          cfl_target_(cfl_target), smag_const_(smagorinsky)
+          cfl_target_(cfl_target), smag_const_(smagorinsky),
+          arena_(make_arena(nx, ny, nz)),
+          flags_(arena_.get()), outlet_normal_(arena_.get()),
+          fluid_list_(arena_.get()),
+          f_(arena_.get()), f_new_(arena_.get()),
+          rho_(arena_.get()), ux_(arena_.get()), uy_(arena_.get()), uz_(arena_.get()),
+          phi_(arena_.get()), phi_new_(arena_.get()),
+          fill_time_(arena_.get()), trapped_time_(arena_.get()),
+          parent_(arena_.get()), root_open_(arena_.get()),
+          target_velocity_owned_(arena_.get()), inlet_distance_owned_(arena_.get())
     {
-        n_ = static_cast<size_t>(nx_) * ny_ * nz_;
 
         // The UI passes a normalized gravity direction vector.  LBM needs the
         // physical magnitude of standard gravity (9.81 m/s^2).
@@ -269,6 +282,7 @@ public:
 
         cavity_cells_ = 0;
         fluid_list_.clear();
+        fluid_list_.reserve(n_);
         for (size_t i = 0; i < n_; ++i) {
             if (flags_[i] != 1) {
                 // Outlets/vents (flags == 3) remain air and should not count
@@ -350,9 +364,15 @@ public:
         }
     }
 
-    void get_phi(std::vector<double>* out) const { *out = phi_; }
+    void get_phi(std::vector<double>* out) const {
+        out->resize(n_);
+        std::copy(phi_.begin(), phi_.end(), out->begin());
+    }
 
-    void get_fill_time(std::vector<double>* out) const { *out = fill_time_; }
+    void get_fill_time(std::vector<double>* out) const {
+        out->resize(n_);
+        std::copy(fill_time_.begin(), fill_time_.end(), out->begin());
+    }
 
     void get_entrapment(std::vector<double>* out) const {
         out->resize(n_);
@@ -395,26 +415,48 @@ private:
     bool has_target_ = false;
     double target_scale_ = 0.0;  // (dt/dx) converts physical velocity to lattice velocity.
 
-    std::vector<uint8_t> flags_;
-    std::vector<std::array<double, 3>> outlet_normal_;
-    std::vector<size_t> fluid_list_;
-    std::vector<double> f_;
-    std::vector<double> f_new_;
-    std::vector<double> rho_, ux_, uy_, uz_;
-    std::vector<double> phi_, phi_new_;
-    std::vector<double> fill_time_, trapped_time_;
+    // Single virtual-address arena for all large per-voxel arrays.  Pages are
+    // committed only when the vectors are written, so a fragmented heap cannot
+    // cause a single 500+ MiB allocation failure.
+    std::unique_ptr<VirtualArena> arena_;
+    std::pmr::vector<uint8_t> flags_;
+    std::pmr::vector<std::array<double, 3>> outlet_normal_;
+    std::pmr::vector<size_t> fluid_list_;
+    std::pmr::vector<double> f_;
+    std::pmr::vector<double> f_new_;
+    std::pmr::vector<double> rho_, ux_, uy_, uz_;
+    std::pmr::vector<double> phi_, phi_new_;
+    std::pmr::vector<double> fill_time_, trapped_time_;
+    std::pmr::vector<int> parent_;
+    std::pmr::vector<char> root_open_;
     const double* inlet_distance_ = nullptr;
     bool has_inlet_dist_ = false;
     int current_step_ = 0;
 
-    std::vector<double> target_velocity_owned_;
-    std::vector<double> inlet_distance_owned_;
+    std::pmr::vector<double> target_velocity_owned_;
+    std::pmr::vector<double> inlet_distance_owned_;
+
+    static std::unique_ptr<VirtualArena> make_arena(int nx, int ny, int nz) {
+        size_t n = static_cast<size_t>(nx) * ny * nz;
+        const std::size_t multipliers[] = {500, 350, 250, 200, 150, 100};
+        for (std::size_t m : multipliers) {
+            try {
+                return std::make_unique<VirtualArena>(VirtualArena::recommended(n, m));
+            } catch (const std::bad_alloc&) {
+                continue;
+            }
+        }
+        throw std::bad_alloc();
+    }
 
     void build_geodesic_target() {
         // 26-neighbour Dijkstra from inlet cells within the cavity.
-        std::vector<double> dist(n_, std::numeric_limits<double>::infinity());
+        // Reuse the member inlet_distance_owned_ as the distance buffer so the
+        // data stays in the VirtualArena.
+        inlet_distance_owned_.assign(n_, std::numeric_limits<double>::infinity());
         using PQItem = std::pair<double, size_t>;
-        std::priority_queue<PQItem, std::vector<PQItem>, std::greater<PQItem>> pq;
+        std::priority_queue<PQItem, std::pmr::vector<PQItem>, std::greater<PQItem>> pq(
+            std::greater<PQItem>{}, std::pmr::vector<PQItem>{arena_.get()});
 
         auto linear_to_ijk = [&](size_t idx, int& x, int& y, int& z) {
             x = static_cast<int>(idx / (ny_ * nz_));
@@ -425,7 +467,7 @@ private:
 
         for (size_t i = 0; i < n_; ++i) {
             if (flags_[i] == 2) {
-                dist[i] = 0.0;
+                inlet_distance_owned_[i] = 0.0;
                 pq.emplace(0.0, i);
             }
         }
@@ -433,7 +475,7 @@ private:
         while (!pq.empty()) {
             auto [d, i] = pq.top();
             pq.pop();
-            if (d > dist[i] + 1e-12) continue;
+            if (d > inlet_distance_owned_[i] + 1e-12) continue;
             int x, y, z;
             linear_to_ijk(i, x, y, z);
             for (int dz = -1; dz <= 1; ++dz) {
@@ -446,8 +488,8 @@ private:
                         if (flags_[j] == 1) continue; // solid
                         double w = std::sqrt(static_cast<double>(dx * dx + dy * dy + dz * dz));
                         double nd = d + w;
-                        if (nd + 1e-12 < dist[j]) {
-                            dist[j] = nd;
+                        if (nd + 1e-12 < inlet_distance_owned_[j]) {
+                            inlet_distance_owned_[j] = nd;
                             pq.emplace(nd, j);
                         }
                     }
@@ -455,7 +497,6 @@ private:
             }
         }
 
-        inlet_distance_owned_ = std::move(dist);
         inlet_distance_ = inlet_distance_owned_.data();
         has_inlet_dist_ = true;
 
@@ -1040,15 +1081,16 @@ private:
     void detect_entrapment() {
         if (n_ == 0) return;
 
-        std::vector<int> parent(n_, -1);
+        // Allocate once from the VirtualArena, then reuse every call.
+        parent_.assign(n_, -1);
         for (size_t i = 0; i < n_; ++i) {
-            if (flags_[i] != 1 && phi_[i] < 0.5) parent[i] = static_cast<int>(i);
+            if (flags_[i] != 1 && phi_[i] < 0.5) parent_[i] = static_cast<int>(i);
         }
 
         auto find = [&](int a) {
-            while (parent[a] >= 0 && parent[a] != a) {
-                parent[a] = parent[parent[a]];
-                a = parent[a];
+            while (parent_[a] >= 0 && parent_[a] != a) {
+                parent_[a] = parent_[parent_[a]];
+                a = parent_[a];
             }
             return a;
         };
@@ -1058,36 +1100,36 @@ private:
             int rb = find(b);
             if (ra == rb) return;
             if (ra > rb) std::swap(ra, rb);
-            parent[rb] = ra;
+            parent_[rb] = ra;
         };
 
         for (int x = 0; x < nx_; ++x) {
             for (int y = 0; y < ny_; ++y) {
                 for (int z = 0; z < nz_; ++z) {
                     size_t i = cidx(x, y, z, ny_, nz_);
-                    if (parent[i] < 0) continue;
+                    if (parent_[i] < 0) continue;
                     if (x + 1 < nx_) {
                         size_t j = cidx(x + 1, y, z, ny_, nz_);
-                        if (parent[j] >= 0) unite(static_cast<int>(i), static_cast<int>(j));
+                        if (parent_[j] >= 0) unite(static_cast<int>(i), static_cast<int>(j));
                     }
                     if (y + 1 < ny_) {
                         size_t j = cidx(x, y + 1, z, ny_, nz_);
-                        if (parent[j] >= 0) unite(static_cast<int>(i), static_cast<int>(j));
+                        if (parent_[j] >= 0) unite(static_cast<int>(i), static_cast<int>(j));
                     }
                     if (z + 1 < nz_) {
                         size_t j = cidx(x, y, z + 1, ny_, nz_);
-                        if (parent[j] >= 0) unite(static_cast<int>(i), static_cast<int>(j));
+                        if (parent_[j] >= 0) unite(static_cast<int>(i), static_cast<int>(j));
                     }
                 }
             }
         }
 
-        std::vector<char> root_open(n_, 0);
+        root_open_.assign(n_, 0);
         for (int x = 0; x < nx_; ++x) {
             for (int y = 0; y < ny_; ++y) {
                 for (int z = 0; z < nz_; ++z) {
                     size_t i = cidx(x, y, z, ny_, nz_);
-                    if (parent[i] < 0) continue;
+                    if (parent_[i] < 0) continue;
                     bool open = false;
                     if (x == 0 || x == nx_ - 1 || y == 0 || y == ny_ - 1 || z == 0 || z == nz_ - 1) {
                         open = true;
@@ -1095,16 +1137,16 @@ private:
                     if (flags_[i] == 3) open = true;
                     if (open) {
                         int r = find(static_cast<int>(i));
-                        root_open[r] = 1;
+                        root_open_[r] = 1;
                     }
                 }
             }
         }
 
         for (size_t i = 0; i < n_; ++i) {
-            if (parent[i] < 0) continue;
+            if (parent_[i] < 0) continue;
             int r = find(static_cast<int>(i));
-            if (root_open[r]) continue;
+            if (root_open_[r]) continue;
             if (trapped_time_[i] > t_ + dt_ * 0.5) {
                 trapped_time_[i] = t_;
             }

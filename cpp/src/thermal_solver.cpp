@@ -7,6 +7,7 @@
  */
 
 #include "josecast/thermal_solver.h"
+#include "josecast/arena.hpp"
 
 #include <Eigen/Sparse>
 #include <Eigen/IterativeLinearSolvers>
@@ -17,6 +18,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory_resource>
 #include <queue>
 #include <string>
 #include <vector>
@@ -111,6 +113,13 @@ nb::tuple solve_thermal(
     size_t n = static_cast<size_t>(nx) * ny * nz;
     const double dx_m = dx_mm / 1000.0;
 
+    // One virtual-address arena for all large per-voxel working arrays.
+    // 250 bytes/voxel covers T, k, rho, cp0, T_new/T_adv/T_tmp, t_liq, t_sol,
+    // G/R, fs_final, cp_eff, metal/gating/chill/mold_layer masks, full_to_int,
+    // and boundary/C/b buffers.  Reserve 3x to leave headroom for temporaries.
+    VirtualArena arena(VirtualArena::recommended(n, 250));
+    auto ar = &arena;
+
     // ---- alloy / mould properties ----
     const double Tl = getd(alloy, "t_liquidus_c", 1500.0);
     const double Ts = getd(alloy, "t_solidus_c", 1400.0);
@@ -179,9 +188,9 @@ nb::tuple solve_thermal(
     const uint8_t *gating_ptr = is_gating.data();
     const uint8_t *chill_ptr = is_chill.data();
 
-    std::vector<double> T(n, T0), k(n, k_bulk), rho(n, mold_rho), cp0(n, cp_bulk);
-    std::vector<uint8_t> metal(n), gating(n), chill(n);
-    std::vector<int> mold_layer(n, -1);
+    std::pmr::vector<double> T(n, T0, ar), k(n, k_bulk, ar), rho(n, mold_rho, ar), cp0(n, cp_bulk, ar);
+    std::pmr::vector<uint8_t> metal(n, 0, ar), gating(n, 0, ar), chill(n, 0, ar);
+    std::pmr::vector<int> mold_layer(n, -1, ar);
     std::queue<size_t> layer_q;
     for (size_t i = 0; i < n; ++i) {
         metal[i] = metal_ptr[i];
@@ -286,8 +295,8 @@ nb::tuple solve_thermal(
     // ---- precompute diffusion operator on the interior ----
     const int stride_x = ny * nz;
     const int stride_y = nz;
-    std::vector<int> full_to_int(n, -1);
-    std::vector<int> int_to_full;
+    std::pmr::vector<int> full_to_int(n, -1, ar);
+    std::pmr::vector<int> int_to_full(ar);
     int n_int = 0;
     for (int x = 1; x < nx - 1; ++x)
         for (int y = 1; y < ny - 1; ++y)
@@ -298,9 +307,9 @@ nb::tuple solve_thermal(
                 ++n_int;
             }
 
-    std::vector<Eigen::Triplet<double>> trips_A;
+    std::pmr::vector<Eigen::Triplet<double>> trips_A(ar);
     trips_A.reserve(static_cast<size_t>(n_int) * 7);
-    std::vector<double> boundary_sum(n_int, 0.0);
+    std::pmr::vector<double> boundary_sum(n_int, 0.0, ar);
     const double inv_dx2 = 1.0 / (dx_m * dx_m);
 
     for (int x = 1; x < nx - 1; ++x) {
@@ -331,14 +340,15 @@ nb::tuple solve_thermal(
     }
 
     // ---- solver state ----
-    std::vector<double> T_new(n), T_adv(n);
-    std::vector<double> t_liq(n, std::numeric_limits<double>::infinity());
-    std::vector<double> t_sol(n, std::numeric_limits<double>::infinity());
-    std::vector<double> G_at_ts(n, 0.0), R_at_ts(n, 0.0);
-    std::vector<double> fs_final(n);
-    std::vector<double> cp_eff(n);
-    std::vector<double> C_int(n_int), b(n_int);
-    std::vector<Eigen::Triplet<double>> trips_M;
+    std::pmr::vector<double> T_new(n, 0.0, ar), T_adv(n, 0.0, ar);
+    std::pmr::vector<double> t_liq(n, std::numeric_limits<double>::infinity(), ar);
+    std::pmr::vector<double> t_sol(n, std::numeric_limits<double>::infinity(), ar);
+    std::pmr::vector<double> G_at_ts(n, 0.0, ar), R_at_ts(n, 0.0, ar);
+    std::pmr::vector<double> fs_final(n, 0.0, ar);
+    std::pmr::vector<double> cp_eff(n, 0.0, ar);
+    std::pmr::vector<double> T_tmp(n, 0.0, ar);
+    std::pmr::vector<double> C_int(n_int, 0.0, ar), b(n_int, 0.0, ar);
+    std::pmr::vector<Eigen::Triplet<double>> trips_M(ar);
     trips_M.reserve(trips_A.size());
 
     Eigen::ConjugateGradient<Eigen::SparseMatrix<double>, Eigen::Lower | Eigen::Upper,
@@ -365,7 +375,6 @@ nb::tuple solve_thermal(
             double dt_local = use_vel ? dt_adv : dt_feed;
             int n_sub = std::max(1, static_cast<int>(std::ceil(adv_dt / dt_local)));
             double sub_dt = adv_dt / n_sub;
-            std::vector<double> T_tmp(n);
 
             for (int s = 0; s < n_sub; ++s) {
                 double sub_t = t + (s + 0.5) * sub_dt;
@@ -559,7 +568,7 @@ nb::tuple solve_thermal(
     }
 
     // ---- final Niyama and solid fraction ----
-    std::vector<double> niyama(n, 0.0);
+    std::pmr::vector<double> niyama(n, 0.0, ar);
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
@@ -571,13 +580,15 @@ nb::tuple solve_thermal(
         }
     }
 
-    auto *T_out = new std::vector<double>(std::move(T));
-    auto *fs_out = new std::vector<double>(std::move(fs_final));
-    auto *tliq_out = new std::vector<double>(std::move(t_liq));
-    auto *tsol_out = new std::vector<double>(std::move(t_sol));
-    auto *G_out = new std::vector<double>(std::move(G_at_ts));
-    auto *R_out = new std::vector<double>(std::move(R_at_ts));
-    auto *N_out = new std::vector<double>(std::move(niyama));
+    // Copy the final fields to heap-owned std::vectors so they survive the
+    // function scope and can be returned to Python.
+    auto *T_out = new std::vector<double>(T.begin(), T.end());
+    auto *fs_out = new std::vector<double>(fs_final.begin(), fs_final.end());
+    auto *tliq_out = new std::vector<double>(t_liq.begin(), t_liq.end());
+    auto *tsol_out = new std::vector<double>(t_sol.begin(), t_sol.end());
+    auto *G_out = new std::vector<double>(G_at_ts.begin(), G_at_ts.end());
+    auto *R_out = new std::vector<double>(R_at_ts.begin(), R_at_ts.end());
+    auto *N_out = new std::vector<double>(niyama.begin(), niyama.end());
 
     std::initializer_list<size_t> shape{static_cast<size_t>(nx), static_cast<size_t>(ny), static_cast<size_t>(nz)};
 
@@ -611,6 +622,10 @@ nb::tuple compute_porosity(
     int ny = static_cast<int>(niyama.shape(1));
     int nz = static_cast<int>(niyama.shape(2));
     size_t n = static_cast<size_t>(nx) * ny * nz;
+
+    // Virtual-address arena for all porosity working arrays.
+    VirtualArena arena(VirtualArena::recommended(n, 80));
+    auto ar = &arena;
 
     const double shrinkage_factor = getd(alloy, "shrinkage_factor", 0.03);
     const double dendrite_spacing_mm = getd(alloy, "dendrite_spacing_mm", 0.12);
@@ -709,8 +724,8 @@ nb::tuple compute_porosity(
         if (part_ptr[i] && std::isfinite(M_ptr[i]) && M_ptr[i] > m_max) m_max = M_ptr[i];
     }
 
-    std::vector<double> pore_size_um(n), pore_size_mm(n), shrinkage_um(n), gp_pct(n), mold_movement_um(n);
-    std::vector<uint8_t> macro_mask(n), micro_mask(n), fine_mask(n);
+    std::pmr::vector<double> pore_size_um(n, 0.0, ar), pore_size_mm(n, 0.0, ar), shrinkage_um(n, 0.0, ar), gp_pct(n, 0.0, ar), mold_movement_um(n, 0.0, ar);
+    std::pmr::vector<uint8_t> macro_mask(n, 0, ar), micro_mask(n, 0, ar), fine_mask(n, 0, ar);
 
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
@@ -772,14 +787,15 @@ nb::tuple compute_porosity(
         fine_mask[i] = part && (psize > 0.0) && (psize < micro_pore_limit_um) && (risk_local > 0.01) ? 1 : 0;
     }
 
-    auto *ps_out = new std::vector<double>(std::move(pore_size_um));
-    auto *psmm_out = new std::vector<double>(std::move(pore_size_mm));
-    auto *macro_out = new std::vector<uint8_t>(std::move(macro_mask));
-    auto *micro_out = new std::vector<uint8_t>(std::move(micro_mask));
-    auto *fine_out = new std::vector<uint8_t>(std::move(fine_mask));
-    auto *shrink_out = new std::vector<double>(std::move(shrinkage_um));
-    auto *gp_out = new std::vector<double>(std::move(gp_pct));
-    auto *mold_move_out = new std::vector<double>(std::move(mold_movement_um));
+    // Copy result fields to heap-owned vectors for the Python capsules.
+    auto *ps_out = new std::vector<double>(pore_size_um.begin(), pore_size_um.end());
+    auto *psmm_out = new std::vector<double>(pore_size_mm.begin(), pore_size_mm.end());
+    auto *macro_out = new std::vector<uint8_t>(macro_mask.begin(), macro_mask.end());
+    auto *micro_out = new std::vector<uint8_t>(micro_mask.begin(), micro_mask.end());
+    auto *fine_out = new std::vector<uint8_t>(fine_mask.begin(), fine_mask.end());
+    auto *shrink_out = new std::vector<double>(shrinkage_um.begin(), shrinkage_um.end());
+    auto *gp_out = new std::vector<double>(gp_pct.begin(), gp_pct.end());
+    auto *mold_move_out = new std::vector<double>(mold_movement_um.begin(), mold_movement_um.end());
 
     std::initializer_list<size_t> shape{static_cast<size_t>(nx), static_cast<size_t>(ny), static_cast<size_t>(nz)};
 

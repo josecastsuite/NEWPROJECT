@@ -1,4 +1,5 @@
 set(JOSECAST_SOURCES
+    arena.cpp
     bindings.cpp
     cgal_skeleton.cpp
     darcy_solver.cpp
