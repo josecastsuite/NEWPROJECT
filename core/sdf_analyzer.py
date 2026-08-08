@@ -1422,10 +1422,11 @@ def feeding_distance_dijkstra(
     if not (is_metal & riser_mask).any():
         return dist
 
-    idx = np.full(is_metal.shape, -1, dtype=np.int64)
     metal_vox = np.argwhere(is_metal)
     n = int(metal_vox.shape[0])
-    idx[tuple(metal_vox.T)] = np.arange(n)
+    idx_dtype = np.int32 if n <= np.iinfo(np.int32).max else np.int64
+    idx = np.full(is_metal.shape, -1, dtype=idx_dtype)
+    idx[tuple(metal_vox.T)] = np.arange(n, dtype=idx_dtype)
 
     gx, gy, gz = gravity_vector
     norm = math.sqrt(gx * gx + gy * gy + gz * gz) + 1e-12
@@ -1462,15 +1463,15 @@ def feeding_distance_dijkstra(
             step *= (1.0 + UPWARD_PENALTY * (-dot))
         elif dot > 0:
             step *= max(0.5, 1.0 - 0.3 * dot)
-        rows.append(source_idx[valid])
-        cols.append(neighbor_idx[valid])
+        rows.append(source_idx[valid].astype(idx_dtype, copy=False))
+        cols.append(neighbor_idx[valid].astype(idx_dtype, copy=False))
         vals.append(step.astype(np.float32))
 
     riser_flat = np.where(riser_mask[tuple(metal_vox.T)])[0]
     if len(riser_flat) == 0:
         return dist
-    rows.append(np.full(len(riser_flat), n, dtype=np.int64))
-    cols.append(riser_flat.astype(np.int64))
+    rows.append(np.full(len(riser_flat), n, dtype=idx_dtype))
+    cols.append(riser_flat.astype(idx_dtype, copy=False))
     vals.append(np.zeros(len(riser_flat), dtype=np.float32))
 
     graph = sparse.coo_matrix(
@@ -1496,14 +1497,18 @@ def feeding_cost_dijkstra(
     (cost_grid, predecessors, metal_vox).
     """
     cost = np.full(is_metal.shape, np.inf, dtype=np.float64)
-    pred = np.full(is_metal.shape, -1, dtype=np.int64)
+    # Predecessor values are flat voxel indices; int32 is enough for grids up to
+    # 2^31 voxels and halves memory on large industrial meshes.
+    flat_idx_dtype = np.int32 if is_metal.size <= np.iinfo(np.int32).max else np.int64
+    pred = np.full(is_metal.shape, -1, dtype=flat_idx_dtype)
     if not (is_metal & riser_mask).any():
         return cost, pred, np.empty((0, 3), dtype=np.int64)
 
-    idx = np.full(is_metal.shape, -1, dtype=np.int64)
     metal_vox = np.argwhere(is_metal)
     n = int(metal_vox.shape[0])
-    idx[tuple(metal_vox.T)] = np.arange(n)
+    idx_dtype = np.int32 if n <= np.iinfo(np.int32).max else np.int64
+    idx = np.full(is_metal.shape, -1, dtype=idx_dtype)
+    idx[tuple(metal_vox.T)] = np.arange(n, dtype=idx_dtype)
 
     gx, gy, gz = gravity_vector
     norm = math.sqrt(gx * gx + gy * gy + gz * gz) + 1e-12
@@ -1539,15 +1544,15 @@ def feeding_cost_dijkstra(
             step *= (1.0 + UPWARD_PENALTY * (-dot))
         elif dot > 0:
             step *= max(0.5, 1.0 - 0.3 * dot)
-        rows.append(source_idx[valid])
-        cols.append(neighbor_idx[valid])
+        rows.append(source_idx[valid].astype(idx_dtype, copy=False))
+        cols.append(neighbor_idx[valid].astype(idx_dtype, copy=False))
         vals.append(step.astype(np.float32))
 
     riser_flat = np.where(riser_mask[tuple(metal_vox.T)])[0]
     if len(riser_flat) == 0:
         return cost, pred, metal_vox
-    rows.append(np.full(len(riser_flat), n, dtype=np.int64))
-    cols.append(riser_flat.astype(np.int64))
+    rows.append(np.full(len(riser_flat), n, dtype=idx_dtype))
+    cols.append(riser_flat.astype(idx_dtype, copy=False))
     vals.append(np.zeros(len(riser_flat), dtype=np.float32))
 
     graph = sparse.coo_matrix(
@@ -1563,14 +1568,14 @@ def feeding_cost_dijkstra(
     flat_cost = flat_cost[:n].astype(np.float64)
     cost[tuple(metal_vox.T)] = flat_cost
     # flat_pred is 1D array of length n+1; map valid graph predecessors to flat voxel indices.
-    fp = flat_pred[:n]
-    pred_values = np.full(n, -1, dtype=np.int64)
+    fp = flat_pred[:n].astype(idx_dtype, copy=False)
+    pred_values = np.full(n, -1, dtype=flat_idx_dtype)
     valid = (fp >= 0) & (fp < n)
     if valid.any():
         pv = metal_vox[fp[valid], 0] * is_metal.shape[1] * is_metal.shape[2]
         pv += metal_vox[fp[valid], 1] * is_metal.shape[2]
         pv += metal_vox[fp[valid], 2]
-        pred_values[valid] = pv
+        pred_values[valid] = pv.astype(flat_idx_dtype, copy=False)
     pred[tuple(metal_vox.T)] = pred_values
     return cost, pred, metal_vox
 
