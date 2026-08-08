@@ -1,4 +1,5 @@
 #include "josecast/ns_solver.h"
+#include "josecast/arena.hpp"
 
 #include <amgcl/make_solver.hpp>
 #include <amgcl/amg.hpp>
@@ -12,6 +13,8 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <memory_resource>
 #include <vector>
 
 namespace josecast {
@@ -27,7 +30,7 @@ inline bool in_cell(int x, int y, int z, int nx, int ny, int nz) {
     return x >= 0 && x < nx && y >= 0 && y < ny && z >= 0 && z < nz;
 }
 
-double trilerp(const std::vector<double>& f, int nx, int ny, int nz,
+double trilerp(const std::pmr::vector<double>& f, int nx, int ny, int nz,
                double x, double y, double z)
 {
     int x0 = static_cast<int>(std::floor(x));
@@ -55,18 +58,21 @@ double trilerp(const std::vector<double>& f, int nx, int ny, int nz,
 }
 
 std::vector<double> amgcl_solve_cg(
-    const std::vector<int>& rows,
-    const std::vector<int>& cols,
-    const std::vector<double>& data,
-    const std::vector<double>& rhs,
+    const std::pmr::vector<int>& rows,
+    const std::pmr::vector<int>& cols,
+    const std::pmr::vector<double>& data,
+    const std::pmr::vector<double>& rhs,
+    std::pmr::memory_resource* ar,
     int max_iter,
     double tol)
 {
     const size_t n = rhs.size();
     const size_t nnz = rows.size();
 
-    // COO -> CSR
-    std::vector<ptrdiff_t> ptr(n + 1, 0);
+    // COO -> CSR, index arrays carved from the arena.  The AMGCL CG solver
+    // requires standard std::vectors for its right-hand-side and solution
+    // vectors, so those remain heap-owned.
+    std::pmr::vector<ptrdiff_t> ptr(n + 1, 0, ar);
     for (size_t i = 0; i < nnz; ++i) {
         ptr[static_cast<size_t>(rows[i]) + 1]++;
     }
@@ -74,9 +80,9 @@ std::vector<double> amgcl_solve_cg(
         ptr[i + 1] += ptr[i];
     }
 
-    std::vector<ptrdiff_t> tmp = ptr;
-    std::vector<ptrdiff_t> col(nnz);
-    std::vector<double> val(nnz);
+    std::pmr::vector<ptrdiff_t> tmp = ptr;
+    std::pmr::vector<ptrdiff_t> col(nnz, 0, ar);
+    std::pmr::vector<double> val(nnz, 0.0, ar);
     for (size_t i = 0; i < nnz; ++i) {
         size_t r = static_cast<size_t>(rows[i]);
         size_t pos = tmp[r]++;
@@ -87,7 +93,7 @@ std::vector<double> amgcl_solve_cg(
     for (size_t i = 0; i < n; ++i) {
         size_t start = ptr[i];
         size_t end = ptr[i + 1];
-        std::vector<std::pair<ptrdiff_t, double>> pairs;
+        std::pmr::vector<std::pair<ptrdiff_t, double>> pairs(ar);
         pairs.reserve(end - start);
         for (size_t j = start; j < end; ++j) pairs.emplace_back(col[j], -val[j]);
         std::sort(pairs.begin(), pairs.end(),
@@ -134,7 +140,13 @@ public:
                     double rho, double nu, double inflow_velocity,
                     double gravity_magnitude = 9.81)
         : nx_(nx), ny_(ny), nz_(nz), dx_(dx), rho_(rho), nu_(nu),
-          inflow_(inflow_velocity), grav_(gravity_magnitude)
+          inflow_(inflow_velocity), grav_(gravity_magnitude),
+          arena_(make_arena(nx, ny, nz)),
+          solid_(arena_.get()), source_(arena_.get()),
+          phi_(arena_.get()), phi_new_(arena_.get()), phi_prev_(arena_.get()),
+          u_(arena_.get()), v_(arena_.get()), w_(arena_.get()),
+          u_prev_(arena_.get()), v_prev_(arena_.get()), w_prev_(arena_.get()),
+          p_(arena_.get()), fill_time_(arena_.get())
     {
         const size_t n = static_cast<size_t>(nx_) * ny_ * nz_;
         solid_.assign(n, 0);
@@ -206,8 +218,8 @@ public:
         if (t_ >= t_max - 1e-9) success_ = true;
     }
 
-    const std::vector<double>& phi() const { return phi_; }
-    const std::vector<double>& fill_time() const { return fill_time_; }
+    const std::pmr::vector<double>& phi() const { return phi_; }
+    const std::pmr::vector<double>& fill_time() const { return fill_time_; }
     int steps() const { return steps_; }
     double current_time() const { return t_; }
     bool success() const { return success_; }
@@ -259,13 +271,28 @@ private:
     int nx_, ny_, nz_;
     double dx_, rho_, nu_, inflow_, grav_;
     std::array<double, 3> g_;
-    std::vector<char> solid_, source_;
-    std::vector<double> phi_, phi_new_, phi_prev_;
-    std::vector<double> u_, v_, w_, u_prev_, v_prev_, w_prev_;
-    std::vector<double> p_, fill_time_;
+
+    std::unique_ptr<VirtualArena> arena_;
+    std::pmr::vector<char> solid_, source_;
+    std::pmr::vector<double> phi_, phi_new_, phi_prev_;
+    std::pmr::vector<double> u_, v_, w_, u_prev_, v_prev_, w_prev_;
+    std::pmr::vector<double> p_, fill_time_;
     double t_ = 0.0;
     int steps_ = 0;
     bool success_ = false;
+
+    static std::unique_ptr<VirtualArena> make_arena(int nx, int ny, int nz) {
+        size_t n = static_cast<size_t>(nx) * ny * nz;
+        const std::size_t multipliers[] = {200, 150, 120, 100, 80};
+        for (std::size_t m : multipliers) {
+            try {
+                return std::make_unique<VirtualArena>(VirtualArena::recommended(n, m));
+            } catch (const std::bad_alloc&) {
+                continue;
+            }
+        }
+        throw std::bad_alloc();
+    }
 
     inline bool is_solid(int x, int y, int z) const {
         if (!in_cell(x, y, z, nx_, ny_, nz_)) return true;
@@ -505,8 +532,9 @@ private:
 
     void project(double dt, int max_iter, double tol) {
         const size_t n = static_cast<size_t>(nx_) * ny_ * nz_;
+        std::pmr::memory_resource* ar = arena_.get();
 
-        std::vector<int> flat(n, -1);
+        std::pmr::vector<int> flat(n, -1, ar);
         size_t nunk = 0;
         for (int x = 0; x < nx_; ++x) {
             for (int y = 0; y < ny_; ++y) {
@@ -520,9 +548,9 @@ private:
         }
         if (nunk == 0) return;
 
-        std::vector<int> rows, cols;
-        std::vector<double> data;
-        std::vector<double> rhs(nunk, 0.0);
+        std::pmr::vector<int> rows(ar), cols(ar);
+        std::pmr::vector<double> data(ar);
+        std::pmr::vector<double> rhs(nunk, 0.0, ar);
         const double inv_dx2 = 1.0 / (dx_ * dx_);
         const double alpha = 1e-6;
 
@@ -573,7 +601,8 @@ private:
         rmean /= static_cast<double>(nunk);
         for (double& v : rhs) v -= rmean;
 
-        p_ = amgcl_solve_cg(rows, cols, data, rhs, max_iter, tol);
+        auto p_sol = amgcl_solve_cg(rows, cols, data, rhs, ar, max_iter, tol);
+        p_.assign(p_sol.begin(), p_sol.end());
 
         const double scale = dt / (rho_ * dx_);
         // u (x-face)
@@ -671,8 +700,8 @@ nb::tuple solve_ns_vof(
 
     solver.run(t_max, max_steps, cfl, max_pressure_iter, pressure_tol);
 
-    std::vector<double> phi_out = solver.phi();
-    std::vector<double> ft_out = solver.fill_time();
+    std::vector<double> phi_out(solver.phi().begin(), solver.phi().end());
+    std::vector<double> ft_out(solver.fill_time().begin(), solver.fill_time().end());
     std::vector<double> vmag_out, vel_out;
     solver.get_velocity_magnitude(&vmag_out);
     solver.get_velocity(&vel_out);
