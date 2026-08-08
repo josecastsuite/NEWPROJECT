@@ -20,6 +20,7 @@ High-level usage:
 velocity and an optional per-voxel fill-time estimate.
 """
 import heapq
+import math
 import os
 from dataclasses import dataclass, field
 from itertools import combinations
@@ -56,6 +57,63 @@ _NON_CAVITY_TYPES = frozenset([int(BodyType.CORE)]) | _CHILL_TYPES
 # FILTER is an insert metal passes through, so it stays in the flow graph but is
 # never itself a trapped-air region.
 _AIR_SKIP_TYPES = frozenset([int(BodyType.FILTER)]) | _NON_CAVITY_TYPES
+# How many neighbouring voxels the air-entrapment risk is spread over so the
+# viewer shows a cloud instead of a single ceiling voxel.
+_AIR_CLOUD_DILATION_SIZE = 3
+
+
+def _expand_air_entrapment_cloud(
+    risk: np.ndarray, mask: np.ndarray, size: int = _AIR_CLOUD_DILATION_SIZE
+) -> np.ndarray:
+    """Spread non-zero air-entrapment risk into a 3-D voxel cloud.
+
+    A maximum filter propagates the peak risk value to the ``size``
+    neighbourhood, so a pocket that used to colour only one ceiling voxel now
+    colours a visible cluster.  The result is masked back to the valid region
+    (metal/cavity) and clipped to [0, 1].
+    """
+    if size <= 1:
+        return risk
+    expanded = ndimage.maximum_filter(risk, size=size, mode="nearest")
+    expanded = np.where(mask, expanded, 0.0)
+    return np.clip(expanded, 0.0, 1.0)
+
+
+def _mold_air_escape_damping(mold: Any, casting_params: Any) -> float:
+    """Fraction of trapped air that can escape through the mould material.
+
+    * Sand moulds use the grain-size (AFS) / Dietert permeability formula plus
+      moisture/binder/compactability corrections.
+    * Non-sand moulds (ceramic, metal, shell, investment) use the material's
+      ``permeability_proxy`` (0 = impermeable, 1 = sand-like).
+    """
+    if mold is None:
+        return 0.0
+    is_sand = bool(getattr(mold, "is_sand", False))
+    proxy = float(getattr(mold, "permeability_proxy", 0.0) or 0.0)
+    proxy_damping = 1.0 - math.exp(-proxy * 1.0)
+    if not is_sand:
+        return proxy_damping
+    d50 = float(getattr(casting_params, "mold_particle_size_mm", 0.0) or 0.0)
+    if d50 <= 0.0:
+        d50 = float(getattr(mold, "particle_size_mm", 0.0) or 0.0)
+    if d50 > 0.0:
+        afs = 15.5 / d50
+        P = 300000.0 / (afs ** 1.5)
+        sand_damping = 1.0 - math.exp(-P / 500.0)
+    else:
+        sand_damping = proxy_damping
+    moisture = float(getattr(mold, "moisture_percent", 0.0) or 0.0)
+    binder = float(getattr(mold, "binder_percent", 0.0) or 0.0)
+    compact = float(getattr(mold, "compactability_percent", 0.0) or 0.0)
+    # Moisture, binder and excess compactability all reduce permeability.
+    sand_damping *= (
+        1.0
+        + 0.04 * max(moisture, 0.0)
+        + 0.03 * max(binder, 0.0)
+        + 0.005 * max(compact - 45.0, 0.0)
+    )
+    return float(np.clip(max(sand_damping, proxy_damping), 0.0, 0.99))
 
 
 def _downsample_grid(
@@ -772,26 +830,8 @@ def _compute_air_entrapment_risk(
 
 
 def _sand_permeability_damping(mold: Any, casting_params: Any) -> float:
-    """Compute a 0-1 surface-escape damping factor from AFS/permeability P.
-
-    User formulas:
-        AFS = 15.5 / d50        (d50 in mm)
-        P   = 300000 / AFS^1.5  (Dietert permeability number)
-    Larger P means the sand breathes more; the damping factor approaches 1.
-    For metal/ceramic molds or missing d50 the factor is 0.
-    """
-    is_sand = bool(getattr(mold, "is_sand", False))
-    if not is_sand:
-        return 0.0
-    d50 = float(getattr(casting_params, "mold_particle_size_mm", 0.0))
-    if d50 <= 0.0:
-        d50 = float(getattr(mold, "particle_size_mm", 0.0))
-    if d50 <= 0.0:
-        return 0.0
-    afs = 15.5 / d50
-    P = 300000.0 / (afs ** 1.5)
-    # Smooth saturation: P=500 -> ~0.63, P=1000 -> ~0.86, P>=2000 -> ~0.98
-    return float(np.clip(1.0 - np.exp(-P / 500.0), 0.0, 1.0))
+    """Backward-compatible wrapper for the mould air-escape damping model."""
+    return _mold_air_escape_damping(mold, casting_params)
 
 
 def _apply_sand_permeability_correction(
@@ -801,15 +841,13 @@ def _apply_sand_permeability_correction(
     casting_params: Any,
     dx_mm: float,
 ) -> np.ndarray:
-    """Reduce near-surface air-entrapment risk in permeable sand molds.
+    """Reduce near-surface air-entrapment risk according to mould permeability.
 
-    The damping factor from Dietert permeability P is applied with an
+    The damping factor combines sand AFS/moisture/binder data and the material
+    ``permeability_proxy`` for ceramics/metals/shells.  It is applied with an
     exponential decay away from the cavity surface so deep closed pockets are
-    not artificially lowered.
-
-    For non-sand real moulds the permeability-proxy is deliberately *not* used as
-    a substitute for venting.  Graphite moulds get a tiny optional relief because
-    the material can out-gas/breathe slightly; metal and ceramic stay unchanged.
+    not artificially lowered and so sand, ceramic and metal moulds give visibly
+    different air-entrapment results.
     """
     corrected = risk
     damping = _sand_permeability_damping(mold, casting_params)
@@ -1045,7 +1083,7 @@ def compute_geometric_air_entrapment(
     risk = ndimage.maximum_filter(trapped_empty.astype(np.float32), footprint=s6)
     risk = np.where(body, risk, 0.0)
 
-    if mold is not None and casting_params is not None:
+    if mold is not None:
         risk = _apply_sand_permeability_correction(
             risk, body, mold, casting_params, float(dx_mm)
         )
@@ -1363,6 +1401,9 @@ def compute_air_entrapment_geofc(
     orig_origin = origin.copy()
     orig_dx_mm = float(dx_mm)
     orig_shape = grid.shape
+    orig_air_mask = (orig_grid != int(BodyType.EMPTY)) & ~np.isin(
+        orig_grid, list(_AIR_SKIP_TYPES)
+    )
 
     cavity_for_downsample = (grid != int(BodyType.EMPTY)) & ~np.isin(
         grid, list(_NON_CAVITY_TYPES)
@@ -1651,7 +1692,7 @@ def compute_air_entrapment_geofc(
         # Do not smear risk into the air volume; paint only the ceiling surface.
         risk[ceiling] = risk_val
 
-    if mold is not None and casting_params is not None:
+    if mold is not None:
         risk = _apply_sand_permeability_correction(
             risk, air_mask, mold, casting_params, float(dx_mm)
         )
@@ -1688,6 +1729,10 @@ def compute_air_entrapment_geofc(
         centroid_mm = np.asarray(centroid_mm, dtype=np.float64)
     else:
         centroid_mm = np.array([], dtype=np.float64)
+
+    # Spread the geometric air-entrapment risk into a 3-D voxel cloud so the
+    # viewer does not show a single ceiling voxel.
+    risk = _expand_air_entrapment_cloud(risk, orig_air_mask, size=_AIR_CLOUD_DILATION_SIZE)
 
     return risk.astype(np.float32), trapped_volume_m3, centroid_mm
 
@@ -7023,7 +7068,7 @@ def solve_filling_flow(
             and "fill_time" in vof_res
             and vof_outlet is not None
         ):
-            risk_c, _, _ = _compute_air_entrapment_risk(
+            risk_c, risk_volume_m3, risk_centroid_vox = _compute_air_entrapment_risk(
                 np.asarray(vof_res["phi"]),
                 np.asarray(vof_res["fill_time"]),
                 vof_outlet,
@@ -7049,7 +7094,8 @@ def solve_filling_flow(
             air_entrapment_fine = np.clip(air_entrapment_fine, 0.0, 1.0)
             air_entrapment_fine = np.where(fine_metal, air_entrapment_fine, 0.0)
 
-            # Stage 2: sand AFS/permeability correction (near-surface only).
+            # Stage 2: mould permeability correction (sand AFS/moisture/binder,
+            # ceramic/metal permeability_proxy).
             if mold is not None:
                 air_entrapment_fine = _apply_sand_permeability_correction(
                     air_entrapment_fine,
@@ -7069,14 +7115,29 @@ def solve_filling_flow(
             air_entrapment_fine = np.maximum(air_entrapment_fine, entrainment_risk)
 
             if air_entrapment_fine.any():
-                trapped_air_volume_m3 = float(np.sum(air_entrapment_fine)) * (
-                    orig_dx_m ** 3
+                # Use the physical pocket volume from the LBM post-processor, not the
+                # sum of the risk field, and capture the centroid before the cloud
+                # expansion smears it.
+                trapped_air_volume_m3 = float(risk_volume_m3)
+                if risk_centroid_vox.size == 3 and np.all(np.isfinite(risk_centroid_vox)):
+                    air_entrapment_centroid_mm = (
+                        vof_origin + (risk_centroid_vox + 0.5) * vof_dx
+                    )
+                else:
+                    centroid_vox = np.array(
+                        ndimage.center_of_mass(air_entrapment_fine), dtype=np.float64
+                    )
+                    if centroid_vox.size == 3 and np.all(np.isfinite(centroid_vox)):
+                        air_entrapment_centroid_mm = (
+                            orig_origin + (centroid_vox + 0.5) * orig_dx
+                        )
+
+                # Expand the risk into a 3-D voxel cloud instead of a few ceiling
+                # voxels so the viewer renders a visible bubble, not a single point.
+                cloud_mask = fine_metal if fine_metal is not None else (orig_grid != BodyType.EMPTY)
+                air_entrapment_fine = _expand_air_entrapment_cloud(
+                    air_entrapment_fine, cloud_mask, size=_AIR_CLOUD_DILATION_SIZE
                 )
-                centroid_vox = np.array(
-                    ndimage.center_of_mass(air_entrapment_fine), dtype=np.float64
-                )
-                if centroid_vox.size == 3 and np.all(np.isfinite(centroid_vox)):
-                    air_entrapment_centroid_mm = orig_origin + centroid_vox * orig_dx
 
     # Post-process 3-D flow turbulence metrics (Re, turbulent intensity).
     if fine_metal.any():

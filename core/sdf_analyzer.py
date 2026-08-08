@@ -7,7 +7,7 @@ import sys
 import time
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import trimesh
@@ -767,6 +767,7 @@ def compute_cold_shot_risk(
     dx: float,
     origin_mm: np.ndarray,
     t_liq: Optional[np.ndarray] = None,
+    mold: Optional[Any] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Estimate per-voxel cold-shut (soğuk birleşme) risk and the last fill point.
 
@@ -1004,12 +1005,20 @@ def compute_cold_shot_risk(
             np.multiply(v_local, thin, out=v_local)
             np.nan_to_num(v_local, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
-            # Apply material-specific cold-shut gain before clipping.  This lets
-            # the model be more conservative for alloys prone to cold shuts
-            # without rewriting the underlying physics factors.
+            # Apply material-specific cold-shut gain and a mould-diffusivity
+            # factor before clipping.  Metal/ceramic moulds chill faster, so the
+            # same fill front is more likely to produce a cold shut than sand.
             cold_shot_gain = float(getattr(alloy, "cold_shot_gain", 1.25))
-            if cold_shot_gain != 1.0:
-                np.multiply(v_local, np.float32(cold_shot_gain), out=v_local)
+            mold_factor = 1.0
+            if mold is not None:
+                alpha = float(getattr(mold, "diffusivity_mm2_s", 0.0) or 0.0)
+                if alpha > 0.0:
+                    alpha_ref = 0.31  # green-sand reference diffusivity [mm2/s]
+                    mold_factor = 1.0 + math.log1p(alpha / alpha_ref) * 0.5
+                    mold_factor = float(np.clip(mold_factor, 0.5, 2.0))
+            scale = cold_shot_gain * mold_factor
+            if scale != 1.0:
+                np.multiply(v_local, np.float32(scale), out=v_local)
 
             np.clip(v_local, 0.0, 1.0, out=v_local)
 
@@ -3398,6 +3407,7 @@ def analyze(
         dx=dx,
         origin_mm=origin_mm,
         t_liq=t_liq,
+        mold=mold,
     )
 
     # v10.5: per-voxel mold-sand erosion risk from local metal velocity.

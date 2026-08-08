@@ -1404,7 +1404,7 @@ class Analyzer3DViewer(QtInteractor):
             self._air_entrapment_marker_actor = self.add_mesh(
                 sphere,
                 color="cyan",
-                opacity=0.9,
+                opacity=0.35,
                 show_scalar_bar=False,
             )
 
