@@ -133,7 +133,7 @@ nb::tuple solve_thermal(
     // 250 bytes/voxel covers T, k, rho, cp0, T_new/T_adv/T_tmp, t_liq, t_sol,
     // G/R, fs_final, cp_eff, metal/gating/chill/mold_layer masks, full_to_int,
     // and boundary/C/b buffers.  Reserve 3x to leave headroom for temporaries.
-    auto arena_ptr = make_arena_fallback(n, {80, 60, 45, 30, 20});
+    auto arena_ptr = make_arena_fallback(n, {250, 200, 180, 150, 120});
     VirtualArena* ar = arena_ptr.get();
 
     // ---- alloy / mould properties ----
