@@ -1003,6 +1003,14 @@ def compute_cold_shot_risk(
             np.multiply(v_local, low_vel, out=v_local)
             np.multiply(v_local, thin, out=v_local)
             np.nan_to_num(v_local, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Apply material-specific cold-shut gain before clipping.  This lets
+            # the model be more conservative for alloys prone to cold shuts
+            # without rewriting the underlying physics factors.
+            cold_shot_gain = float(getattr(alloy, "cold_shot_gain", 1.25))
+            if cold_shot_gain != 1.0:
+                np.multiply(v_local, np.float32(cold_shot_gain), out=v_local)
+
             np.clip(v_local, 0.0, 1.0, out=v_local)
 
             np.copyto(out, v_local, casting="unsafe")
