@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
 #include <memory_resource>
 #include <queue>
 #include <string>
@@ -40,6 +41,21 @@ inline size_t cidx(int x, int y, int z, int ny, int nz) {
 double getd(const std::map<std::string, double> &m, const std::string &key, double def = 0.0) {
     auto it = m.find(key);
     return (it == m.end()) ? def : it->second;
+}
+
+// Try a 3x over-allocation arena first; if the OS cannot back that much
+// virtual address / page-file space, fall back to smaller multipliers.  This
+// keeps the solver from failing on 100M+ voxel grids when 3x would exceed the
+// process commit limit, while still preferring the requested headroom.
+std::unique_ptr<VirtualArena> make_arena_fallback(size_t n, const std::vector<std::size_t>& multipliers) {
+    for (std::size_t m : multipliers) {
+        try {
+            return std::make_unique<VirtualArena>(VirtualArena::recommended(n, m));
+        } catch (const std::bad_alloc&) {
+            continue;
+        }
+    }
+    throw std::bad_alloc();
 }
 
 // Scheil solid fraction [0..1]
@@ -117,8 +133,8 @@ nb::tuple solve_thermal(
     // 250 bytes/voxel covers T, k, rho, cp0, T_new/T_adv/T_tmp, t_liq, t_sol,
     // G/R, fs_final, cp_eff, metal/gating/chill/mold_layer masks, full_to_int,
     // and boundary/C/b buffers.  Reserve 3x to leave headroom for temporaries.
-    VirtualArena arena(VirtualArena::recommended(n, 250));
-    auto ar = &arena;
+    auto arena_ptr = make_arena_fallback(n, {80, 60, 45, 30, 20});
+    VirtualArena* ar = arena_ptr.get();
 
     // ---- alloy / mould properties ----
     const double Tl = getd(alloy, "t_liquidus_c", 1500.0);
@@ -624,8 +640,8 @@ nb::tuple compute_porosity(
     size_t n = static_cast<size_t>(nx) * ny * nz;
 
     // Virtual-address arena for all porosity working arrays.
-    VirtualArena arena(VirtualArena::recommended(n, 80));
-    auto ar = &arena;
+    auto arena_ptr = make_arena_fallback(n, {50, 40, 30, 25, 15});
+    VirtualArena* ar = arena_ptr.get();
 
     const double shrinkage_factor = getd(alloy, "shrinkage_factor", 0.03);
     const double dendrite_spacing_mm = getd(alloy, "dendrite_spacing_mm", 0.12);

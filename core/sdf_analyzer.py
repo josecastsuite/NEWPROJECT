@@ -526,6 +526,68 @@ def compute_pore_size(
     Returns pore_size_um, pore_size_mm, macro_mask, micro_mask, fine_mask,
     shrinkage_pore_size_um, pore_volume_pct, mold_wall_movement_pct.
     """
+    # Directional feeding: a feeder aligned with the solidification front and
+    # located above the voxel (opposite to the user-defined gravity vector) is
+    # much more effective, but never removes all risk.
+    _feeder = feeder_mask if feeder_mask is not None else np.zeros_like(part_mask)
+    feed_eff = directional_feed_efficiency(
+        t_s, _feeder, part_mask, dx, gravity_vector=gravity_vector, fill_time=fill_time
+    )
+
+    # Optional C++ accelerated porosity map.  Call before any large Python
+    # temporaries are built so Windows is not asked for a fresh 807 MiB block.
+    if USE_CPP_POROSITY and JOSECAST_CORE is not None:
+        def _to_3d(arr: Optional[np.ndarray]) -> np.ndarray:
+            if arr is None:
+                return np.empty((0, 0, 0), dtype=np.float64)
+            if arr.ndim == 3:
+                return arr.astype(np.float64, copy=False)
+            if arr.size == 0:
+                return np.empty((0, 0, 0), dtype=np.float64)
+            return arr.astype(np.float64, copy=False)
+
+        v_in = _to_3d(velocity_magnitude)
+        d_in = _to_3d(darcy_factor)
+        fs_in = (
+            solid_fraction.astype(np.float64, copy=False)
+            if solid_fraction is not None and solid_fraction.ndim == 3 and solid_fraction.shape == niyama.shape
+            else np.empty((0, 0, 0), dtype=np.float64)
+        )
+        try:
+            ps_um, ps_mm, macro, micro, fine, shrink, gp, mold_move = JOSECAST_CORE.compute_porosity(
+                niyama.astype(np.float64, copy=False),
+                M_mod.astype(np.float64, copy=False),
+                feed_risk.astype(np.float64, copy=False),
+                feed_eff.astype(np.float64, copy=False),
+                part_mask.astype(np.uint8, copy=False),
+                v_in,
+                d_in,
+                _alloy_to_dict(alloy),
+                alloy.carlson_curve_key,
+                alloy.material_family,
+                fs_in,
+                alloy.carbon_equivalent,
+                float(mold.mold_rigidity_factor) if mold is not None else 1.0,
+                alloy.graphite_expansion_fraction,
+                alloy.inoculation_factor,
+            )
+            return (
+                ps_um,
+                ps_mm,
+                macro.astype(bool),
+                micro.astype(bool),
+                fine.astype(bool),
+                shrink,
+                gp,
+                mold_move,
+            )
+        except Exception as exc:
+            print(
+                f"[Porosity] C++ imza/argüman hatası, Python fallback kullanılıyor: {exc}",
+                file=sys.stderr,
+            )
+
+    # Python fallback (C++ disabled or failed).
     valid = part_mask & np.isfinite(niyama) & (niyama > 0.0)
 
     # ---- fs-dependent shrinkage / graphite expansion (cast irons) ----
@@ -580,65 +642,7 @@ def compute_pore_size(
         valid, np.clip(expansion * (1.0 - rigidity) * 100.0, 0.0, None), 0.0
     )
 
-    # Directional feeding: a feeder aligned with the solidification front and
-    # located above the voxel (opposite to the user-defined gravity vector) is
-    # much more effective, but never removes all risk.
-    _feeder = feeder_mask if feeder_mask is not None else np.zeros_like(part_mask)
-    feed_eff = directional_feed_efficiency(
-        t_s, _feeder, part_mask, dx, gravity_vector=gravity_vector, fill_time=fill_time
-    )
-
-    # Optional C++ accelerated porosity map.
-    if USE_CPP_POROSITY and JOSECAST_CORE is not None:
-        def _to_3d(arr: Optional[np.ndarray]) -> np.ndarray:
-            if arr is None:
-                return np.empty((0, 0, 0), dtype=np.float64)
-            if arr.ndim == 3:
-                return arr.astype(np.float64, copy=False)
-            if arr.size == 0:
-                return np.empty((0, 0, 0), dtype=np.float64)
-            return arr.astype(np.float64, copy=False)
-
-        v_in = _to_3d(velocity_magnitude)
-        d_in = _to_3d(darcy_factor)
-        fs_in = (
-            solid_fraction.astype(np.float64, copy=False)
-            if solid_fraction is not None and solid_fraction.ndim == 3 and solid_fraction.shape == niyama.shape
-            else np.empty((0, 0, 0), dtype=np.float64)
-        )
-        try:
-            ps_um, ps_mm, macro, micro, fine, shrink, gp, mold_move = JOSECAST_CORE.compute_porosity(
-                niyama.astype(np.float64, copy=False),
-                M_mod.astype(np.float64, copy=False),
-                feed_risk.astype(np.float64, copy=False),
-                feed_eff.astype(np.float64, copy=False),
-                part_mask.astype(np.uint8, copy=False),
-                v_in,
-                d_in,
-                _alloy_to_dict(alloy),
-                alloy.carlson_curve_key,
-                alloy.material_family,
-                fs_in,
-                alloy.carbon_equivalent,
-                float(mold.mold_rigidity_factor) if mold is not None else 1.0,
-                alloy.graphite_expansion_fraction,
-                alloy.inoculation_factor,
-            )
-            return (
-                ps_um,
-                ps_mm,
-                macro.astype(bool),
-                micro.astype(bool),
-                fine.astype(bool),
-                shrink,
-                gp,
-                mold_move,
-            )
-        except Exception as exc:
-            print(
-                f"[Porosity] C++ imza/argüman hatası, Python fallback kullanılıyor: {exc}",
-                file=sys.stderr,
-            )
+    # (C++ porosity path is attempted before this fallback code.)
 
     feed_factor = np.power(np.clip(feed_risk, 0.0, 1.0), alloy.feed_risk_exponent) * feed_eff
 
