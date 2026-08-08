@@ -43,19 +43,11 @@ double getd(const std::map<std::string, double> &m, const std::string &key, doub
     return (it == m.end()) ? def : it->second;
 }
 
-// Try a 3x over-allocation arena first; if the OS cannot back that much
-// virtual address / page-file space, fall back to smaller multipliers.  This
-// keeps the solver from failing on 100M+ voxel grids when 3x would exceed the
-// process commit limit, while still preferring the requested headroom.
-std::unique_ptr<VirtualArena> make_arena_fallback(size_t n, const std::vector<std::size_t>& multipliers) {
-    for (std::size_t m : multipliers) {
-        try {
-            return std::make_unique<VirtualArena>(VirtualArena::recommended(n, m));
-        } catch (const std::bad_alloc&) {
-            continue;
-        }
-    }
-    throw std::bad_alloc();
+// ChunkedArena grows on demand in 256 MiB virtual blocks, so no single huge
+// contiguous reservation is required.  The hint is just an expected committed
+// working-set size; extra space is allocated as 1 GiB chunks only when touched.
+std::unique_ptr<ChunkedArena> make_thermal_arena(size_t n) {
+    return std::make_unique<ChunkedArena>(ChunkedArena::recommended(n, 60));
 }
 
 // Scheil solid fraction [0..1]
@@ -107,6 +99,136 @@ double carlson_gp(double ny_star, double b0, const std::string &key) {
     return std::max(0.0, std::min(b0, gp));
 }
 
+inline void linear_to_ijk(size_t idx, int& x, int& y, int& z, int ny, int nz) {
+    z = static_cast<int>(idx % nz);
+    size_t r = idx / nz;
+    y = static_cast<int>(r % ny);
+    x = static_cast<int>(r / ny);
+}
+
+// Matrix-free application of the implicit diffusion operator
+//     A x = C * x + dt * (diagA * x - sum_interior kface * x[col])
+// where diagA already contains the sum of all 6 face conductivities.
+void apply_matrix_free(int n_int, const int* int_to_full, const int* full_to_int,
+                       const double* C, const double* k, const double* diagA,
+                       double dt, double inv_dx2, int nx, int ny, int nz,
+                       const double* x, double* Ax) {
+    const int dxs[6] = {1, -1, 0, 0, 0, 0};
+    const int dys[6] = {0, 0, 1, -1, 0, 0};
+    const int dzs[6] = {0, 0, 0, 0, 1, -1};
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int r = 0; r < n_int; ++r) {
+        size_t fi = static_cast<size_t>(int_to_full[r]);
+        int x0, y0, z0;
+        linear_to_ijk(fi, x0, y0, z0, ny, nz);
+        double sum = 0.0;
+        for (int d = 0; d < 6; ++d) {
+            int xn = x0 + dxs[d], yn = y0 + dys[d], zn = z0 + dzs[d];
+            size_t nb = cidx(xn, yn, zn, ny, nz);
+            double kface = 2.0 * k[fi] * k[nb] / (k[fi] + k[nb] + 1e-12) * inv_dx2;
+            int c = full_to_int[nb];
+            if (c >= 0) sum += kface * x[c];
+        }
+        Ax[r] = C[r] * x[r] + dt * (diagA[r] * x[r] - sum);
+    }
+}
+
+double dot_product(int n, const double* a, const double* b) {
+    double s = 0.0;
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) reduction(+:s)
+    #endif
+    for (int i = 0; i < n; ++i) s += a[i] * b[i];
+    return s;
+}
+
+void vector_axpby(int n, double a, const double* x, double b, double* y) {
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int i = 0; i < n; ++i) y[i] = a * x[i] + b * y[i];
+}
+
+void vector_copy(int n, const double* src, double* dst) {
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int i = 0; i < n; ++i) dst[i] = src[i];
+}
+
+// Conjugate-gradient solver for the matrix-free system A x = b with a simple
+// diagonal (Jacobi) preconditioner.  Memory is O(n_int) and no large sparse
+// matrix is built, so this works on 100M+ voxel grids without huge allocations.
+void solve_cg_matrix_free(int n_int, const int* int_to_full, const int* full_to_int,
+                          const double* C, const double* k, const double* diagA,
+                          double dt, double inv_dx2, int nx, int ny, int nz,
+                          const double* b, double* x, std::pmr::memory_resource* ar,
+                          double tol = 1e-5, int max_iter = 300) {
+    std::pmr::vector<double> r(n_int, 0.0, ar), p_vec(n_int, 0.0, ar);
+    std::pmr::vector<double> z(n_int, 0.0, ar), Ap(n_int, 0.0, ar);
+
+    apply_matrix_free(n_int, int_to_full, full_to_int, C, k, diagA,
+                      dt, inv_dx2, nx, ny, nz, x, Ap.data());
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int i = 0; i < n_int; ++i) r[i] = b[i] - Ap[i];
+
+    double b_norm = std::sqrt(dot_product(n_int, b, b));
+    if (b_norm < 1e-30) b_norm = 1.0;
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int i = 0; i < n_int; ++i) {
+        double diag = C[i] + dt * diagA[i] + 1e-12;
+        z[i] = r[i] / diag;
+        p_vec[i] = z[i];
+    }
+
+    double rz = dot_product(n_int, r.data(), z.data());
+    for (int iter = 0; iter < max_iter; ++iter) {
+        apply_matrix_free(n_int, int_to_full, full_to_int, C, k, diagA,
+                          dt, inv_dx2, nx, ny, nz, p_vec.data(), Ap.data());
+        double pAp = dot_product(n_int, p_vec.data(), Ap.data());
+        if (pAp <= 1e-30) break;
+        double alpha = rz / pAp;
+
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int i = 0; i < n_int; ++i) {
+            x[i] += alpha * p_vec[i];
+            r[i] -= alpha * Ap[i];
+        }
+
+        double res_norm = std::sqrt(dot_product(n_int, r.data(), r.data()));
+        if (res_norm <= tol * b_norm) break;
+
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int i = 0; i < n_int; ++i) {
+            double diag = C[i] + dt * diagA[i] + 1e-12;
+            z[i] = r[i] / diag;
+        }
+        double rz_new = dot_product(n_int, r.data(), z.data());
+        if (rz_new <= 1e-30) break;
+        double beta = rz_new / rz;
+
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int i = 0; i < n_int; ++i) {
+            p_vec[i] = z[i] + beta * p_vec[i];
+        }
+        rz = rz_new;
+    }
+}
+
 } // namespace
 
 nb::tuple solve_thermal(
@@ -133,8 +255,8 @@ nb::tuple solve_thermal(
     // 250 bytes/voxel covers T, k, rho, cp0, T_new/T_adv/T_tmp, t_liq, t_sol,
     // G/R, fs_final, cp_eff, metal/gating/chill/mold_layer masks, full_to_int,
     // and boundary/C/b buffers.  Reserve 3x to leave headroom for temporaries.
-    auto arena_ptr = make_arena_fallback(n, {250, 200, 180, 150, 120});
-    VirtualArena* ar = arena_ptr.get();
+    auto arena_ptr = make_thermal_arena(n);
+    ChunkedArena* ar = arena_ptr.get();
 
     // ---- alloy / mould properties ----
     const double Tl = getd(alloy, "t_liquidus_c", 1500.0);
@@ -323,26 +445,21 @@ nb::tuple solve_thermal(
                 ++n_int;
             }
 
-    std::pmr::vector<Eigen::Triplet<double>> trips_A(ar);
-    trips_A.reserve(static_cast<size_t>(n_int) * 7);
-    std::pmr::vector<double> boundary_sum(n_int, 0.0, ar);
     const double inv_dx2 = 1.0 / (dx_m * dx_m);
-
+    std::pmr::vector<double> diagA(n_int, 0.0, ar);
+    std::pmr::vector<double> boundary_sum(n_int, 0.0, ar);
     for (int x = 1; x < nx - 1; ++x) {
         for (int y = 1; y < ny - 1; ++y) {
             for (int z = 1; z < nz - 1; ++z) {
                 size_t fi = cidx(x, y, z, ny, nz);
                 int row = full_to_int[fi];
-                double diag = 0.0;
+                double dsum = 0.0, bsum = 0.0;
                 auto add_face = [&](size_t nb) {
                     double kface = 2.0 * k[fi] * k[nb] / (k[fi] + k[nb] + 1e-12);
                     double coeff = kface * inv_dx2;
                     int col = full_to_int[nb];
-                    if (col >= 0)
-                        trips_A.emplace_back(row, col, coeff);
-                    else
-                        boundary_sum[row] += coeff;
-                    diag -= coeff;
+                    if (col < 0) bsum += coeff;
+                    dsum += coeff;
                 };
                 add_face(cidx(x - 1, y, z, ny, nz));
                 add_face(cidx(x + 1, y, z, ny, nz));
@@ -350,7 +467,8 @@ nb::tuple solve_thermal(
                 add_face(cidx(x, y + 1, z, ny, nz));
                 add_face(cidx(x, y, z - 1, ny, nz));
                 add_face(cidx(x, y, z + 1, ny, nz));
-                trips_A.emplace_back(row, row, diag);
+                diagA[row] = dsum;
+                boundary_sum[row] = bsum;
             }
         }
     }
@@ -364,13 +482,7 @@ nb::tuple solve_thermal(
     std::pmr::vector<double> cp_eff(n, 0.0, ar);
     std::pmr::vector<double> T_tmp(n, 0.0, ar);
     std::pmr::vector<double> C_int(n_int, 0.0, ar), b(n_int, 0.0, ar);
-    std::pmr::vector<Eigen::Triplet<double>> trips_M(ar);
-    trips_M.reserve(trips_A.size());
-
-    Eigen::ConjugateGradient<Eigen::SparseMatrix<double>, Eigen::Lower | Eigen::Upper,
-                              Eigen::DiagonalPreconditioner<double>> solver;
-    solver.setTolerance(1e-5);
-    solver.setMaxIterations(300);
+    std::pmr::vector<double> x_int(n_int, 0.0, ar);
 
     double t = 0.0;
     int step = 0;
@@ -456,32 +568,14 @@ nb::tuple solve_thermal(
             int fi = int_to_full[r];
             C_int[r] = rho[fi] * cp_eff[fi];
             b[r] = C_int[r] * T_adv[fi] + dt * T0 * boundary_sum[r];
+            x_int[r] = T_adv[fi];
         }
 
-        trips_M.clear();
-        for (const auto &tp : trips_A) {
-            double aval = tp.value();
-            double mval;
-            if (tp.row() == tp.col())
-                mval = -dt * aval + C_int[tp.row()];
-            else
-                mval = -dt * aval;
-            trips_M.emplace_back(tp.row(), tp.col(), mval);
-        }
-
-        Eigen::SparseMatrix<double> M(n_int, n_int);
-        M.setFromTriplets(trips_M.begin(), trips_M.end());
-
-        Eigen::VectorXd rhs(n_int), x(n_int);
-        for (int r = 0; r < n_int; ++r) rhs[r] = b[r];
-        for (int r = 0; r < n_int; ++r) x[r] = T_adv[int_to_full[r]];
-
-        solver.compute(M);
-        if (solver.info() == Eigen::Success) {
-            x = solver.solveWithGuess(rhs, x);
-        } else {
-            for (int r = 0; r < n_int; ++r) x[r] = T_adv[int_to_full[r]];
-        }
+        // Matrix-free CG: no large sparse matrix is built; memory stays bounded.
+        solve_cg_matrix_free(n_int, int_to_full.data(), full_to_int.data(),
+                             C_int.data(), k.data(), diagA.data(),
+                             dt, inv_dx2, nx, ny, nz,
+                             b.data(), x_int.data(), ar, 1e-5, 300);
 
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
@@ -489,7 +583,7 @@ nb::tuple solve_thermal(
         for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) T_new[i] = T0; // boundary default
         for (int r = 0; r < n_int; ++r) {
             int fi = int_to_full[r];
-            T_new[fi] = x[r];
+            T_new[fi] = x_int[r];
         }
 
         #ifdef _OPENMP
@@ -640,8 +734,8 @@ nb::tuple compute_porosity(
     size_t n = static_cast<size_t>(nx) * ny * nz;
 
     // Virtual-address arena for all porosity working arrays.
-    auto arena_ptr = make_arena_fallback(n, {50, 40, 30, 25, 15});
-    VirtualArena* ar = arena_ptr.get();
+    auto arena_ptr = std::make_unique<ChunkedArena>(ChunkedArena::recommended(n, 60));
+    ChunkedArena* ar = arena_ptr.get();
 
     const double shrinkage_factor = getd(alloy, "shrinkage_factor", 0.03);
     const double dendrite_spacing_mm = getd(alloy, "dendrite_spacing_mm", 0.12);

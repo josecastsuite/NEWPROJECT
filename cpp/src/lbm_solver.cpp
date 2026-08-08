@@ -415,10 +415,9 @@ private:
     bool has_target_ = false;
     double target_scale_ = 0.0;  // (dt/dx) converts physical velocity to lattice velocity.
 
-    // Single virtual-address arena for all large per-voxel arrays.  Pages are
-    // committed only when the vectors are written, so a fragmented heap cannot
-    // cause a single 500+ MiB allocation failure.
-    std::unique_ptr<VirtualArena> arena_;
+    // Chunked virtual-address arena: 256 MiB blocks that grow on demand.  No
+    // single huge contiguous reservation is required.
+    std::unique_ptr<ChunkedArena> arena_;
     std::pmr::vector<uint8_t> flags_;
     std::pmr::vector<std::array<double, 3>> outlet_normal_;
     std::pmr::vector<size_t> fluid_list_;
@@ -436,17 +435,9 @@ private:
     std::pmr::vector<double> target_velocity_owned_;
     std::pmr::vector<double> inlet_distance_owned_;
 
-    static std::unique_ptr<VirtualArena> make_arena(int nx, int ny, int nz) {
-        size_t n = static_cast<size_t>(nx) * ny * nz;
-        const std::size_t multipliers[] = {500, 350, 250, 200, 150, 100};
-        for (std::size_t m : multipliers) {
-            try {
-                return std::make_unique<VirtualArena>(VirtualArena::recommended(n, m));
-            } catch (const std::bad_alloc&) {
-                continue;
-            }
-        }
-        throw std::bad_alloc();
+    static std::unique_ptr<ChunkedArena> make_arena(int nx, int ny, int nz) {
+        (void)nx; (void)ny; (void)nz;
+        return std::make_unique<ChunkedArena>(0);
     }
 
     void build_geodesic_target() {

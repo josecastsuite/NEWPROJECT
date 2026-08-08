@@ -272,7 +272,7 @@ private:
     double dx_, rho_, nu_, inflow_, grav_;
     std::array<double, 3> g_;
 
-    std::unique_ptr<VirtualArena> arena_;
+    std::unique_ptr<ChunkedArena> arena_;
     std::pmr::vector<char> solid_, source_;
     std::pmr::vector<double> phi_, phi_new_, phi_prev_;
     std::pmr::vector<double> u_, v_, w_, u_prev_, v_prev_, w_prev_;
@@ -281,17 +281,9 @@ private:
     int steps_ = 0;
     bool success_ = false;
 
-    static std::unique_ptr<VirtualArena> make_arena(int nx, int ny, int nz) {
-        size_t n = static_cast<size_t>(nx) * ny * nz;
-        const std::size_t multipliers[] = {200, 150, 120, 100, 80};
-        for (std::size_t m : multipliers) {
-            try {
-                return std::make_unique<VirtualArena>(VirtualArena::recommended(n, m));
-            } catch (const std::bad_alloc&) {
-                continue;
-            }
-        }
-        throw std::bad_alloc();
+    static std::unique_ptr<ChunkedArena> make_arena(int nx, int ny, int nz) {
+        (void)nx; (void)ny; (void)nz;
+        return std::make_unique<ChunkedArena>(0);
     }
 
     inline bool is_solid(int x, int y, int z) const {
