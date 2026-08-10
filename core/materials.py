@@ -152,7 +152,7 @@ class Alloy:
     # temperature, fill-delay, low-velocity and thin-section factors; this gain
     # scales the final value before clipping to [0, 1].  >1 makes cold shuts
     # more visible; <1 suppresses them for alloys that are very tolerant.
-    cold_shot_gain: float = 1.25
+    cold_shot_gain: float = 1.0
 
     def __post_init__(self):
         if self.density_g_cm3 == 0.0:
