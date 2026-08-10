@@ -774,9 +774,10 @@ def compute_cold_shot_risk(
     """Estimate per-voxel cold-shut (soğuk birleşme) risk and the last fill point.
 
     The risk is the product of four normalised base factors:
-        temperature_factor    : how cold the metal is when the front reaches the cell
-        fill_delay_factor     : how late the cell fills relative to the last-filled cell
-        low_velocity_factor   : how far below the critical front velocity the flow is
+        temperature_factor    : how close to liquidus the metal is when the front reaches the cell,
+                                gated by the final thermal state (cells still above liquidus are safe)
+        fill_delay_factor     : voxel transit time of the front relative to the remaining liquid time
+        low_velocity_factor   : kept neutral; front speed is already part of fill_delay_factor
         thin_section_factor   : how thin the local section is (small modulus -> high risk)
 
     Two physically-based modifiers are then applied:
@@ -851,37 +852,105 @@ def compute_cold_shot_risk(
             t_super = arena.alloc(shape, np.float32, name="t_super")
             tmp = arena.alloc(shape, np.float32, name="tmp")
             thin = arena.alloc(shape, np.float32, name="thin")
+            dt_step = arena.alloc(shape, np.float32, name="dt_step")
 
             # ---------- fill_delay_factor ----------
+            # The danger of a cold shut is not "how late did the cell fill"
+            # but "does the front reach the next voxel before the current one
+            # solidifies".  Estimate the local voxel transit time dt_step:
+            #     dt_step = dx / v_front  [s]
+            # where v_front is either the LBM velocity magnitude or the inverse of
+            # the fill_time gradient.  Compare dt_step to the remaining liquid
+            # time (t_liq - fill_time) for that voxel.
             fill_delay.fill(0.0)
-            if t_max > 0.0:
-                np.divide(ft, t_max, out=tmp)
-                np.copyto(fill_delay, tmp, where=valid_fill, casting="unsafe")
-            np.clip(fill_delay, 0.0, 1.0, out=fill_delay)
-
-            # ---------- low_velocity_factor ----------
-            v_threshold = float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.5))
-            if v_threshold <= 1e-9:
-                v_threshold = 0.5
+            dt_step.fill(0.0)
 
             if velocity_magnitude is not None and velocity_magnitude.size == n:
-                np.copyto(v_local, velocity_magnitude, casting="unsafe")
+                # velocity_magnitude is m/s; convert to mm/s for dx [mm].
+                np.copyto(dt_step, velocity_magnitude, casting="unsafe")
+                np.multiply(dt_step, np.float32(1000.0), out=dt_step)
+                np.maximum(dt_step, np.float32(1e-9), out=dt_step)
+                # dt_step = dx / v (mm/s) -> seconds per voxel
+                np.divide(np.float32(dx), dt_step, out=dt_step, casting="unsafe")
             else:
-                v_local.fill(0.0)
+                # Compute |∇ft| in-place (s/mm), then dt_step = dx * |∇ft|.
+                dx_float = float(dx)
+                # x axis
+                np.subtract(ft[2:, :, :], ft[:-2, :, :], out=tmp[1:-1, :, :], casting="unsafe")
+                np.divide(tmp[1:-1, :, :], np.float32(2.0 * dx_float), out=tmp[1:-1, :, :])
+                np.square(tmp[1:-1, :, :], out=tmp[1:-1, :, :])
+                np.add(dt_step[1:-1, :, :], tmp[1:-1, :, :], out=dt_step[1:-1, :, :])
+                np.subtract(ft[1, :, :], ft[0, :, :], out=tmp[0, :, :], casting="unsafe")
+                np.divide(tmp[0, :, :], np.float32(dx_float), out=tmp[0, :, :])
+                np.square(tmp[0, :, :], out=tmp[0, :, :])
+                np.add(dt_step[0, :, :], tmp[0, :, :], out=dt_step[0, :, :])
+                np.subtract(ft[-1, :, :], ft[-2, :, :], out=tmp[-1, :, :], casting="unsafe")
+                np.divide(tmp[-1, :, :], np.float32(dx_float), out=tmp[-1, :, :])
+                np.square(tmp[-1, :, :], out=tmp[-1, :, :])
+                np.add(dt_step[-1, :, :], tmp[-1, :, :], out=dt_step[-1, :, :])
+                # y axis
+                np.subtract(ft[:, 2:, :], ft[:, :-2, :], out=tmp[:, 1:-1, :], casting="unsafe")
+                np.divide(tmp[:, 1:-1, :], np.float32(2.0 * dx_float), out=tmp[:, 1:-1, :])
+                np.square(tmp[:, 1:-1, :], out=tmp[:, 1:-1, :])
+                np.add(dt_step[:, 1:-1, :], tmp[:, 1:-1, :], out=dt_step[:, 1:-1, :])
+                np.subtract(ft[:, 1, :], ft[:, 0, :], out=tmp[:, 0, :], casting="unsafe")
+                np.divide(tmp[:, 0, :], np.float32(dx_float), out=tmp[:, 0, :])
+                np.square(tmp[:, 0, :], out=tmp[:, 0, :])
+                np.add(dt_step[:, 0, :], tmp[:, 0, :], out=dt_step[:, 0, :])
+                np.subtract(ft[:, -1, :], ft[:, -2, :], out=tmp[:, -1, :], casting="unsafe")
+                np.divide(tmp[:, -1, :], np.float32(dx_float), out=tmp[:, -1, :])
+                np.square(tmp[:, -1, :], out=tmp[:, -1, :])
+                np.add(dt_step[:, -1, :], tmp[:, -1, :], out=dt_step[:, -1, :])
+                # z axis
+                np.subtract(ft[:, :, 2:], ft[:, :, :-2], out=tmp[:, :, 1:-1], casting="unsafe")
+                np.divide(tmp[:, :, 1:-1], np.float32(2.0 * dx_float), out=tmp[:, :, 1:-1])
+                np.square(tmp[:, :, 1:-1], out=tmp[:, :, 1:-1])
+                np.add(dt_step[:, :, 1:-1], tmp[:, :, 1:-1], out=dt_step[:, :, 1:-1])
+                np.subtract(ft[:, :, 1], ft[:, :, 0], out=tmp[:, :, 0], casting="unsafe")
+                np.divide(tmp[:, :, 0], np.float32(dx_float), out=tmp[:, :, 0])
+                np.square(tmp[:, :, 0], out=tmp[:, :, 0])
+                np.add(dt_step[:, :, 0], tmp[:, :, 0], out=dt_step[:, :, 0])
+                np.subtract(ft[:, :, -1], ft[:, :, -2], out=tmp[:, :, -1], casting="unsafe")
+                np.divide(tmp[:, :, -1], np.float32(dx_float), out=tmp[:, :, -1])
+                np.square(tmp[:, :, -1], out=tmp[:, :, -1])
+                np.add(dt_step[:, :, -1], tmp[:, :, -1], out=dt_step[:, :, -1])
 
-            has_velocity = np.any((v_local > 1e-9) & part_mask)
-            if not has_velocity:
-                # v_local = v_threshold * (1 - fill_delay) on the part, 0 outside.
-                np.subtract(1.0, fill_delay, out=v_local)
-                np.multiply(v_local, v_threshold, out=v_local)
-                np.copyto(v_local, 0.0, where=~part_mask)
+                np.sqrt(dt_step, out=dt_step)
+                np.multiply(dt_step, np.float32(dx), out=dt_step)
 
-            np.divide(v_local, v_threshold, out=low_vel)
-            np.clip(low_vel, 0.0, 1.0, out=low_vel)
-            np.subtract(1.0, low_vel, out=low_vel)
-            np.copyto(low_vel, 0.0, where=~part_mask)
-            np.nan_to_num(low_vel, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-            np.clip(low_vel, 0.0, 1.0, out=low_vel)
+            # Remaining liquid time after the cell is filled.
+            if t_liq is not None and t_liq.size == n and np.any(np.isfinite(t_liq)):
+                np.subtract(t_liq, ft, out=t_liq_surf, casting="unsafe")
+            else:
+                np.subtract(t_solid, ft, out=t_liq_surf, casting="unsafe")
+            np.maximum(t_liq_surf, np.float32(1e-9), out=t_liq_surf)
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                np.divide(dt_step, t_liq_surf, out=fill_delay, casting="unsafe")
+            np.nan_to_num(fill_delay, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            np.clip(fill_delay, 0.0, 1.0, out=fill_delay)
+            np.copyto(fill_delay, 0.0, where=~part_mask)
+
+            # Free-surface damping: the topmost layer of the part is where a
+            # single front impinges on the free surface, not a meeting of two
+            # fronts.  Reduce the fill-delay contribution there.
+            np.multiply(
+                fill_delay[:, :, :-1],
+                np.float32(0.65),
+                out=fill_delay[:, :, :-1],
+                where=part_mask[:, :, :-1] & ~part_mask[:, :, 1:],
+            )
+            np.multiply(
+                fill_delay[:, :, -1],
+                np.float32(0.65),
+                out=fill_delay[:, :, -1],
+                where=part_mask[:, :, -1],
+            )
+
+            # ---------- low_velocity_factor ----------
+            # The front-velocity analysis above already captures the effect of a
+            # slow or stagnant front, so this factor is kept neutral.
+            low_vel.fill(1.0)
 
             # ---------- temperature_factor ----------
             t_liq_c = float(alloy.t_liquidus_c)
@@ -904,12 +973,13 @@ def compute_cold_shot_risk(
                 np.greater(t_solid, t_liq, out=tmp_bool)
                 np.logical_and(fin, tmp_bool, out=fin)
 
-                surface_scale = np.float32(0.25 * 0.25)
-                # t_liq_surf = fin ? t_liq * surface_scale : inf
+                # Use the absolute liquidus/solidus times directly.
+                # solve_3d_thermal adds fill_time to t_liq/t_solid, so they
+                # already represent "clock time" since the start of pour.
                 t_liq_surf.fill(np.float32(np.inf))
-                np.multiply(t_liq, surface_scale, out=t_liq_surf, where=fin)
+                np.copyto(t_liq_surf, t_liq, where=fin, casting="unsafe")
                 t_sol_surf.fill(np.float32(np.inf))
-                np.multiply(t_solid, surface_scale, out=t_sol_surf, where=fin)
+                np.copyto(t_sol_surf, t_solid, where=fin, casting="unsafe")
 
                 # t_super = clip( fin&(cond) ? t_liq_surf * k : 0 , 0, t_liq_surf)
                 k_super = 0.0
@@ -995,6 +1065,12 @@ def compute_cold_shot_risk(
             np.clip(T_meet, 0.0, 1.0, out=T_meet)
             temperature_factor = T_meet
 
+            # Superheat gate: if the thermal solver reports the cell is still
+            # above the liquidus at the end of the simulated time horizon, it
+            # cannot have undergone a cold shut.
+            if temperature is not None and temperature.size == n:
+                np.copyto(temperature_factor, 0.0, where=part_mask & (temperature > t_liq_c))
+
             # ---------- thin_section_factor ----------
             # thin = part_mask ? M_mod : inf, then clip(m_ref / max(thin, m_ref), 0, 1), then 0 outside.
             thin.fill(np.float32(np.inf))
@@ -1027,13 +1103,16 @@ def compute_cold_shot_risk(
                 if k_m > 0.0 and rho_m > 0.0 and cp_m > 0.0:
                     e_m = math.sqrt(k_m * rho_m * cp_m)
                     e_ref = math.sqrt(0.58 * 1600.0 * 1170.0)
-                    mold_chill_factor = math.sqrt(max(e_m / e_ref, 0.01))
+                    ratio = max(e_m / e_ref, 0.25)
+                    # Logarithmic dependence avoids saturating metal-mold cases
+                    # while still separating sand / ceramic / metal clearly.
+                    mold_chill_factor = 1.0 + 0.5 * math.log(ratio)
                 else:
                     alpha = float(getattr(mold, "diffusivity_mm2_s", 0.0) or 0.0)
                     if alpha > 0.0:
                         alpha_ref = 0.31
                         mold_chill_factor = 1.0 + math.log1p(alpha / alpha_ref) * 0.5
-                mold_chill_factor = float(np.clip(mold_chill_factor, 0.5, 5.0))
+                mold_chill_factor = float(np.clip(mold_chill_factor, 0.5, 3.5))
 
             scale = cold_shot_gain * mold_chill_factor
             if scale != 1.0:
