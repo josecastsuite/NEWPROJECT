@@ -768,14 +768,22 @@ def compute_cold_shot_risk(
     origin_mm: np.ndarray,
     t_liq: Optional[np.ndarray] = None,
     mold: Optional[Any] = None,
+    feeder_mask: Optional[np.ndarray] = None,
+    feed_risk: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Estimate per-voxel cold-shut (soğuk birleşme) risk and the last fill point.
 
-    The risk is the product of four normalised factors:
+    The risk is the product of four normalised base factors:
         temperature_factor    : how cold the metal is when the front reaches the cell
         fill_delay_factor     : how late the cell fills relative to the last-filled cell
         low_velocity_factor   : how far below the critical front velocity the flow is
         thin_section_factor   : how thin the local section is (small modulus -> high risk)
+
+    Two physically-based modifiers are then applied:
+        mold_chill_factor     : metal/ceramic molds chill faster than sand (effusivity)
+        feeder_factor         : feeder/riser surroundings keep the metal hotter, so
+                                cold-shut risk is reduced near a feeder and grows
+                                smoothly with distance up to the local feeding distance.
 
     Returns ``(cold_shot_risk, last_fill_point_mm)``.  ``last_fill_point_mm`` is
     an empty array when no valid fill data exists.
@@ -1005,20 +1013,58 @@ def compute_cold_shot_risk(
             np.multiply(v_local, thin, out=v_local)
             np.nan_to_num(v_local, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
-            # Apply material-specific cold-shut gain and a mould-diffusivity
-            # factor before clipping.  Metal/ceramic moulds chill faster, so the
-            # same fill front is more likely to produce a cold shut than sand.
+            # Material-specific chill factor from thermal effusivity.
+            # e = sqrt(k * rho * cp) [J m^-2 K^-1 s^-0.5]; higher effusivity
+            # extracts heat faster at the metal-mould interface, so the same
+            # fill front is more likely to produce a cold shut.  Reference is
+            # a typical green-sand mould.
             cold_shot_gain = float(getattr(alloy, "cold_shot_gain", 1.25))
-            mold_factor = 1.0
+            mold_chill_factor = 1.0
             if mold is not None:
-                alpha = float(getattr(mold, "diffusivity_mm2_s", 0.0) or 0.0)
-                if alpha > 0.0:
-                    alpha_ref = 0.31  # green-sand reference diffusivity [mm2/s]
-                    mold_factor = 1.0 + math.log1p(alpha / alpha_ref) * 0.5
-                    mold_factor = float(np.clip(mold_factor, 0.5, 2.0))
-            scale = cold_shot_gain * mold_factor
+                k_m = float(getattr(mold, "k_w_mk", 0.0) or 0.0)
+                rho_m = float(getattr(mold, "rho_kg_m3", 0.0) or 0.0)
+                cp_m = float(getattr(mold, "cp_j_kgk", 0.0) or 0.0)
+                if k_m > 0.0 and rho_m > 0.0 and cp_m > 0.0:
+                    e_m = math.sqrt(k_m * rho_m * cp_m)
+                    e_ref = math.sqrt(0.58 * 1600.0 * 1170.0)
+                    mold_chill_factor = math.sqrt(max(e_m / e_ref, 0.01))
+                else:
+                    alpha = float(getattr(mold, "diffusivity_mm2_s", 0.0) or 0.0)
+                    if alpha > 0.0:
+                        alpha_ref = 0.31
+                        mold_chill_factor = 1.0 + math.log1p(alpha / alpha_ref) * 0.5
+                mold_chill_factor = float(np.clip(mold_chill_factor, 0.5, 5.0))
+
+            scale = cold_shot_gain * mold_chill_factor
             if scale != 1.0:
                 np.multiply(v_local, np.float32(scale), out=v_local)
+
+            # Feeder/riser surroundings keep the metal hotter.  Where the
+            # feeding risk is low (well fed) the cold-shut risk is reduced.
+            # If no feeding-risk field is supplied but a feeder mask is, fall
+            # back to an exponential decay from the nearest feeder voxel with a
+            # feeding distance tied to the local modulus (~2.5 M).
+            if feed_risk is not None and feed_risk.size == n:
+                np.copyto(thin, feed_risk, casting="unsafe")
+                np.multiply(thin, np.float32(0.8), out=thin)
+                np.add(thin, np.float32(0.2), out=thin)
+                np.copyto(thin, np.float32(1.0), where=~part_mask)
+                np.multiply(v_local, thin, out=v_local)
+            elif feeder_mask is not None and feeder_mask.size == n and np.any(feeder_mask):
+                dist_to_feeder = ndimage.distance_transform_edt(
+                    ~feeder_mask, sampling=float(dx)
+                )
+                L_feed = np.full(shape, float(dx), dtype=np.float64)
+                np.multiply(M_mod, 2.5, out=L_feed, where=part_mask)
+                np.maximum(L_feed, float(dx), out=L_feed)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    np.divide(dist_to_feeder, L_feed, out=dist_to_feeder)
+                    np.negative(dist_to_feeder, out=dist_to_feeder)
+                    np.exp(dist_to_feeder, out=dist_to_feeder)
+                np.multiply(dist_to_feeder, np.float64(-0.8), out=dist_to_feeder)
+                np.add(dist_to_feeder, np.float64(1.0), out=dist_to_feeder)
+                np.copyto(dist_to_feeder, np.float64(1.0), where=~part_mask)
+                np.multiply(v_local, dist_to_feeder, out=v_local, casting="unsafe")
 
             np.clip(v_local, 0.0, 1.0, out=v_local)
 
@@ -3408,6 +3454,8 @@ def analyze(
         origin_mm=origin_mm,
         t_liq=t_liq,
         mold=mold,
+        feeder_mask=feeder_mask,
+        feed_risk=feed_risk,
     )
 
     # v10.5: per-voxel mold-sand erosion risk from local metal velocity.
