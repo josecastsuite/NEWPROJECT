@@ -1226,16 +1226,12 @@ class Analyzer3DViewer(QtInteractor):
         if part.n_cells == 0:
             return
 
-        # Threshold: show any non-negligible risk so the operator can see
-        # gradients.  A cell is kept if any of its points exceeds the low
-        # threshold; the scalar bar then maps 0..vmax.
-        cells = part.threshold(0.01, scalars="cold_shot_risk", all_scalars=False)
-        if cells.n_cells == 0:
-            return
-
-        vmax = float(np.percentile(cells["cold_shot_risk"], 99))
-        vmax = max(vmax, 0.05)
-        clim = [0.0, vmax]
+        # Show the whole part surface with a fixed 0..1 risk scale so the
+        # scalar bar is always visible.  Low risks appear as light yellow/orange,
+        # high risks as red, and zero/negligible risk still maps to the bottom
+        # of the scale instead of disappearing.
+        cells = part
+        clim = [0.0, 1.0]
 
         self._cold_shot_actor = self.add_mesh(
             cells,
