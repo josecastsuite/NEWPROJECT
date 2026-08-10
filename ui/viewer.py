@@ -1205,10 +1205,11 @@ class Analyzer3DViewer(QtInteractor):
     def show_cold_shot_risk(self, result: Optional[AnalysisResult]):
         """Heatmap of cold-shut (soğuk birleşme) risk on the part surface.
 
-        Risk values below 0.3 are made transparent.  Values between 0.3 and 1.0
-        are shown with a yellow-orange-red heatmap.  The latest-filled voxel is
-        marked with a red sphere so the operator sees where air/oxide is most
-        likely trapped.
+        The whole part surface is rendered on a fixed 0..1 scale so the colour
+        bar is always visible.  Low risks appear as light yellow/orange, high
+        risks as red, and zero/negligible risk maps to the bottom of the scale
+        instead of disappearing.  The latest-filled voxel is marked with a red
+        sphere so the operator sees the last point reached by the metal.
         """
         if self._cold_shot_actor is not None:
             self.remove_actor(self._cold_shot_actor)
