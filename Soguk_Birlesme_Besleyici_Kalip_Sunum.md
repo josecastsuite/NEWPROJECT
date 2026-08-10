@@ -1,71 +1,51 @@
-# Soğuk Birleşme (Cold Shut) Riski – Besleyici ve Kalıp Malzemesi Etkisi
+# Soğuk Birleşme (Cold Shut) – Güncel Sonuç Sunumu
 
-## 1. Soğuk birleşme nedir?
+## 1. Değişiklik özeti
 
-Dökümde iki sıvı metal cephesi birleşmeden önce yeterince soğur veya ince bir kesit katılaşmadan akışı tamamlayamazsa, **soğuk birleşme (cold shut)** oluşur. Riski artıran başlıca faktörler:
+`core/sdf_analyzer.py` içindeki `compute_cold_shot_risk` fonksiyonu aşağıdaki 4 bilimsel geliştirmeyi içerecek şekilde güncellendi:
 
-- Metalin sıvı sıcaklığının altına düşmesi
-- Doldurma ön cephesinin çok yavaş ilerlemesi
-- İnce kesit (küçük modülüs)
-- Kalıbın metalden çok hızlı ısı çekmesi
+1. **Feng & Liao voxel staircasing filtresi**: `fill_time` alanına 3-B Gaussian blur (`sigma=1`) uygulanıp gradyan büyüklüğü hesaplanır; sahte tepe çizgileri süzülür.
+2. **Kashiwai `f_s = 0.52` yumuşak geçişi**: Scheil denklemi ile alaşımın `partition_coefficient` değeri kullanılarak `fs = 0.52`’ye ulaşma zamanı hesaplanır.
+3. **Scheil partition coefficient**: Alaşım JSON’ından `k_partition` okunarak Al ve çelik/dökme demir farklı katılaşma aralıklarına göre ayrılır.
+4. **Vektörel dot-product confluence**: Komşu yüzeylerdeki hız vektörlerinin iç çarpımı (`dot < -0.5`) ile kafa kafaya çarpışan cepheler tespit edilir.
 
-## 2. Kalıp malzemesi neden fark yaratır?
+Ek olarak:
+- Dolum anındaki metal sıcaklığı **yerel Chvorinov soğuma zamanına** (`t_cool_local`) göre hesaplanır; böylece kalın kesitler süper ısısını korur.
+- Dolum cephesi hızı (`front_speed`) `fill_time` gradyanından çıkarılır; dolduktan sonra sıfıra yakınlaşan statik hız alanı yerine gerçek cephe hızı kullanılır.
+- Kalıp malzemesi etkisi `mold_chill_factor` ile `clip(1 + 0.25 log(e_m/e_ref), 0.7, 2.0)` olarak logaritmik doyumlu hesaplanır.
+- Besleyici etkisi `feeder_factor = 0.2 + 0.8 * feed_risk` ile korunur.
+- Dolum ve katılaşma çözücülerine dokunulmadı.
 
-Aynı geometri ve aynı alaşım için soğuk birleşme riski büyük ölçüde **kalıp-malzeme arayüzündeki ısı çekme hızına** bağlıdır. Bunu en iyi gösteren fiziksel nicelik **termal effusivite**dir:
+## 2. Deneme_Ring.STEP matris sonuçları
 
-```
-e = sqrt(k * rho * cp)   [J m^-2 K^-1 s^-0.5]
-```
+Aynı ızgara (`target_dim=120`) ve aynı geometri üzerinde farklı alaşım/kalıp kombinasyonları:
 
-| Kalıp malzemesi | k (W/m·K) | rho (kg/m³) | cp (J/kg·K) | e (effusivity) | Soğutma hızı |
-|----------------|-----------|-------------|-------------|------------------|--------------|
-| Kum (green sand) | 0.58 | 1600 | 1170 | ~1040 | En yavaş |
-| Seramik | 1.20 | 2000 | 1000 | ~1550 | Orta |
-| Metal (çelik kalıp) | 45.0 | 7850 | 460 | ~12 700 | En hızlı |
+| Alaşım | Kalıp | Max risk | Ortalama risk | Süre |
+|--------|-------|----------|---------------|------|
+| AlSi7 | Kum (sand) | 0.559 | 0.057 | ~236 s |
+| AlSi7 | Seramik (ceramic) | 0.583 | 0.059 | ~242 s |
+| AlSi7 | Metal kalıp | 0.862 | 0.087 | ~235 s |
+| A356 | Metal kalıp | 0.866 | 0.088 | ~229 s |
+| 42CrMo4 | Metal kalıp | 0.909 | 0.140 | ~231 s |
+| GGG40 | Metal kalıp | 0.860 | 0.145 | ~225 s |
 
-Programda `mold_chill_factor = 1.0 + 0.5 * log(e_mold / e_sand)` şeklinde uygulanır. Kum için ~1.0, seramik için ~1.2, metal kalıp için ~2.25 aralığında çıkar; böylece aynı hücrede metal kalıpta soğuk birleşme riski kuma göre belirgin şekilde yükselir, ancak küçük baz riskleri otomatik olarak `1.0`’e kliplenmez.
+**Yorum:**
+- Metal kalıp > seramik > kum riski veriyor.
+- Çelik (42CrMo4) ve dökme demir (GGG40), Al-Si alaşımlarına göre daha yüksek ortalama risk üretiyor.
+- Risk artık tek düze kırmızı değil; cephe birleşme ve ince kesitlerde lokalize.
 
-## 3. Besleyici (riser) etkisi
+## 3. Ekran görüntüleri
 
-Besleyici, parçanın bağlı olduğu bölgeye **sıcak metal rezervi** sağlar. Soğuk birleşme hesabında bunu iki şekilde dikkate alıyoruz:
+Aşağıdaki matris, aynı kamera açısından Al/çelik/demir + kum/seramik/metal kombinasyonlarını gösterir. Renk skalası sabit `[0, 1]`: açık sarı = düşük risk, kırmızı = yüksek risk.
 
-- **Girdi olarak `feed_risk` varsa**: `feed_risk = 0` besleyici tarafından iyi beslenen bölge demektir. `feeder_factor = 0.2 + 0.8 * feed_risk` ile soğuk birleşme riski beslenen bölgede en fazla %80 azaltılır.
-- **Sadece `feeder_mask` varsa**: En yakın besleyici vokseline olan mesafe ve yerel modül (`M_mod`) kullanılarak besleme mesafesi (`~2.5 M`) üzerinden üstel sönüm uygulanır.
+![Soğuk birleşme matrisi](validation/results/cold_shot_matrix_v3.png)
 
-Sonuç: besleyiciye yakın hücreler daha düşük soğuk birleşme riski üretir, uzak veya ince bölgeler yüksek risk üretmeye devam eder.
+## 4. Doğrulama
 
-## 4. Kodda ne değişti?
+- `python -m py_compile core/sdf_analyzer.py core/materials.py ui/viewer.py` OK
+- `python -m pytest tests/ -q` 9/9 passed
+- Sentetik test: iyi hizalanmış besleyici dibinde risk ~0; karşı cephelerde maksimum risk.
 
-`core/sdf_analyzer.py` içindeki `compute_cold_shot_risk` fonksiyonu güncellendi:
+## 5. PR
 
-- `fill_delay_factor` artık global "en son dolma zamanı" yerine **ön cephe hızı / kalan sıvı süresi** (`dt_step / (t_liq - fill_time)`) ile hesaplanıyor
-- Parçanın **en üst serbest yüzeyinde** `fill_delay` %35 sönümleniyor; tek cephenin durduğu yer iki soğuk cephenin karşılaşması gibi değerlendirilmiyor
-- `mold_chill_factor` artık `sqrt` yerine **logaritmik** bağımlılıkla hesaplanıyor; metal kalıp riski kliplenmiyor
-- Termal çözücüden gelen `temperature` alanı hâlâ likidüs üzerindeyse **sıcaklık faktörü 0** yapılıyor (superheat kapısı)
-- `feeder_mask` ve `feed_risk` ile besleyici etkisi korunuyor
-- Dolum/katılaşma çözücülerine dokunulmadı; sadece soğuk birleşme risk skoru değişti
-
-## 5. Sentetik doğrulama
-
-Bir 40×40×40 voxel küpü üzerinde, iç köşede bir besleyici ve kum/seramik/metal kalıp kombinasyonları ile test edildi.
-
-```
-Malzeme    maks  ort  besleyici_hücresi  uzak_hücre
-sand       0.210 0.028 0.0000            0.176
-ceramic    0.251 0.033 0.0000            0.210
-metal_mold 0.472 0.062 0.0000            0.395
-```
-
-- **Kum** en düşük ortalama risk (~0.03)
-- **Seramik** orta risk (~0.03)
-- **Metal kalıp** en yüksek risk (~0.06; uzak hücrede ~0.4)
-- **Besleyici** tüm malzemelerde riski düşürüyor; besleyici hücrelerinde risk hemen hemen sıfır
-- Artık "her yer kırmızı" değil; risk gerçekten yüksek olan bölgelerde belirgin
-
-![Soğuk birleşme karşılaştırması](validation/results/cold_shot_material_feeder.png)
-
-## 6. Sonuç
-
-Soğuk birleşme artık hem **kalıp malzemesine** (kum / seramik / metal) hem de **besleyicinin ısıtıcı etkisine** duyarlı. Dolum ve katılaşma simülasyonu bozulmadan sadece risk skoru güncellendi.
-
-PR: https://github.com/josecastsuite/NEWPROJECT/pull/3
+https://github.com/josecastsuite/NEWPROJECT/pull/3

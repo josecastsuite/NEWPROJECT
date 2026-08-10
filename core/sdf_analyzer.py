@@ -870,23 +870,24 @@ def compute_cold_shot_risk(
             t_liq_c = float(alloy.t_liquidus_c)
             t_sol_c = float(alloy.t_solidus_c)
 
-            # Global characteristic solidification time of the whole casting.
-            # This sets the rate at which the poured metal cools during filling,
-            # not the local time for a thin section to solidify.
             C_ch = float(chvorinov_c_from_properties(alloy, mold)) if mold is not None else 1.0
-            finite_M = M_mod[np.isfinite(M_mod) & part_mask]
-            M_ref = float(np.median(finite_M)) if finite_M.size > 0 else float(dx)
-            t_cool_s = max(C_ch * (M_ref / 10.0) ** 2 * 60.0, 1e-9)
 
-            # Local time to reach liquidus from the moment the cell is filled.
+            # Local time to reach the Kashiwai critical solid fraction (fs = 0.52)
+            # from the moment the cell is filled, using the alloy's partition
+            # coefficient in the Scheil equation.
             cp_m = float(alloy.cp_j_kgk)
             L_m = float(getattr(alloy, "latent_heat_j_kg", 0.0))
+            k_partition = float(getattr(alloy, "partition_coefficient", 0.2))
+            k = max(min(k_partition, 0.999), 1e-6)
+            # fs = 1 - (1 - ratio)^(1/(1-k)); solve fs = 0.52 for ratio
+            ratio_fs52 = 1.0 - 0.48 ** (1.0 - k)
+            T_52 = t_liq_c - ratio_fs52 * (t_liq_c - t_sol_c)
             H_total = max(cp_m * (t_pour_c - t_sol_c) + L_m, 1e-9)
-            H_to_liq = max(cp_m * (t_pour_c - t_liq_c), 0.0)
-            frac_to_liq = float(H_to_liq / H_total)
-            ch_const = float(C_ch * 60.0 * frac_to_liq)
+            H_to_fs52 = max(cp_m * (t_pour_c - T_52), 0.0) + 0.52 * L_m
+            frac_to_fs52 = float(H_to_fs52 / H_total)
+            ch_const = float(C_ch * 60.0 * frac_to_fs52)
 
-            # t_liq_surf <- t_liq_local [s]
+            # t_liq_surf <- local time to reach fs = 0.52 [s]
             t_liq_surf.fill(np.float32(0.0))
             np.copyto(t_liq_surf, M_mod, where=part_mask, casting="unsafe")
             np.maximum(t_liq_surf, np.float32(1e-3), out=t_liq_surf)
@@ -894,47 +895,26 @@ def compute_cold_shot_risk(
             np.multiply(t_liq_surf, t_liq_surf, out=t_liq_surf)
             np.multiply(t_liq_surf, np.float32(ch_const), out=t_liq_surf)
 
-            # Fill-temperature drop is governed by the GLOBAL cooling time.
-            # A late-filled cell receives freshly poured metal; it does not cool
-            # from the start of the pour.  T_meet = t_pour - (t_pour - t_liq)*min(ft/t_cool, 1).
-            np.divide(np.asarray(ft, dtype=np.float32), np.float32(t_cool_s), out=tmp, casting="unsafe")
+            # t_super <- local Chvorinov solidification time per voxel [s].
+            # M_mod is in mm, C_ch is in min/cm2, so M/10 converts mm to cm.
+            t_super.fill(np.float32(0.0))
+            np.copyto(t_super, M_mod, where=part_mask, casting="unsafe")
+            np.maximum(t_super, np.float32(1e-3), out=t_super)
+            np.divide(t_super, np.float32(10.0), out=t_super)
+            np.multiply(t_super, t_super, out=t_super)
+            np.multiply(t_super, np.float32(C_ch * 60.0), out=t_super)
+
+            # Fill-temperature drop is governed by the LOCAL cooling time.
+            # Thick sections keep their superheat; thin/late-filled cells arrive
+            # near the liquidus.  T_meet = t_pour - (t_pour - t_liq)*min(ft/t_cool_local, 1).
+            np.divide(np.asarray(ft, dtype=np.float32), t_super, out=tmp, casting="unsafe")
             np.clip(tmp, 0.0, 1.0, out=tmp)
             np.subtract(np.float32(t_pour_c), np.float32(t_liq_c), out=t_sol_surf)
             np.multiply(tmp, t_sol_surf, out=tmp)
             np.subtract(np.float32(t_pour_c), tmp, out=T_meet)
             np.clip(T_meet, np.float32(t_mold_c), np.float32(t_pour_c), out=T_meet)
 
-            # temperature_factor: 1 at/below liquidus, exp(-(T_meet - t_liq)/safe_super) above.
-            superheat = max(t_pour_c - t_liq_c, 1.0)
-            safe_super = max(superheat / 3.0, 10.0)
-            np.subtract(T_meet, np.float32(t_liq_c), out=tmp)
-            np.divide(tmp, np.float32(safe_super), out=tmp)
-            np.negative(tmp, out=tmp)
-            np.maximum(tmp, np.float32(0.0), out=tmp)
-            np.exp(tmp, out=tmp)
-
-            # solid_time_factor: short local liquidus time compared to the remaining
-            # fill window -> high risk.  Cells filled early with a short liquidus
-            # window solidify before later fronts can weld with them.
-            # t_ref = max(t_max - ft, 1e-9)
-            np.subtract(np.float32(t_max), np.asarray(ft, dtype=np.float32), out=t_sol_surf)
-            np.maximum(t_sol_surf, np.float32(1e-9), out=t_sol_surf)
-            np.copyto(t_super, t_liq_surf, casting="unsafe")
-            np.divide(t_super, t_sol_surf, out=t_super)
-            np.negative(t_super, out=t_super)
-            np.exp(t_super, out=t_super)
-
-            # thermal_risk = temperature_factor * solid_time_factor
-            np.multiply(tmp, t_super, out=T_meet)
-            np.copyto(T_meet, np.float32(0.0), where=~part_mask)
-            np.nan_to_num(T_meet, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-
-            # Superheat gate: final temperature still above liquidus -> no cold shut.
-            if temperature is not None and temperature.size == n:
-                np.copyto(T_meet, np.float32(0.0), where=part_mask & (temperature > np.float32(t_liq_c)))
-
-            # ---------- flow_risk : low velocity / stagnation + confluence ----------
-            # Local metal speed.  Prefer the 3-D velocity vector; fall back to scalar magnitude.
+            # Local metal speed (used for confluence and solid-time correction).
             v_local.fill(0.0)
             if velocity_m_s is not None and velocity_m_s.size == 3 * n:
                 if velocity_m_s.ndim == 4 and velocity_m_s.shape[0] == 3:
@@ -958,20 +938,89 @@ def compute_cold_shot_risk(
             elif velocity_magnitude is not None and velocity_magnitude.size == n:
                 np.copyto(v_local, velocity_magnitude, casting="unsafe")
 
-            # Stagnation factor: high when the local metal speed is low.
-            # Fourth-power exponent: speeds well above the critical value contribute
-            # essentially zero risk, while very slow or stagnant metal dominates.
             v_crit_cold = float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.5))
-            v_crit_cold = max(np.float32(0.15), v_crit_cold)
-            np.divide(v_local, v_crit_cold, out=low_vel)
+            # The cold-shut threshold is lower than the entrainment threshold:
+            # metal can be slow and still avoid a cold shut, but truly stagnant or
+            # converging fronts are dangerous.  Scale the material threshold down.
+            v_crit_cold = max(np.float32(0.10), v_crit_cold * 0.45)
+
+            # temperature_factor: 1 at/below liquidus, exp(-(T_meet - t_liq)/safe_super) above.
+            superheat = max(t_pour_c - t_liq_c, 1.0)
+            safe_super = max(superheat / 3.0, 10.0)
+            np.subtract(T_meet, np.float32(t_liq_c), out=tmp)
+            np.divide(tmp, np.float32(safe_super), out=tmp)
+            np.negative(tmp, out=tmp)
+            np.maximum(tmp, np.float32(0.0), out=tmp)
+            np.exp(tmp, out=tmp)
+
+            # solid_time_factor: t_liq_local / t_cool_local gives the fraction of
+            # the local solidification interval needed to reach fs = 0.52.  Fast
+            # local motion delays solidification, so multiply by (1 + (v/vcrit)^2).
+            np.divide(t_liq_surf, t_super, out=t_super)
+            np.maximum(t_super, np.float32(0.0), out=t_super)
+            np.divide(v_local, np.float32(v_crit_cold), out=t_sol_surf)
+            np.multiply(t_sol_surf, t_sol_surf, out=t_sol_surf)
+            np.add(t_sol_surf, np.float32(1.0), out=t_sol_surf)
+            np.multiply(t_super, t_sol_surf, out=t_super)
+            np.negative(t_super, out=t_super)
+            np.exp(t_super, out=t_super)
+
+            # thermal_risk = temperature_factor * solid_time_factor
+            np.multiply(tmp, t_super, out=T_meet)
+            np.copyto(T_meet, np.float32(0.0), where=~part_mask)
+            np.nan_to_num(T_meet, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Superheat gate: final temperature still above liquidus -> no cold shut.
+            if temperature is not None and temperature.size == n:
+                np.copyto(T_meet, np.float32(0.0), where=part_mask & (temperature > np.float32(t_liq_c)))
+
+            # ---------- flow_risk : low velocity / stagnation + confluence ----------
+            # Feng & Liao ridge filter: smooth fill_time (suppress voxel staircasing)
+            # and compute gradient magnitude.  High gradient = a sharp fill front.
+            finite_ft = ft[part_mask]
+            ft_mean = float(finite_ft[np.isfinite(finite_ft)].mean()) if finite_ft.size > 0 else 0.0
+            np.copyto(t_liq_surf, np.asarray(ft, dtype=np.float32), casting="unsafe")
+            np.copyto(t_liq_surf, np.float32(ft_mean), where=~part_mask)
+            ndimage.gaussian_filter(t_liq_surf, sigma=1.0, output=t_liq_surf)
+
+            grad_x = np.gradient(t_liq_surf, axis=0)
+            grad_y = np.gradient(t_liq_surf, axis=1)
+            grad_z = np.gradient(t_liq_surf, axis=2)
+            np.square(grad_x, out=tmp)
+            np.square(grad_y, out=t_super)
+            np.add(tmp, t_super, out=tmp)
+            np.square(grad_z, out=t_super)
+            np.add(tmp, t_super, out=tmp)
+            np.sqrt(tmp, out=t_sol_surf)  # gradient magnitude |∇ft| in t_sol_surf
+
+            # Front speed from the fill-time gradient: v_front = dx / |∇ft|.
+            # This is far more stable than the final static velocity field, which
+            # tends to zero after a cell has filled.  Cap at 10 m/s.
+            np.add(t_sol_surf, np.float32(1e-9), out=t_liq_surf)
+            np.divide(np.float32(dx / 1000.0), t_liq_surf, out=t_liq_surf)
+            np.clip(t_liq_surf, np.float32(0.0), np.float32(10.0), out=t_liq_surf)
+
+            finite_grad = t_sol_surf[part_mask]
+            mean_grad = float(finite_grad[np.isfinite(finite_grad)].mean()) + 1e-12
+            np.divide(t_sol_surf, np.float32(mean_grad), out=t_super)
+            np.negative(t_super, out=t_super)
+            np.exp(t_super, out=t_super)
+            np.subtract(np.float32(1.0), t_super, out=t_super)  # ridge factor in t_super
+            np.copyto(t_super, np.float32(0.0), where=~part_mask)
+
+            # Stagnation factor: high when the local front speed is low.
+            # Prefer the larger of the flow velocity and the fill-front speed so
+            # filled-but-stagnant bulk metal does not get over-penalised.
+            np.maximum(v_local, t_liq_surf, out=low_vel)
+            np.divide(low_vel, np.float32(v_crit_cold), out=low_vel)
             np.multiply(low_vel, low_vel, out=low_vel)      # (v/vcrit)^2
             np.multiply(low_vel, low_vel, out=low_vel)      # (v/vcrit)^4
             np.negative(low_vel, out=low_vel)
             np.exp(low_vel, out=low_vel)
 
-            # Confluence from 3-D velocity: measure how balanced / multi-directional
-            # the inflow into each voxel is.  Following Kashiwai et al., cold shuts
-            # form where opposing or multiple streams meet.
+            # Confluence from 3-D velocity: opposing fronts are detected by the
+            # normalised dot product between a voxel and each face neighbour.
+            # Dot product < -0.5 means the two cells move in opposite directions.
             fill_delay.fill(0.0)
             if velocity_m_s is not None and velocity_m_s.size == 3 * n:
                 if velocity_m_s.ndim == 4 and velocity_m_s.shape[0] == 3:
@@ -981,61 +1030,66 @@ def compute_cold_shot_risk(
                 else:
                     vel = None
                 if vel is not None:
-                    dt_step.fill(0.0)   # primary_total
-                    tmp.fill(0.0)       # secondary_total
-                    t_super.fill(0.0)   # max_primary
+                    min_dot = t_liq_surf
+                    min_dot.fill(1.0)
+                    eps = np.float32(1e-6)
 
-                    eps = 1e-9
-                    # x-axis
-                    t_liq_surf.fill(0.0)
-                    t_sol_surf.fill(0.0)
-                    np.maximum(0.0, vel[0][:-1], out=t_liq_surf[1:])
-                    np.maximum(0.0, -vel[0][1:], out=t_sol_surf[:-1])
-                    np.maximum(t_liq_surf, t_sol_surf, out=fill_delay)
-                    np.minimum(t_liq_surf, t_sol_surf, out=t_liq_surf)
-                    np.add(dt_step, fill_delay, out=dt_step)
-                    np.add(tmp, t_liq_surf, out=tmp)
-                    np.maximum(t_super, fill_delay, out=t_super)
+                    # x faces -> t_sol_surf[:-1]
+                    np.multiply(vel[0][:-1, :, :], vel[0][1:, :, :], out=t_sol_surf[:-1, :, :])
+                    np.multiply(vel[1][:-1, :, :], vel[1][1:, :, :], out=tmp[:-1, :, :])
+                    np.add(t_sol_surf[:-1, :, :], tmp[:-1, :, :], out=t_sol_surf[:-1, :, :])
+                    np.multiply(vel[2][:-1, :, :], vel[2][1:, :, :], out=tmp[:-1, :, :])
+                    np.add(t_sol_surf[:-1, :, :], tmp[:-1, :, :], out=t_sol_surf[:-1, :, :])
+                    np.add(v_local[:-1, :, :], eps, out=tmp[:-1, :, :])
+                    np.add(v_local[1:, :, :], eps, out=dt_step[:-1, :, :])
+                    np.multiply(tmp[:-1, :, :], dt_step[:-1, :, :], out=tmp[:-1, :, :])
+                    np.divide(t_sol_surf[:-1, :, :], tmp[:-1, :, :], out=t_sol_surf[:-1, :, :])
+                    mask_x = (v_local[:-1, :, :] > eps) & (v_local[1:, :, :] > eps)
+                    np.putmask(t_sol_surf[:-1, :, :], ~mask_x, 1.0)
+                    np.minimum(min_dot[:-1, :, :], t_sol_surf[:-1, :, :], out=min_dot[:-1, :, :])
+                    np.minimum(min_dot[1:, :, :], t_sol_surf[:-1, :, :], out=min_dot[1:, :, :])
 
-                    # y-axis
-                    t_liq_surf.fill(0.0)
-                    t_sol_surf.fill(0.0)
-                    np.maximum(0.0, vel[1][:, :-1], out=t_liq_surf[:, 1:])
-                    np.maximum(0.0, -vel[1][:, 1:], out=t_sol_surf[:, :-1])
-                    np.maximum(t_liq_surf, t_sol_surf, out=fill_delay)
-                    np.minimum(t_liq_surf, t_sol_surf, out=t_liq_surf)
-                    np.add(dt_step, fill_delay, out=dt_step)
-                    np.add(tmp, t_liq_surf, out=tmp)
-                    np.maximum(t_super, fill_delay, out=t_super)
+                    # y faces -> t_sol_surf[:, :-1]
+                    np.multiply(vel[0][:, :-1, :], vel[0][:, 1:, :], out=t_sol_surf[:, :-1, :])
+                    np.multiply(vel[1][:, :-1, :], vel[1][:, 1:, :], out=tmp[:, :-1, :])
+                    np.add(t_sol_surf[:, :-1, :], tmp[:, :-1, :], out=t_sol_surf[:, :-1, :])
+                    np.multiply(vel[2][:, :-1, :], vel[2][:, 1:, :], out=tmp[:, :-1, :])
+                    np.add(t_sol_surf[:, :-1, :], tmp[:, :-1, :], out=t_sol_surf[:, :-1, :])
+                    np.add(v_local[:, :-1, :], eps, out=tmp[:, :-1, :])
+                    np.add(v_local[:, 1:, :], eps, out=dt_step[:, :-1, :])
+                    np.multiply(tmp[:, :-1, :], dt_step[:, :-1, :], out=tmp[:, :-1, :])
+                    np.divide(t_sol_surf[:, :-1, :], tmp[:, :-1, :], out=t_sol_surf[:, :-1, :])
+                    mask_y = (v_local[:, :-1, :] > eps) & (v_local[:, 1:, :] > eps)
+                    np.putmask(t_sol_surf[:, :-1, :], ~mask_y, 1.0)
+                    np.minimum(min_dot[:, :-1, :], t_sol_surf[:, :-1, :], out=min_dot[:, :-1, :])
+                    np.minimum(min_dot[:, 1:, :], t_sol_surf[:, :-1, :], out=min_dot[:, 1:, :])
 
-                    # z-axis
-                    t_liq_surf.fill(0.0)
-                    t_sol_surf.fill(0.0)
-                    np.maximum(0.0, vel[2][:, :, :-1], out=t_liq_surf[:, :, 1:])
-                    np.maximum(0.0, -vel[2][:, :, 1:], out=t_sol_surf[:, :, :-1])
-                    np.maximum(t_liq_surf, t_sol_surf, out=fill_delay)
-                    np.minimum(t_liq_surf, t_sol_surf, out=t_liq_surf)
-                    np.add(dt_step, fill_delay, out=dt_step)
-                    np.add(tmp, t_liq_surf, out=tmp)
-                    np.maximum(t_super, fill_delay, out=t_super)
+                    # z faces -> t_sol_surf[:, :, :-1]
+                    np.multiply(vel[0][:, :, :-1], vel[0][:, :, 1:], out=t_sol_surf[:, :, :-1])
+                    np.multiply(vel[1][:, :, :-1], vel[1][:, :, 1:], out=tmp[:, :, :-1])
+                    np.add(t_sol_surf[:, :, :-1], tmp[:, :, :-1], out=t_sol_surf[:, :, :-1])
+                    np.multiply(vel[2][:, :, :-1], vel[2][:, :, 1:], out=tmp[:, :, :-1])
+                    np.add(t_sol_surf[:, :, :-1], tmp[:, :, :-1], out=t_sol_surf[:, :, :-1])
+                    np.add(v_local[:, :, :-1], eps, out=tmp[:, :, :-1])
+                    np.add(v_local[:, :, 1:], eps, out=dt_step[:, :, :-1])
+                    np.multiply(tmp[:, :, :-1], dt_step[:, :, :-1], out=tmp[:, :, :-1])
+                    np.divide(t_sol_surf[:, :, :-1], tmp[:, :, :-1], out=t_sol_surf[:, :, :-1])
+                    mask_z = (v_local[:, :, :-1] > eps) & (v_local[:, :, 1:] > eps)
+                    np.putmask(t_sol_surf[:, :, :-1], ~mask_z, 1.0)
+                    np.minimum(min_dot[:, :, :-1], t_sol_surf[:, :, :-1], out=min_dot[:, :, :-1])
+                    np.minimum(min_dot[:, :, 1:], t_sol_surf[:, :, :-1], out=min_dot[:, :, 1:])
 
-                    # balance = secondary / (primary + secondary)
-                    # multi_axis = 1 - max_primary / primary_total
-                    np.add(dt_step, tmp, out=fill_delay)
-                    with np.errstate(divide="ignore", invalid="ignore"):
-                        np.divide(tmp, fill_delay, out=tmp)
-                        np.divide(t_super, dt_step, out=t_super)
-                    np.subtract(1.0, t_super, out=t_super)
-                    np.nan_to_num(tmp, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-                    np.nan_to_num(t_super, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-                    np.clip(tmp, 0.0, 1.0, out=tmp)
-                    np.clip(t_super, 0.0, 1.0, out=t_super)
-                    # Confluence requires both balanced inflow/outflow and no single
-                    # dominant direction: use the geometric mean of balance and multi-axis.
-                    np.multiply(tmp, t_super, out=fill_delay)
-                    np.sqrt(fill_delay, out=fill_delay)
+                    # confluence: dot < -0.5 -> max, dot >= -0.5 -> 0, linear in between
+                    np.add(min_dot, np.float32(0.5), out=fill_delay)
+                    np.negative(fill_delay, out=fill_delay)
+                    np.clip(fill_delay, 0.0, 0.5, out=fill_delay)
+                    np.multiply(fill_delay, np.float32(2.0), out=fill_delay)
                     np.nan_to_num(fill_delay, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-                    np.copyto(fill_delay, 0.0, where=~part_mask)
+
+            # Modulate confluence by the fill-time ridge factor (suppresses false
+            # confluence in flat, uniform fill regions).
+            np.multiply(fill_delay, t_super, out=fill_delay)
+            np.copyto(fill_delay, np.float32(0.0), where=~part_mask)
 
             # flow_risk: confluence only matters when the metal is already slow.
             # Fast multi-directional jets tend to weld; slow converging fronts cold shut.
