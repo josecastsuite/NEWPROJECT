@@ -1,0 +1,20 @@
+{
+  "sand": {
+    "mold": "sand",
+    "max": 1.0,
+    "mean": 0.011232382536599507,
+    "trapped_air_volume_m3": 0.0006199941235444774
+  },
+  "ceramic": {
+    "mold": "ceramic",
+    "max": 1.0,
+    "mean": 0.03429704189360671,
+    "trapped_air_volume_m3": 0.0018896351603498725
+  },
+  "metal_mold": {
+    "mold": "metal_mold",
+    "max": 1.0,
+    "mean": 0.03726745834709008,
+    "trapped_air_volume_m3": 0.0020532796765978254
+  }
+}
