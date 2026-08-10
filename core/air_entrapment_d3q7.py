@@ -304,6 +304,7 @@ def _compute_darcy_sink(
     is_boundary: np.ndarray,
     K_mold: np.ndarray,
     b_klink: np.ndarray,
+    P_dynamic: np.ndarray,
     m_dot: np.ndarray,
     T_melt: float,
     dx: float,
@@ -318,6 +319,10 @@ def _compute_darcy_sink(
     The local permeability is corrected with the Klinkenberg slip factor
     ``K_app = K_inf * (1 + b_klink / P_gas)``.  At low gas pressures this
     raises the effective permeability; at high pressures it tends to K_inf.
+
+    The driving pressure difference is the larger of the gas overpressure and
+    a local metal dynamic pressure, so that vented sand moulds can lose gas
+    even before the pocket has had time to build up a large overpressure.
     """
     for idx in numba.prange(nx * ny * nz):
         i = idx // (ny * nz)
@@ -334,6 +339,9 @@ def _compute_darcy_sink(
         P_gas[i, j, k] = rg * R_AIR * T_melt
 
         dP = P_gas[i, j, k] - P_ATM
+        pdyn = P_dynamic[i, j, k]
+        if dP < pdyn:
+            dP = pdyn
         if dP <= 0.0:
             m_dot[i, j, k] = 0.0
             continue
@@ -370,6 +378,7 @@ class AirEntrapmentSolver_D3Q7:
         L_wall: float = 1e-3,
         rho_atm: Optional[float] = None,
         tau_min: float = 1.0,
+        rho_metal: float = 7000.0,
     ):
         self.nx, self.ny, self.nz = grid_shape
         self.dx = float(dx)
@@ -380,6 +389,7 @@ class AirEntrapmentSolver_D3Q7:
         self.rho_atm = float(rho_atm if rho_atm is not None else P_ATM / (R_AIR * T_melt))
         self.tau_min = float(tau_min)
         self.cs2_lb = 1.0 / 4.0  # D3Q7 lattice speed of sound squared (lattice units)
+        self.rho_metal = float(rho_metal)
 
         self.alpha_rho = np.zeros(grid_shape, dtype=np.float64)
         self.alpha_rho_new = np.zeros(grid_shape, dtype=np.float64)
@@ -464,6 +474,18 @@ class AirEntrapmentSolver_D3Q7:
             if self.b_klink is None:
                 self.b_klink = np.full_like(F, 0.1 * P_ATM, dtype=np.float64)
 
+        # Physical and lattice velocity fields (used for dynamic pressure below).
+        v = np.stack([vx, vy, vz], axis=0)
+        v2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
+        # 0.5 * rho_metal * v^2 is the metal dynamic pressure that pushes gas
+        # through the mould wall.  A floor (0.5 % atm) represents the minimum
+        # metal-head pressure available to drive gas through a permeable wall.
+        P_dynamic = 0.5 * self.rho_metal * v2
+        # A modest floor (0.5 % atm) represents the minimum metal-head pressure
+        # available to push gas through a permeable mould wall.
+        P_floor = 0.005 * P_ATM
+        P_dynamic = np.where(P_dynamic > P_floor, P_dynamic, P_floor)
+
         if self.dt == 0.0 or step == 0:
             self.dt = float(dt)
             self.dx = float(dx)
@@ -474,8 +496,7 @@ class AirEntrapmentSolver_D3Q7:
         n_substeps = max(1, int(step) - self.last_step)
         self.last_step = int(step)
 
-        # Physical and lattice velocity fields.
-        v = np.stack([vx, vy, vz], axis=0)
+        # Lattice velocity for the D3Q7 advection step.
         u_lb = v * (self.dt / self.dx)
 
         # D3Q7 diffusion relaxation time.  cs2_lb = 1/4 for the weights above,
@@ -498,6 +519,7 @@ class AirEntrapmentSolver_D3Q7:
                 self.is_boundary,
                 self.K_mold,
                 self.b_klink,
+                P_dynamic,
                 m_dot,
                 self.T_melt,
                 self.dx,
@@ -530,10 +552,17 @@ class AirEntrapmentSolver_D3Q7:
 
         alpha = np.clip(F, 1e-9, 1.0)
         # rho_g = (alpha*rho_g) / alpha; guard empty cells to avoid divide-by-zero warnings.
+        # Clamp to rho_atm: gas cannot become rarer than the surrounding
+        # atmosphere; if mass is removed the pocket volume (alpha_g) shrinks
+        # instead of the density dropping below atmospheric.
         self.rho_g = np.full_like(self.alpha_rho, self.rho_atm)
         np.divide(self.alpha_rho, alpha, out=self.rho_g, where=F > 1e-9)
+        self.rho_g = np.maximum(self.rho_g, self.rho_atm)
         self.P_gas = self.rho_g * R_AIR * self.T_melt
 
     def risk_field(self) -> np.ndarray:
         """Gas volume fraction as air-entrapment risk."""
-        return np.clip(self.alpha_rho / np.maximum(self.rho_g, 1e-9), 0.0, 1.0)
+        # Use the larger of the computed gas density and the atmospheric density;
+        # this makes escaped gas in vented sand moulds show a reduced alpha_g.
+        rho_eff = np.maximum(self.rho_g, self.rho_atm)
+        return np.clip(self.alpha_rho / rho_eff, 0.0, 1.0)

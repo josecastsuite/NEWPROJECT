@@ -348,8 +348,9 @@ def _build_air_solver(
     nx, ny, nz = grid.shape
     T_melt_c = float(getattr(alloy, "t_pour_c", 1500.0) or 1500.0)
     T_melt = T_melt_c + 273.15
+    rho_metal = float(getattr(alloy, "rho_liquid_kg_m3", 7000.0) or 7000.0)
     solver = AirEntrapmentSolver_D3Q7(
-        (nx, ny, nz), float(dx_m), T_melt=T_melt, L_wall=float(dx_m)
+        (nx, ny, nz), float(dx_m), T_melt=T_melt, L_wall=float(dx_m), rho_metal=rho_metal
     )
 
     cavity, solid = _cavity_and_solid_masks(grid)
