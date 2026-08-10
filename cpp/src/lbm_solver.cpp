@@ -98,7 +98,7 @@ public:
           f_(arena_.get()), f_new_(arena_.get()),
           rho_(arena_.get()), ux_(arena_.get()), uy_(arena_.get()), uz_(arena_.get()),
           phi_(arena_.get()), phi_new_(arena_.get()),
-          fill_time_(arena_.get()), trapped_time_(arena_.get()),
+          fill_time_(arena_.get()), trapped_time_(arena_.get()), nu_t_(arena_.get()),
           parent_(arena_.get()), root_open_(arena_.get()),
           target_velocity_owned_(arena_.get()), inlet_distance_owned_(arena_.get())
     {
@@ -247,6 +247,7 @@ public:
         phi_new_.assign(n_, 0.0);
         fill_time_.assign(n_, std::numeric_limits<double>::infinity());
         trapped_time_.assign(n_, std::numeric_limits<double>::infinity());
+        nu_t_.assign(n_, 0.0);
 
         #ifdef _OPENMP
         omp_set_num_threads(omp_get_max_threads());
@@ -317,12 +318,62 @@ public:
 
             collide_and_stream();
 
+            if (callback_every_n_ > 0 && step % callback_every_n_ == 0) {
+                do_callback(step);
+            }
+
             t_ += dt_;
             ++steps_;
         }
 
         compute_macroscopic();
         detect_entrapment();
+    }
+
+    void set_step_callback(nb::callable cb, int every_n) {
+        callback_ = cb;
+        callback_every_n_ = every_n;
+    }
+
+    // Invoke the Python callback with (step, dt, dx, cs2, vx, vy, vz, F, nu_t).
+    // Arrays are float32, C-order, shape (nx, ny, nz).  v and nu_t are SI units.
+    void do_callback(int step) {
+        if (!callback_ || callback_every_n_ <= 0) return;
+
+        std::vector<float> vx_buf(n_, 0.0f), vy_buf(n_, 0.0f), vz_buf(n_, 0.0f);
+        std::vector<float> F_buf(n_, 0.0f), nu_buf(n_, 0.0f);
+        const double v_scale = dx_ / dt_;
+        const double nu_scale = dx_ * dx_ / dt_;
+
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
+            if (flags_[i] == 1) continue; // solid
+            vx_buf[i] = static_cast<float>(ux_[i] * v_scale);
+            vy_buf[i] = static_cast<float>(uy_[i] * v_scale);
+            vz_buf[i] = static_cast<float>(uz_[i] * v_scale);
+            F_buf[i] = static_cast<float>(1.0 - phi_[i]);
+            nu_buf[i] = static_cast<float>(nu_t_[i] * nu_scale);
+        }
+
+        auto make_arr = [&](std::vector<float>& buf) -> nb::ndarray<nb::numpy, float, nb::shape<-1, -1, -1>> {
+            auto* owned = new std::vector<float>(std::move(buf));
+            nb::capsule cap(owned, [](void* p) noexcept { delete static_cast<std::vector<float>*>(p); });
+            return nb::ndarray<nb::numpy, float, nb::shape<-1, -1, -1>>(
+                owned->data(),
+                {static_cast<size_t>(nx_), static_cast<size_t>(ny_), static_cast<size_t>(nz_)},
+                cap);
+        };
+
+        const double cs2 = dx_ * dx_ / (3.0 * dt_ * dt_);
+
+        {
+            nb::gil_scoped_acquire acquire;
+            callback_(step, dt_, dx_, cs2,
+                      make_arr(vx_buf), make_arr(vy_buf), make_arr(vz_buf),
+                      make_arr(F_buf), make_arr(nu_buf));
+        }
     }
 
     double filled_fraction() const {
@@ -431,6 +482,9 @@ private:
     const double* inlet_distance_ = nullptr;
     bool has_inlet_dist_ = false;
     int current_step_ = 0;
+    nb::callable callback_;
+    int callback_every_n_ = 0;
+    std::pmr::vector<double> nu_t_;
 
     std::pmr::vector<double> target_velocity_owned_;
     std::pmr::vector<double> inlet_distance_owned_;
@@ -657,9 +711,12 @@ private:
             if (smag_const_ > 0.0 && q_norm > 0.0) {
                 double s_mag = (3.0 / (2.0 * r * tau0_)) * q_norm;
                 double nu_t = smag_const_ * smag_const_ * s_mag;
+                nu_t_[i] = nu_t;
                 double tau_eff = tau0_ + 3.0 * nu_t;
                 if (tau_eff < tau_min_) tau_eff = tau_min_;
                 tau = tau_eff;
+            } else {
+                nu_t_[i] = 0.0;
             }
 
             double one_minus_half_omega = 1.0 - 0.5 / tau;
@@ -1188,6 +1245,96 @@ nb::tuple solve_lbm_filling(
                       dx, g, rho, nu, inflow_velocity, t_max, max_steps,
                       cfl_target, smagorinsky, target_ptr, inlet_dist_ptr);
 
+    solver.run();
+
+    std::vector<double> ft, vmag, vel, phi, trap;
+    solver.get_fill_time(&ft);
+    solver.get_velocity_magnitude(&vmag);
+    solver.get_velocity(&vel);
+    solver.get_phi(&phi);
+    solver.get_entrapment(&trap);
+
+    auto* ft_vec = new std::vector<double>(std::move(ft));
+    auto* vmag_vec = new std::vector<double>(std::move(vmag));
+    auto* vel_vec = new std::vector<double>(std::move(vel));
+    auto* phi_vec = new std::vector<double>(std::move(phi));
+    auto* trap_vec = new std::vector<double>(std::move(trap));
+
+    auto cap_ft = nb::capsule(ft_vec, [](void* p) noexcept { delete static_cast<std::vector<double>*>(p); });
+    auto cap_vmag = nb::capsule(vmag_vec, [](void* p) noexcept { delete static_cast<std::vector<double>*>(p); });
+    auto cap_vel = nb::capsule(vel_vec, [](void* p) noexcept { delete static_cast<std::vector<double>*>(p); });
+    auto cap_phi = nb::capsule(phi_vec, [](void* p) noexcept { delete static_cast<std::vector<double>*>(p); });
+    auto cap_trap = nb::capsule(trap_vec, [](void* p) noexcept { delete static_cast<std::vector<double>*>(p); });
+
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> arr_ft(
+        ft_vec->data(), {static_cast<size_t>(nx), static_cast<size_t>(ny), static_cast<size_t>(nz)}, cap_ft);
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> arr_vmag(
+        vmag_vec->data(), {static_cast<size_t>(nx), static_cast<size_t>(ny), static_cast<size_t>(nz)}, cap_vmag);
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> arr_phi(
+        phi_vec->data(), {static_cast<size_t>(nx), static_cast<size_t>(ny), static_cast<size_t>(nz)}, cap_phi);
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> arr_trap(
+        trap_vec->data(), {static_cast<size_t>(nx), static_cast<size_t>(ny), static_cast<size_t>(nz)}, cap_trap);
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> arr_vel(
+        vel_vec->data(), {3, static_cast<size_t>(nx), static_cast<size_t>(ny), static_cast<size_t>(nz)}, cap_vel);
+
+    return nb::make_tuple(
+        arr_ft,
+        arr_vmag,
+        arr_vel,
+        arr_phi,
+        arr_trap,
+        solver.total_entrapped_volume(),
+        solver.filled_fraction() >= 0.9999,
+        solver.current_time(),
+        solver.filled_fraction(),
+        solver.steps()
+    );
+}
+
+nb::tuple solve_lbm_filling_callback(
+    nb::ndarray<nb::numpy, uint8_t, nb::shape<-1, -1, -1>> grid,
+    nb::ndarray<nb::numpy, uint8_t, nb::shape<-1, -1, -1>> inlet_mask,
+    nb::ndarray<nb::numpy, uint8_t, nb::shape<-1, -1, -1>> outlet_mask,
+    double dx,
+    std::array<double, 3> g,
+    double rho,
+    double nu,
+    double inflow_velocity,
+    double t_max,
+    int max_steps,
+    double cfl_target,
+    double smagorinsky,
+    nb::callable callback,
+    int callback_every_n,
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1, -1>> target_velocity,
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> inlet_distance)
+{
+    int nx = static_cast<int>(grid.shape(0));
+    int ny = static_cast<int>(grid.shape(1));
+    int nz = static_cast<int>(grid.shape(2));
+
+    if (inlet_mask.shape(0) != nx || inlet_mask.shape(1) != ny || inlet_mask.shape(2) != nz ||
+        outlet_mask.shape(0) != nx || outlet_mask.shape(1) != ny || outlet_mask.shape(2) != nz) {
+        throw std::runtime_error("solve_lbm_filling_callback: mask shapes do not match grid");
+    }
+
+    const size_t n = static_cast<size_t>(nx) * ny * nz;
+    const double* target_ptr = nullptr;
+    if (target_velocity.ndim() == 4 && target_velocity.shape(0) == 3 &&
+        static_cast<size_t>(target_velocity.size()) == 3 * n) {
+        target_ptr = target_velocity.data();
+    }
+    const double* inlet_dist_ptr = nullptr;
+    if (inlet_distance.ndim() == 3 &&
+        static_cast<size_t>(inlet_distance.size()) == n) {
+        inlet_dist_ptr = inlet_distance.data();
+    }
+
+    LBMFilling solver(nx, ny, nz, grid.data(), inlet_mask.data(), outlet_mask.data(),
+                      dx, g, rho, nu, inflow_velocity, t_max, max_steps,
+                      cfl_target, smagorinsky, target_ptr, inlet_dist_ptr);
+
+    solver.set_step_callback(callback, callback_every_n);
     solver.run();
 
     std::vector<double> ft, vmag, vel, phi, trap;
