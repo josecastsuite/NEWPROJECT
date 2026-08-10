@@ -325,6 +325,9 @@ class FillingResult:
     air_entrapment: Optional[np.ndarray] = None
     trapped_air_volume_m3: float = 0.0
     air_entrapment_centroid_mm: np.ndarray = field(default_factory=lambda: np.array([]))
+    # D3Q7 trapped-gas physical fields (alpha_g already in air_entrapment).
+    air_pressure_pa: Optional[np.ndarray] = None
+    air_density_kg_m3: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -494,6 +497,8 @@ class AnalysisResult:
     air_entrapment: np.ndarray = field(default_factory=lambda: np.array([]))
     trapped_air_volume_m3: float = 0.0
     air_entrapment_centroid_mm: np.ndarray = field(default_factory=lambda: np.array([]))
+    air_pressure_pa: np.ndarray = field(default_factory=lambda: np.array([]))
+    air_density_kg_m3: np.ndarray = field(default_factory=lambda: np.array([]))
     # v8.9: per-class display filters (top % of computed porosity to display)
     pore_size_noise_percent: float = 3.0
     pore_size_threshold_um: float = 0.0

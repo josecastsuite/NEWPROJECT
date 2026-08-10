@@ -2935,6 +2935,8 @@ def analyze(
     )
     # v10.6: air entrapment from LBM/VOF free-surface tracking.
     air_entrapment_field = np.zeros_like(grid, dtype=np.float64)
+    air_pressure_pa_field = np.zeros_like(grid, dtype=np.float64)
+    air_density_kg_m3_field = np.zeros_like(grid, dtype=np.float64)
     trapped_air_volume_m3 = 0.0
     air_entrapment_centroid_mm = np.array([], dtype=np.float64)
     if (
@@ -2948,6 +2950,14 @@ def analyze(
             getattr(flow_result_for_thermal, "air_entrapment_centroid_mm", np.array([])),
             dtype=np.float64,
         )
+        if getattr(flow_result_for_thermal, "air_pressure_pa", None) is not None:
+            air_pressure_pa_field = np.asarray(
+                flow_result_for_thermal.air_pressure_pa, dtype=np.float64
+            ).reshape(grid.shape)
+        if getattr(flow_result_for_thermal, "air_density_kg_m3", None) is not None:
+            air_density_kg_m3_field = np.asarray(
+                flow_result_for_thermal.air_density_kg_m3, dtype=np.float64
+            ).reshape(grid.shape)
 
     # Geometric trapped-air fallback / complement: runs even when the 3-D LBM
     # solver is disabled or misses closed pockets under overhangs.
@@ -3687,6 +3697,8 @@ def analyze(
         air_entrapment=air_entrapment_field,
         trapped_air_volume_m3=trapped_air_volume_m3,
         air_entrapment_centroid_mm=air_entrapment_centroid_mm,
+        air_pressure_pa=air_pressure_pa_field,
+        air_density_kg_m3=air_density_kg_m3_field,
         pore_size_noise_percent=pore_macro_percent,
         pore_size_threshold_um=pore_macro_threshold_um,
         pore_size_macro_percent=pore_macro_percent,

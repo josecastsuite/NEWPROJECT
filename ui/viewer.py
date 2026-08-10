@@ -1319,68 +1319,65 @@ class Analyzer3DViewer(QtInteractor):
         result: Optional[AnalysisResult],
         max_points: Optional[int] = None,
     ):
-        """Render trapped-air risk as a translucent coloured point cloud.
+        """Render trapped-air risk with volume rendering + physical isosurfaces.
 
-        Each metal voxel with non-zero risk becomes a coloured sphere; the
-        colour goes from blue (az riskli) through white to red (cok riskli).
-        This gives a true cloud-like volume instead of blocky isosurfaces.
+        A hybrid volume/isosurface display is used: ``add_volume`` shows the
+        translucent low-risk gas cloud with the ``inferno`` colour map and a
+        sigmoid opacity transfer function, while ``contour`` extracts closed
+        surfaces at the physical thresholds 5 %, 20 %, 50 % and 80 % gas
+        volume fraction.  This is the standard used for compressible-gas
+        visualisation in LBM/VOF literature.
         """
         if self._air_entrapment_actor is not None:
-            self.remove_actor(self._air_entrapment_actor)
+            if isinstance(self._air_entrapment_actor, (list, tuple)):
+                for actor in self._air_entrapment_actor:
+                    try:
+                        self.remove_actor(actor)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    self.remove_actor(self._air_entrapment_actor)
+                except Exception:
+                    pass
             self._air_entrapment_actor = None
         if self._air_entrapment_marker_actor is not None:
-            self.remove_actor(self._air_entrapment_marker_actor)
+            try:
+                self.remove_actor(self._air_entrapment_marker_actor)
+            except Exception:
+                pass
             self._air_entrapment_marker_actor = None
         self._remove_scalar_bar("Hava sıkışması")
 
         if result is None or result.air_entrapment is None or result.air_entrapment.size == 0:
             return
 
-        grid = self._make_grid(result, result.air_entrapment, "air_entrapment")
-        pts = np.asarray(grid.points)
-        is_metal = grid["is_metal"]
-        air = grid["air_entrapment"]
-        min_risk = 0.02
-        mask = (is_metal >= 0.5) & (air >= min_risk)
-        if not mask.any():
-            return
-
-        selected = pts[mask]
-        values = air[mask]
-
-        # Tiny random jitter breaks the regular voxel lattice so the cloud
-        # looks organic instead of a foam/filter lattice.
-        if self._dx_mm > 0.0:
-            rng = np.random.default_rng(0)
-            jitter = (rng.random(selected.shape) - 0.5) * self._dx_mm * 0.5
-            selected = selected + jitter
-
-        cloud = pv.PolyData(selected)
-        cloud["air"] = values
-
-        # Volume/VRAM aware budget + risk-weighted sampling so large parts still
-        # show the highest-risk air bubbles even with a modest GPU.
-        if max_points is None:
-            part_volume_m3 = float(getattr(result, "part_volume_mm3", 0.0)) / 1e9
-            target = _dynamic_max_points(part_volume_m3)
+        grid = pv.ImageData()
+        grid.dimensions = np.array(result.air_entrapment.shape) + 1
+        grid.origin = result.origin_mm
+        grid.spacing = (result.dx_mm, result.dx_mm, result.dx_mm)
+        grid.cell_data["air"] = np.asarray(result.air_entrapment).ravel(order="F").astype(np.float64)
+        if getattr(result, "air_pressure_pa", None) is not None and result.air_pressure_pa.size == result.air_entrapment.size:
+            grid.cell_data["P_gas"] = np.asarray(result.air_pressure_pa).ravel(order="F").astype(np.float64)
         else:
-            target = int(max_points)
-        cloud = _weighted_sample_cloud(cloud, target, "air")
+            grid.cell_data["P_gas"] = np.zeros_like(grid.cell_data["air"])
+        if getattr(result, "air_density_kg_m3", None) is not None and result.air_density_kg_m3.size == result.air_entrapment.size:
+            grid.cell_data["rho_g"] = np.asarray(result.air_density_kg_m3).ravel(order="F").astype(np.float64)
+        else:
+            grid.cell_data["rho_g"] = np.zeros_like(grid.cell_data["air"])
 
-        lut = pv.LookupTable(cmap="coolwarm", scalar_range=(0.0, 1.0))
-        lut.annotations = {0.0: "az riskli", 0.5: "riskli", 1.0: "çok riskli"}
+        # Convert to point data so PyVista volume rendering and isosurfaces work.
+        grid = grid.cell_data_to_point_data()
 
-        # Larger physical pitch -> larger screen points so coarse clouds still overlap.
-        point_size = max(4, min(10, int(round(self._dx_mm * 2.0))))
-
-        self._air_entrapment_actor = self.add_points(
-            cloud,
-            scalars="air",
-            cmap=lut,
+        # Closed isosurfaces at physically meaningful gas-volume fractions.
+        contours = grid.contour(isosurfaces=[0.05, 0.20, 0.50, 0.80], scalars="air")
+        contour_actor = self.add_mesh(
+            contours,
+            cmap="inferno",
             clim=[0.0, 1.0],
-            render_points_as_spheres=True,
-            point_size=point_size,
-            opacity=0.55,
+            smooth_shading=True,
+            specular=0.8,
+            opacity=0.9,
             show_scalar_bar=True,
             scalar_bar_args={
                 "title": "Hava sıkışması",
@@ -1395,6 +1392,16 @@ class Analyzer3DViewer(QtInteractor):
                 "color": "#334155",
             },
         )
+
+        vol_actor = self.add_volume(
+            grid,
+            scalars="air",
+            cmap="inferno",
+            opacity="sigmoid",
+            clim=[0.02, 1.0],
+            show_scalar_bar=False,
+        )
+        self._air_entrapment_actor = [vol_actor, contour_actor]
 
         if result.air_entrapment_centroid_mm is not None and result.air_entrapment_centroid_mm.size == 3:
             radius = max(float(result.dx_mm) * 2.0, 2.0)
@@ -1413,10 +1420,23 @@ class Analyzer3DViewer(QtInteractor):
             self.show_air_entrapment(result)
         else:
             if self._air_entrapment_actor is not None:
-                self.remove_actor(self._air_entrapment_actor)
+                if isinstance(self._air_entrapment_actor, (list, tuple)):
+                    for actor in self._air_entrapment_actor:
+                        try:
+                            self.remove_actor(actor)
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        self.remove_actor(self._air_entrapment_actor)
+                    except Exception:
+                        pass
                 self._air_entrapment_actor = None
             if self._air_entrapment_marker_actor is not None:
-                self.remove_actor(self._air_entrapment_marker_actor)
+                try:
+                    self.remove_actor(self._air_entrapment_marker_actor)
+                except Exception:
+                    pass
                 self._air_entrapment_marker_actor = None
             self._remove_scalar_bar("Hava sıkışması")
 

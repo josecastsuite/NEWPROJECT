@@ -37,6 +37,7 @@ from scipy.sparse import linalg as spla
 from core.config import FlowConfig
 from core.gate_flow import solve_gate_flows
 from core.materials import MOLDS, MoldMaterial
+from core.air_entrapment_d3q7 import AirEntrapmentSolver_D3Q7
 from core.types import (
     BODY_METAL_TYPES,
     Body,
@@ -335,6 +336,44 @@ def _cavity_and_solid_masks(grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     cavity = (grid != BodyType.EMPTY) & ~np.isin(grid, list(_NON_CAVITY_TYPES))
     solid = ~cavity
     return cavity, solid
+
+
+def _build_air_solver(
+    grid: np.ndarray,
+    dx_m: float,
+    mold: Any,
+    alloy: Any,
+) -> AirEntrapmentSolver_D3Q7:
+    """Create a D3Q7 gas solver and attach mould permeability fields."""
+    nx, ny, nz = grid.shape
+    T_melt_c = float(getattr(alloy, "t_pour_c", 1500.0) or 1500.0)
+    T_melt = T_melt_c + 273.15
+    solver = AirEntrapmentSolver_D3Q7(
+        (nx, ny, nz), float(dx_m), T_melt=T_melt, L_wall=float(dx_m)
+    )
+
+    cavity, solid = _cavity_and_solid_masks(grid)
+    is_boundary = np.zeros((nx, ny, nz), dtype=np.bool_)
+    from core.air_entrapment_d3q7 import _compute_mold_boundary_numba
+
+    _compute_mold_boundary_numba(solid, is_boundary, nx, ny, nz)
+
+    K_inf = float(getattr(mold, "K_inf", 1e-11) or 1e-11)
+    b_klink = float(getattr(mold, "b_klink", 0.1 * 101325.0) or 0.1 * 101325.0)
+    K_field = np.full((nx, ny, nz), K_inf, dtype=np.float64)
+    b_field = np.full((nx, ny, nz), b_klink, dtype=np.float64)
+
+    # Core / chill inserts are effectively impermeable to escaping air.
+    if np.any(solid):
+        K_field = np.where(solid, 1e-18, K_field)
+
+    solver.set_mold_properties(
+        solid=solid,
+        is_mold_boundary=is_boundary,
+        K_mold=K_field,
+        b_klink=b_field,
+    )
+    return solver
 
 
 def _resample_to_grid(
@@ -6737,6 +6776,8 @@ def solve_filling_flow(
 
     # Air entrapment placeholders; filled from LBM/VOF or from the fallback detector.
     air_entrapment_fine = np.zeros_like(vmag_fine, dtype=np.float64)
+    air_pressure_pa_fine = None
+    air_density_kg_m3_fine = None
     trapped_air_volume_m3 = 0.0
     air_entrapment_centroid_mm = np.array([], dtype=np.float64)
     orig_dx_m = orig_dx / 1000.0
@@ -6880,10 +6921,30 @@ def solve_filling_flow(
                 # C++ binding expects a plain Python list for the gravity vector.
                 lbm_g = [float(x) for x in g]
 
-                # The compiled C++ LBM is called with exactly 12 positional
-                # arguments.  Older Windows .pyd builds expose 12 positional-only
-                # arguments; newer builds have default optional target_velocity /
-                # inlet_distance arrays, so 12 arguments is safe on both.
+                # Stage the one-way coupled D3Q7 gas solver.  It receives live
+                # v, F and nu_t from the C++ D3Q19 LBM every callback_every_n steps.
+                air_solver = None
+                if mold is not None:
+                    air_solver = _build_air_solver(vof_grid, vof_dx_m, mold, alloy)
+
+                    def _air_callback(step, dt, dx, cs2, vx, vy, vz, F, nu_t):
+                        if air_solver is None:
+                            return
+                        air_solver.on_lbm_step(
+                            int(step),
+                            float(dt),
+                            float(dx),
+                            float(cs2),
+                            vx,
+                            vy,
+                            vz,
+                            F,
+                            nu_t,
+                        )
+
+                callback_every_n = int(
+                    os.environ.get("JOSECAST_CPP_LBM_CALLBACK_EVERY_N", "10")
+                )
                 print(
                     f"[LBM] C++ D3Q19 solve starting: grid={vof_grid.shape}, "
                     f"dx={vof_dx_m:.4f} m, inflow={vof_inflow_v:.3f} m/s, t_max={t_max_vof:.3f} s",
@@ -6900,7 +6961,7 @@ def solve_filling_flow(
                     final_t,
                     filled_frac,
                     steps,
-                ) = JOSECAST_CORE.solve_lbm_filling(
+                ) = JOSECAST_CORE.solve_lbm_filling_callback(
                     vof_grid.astype(np.uint8, copy=False),
                     vof_inlet.astype(np.uint8, copy=False),
                     vof_outlet.astype(np.uint8, copy=False),
@@ -6913,8 +6974,10 @@ def solve_filling_flow(
                     int(os.environ.get("JOSECAST_CPP_LBM_MAX_STEPS", "12000")),
                     float(os.environ.get("JOSECAST_CPP_LBM_CFL", "0.3")),
                     float(os.environ.get("JOSECAST_CPP_LBM_SMAG", "0.18")),
+                    _air_callback if air_solver is not None else (lambda *args, **kwargs: None),
+                    callback_every_n,
                 )
-                vof_res = {
+                vof_res: Dict[str, Any] = {
                     "fill_time": ft,
                     "velocity_magnitude": vmag,
                     "velocity": vel,
@@ -6926,6 +6989,12 @@ def solve_filling_flow(
                     "filled_fraction": filled_frac,
                     "steps": steps,
                 }
+                if air_solver is not None:
+                    vof_res["air_entrapment_alpha_g"] = air_solver.risk_field().astype(
+                        np.float32
+                    )
+                    vof_res["air_pressure_pa"] = air_solver.P_gas.astype(np.float64)
+                    vof_res["air_density_kg_m3"] = air_solver.rho_g.astype(np.float64)
                 if not success or filled_frac < 0.9999:
                     import warnings
 
@@ -7060,9 +7129,69 @@ def solve_filling_flow(
                 if np.isfinite(max_fill_t) and max_fill_t > 0.0:
                     fill_time_s = max_fill_t
 
-        # Air entrapment: per-component vent-capacity risk score (0-1).
-        # Uses the LBM/VOF phi and fill_time fields plus the geometric outlet mask.
-        if (
+        # Air entrapment: D3Q7 one-way coupled gas solver if available,
+        # otherwise fall back to the geometric vent-capacity post-processor.
+        air_pressure_pa_fine: Optional[np.ndarray] = None
+        air_density_kg_m3_fine: Optional[np.ndarray] = None
+        if vof_res is not None and "air_entrapment_alpha_g" in vof_res:
+            alpha_g_c = np.clip(np.asarray(vof_res["air_entrapment_alpha_g"]), 0.0, 1.0)
+            P_c = np.asarray(vof_res["air_pressure_pa"])
+            rho_c = np.asarray(vof_res["air_density_kg_m3"])
+
+            air_entrapment_fine = _resample_to_grid(
+                alpha_g_c,
+                vof_origin,
+                vof_dx,
+                orig_grid.shape,
+                orig_origin,
+                orig_dx,
+                fill_value=0.0,
+                order=1,
+            )
+            air_entrapment_fine = np.clip(air_entrapment_fine, 0.0, 1.0)
+            air_entrapment_fine = np.where(fine_metal, air_entrapment_fine, 0.0)
+
+            air_pressure_pa_fine = _resample_to_grid(
+                P_c,
+                vof_origin,
+                vof_dx,
+                orig_grid.shape,
+                orig_origin,
+                orig_dx,
+                fill_value=float(np.mean(P_c)),
+                order=1,
+            )
+            air_density_kg_m3_fine = _resample_to_grid(
+                rho_c,
+                vof_origin,
+                vof_dx,
+                orig_grid.shape,
+                orig_origin,
+                orig_dx,
+                fill_value=float(np.mean(rho_c)),
+                order=1,
+            )
+
+            # Trapped air volume: alpha_g is the gas volume fraction in each voxel.
+            trapped_air_volume_m3 = float(alpha_g_c[vof_cavity].sum()) * (vof_dx_m ** 3)
+            if alpha_g_c.sum() > 1e-18:
+                coords = np.stack(
+                    np.meshgrid(
+                        np.arange(alpha_g_c.shape[0]),
+                        np.arange(alpha_g_c.shape[1]),
+                        np.arange(alpha_g_c.shape[2]),
+                        indexing="ij",
+                    ),
+                    axis=-1,
+                )
+                weights = alpha_g_c[vof_cavity]
+                if weights.sum() > 0.0:
+                    centroid_vox = (
+                        (coords[vof_cavity] * weights[:, None]).sum(axis=0) / weights.sum()
+                    )
+                    air_entrapment_centroid_mm = vof_origin + (centroid_vox + 0.5) * vof_dx
+
+        elif (
             vof_res is not None
             and "phi" in vof_res
             and "fill_time" in vof_res
@@ -7356,4 +7485,6 @@ def solve_filling_flow(
         air_entrapment=air_entrapment_fine,
         trapped_air_volume_m3=trapped_air_volume_m3,
         air_entrapment_centroid_mm=air_entrapment_centroid_mm,
+        air_pressure_pa=air_pressure_pa_fine,
+        air_density_kg_m3=air_density_kg_m3_fine,
     )

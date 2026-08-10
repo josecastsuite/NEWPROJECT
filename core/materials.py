@@ -45,6 +45,13 @@ class MoldMaterial:
     binder_percent: float = 2.0  # % bentonite / binder
     compactability_percent: float = 45.0  # % compactability
     mold_rigidity_factor: float = 1.0  # 0 = weak green sand, 1 = rigid metal/shell mold
+    # Darcy-Forchheimer air-escape properties (SI).  K_inf is the intrinsic
+    # mould permeability, phi_mold the porosity, and b_klink the Klinkenberg
+    # slip parameter (Pa).  Sand moulds are ~1e-11 m², ceramic ~1e-14 m²,
+    # metal/shell ~1e-18 m² (effectively impermeable).
+    K_inf: float = 1e-11
+    phi_mold: float = 0.35
+    b_klink: float = 1e4
 
     @property
     def diffusivity_mm2_s(self) -> float:
