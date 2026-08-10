@@ -1226,15 +1226,16 @@ class Analyzer3DViewer(QtInteractor):
         if part.n_cells == 0:
             return
 
-        # Threshold: only show risk >= 0.3, per protocol.
-        cells = part.threshold(0.3, scalars="cold_shot_risk", all_scalars=True)
+        # Threshold: show any non-negligible risk so the operator can see
+        # gradients.  A cell is kept if any of its points exceeds the low
+        # threshold; the scalar bar then maps 0..vmax.
+        cells = part.threshold(0.01, scalars="cold_shot_risk", all_scalars=False)
         if cells.n_cells == 0:
             return
 
         vmax = float(np.percentile(cells["cold_shot_risk"], 99))
-        if vmax <= 0.3:
-            vmax = 1.0
-        clim = [0.3, vmax]
+        vmax = max(vmax, 0.05)
+        clim = [0.0, vmax]
 
         self._cold_shot_actor = self.add_mesh(
             cells,
