@@ -14,7 +14,7 @@ from validation.test_v8_phase_d import run_case
 
 
 def render_case(mold_key: str, alloy_key: str, out_dir: Path):
-    report, result = run_case(mold_key, alloy_key)
+    report, result, bodies = run_case(mold_key, alloy_key)
     print(f"[{mold_key}] saddle_count={report['saddle_count']} cs_mean={report['cold_shot_risk_mean']:.3f}")
 
     # Analyzer3DViewer needs a real X/Windows backend; test_v8_phase_d leaves
@@ -24,6 +24,9 @@ def render_case(mold_key: str, alloy_key: str, out_dir: Path):
     app = QApplication.instance() or QApplication(sys.argv)
     viewer = Analyzer3DViewer(off_screen=True)
     viewer.ren_win.SetSize(1280, 960)
+
+    # Draw the part lightgrey and translucent; risk overlays go on top.
+    viewer.show_bodies(bodies, reset_camera=False, analysis_mode=True)
 
     # Cold-shot risk (inferno)
     viewer.show_cold_shot_risk(result)

@@ -1460,17 +1460,7 @@ class Analyzer3DViewer(QtInteractor):
         else:
             contour_actor = None
 
-        # Faint surface heatmap on the part for context (no extra scalar bar).
-        surface_actor = self.add_mesh(
-            part,
-            scalars="cold_shot_risk",
-            cmap="inferno",
-            opacity=0.25,
-            clim=clim,
-            show_scalar_bar=False,
-            smooth_shading=True,
-        )
-        self._cold_shot_actor = [a for a in (contour_actor, surface_actor) if a is not None]
+        self._cold_shot_actor = [contour_actor] if contour_actor is not None else []
 
         # Last-fill point marker: red sphere at the latest-filled voxel.
         if result.last_fill_point_mm is not None and result.last_fill_point_mm.size == 3:
@@ -1546,16 +1536,7 @@ class Analyzer3DViewer(QtInteractor):
         else:
             contour_actor = None
 
-        surface_actor = self.add_mesh(
-            part,
-            scalars="lap_risk",
-            cmap="viridis",
-            opacity=0.25,
-            clim=clim,
-            show_scalar_bar=False,
-            smooth_shading=True,
-        )
-        self._lap_risk_actor = [a for a in (contour_actor, surface_actor) if a is not None]
+        self._lap_risk_actor = [contour_actor] if contour_actor is not None else []
         self._arrange_scalar_bars()
 
     def toggle_lap_risk(self, result: AnalysisResult, checked: bool):
