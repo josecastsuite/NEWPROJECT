@@ -94,7 +94,7 @@ def run_case(mold_key: str, alloy_key: str):
         "lap_risk_max": float(lap.max()) if lap.size else 0.0,
         "lap_risk_mean": float(lap.mean()) if lap.size else 0.0,
     }
-    return report
+    return report, result
 
 
 def main() -> None:
@@ -102,7 +102,8 @@ def main() -> None:
     reports = {}
     for mold_key in ["sand", "metal_mold"]:
         print(f"[test_v8_phase_d] running {alloy_key} + {mold_key} ...")
-        reports[mold_key] = run_case(mold_key, alloy_key)
+        report, _ = run_case(mold_key, alloy_key)
+        reports[mold_key] = report
 
     sand = reports["sand"]
     metal = reports["metal_mold"]

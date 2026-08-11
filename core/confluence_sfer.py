@@ -4,7 +4,7 @@ Fix3, Fix4 and the saddle loop from V8.  For each saddle found by the Reeb/
 watershed detector, 64 directions on a sphere are sampled to find converging
 fill fronts and compute the local cold-shut / lap risk.
 """
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from numba import njit, prange
@@ -77,14 +77,20 @@ def _sfer64_one_saddle(
     h0: float,
     feed_k1: float,
     C_ref: float,
-) -> Tuple[float, float, float, float]:
+) -> Tuple[float, float, float, float, float, float, float, float, float, float, float, float, float, float, float, float, float, float]:
     """
     Compute cold-shot risk, lap risk, and dominant angle for one saddle.
-    Returns (risk_cs, risk_lap, theta_deg, h_final_m).
+
+    Returns (risk_cs, risk_lap, theta_deg, h_final_m, T_int_c, fs_int,
+             We, Pe, M_eff_mm, dt_s, v_rel_m_s, N_front,
+             d1x, d1y, d1z, d2x, d2y, d2z).
     """
     nx, ny, nz = shape
     if not part_mask[i, j, k]:
-        return 0.0, 0.0, 0.0, 0.0
+        return (
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        )
 
     R = M_mod[i, j, k]
     three_dx = 3.0 * dx
@@ -161,7 +167,10 @@ def _sfer64_one_saddle(
                 best_cos = cos_theta
 
     if best_s1 < 0:
-        return 0.0, 0.0, 0.0, 0.0
+        return (
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        )
 
     # precompute front speed for Péclet / M_eff at the saddle
     v_front_saddle = v_front[i, j, k]
@@ -258,7 +267,18 @@ def _sfer64_one_saddle(
         H_fs_lap = 1.0 / (1.0 + np.exp(arg_fs_lap))
         max_lap = H_dt_lap * H_fs_lap * Hh * geom * f_feeder
 
-    return max_cs, max_lap, max_theta, h_final_out
+    N_front = 0
+    for s in range(n_dir):
+        if valid[s]:
+            N_front += 1
+
+    return (
+        max_cs, max_lap, max_theta, h_final_out,
+        float(T_int), float(fs_int), float(We), float(Pe), float(M_eff),
+        float(dt), float(v_rel), float(N_front),
+        float(dirs[best_s1, 0]), float(dirs[best_s1, 1]), float(dirs[best_s1, 2]),
+        float(dirs[best_s2, 0]), float(dirs[best_s2, 1]), float(dirs[best_s2, 2]),
+    )
 
 
 @njit(parallel=True, cache=True)
@@ -303,13 +323,17 @@ def _sfer64_kernel(
     risk_lap: np.ndarray,
     saddle_info: np.ndarray,
 ) -> None:
-    """Parallel SFER over all saddles.  ``saddle_info`` is (N,4) for diagnostics."""
+    """Parallel SFER over all saddles.  ``saddle_info`` is (N,18) for diagnostics."""
     n = saddles.shape[0]
     for idx in prange(n):
         i = int(saddles[idx, 0])
         j = int(saddles[idx, 1])
         k = int(saddles[idx, 2])
-        cs, lap, theta, h_final = _sfer64_one_saddle(
+        (
+            cs, lap, theta, h_final,
+            T_int, fs_int, We, Pe, M_eff, dt, v_rel, N_front,
+            d1x, d1y, d1z, d2x, d2y, d2z,
+        ) = _sfer64_one_saddle(
             i, j, k,
             ft, H_field, M_mod, sdf, C_field, v_front, velocity, dist_feeder,
             part_mask, H_table, T_table, fs_table, dirs, adj,
@@ -325,6 +349,20 @@ def _sfer64_kernel(
         saddle_info[idx, 1] = lap
         saddle_info[idx, 2] = theta
         saddle_info[idx, 3] = h_final
+        saddle_info[idx, 4] = T_int
+        saddle_info[idx, 5] = fs_int
+        saddle_info[idx, 6] = We
+        saddle_info[idx, 7] = Pe
+        saddle_info[idx, 8] = M_eff
+        saddle_info[idx, 9] = dt
+        saddle_info[idx, 10] = v_rel
+        saddle_info[idx, 11] = float(N_front)
+        saddle_info[idx, 12] = d1x
+        saddle_info[idx, 13] = d1y
+        saddle_info[idx, 14] = d1z
+        saddle_info[idx, 15] = d2x
+        saddle_info[idx, 16] = d2y
+        saddle_info[idx, 17] = d2z
 
 
 def compute_sfer_risk(
@@ -345,6 +383,7 @@ def compute_sfer_risk(
     alloy,
     h0: float = 100e-9,
     C_ref: float = 2.8,
+    saddle_persistence: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, float]]]:
     """
     Compute V8 SFER cold-shot / lap risk for a list of saddle points.
@@ -359,7 +398,7 @@ def compute_sfer_risk(
         return risk_cs, risk_lap, []
 
     n = saddles.shape[0]
-    saddle_info = np.empty((n, 4), dtype=np.float64)
+    saddle_info = np.empty((n, 18), dtype=np.float64)
 
     # alloy properties
     rho = float(getattr(alloy, "rho_kg_m3", 7000.0))
@@ -391,8 +430,10 @@ def compute_sfer_risk(
         risk_cs, risk_lap, saddle_info,
     )
 
+    f_eut = float(getattr(alloy, "eutectic_fraction", 0.0))
     diagnostics = []
     for idx in range(n):
+        pers = float(saddle_persistence[idx]) if saddle_persistence is not None and idx < saddle_persistence.shape[0] else 0.0
         diagnostics.append({
             "i": int(saddles[idx, 0]),
             "j": int(saddles[idx, 1]),
@@ -401,5 +442,17 @@ def compute_sfer_risk(
             "risk_lap": float(saddle_info[idx, 1]),
             "theta_deg": float(saddle_info[idx, 2]),
             "h_final_m": float(saddle_info[idx, 3]),
+            "T_int_c": float(saddle_info[idx, 4]),
+            "fs": float(saddle_info[idx, 5]),
+            "We": float(saddle_info[idx, 6]),
+            "Pe": float(saddle_info[idx, 7]),
+            "M_eff_mm": float(saddle_info[idx, 8]),
+            "dt_s": float(saddle_info[idx, 9]),
+            "v_rel_m_s": float(saddle_info[idx, 10]),
+            "N_front": int(saddle_info[idx, 11]),
+            "d1": [float(saddle_info[idx, 12]), float(saddle_info[idx, 13]), float(saddle_info[idx, 14])],
+            "d2": [float(saddle_info[idx, 15]), float(saddle_info[idx, 16]), float(saddle_info[idx, 17])],
+            "persistence_s": pers,
+            "f_eut": f_eut,
         })
     return risk_cs, risk_lap, diagnostics

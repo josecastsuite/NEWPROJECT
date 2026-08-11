@@ -626,6 +626,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cold_shot_toggle.toggled.connect(self.on_toggle_cold_shot_risk)
         vis_layout.addWidget(self.cold_shot_toggle)
 
+        self.lap_risk_toggle = QtWidgets.QCheckBox("Lap Riski")
+        self.lap_risk_toggle.setToolTip("45°–120° arası cephe kapanmasından kaynaklanan lap/doku riski")
+        self.lap_risk_toggle.setChecked(False)
+        self.lap_risk_toggle.toggled.connect(self.on_toggle_lap_risk)
+        vis_layout.addWidget(self.lap_risk_toggle)
+
         self.erosion_toggle = QtWidgets.QCheckBox("Kalıp Erozyonu Riski")
         self.erosion_toggle.setToolTip("Yüksek metal hızına bağlı kum kalıp erozyon riski")
         self.erosion_toggle.setChecked(False)
@@ -1296,6 +1302,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.viewer.toggle_mold_wall_movement(self._analysis, True)
         if self.cold_shot_toggle.isChecked():
             self.viewer.toggle_cold_shot_risk(self._analysis, True)
+        if self.lap_risk_toggle.isChecked():
+            self.viewer.toggle_lap_risk(self._analysis, True)
         if self.erosion_toggle.isChecked():
             self.viewer.toggle_erosion_risk(self._analysis, True)
         if self.air_entrapment_toggle.isChecked():
@@ -1445,6 +1453,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_toggle_cold_shot_risk(self, checked: bool):
         if self._analysis:
             self.viewer.toggle_cold_shot_risk(self._analysis, checked)
+
+    def on_toggle_lap_risk(self, checked: bool):
+        if self._analysis:
+            self.viewer.toggle_lap_risk(self._analysis, checked)
 
     def on_toggle_erosion_risk(self, checked: bool):
         if self._analysis:

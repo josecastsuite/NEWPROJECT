@@ -7,7 +7,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyvista as pv
-from PyQt6 import QtCore, QtWidgets
+import vtk
+from PyQt6 import QtCore, QtGui, QtWidgets
 from pyvistaqt import QtInteractor
 from scipy import ndimage
 from scipy.spatial import cKDTree
@@ -71,8 +72,9 @@ BODY_OPACITY = {
 
 # Post-analysis transparency: all bodies become translucent so internal
 # hotspots, Niyama surfaces and flow fields are visible through the geometry.
+# Part is especially faint so risk isosurfaces stand out.
 BODY_OPACITY_POST = {
-    BodyType.PART: 0.60,
+    BodyType.PART: 0.12,
     BodyType.RISER: 0.35,
     BodyType.INGATE: 0.35,
     BodyType.RUNNER: 0.35,
@@ -244,10 +246,19 @@ class Analyzer3DViewer(QtInteractor):
         self._cold_shot_actor = None
         self._cold_shot_scalar_bar_actor = None
         self._last_fill_actor = None
+        self._lap_risk_actor = None
+        self._saddle_actor = None
+        self._saddle_arrow_actor = None
+        self._reeb_line_actor = None
         self._erosion_actor = None
         self._air_entrapment_actor = None
         self._air_entrapment_marker_actor = None
         self.flow_animator = FlowAnimator(self)
+        self._saddle_tree = None
+        self._saddle_data: List[Dict[str, Any]] = []
+        self._saddle_positions: np.ndarray = np.empty((0, 3), dtype=np.float64)
+        self._saddle_tol_mm = 1.0
+        self._mouse_observer = None
         self._body_legend_actors: List[Any] = []
         self._body_legend_frame = QtWidgets.QFrame(self)
         self._body_legend_frame.setObjectName("bodyLegend")
@@ -270,6 +281,16 @@ class Analyzer3DViewer(QtInteractor):
         self._body_index: Optional[np.ndarray] = None
         self._origin_mm: Optional[np.ndarray] = None
         self._dx_mm: float = 0.0
+
+    def _enable_saddle_picker(self):
+        """Attach the mouse-move observer once the interactor is available."""
+        try:
+            if self._mouse_observer is None and self.iren is not None:
+                self._mouse_observer = self.iren.AddObserver(
+                    vtk.vtkCommand.MouseMoveEvent, self._on_mouse_move
+                )
+        except Exception:
+            self._mouse_observer = None
 
     def _remove_body_legend(self) -> None:
         """Clear the Qt-based body legend overlay."""
@@ -373,9 +394,16 @@ class Analyzer3DViewer(QtInteractor):
         self._cold_shot_actor = None
         self._cold_shot_scalar_bar_actor = None
         self._last_fill_actor = None
+        self._lap_risk_actor = None
+        self._saddle_actor = None
+        self._saddle_arrow_actor = None
+        self._reeb_line_actor = None
         self._erosion_actor = None
         self._air_entrapment_actor = None
         self._air_entrapment_marker_actor = None
+        self._saddle_tree = None
+        self._saddle_data.clear()
+        self._saddle_positions = np.empty((0, 3), dtype=np.float64)
         self._body_legend_actors = []
         self._remove_body_legend()
         self._bodies = []
@@ -508,6 +536,56 @@ class Analyzer3DViewer(QtInteractor):
                 return grid.extract_surface(algorithm="dataset_surface")
             except Exception:
                 return pv.PolyData()
+
+    def _remove_saddle_glyphs(self):
+        for attr in ("_saddle_actor", "_saddle_arrow_actor", "_reeb_line_actor"):
+            actor = getattr(self, attr, None)
+            if actor is not None:
+                try:
+                    if isinstance(actor, (list, tuple)):
+                        for a in actor:
+                            self.remove_actor(a)
+                    else:
+                        self.remove_actor(actor)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self._saddle_tree = None
+        self._saddle_data.clear()
+        self._saddle_positions = np.empty((0, 3), dtype=np.float64)
+        self._remove_scalar_bar("Sıcaklık (°C)")
+        self._remove_scalar_bar("Soğuk birleşme (çoğaltım)")
+
+    def _on_mouse_move(self, obj=None, event=None):
+        """Show a tooltip with saddle physics when hovering near a saddle glyph."""
+        if self._saddle_tree is None or self._saddle_positions.shape[0] == 0:
+            return
+        try:
+            pos = self.iren.GetEventPosition()
+            picker = self.iren.GetPicker()
+            if picker is None:
+                return
+            picker.SetTolerance(0.001)
+            if not picker.Pick(pos[0], pos[1], 0.0, self.renderer):
+                return
+            world = np.asarray(picker.GetPickPosition(), dtype=np.float64)
+            if not np.isfinite(world).all():
+                return
+            dist, idx = self._saddle_tree.query(world)
+            if dist > self._saddle_tol_mm:
+                return
+            s = self._saddle_data[idx]
+            text = (
+                f"<b>Saddle ({s['i']},{s['j']},{s['k']})</b><br>"
+                f"θ={s.get('theta_deg', 0):.1f}° | Δt={s.get('dt_s', 0):.3f}s<br>"
+                f"T_int={s.get('T_int_c', 0):.1f}°C | fs={s.get('fs', 0):.3f} | f_eut={s.get('f_eut', 0):.3f}<br>"
+                f"We={s.get('We', 0):.3f} | Pe={s.get('Pe', 0):.3f}<br>"
+                f"M_eff={s.get('M_eff_mm', 0):.2f}mm | h_final={s.get('h_final_m', 0)*1e9:.1f}nm<br>"
+                f"N_front={s.get('N_front', 0)} | persistence={s.get('persistence_s', 0):.3f}s"
+            )
+            QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), text, self)
+        except Exception:
+            pass
 
     def show_hotspots(self, result: Optional[AnalysisResult]):
         for actor in self._hotspot_actors:
@@ -1202,18 +1280,152 @@ class Analyzer3DViewer(QtInteractor):
                 self._mold_wall_actor = None
             self._remove_scalar_bar("Kalıp şişmesi (%)")
 
-    def show_cold_shot_risk(self, result: Optional[AnalysisResult]):
-        """Heatmap of cold-shut (soğuk birleşme) risk on the part surface.
+    def _show_saddle_glyphs(self, result: AnalysisResult, mode: str = "cold"):
+        """Draw sphere + two arrows per saddle, and the Reeb polyline."""
+        self._remove_saddle_glyphs()
 
-        The whole part surface is rendered on a fixed 0..1 scale so the colour
-        bar is always visible.  Low risks appear as light yellow/orange, high
-        risks as red, and zero/negligible risk maps to the bottom of the scale
-        instead of disappearing.  The latest-filled voxel is marked with a red
-        sphere so the operator sees the last point reached by the metal.
+        saddles = getattr(result, "cold_shot_saddles", None)
+        if not saddles or not saddles.get("saddles"):
+            return
+
+        dx = float(result.dx_mm)
+        origin = np.asarray(result.origin_mm, dtype=np.float64)
+        data = saddles["saddles"]
+        n = len(data)
+        if n == 0 or dx <= 0.0:
+            return
+
+        positions = []
+        t_int_vals = []
+        risk_vals = []
+        sphere_blocks = []
+        arrow_blocks = []
+
+        for s in data:
+            i = int(s.get("i", 0))
+            j = int(s.get("j", 0))
+            k = int(s.get("k", 0))
+            pos = origin + (np.array([i, j, k], dtype=np.float64) + 0.5) * dx
+            positions.append(pos)
+            t_int = float(s.get("T_int_c", 0.0))
+            risk = float(s.get("risk_cs", 0.0))
+            t_int_vals.append(t_int)
+            risk_vals.append(risk)
+
+            sphere = pv.Sphere(
+                radius=0.6 * dx,
+                center=pos,
+                theta_resolution=16,
+                phi_resolution=16,
+            )
+            sphere.cell_data["T_int_c"] = np.full(sphere.n_cells, t_int)
+            sphere_blocks.append(sphere)
+
+            # Two incoming-front arrows: -d1 and -d2 point from source to saddle.
+            d1 = np.asarray(s.get("d1", [0.0, 0.0, 1.0]), dtype=np.float64)
+            d2 = np.asarray(s.get("d2", [0.0, 0.0, -1.0]), dtype=np.float64)
+            v_rel = float(s.get("v_rel_m_s", 0.0))
+            We = float(s.get("We", 0.0))
+            length = max(dx, v_rel * 1000.0)
+            thickness = min(5.0, 1.0 + We)
+            shaft_r = 0.04 * dx * thickness / length
+            tip_r = 2.0 * shaft_r
+            tip_len = 0.3
+            for d in (-d1, -d2):
+                if np.linalg.norm(d) < 1e-9:
+                    continue
+                arrow = pv.Arrow(
+                    start=pos,
+                    direction=d,
+                    tip_length=tip_len,
+                    tip_radius=tip_r,
+                    shaft_radius=shaft_r,
+                    scale=length,
+                )
+                arrow.cell_data["T_int_c"] = np.full(arrow.n_cells, t_int)
+                arrow_blocks.append(arrow)
+
+        if sphere_blocks:
+            t_min = min(t_int_vals) if t_int_vals else 0.0
+            t_max = max(t_int_vals) if t_int_vals else 1.0
+            if t_max - t_min < 1.0:
+                t_min = t_min - 10.0
+                t_max = t_max + 10.0
+            spheres = pv.MultiBlock(sphere_blocks)
+            self._saddle_actor = self.add_mesh(
+                spheres,
+                scalars="T_int_c",
+                cmap="coolwarm",
+                clim=[t_min, t_max],
+                opacity=0.9,
+                show_scalar_bar=True,
+                scalar_bar_args=_scalar_bar_args("Sıcaklık (°C)", (0.02, 0.02), clim=[t_min, t_max]),
+                smooth_shading=True,
+            )
+
+        if arrow_blocks:
+            arrows = pv.MultiBlock(arrow_blocks)
+            self._saddle_arrow_actor = self.add_mesh(
+                arrows,
+                scalars="T_int_c",
+                cmap="coolwarm",
+                clim=[t_min, t_max],
+                opacity=0.85,
+                show_scalar_bar=False,
+                smooth_shading=True,
+            )
+
+        # Reeb polyline: connect saddles ordered by local fill time.
+        if n > 1 and result.fill_time_s is not None and result.fill_time_s.size:
+            ft = result.fill_time_s
+            order = sorted(
+                range(n),
+                key=lambda idx: float(ft[int(data[idx]["i"]), int(data[idx]["j"]), int(data[idx]["k"])]) if idx < len(data) else 0.0,
+            )
+        else:
+            order = list(range(n))
+        ordered_points = np.array([positions[o] for o in order])
+        ordered_risk = np.array([risk_vals[o] for o in order])
+        if len(ordered_points) > 1:
+            line = pv.lines_from_points(ordered_points, close=False)
+            line["risk_cs"] = ordered_risk
+            self._reeb_line_actor = self.add_mesh(
+                line,
+                scalars="risk_cs",
+                cmap="coolwarm",
+                clim=[0.0, 1.0],
+                opacity=0.9,
+                line_width=4,
+                show_scalar_bar=True,
+                scalar_bar_args=_scalar_bar_args("Soğuk birleşme (çoğaltım)", (0.02, 0.02), clim=[0.0, 1.0]),
+            )
+
+        self._saddle_positions = np.array(positions, dtype=np.float64)
+        self._saddle_data = data
+        self._saddle_tol_mm = 2.0 * dx
+        try:
+            self._saddle_tree = cKDTree(self._saddle_positions)
+        except Exception:
+            self._saddle_tree = None
+        self._enable_saddle_picker()
+
+    def show_cold_shot_risk(self, result: Optional[AnalysisResult]):
+        """Isosurface cold-shut (soğuk birleşme) risk with saddle glyphs.
+
+        Closed isosurfaces are extracted at 0.30, 0.50, 0.70 and 0.90 cold-shot
+        risk, coloured with the inferno map on a fixed 0..1 scale.  The part
+        body is kept translucent (BODY_OPACITY_POST) so the risk shells are
+        visible inside the geometry.  Saddle glyphs and the Reeb polyline are
+        added to show the converging-front encounter points.
         """
-        if self._cold_shot_actor is not None:
+        if isinstance(self._cold_shot_actor, (list, tuple)):
+            for actor in self._cold_shot_actor:
+                try:
+                    self.remove_actor(actor)
+                except Exception:
+                    pass
+        elif self._cold_shot_actor is not None:
             self.remove_actor(self._cold_shot_actor)
-            self._cold_shot_actor = None
         if self._last_fill_actor is not None:
             self.remove_actor(self._last_fill_actor)
             self._last_fill_actor = None
@@ -1227,23 +1439,32 @@ class Analyzer3DViewer(QtInteractor):
         if part.n_cells == 0:
             return
 
-        # Show the whole part surface with a fixed 0..1 risk scale so the
-        # scalar bar is always visible.  Low risks appear as light yellow/orange,
-        # high risks as red, and zero/negligible risk still maps to the bottom
-        # of the scale instead of disappearing.
-        cells = part
         clim = [0.0, 1.0]
 
-        self._cold_shot_actor = self.add_mesh(
-            cells,
+        # Closed isosurfaces at risk thresholds; high-risk shells are nested.
+        contours = part.contour(isosurfaces=[0.3, 0.5, 0.7, 0.9], scalars="cold_shot_risk")
+        contour_actor = self.add_mesh(
+            contours,
             scalars="cold_shot_risk",
-            cmap="YlOrRd",
+            cmap="inferno",
             opacity=0.85,
             clim=clim,
             show_scalar_bar=True,
             scalar_bar_args=_scalar_bar_args("Soğuk birleşme riski", (0.02, 0.02), clim=clim),
             smooth_shading=True,
         )
+
+        # Faint surface heatmap on the part for context (no extra scalar bar).
+        surface_actor = self.add_mesh(
+            part,
+            scalars="cold_shot_risk",
+            cmap="inferno",
+            opacity=0.25,
+            clim=clim,
+            show_scalar_bar=False,
+            smooth_shading=True,
+        )
+        self._cold_shot_actor = [contour_actor, surface_actor]
 
         # Last-fill point marker: red sphere at the latest-filled voxel.
         if result.last_fill_point_mm is not None and result.last_fill_point_mm.size == 3:
@@ -1256,19 +1477,89 @@ class Analyzer3DViewer(QtInteractor):
                 show_scalar_bar=False,
             )
 
+        # Saddle glyphs and Reeb polyline for the converging-front network.
+        self._show_saddle_glyphs(result, "cold")
+
         self._arrange_scalar_bars()
 
     def toggle_cold_shot_risk(self, result: AnalysisResult, checked: bool):
         if checked:
             self.show_cold_shot_risk(result)
         else:
-            if self._cold_shot_actor is not None:
+            if isinstance(self._cold_shot_actor, (list, tuple)):
+                for actor in self._cold_shot_actor:
+                    try:
+                        self.remove_actor(actor)
+                    except Exception:
+                        pass
+            elif self._cold_shot_actor is not None:
                 self.remove_actor(self._cold_shot_actor)
-                self._cold_shot_actor = None
+            self._cold_shot_actor = None
             if self._last_fill_actor is not None:
                 self.remove_actor(self._last_fill_actor)
                 self._last_fill_actor = None
+            self._remove_saddle_glyphs()
             self._remove_scalar_bar("Soğuk birleşme riski")
+
+    def show_lap_risk(self, result: Optional[AnalysisResult]):
+        """Isosurface lap risk (45°–120° encounter angles) in viridis."""
+        if isinstance(self._lap_risk_actor, (list, tuple)):
+            for actor in self._lap_risk_actor:
+                try:
+                    self.remove_actor(actor)
+                except Exception:
+                    pass
+        elif self._lap_risk_actor is not None:
+            self.remove_actor(self._lap_risk_actor)
+        self._remove_scalar_bar("Lap riski")
+
+        if result is None or result.lap_risk is None or result.lap_risk.size == 0:
+            return
+
+        grid = self._make_grid(result, result.lap_risk, "lap_risk")
+        part = self._part_only(grid)
+        if part.n_cells == 0:
+            return
+
+        clim = [0.0, 1.0]
+        contours = part.contour(isosurfaces=[0.3, 0.5, 0.7, 0.9], scalars="lap_risk")
+        contour_actor = self.add_mesh(
+            contours,
+            scalars="lap_risk",
+            cmap="viridis",
+            opacity=0.85,
+            clim=clim,
+            show_scalar_bar=True,
+            scalar_bar_args=_scalar_bar_args("Lap riski", (0.02, 0.02), clim=clim),
+            smooth_shading=True,
+        )
+
+        surface_actor = self.add_mesh(
+            part,
+            scalars="lap_risk",
+            cmap="viridis",
+            opacity=0.25,
+            clim=clim,
+            show_scalar_bar=False,
+            smooth_shading=True,
+        )
+        self._lap_risk_actor = [contour_actor, surface_actor]
+        self._arrange_scalar_bars()
+
+    def toggle_lap_risk(self, result: AnalysisResult, checked: bool):
+        if checked:
+            self.show_lap_risk(result)
+        else:
+            if isinstance(self._lap_risk_actor, (list, tuple)):
+                for actor in self._lap_risk_actor:
+                    try:
+                        self.remove_actor(actor)
+                    except Exception:
+                        pass
+            elif self._lap_risk_actor is not None:
+                self.remove_actor(self._lap_risk_actor)
+            self._lap_risk_actor = None
+            self._remove_scalar_bar("Lap riski")
 
     def show_erosion_risk(self, result: Optional[AnalysisResult]):
         """Heatmap of mold-sand erosion risk driven by local metal velocity."""

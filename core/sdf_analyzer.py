@@ -1359,8 +1359,9 @@ def compute_cold_shot_risk(
         saddles = np.empty((0, 3), dtype=np.int64)
 
         # 1) Gate-body seeded watershed (multiple ingates give distinct fronts).
+        saddle_pers = np.empty(0, dtype=np.float64)
         if grid is not None and body_index is not None and grid.shape == shape and body_index.shape == shape:
-            saddles, _, _ = find_saddles_gate_watershed(
+            saddles, _, saddle_pers = find_saddles_gate_watershed(
                 ft,
                 part_mask,
                 grid,
@@ -1372,25 +1373,25 @@ def compute_cold_shot_risk(
 
         # 2) Sublevel-set persistence (merge-tree saddles) on the fill-time field.
         if saddles.shape[0] < 10:
-            saddles, _, _ = find_saddles_sublevel(
+            saddles, _, saddle_pers = find_saddles_sublevel(
                 ft, part_mask, persistence_thresh_s=base_persistence, max_saddles=1000
             )
             if saddles.shape[0] < 10 and ft_range > 0.0:
                 persistence = max(0.001, 0.001 * ft_range)
-                saddles, _, _ = find_saddles_sublevel(
+                saddles, _, saddle_pers = find_saddles_sublevel(
                     ft, part_mask, persistence_thresh_s=persistence, max_saddles=1000
                 )
 
         # 3) Persistent local maxima of fill time are closure/confluence points.
         if saddles.shape[0] < 10:
-            saddles, _, _ = find_local_maxima(
+            saddles, _, saddle_pers = find_local_maxima(
                 ft, part_mask, h_relative=0.05, sigma=2.0, max_candidates=1000
             )
 
         # 4) Medial-axis / skeleton ridges capture confluence lines even when
         #    the fill-time landscape has only one broad closure region.
         if saddles.shape[0] < 10:
-            saddles, _, _ = find_saddles_skeleton(
+            saddles, _, saddle_pers = find_saddles_skeleton(
                 ft, part_mask, persistence_thresh_s=base_persistence, ft_percentile=80.0, max_saddles=1000
             )
 
@@ -1413,6 +1414,7 @@ def compute_cold_shot_risk(
                 adj,
                 dx,
                 alloy,
+                saddle_persistence=saddle_pers,
             )
             np.maximum(out, risk_cs_sfer, out=out)
             np.copyto(lap_risk, risk_lap_sfer)
