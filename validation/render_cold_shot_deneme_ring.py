@@ -15,7 +15,7 @@ from validation.test_v8_phase_d import run_case
 
 def render_case(mold_key: str, alloy_key: str, out_dir: Path):
     report, result, bodies = run_case(mold_key, alloy_key)
-    print(f"[{mold_key}] saddle_count={report['saddle_count']} cs_mean={report['cold_shot_risk_mean']:.3f}")
+    print(f"[{mold_key}/{alloy_key}] saddle_count={report['saddle_count']} cs_mean={report['cold_shot_risk_mean']:.3f}")
 
     # Analyzer3DViewer needs a real X/Windows backend; test_v8_phase_d leaves
     # QT_QPA_PLATFORM=offscreen, so override it before creating QApplication.
@@ -32,7 +32,7 @@ def render_case(mold_key: str, alloy_key: str, out_dir: Path):
     viewer.show_cold_shot_risk(result)
     viewer.camera_position = "xz"
     viewer.reset_camera()
-    cs_png = out_dir / f"Deneme_Ring_{mold_key}_cold_shot.png"
+    cs_png = out_dir / f"Deneme_Ring_{mold_key}_{alloy_key}_cold_shot.png"
     viewer.screenshot(str(cs_png))
     print(f"wrote {cs_png}")
 
@@ -41,7 +41,7 @@ def render_case(mold_key: str, alloy_key: str, out_dir: Path):
     viewer.show_lap_risk(result)
     viewer.camera_position = "xz"
     viewer.reset_camera()
-    lap_png = out_dir / f"Deneme_Ring_{mold_key}_lap.png"
+    lap_png = out_dir / f"Deneme_Ring_{mold_key}_{alloy_key}_lap.png"
     viewer.screenshot(str(lap_png))
     print(f"wrote {lap_png}")
 
@@ -49,8 +49,14 @@ def render_case(mold_key: str, alloy_key: str, out_dir: Path):
 def main():
     out_dir = Path(__file__).parent / "results"
     out_dir.mkdir(parents=True, exist_ok=True)
-    for mold_key in ["sand", "metal_mold"]:
-        render_case(mold_key, "AlSi7", out_dir)
+    cases = [
+        ("sand", "AlSi7"),
+        ("ceramic", "AlSi7"),
+        ("metal_mold", "AlSi7"),
+        ("metal_mold", "42CrMo4"),
+    ]
+    for mold_key, alloy_key in cases:
+        render_case(mold_key, alloy_key, out_dir)
 
 
 if __name__ == "__main__":
