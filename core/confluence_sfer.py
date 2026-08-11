@@ -4,6 +4,7 @@ Fix3, Fix4 and the saddle loop from V8.  For each saddle found by the Reeb/
 watershed detector, 64 directions on a sphere are sampled to find converging
 fill fronts and compute the local cold-shut / lap risk.
 """
+import math
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -456,3 +457,78 @@ def compute_sfer_risk(
             "f_eut": f_eut,
         })
     return risk_cs, risk_lap, diagnostics
+
+
+@njit(cache=True)
+def splat_saddle_risks(
+    saddles: np.ndarray,
+    source: np.ndarray,
+    sdf: np.ndarray,
+    dx: float,
+    threshold: float,
+    out: np.ndarray,
+) -> None:
+    """Splat per-saddle source risk into a small spherical neighbourhood.
+
+    Radius is thickness-aware: ``r_world = clip(0.15 * t_local, dx, 2.5*dx)``,
+    where ``t_local = max(dx, 2.0 * sdf)``.  Very thin local sections fall
+    back to a 1-voxel glyph.  Values below ``threshold`` are skipped so low
+    risk saddles do not clutter the view.
+    """
+    if saddles.size == 0:
+        return
+    nx, ny, nz = out.shape
+    n = saddles.shape[0]
+    two_sigma_factor = 1.0 / (2.0 * 0.6 * 0.6)  # sigma = 0.6 * r_vox
+    min_fall = 0.01
+    for idx in range(n):
+        i = int(saddles[idx, 0])
+        j = int(saddles[idx, 1])
+        k = int(saddles[idx, 2])
+        if i < 0 or i >= nx or j < 0 or j >= ny or k < 0 or k >= nz:
+            continue
+        val = source[i, j, k]
+        if val < threshold or val <= 0.0:
+            continue
+        t_local = 2.0 * sdf[i, j, k]
+        if t_local < dx:
+            t_local = dx
+        r_world = 0.15 * t_local
+        if r_world < dx:
+            r_world = dx
+        if r_world > 2.5 * dx:
+            r_world = 2.5 * dx
+        r_vox = int(round(r_world / dx))
+        if r_vox < 1:
+            r_vox = 1
+
+        use_glyph = t_local < 5.0 * dx
+        if use_glyph:
+            r_vox = 1
+
+        r2_max = r_vox * r_vox
+        for di in range(-r_vox, r_vox + 1):
+            ni = i + di
+            if ni < 0 or ni >= nx:
+                continue
+            for dj in range(-r_vox, r_vox + 1):
+                nj = j + dj
+                if nj < 0 or nj >= ny:
+                    continue
+                for dk in range(-r_vox, r_vox + 1):
+                    nk = k + dk
+                    if nk < 0 or nk >= nz:
+                        continue
+                    d2 = di * di + dj * dj + dk * dk
+                    if d2 > r2_max:
+                        continue
+                    if use_glyph:
+                        splat_val = val
+                    else:
+                        sigma2 = 0.36 * r2_max  # (0.6*r_vox)^2
+                        fall = math.exp(-d2 / (2.0 * sigma2))
+                        if fall < min_fall:
+                            continue
+                        splat_val = val * fall
+                    if splat_val > out[ni, nj, nk]:
+                        out[ni, nj, nk] = splat_val

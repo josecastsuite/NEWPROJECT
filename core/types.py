@@ -491,6 +491,9 @@ class AnalysisResult:
     # v10.4: per-voxel cold-shut (cold shot) risk and the last fill location
     cold_shot_risk: np.ndarray = field(default_factory=lambda: np.array([]))
     lap_risk: np.ndarray = field(default_factory=lambda: np.array([]))
+    # V8 cold-shot/lap visualisation: sparse, thickness-aware splats around saddles
+    cold_shot_risk_viz: np.ndarray = field(default_factory=lambda: np.array([]))
+    lap_risk_viz: np.ndarray = field(default_factory=lambda: np.array([]))
     cold_shot_saddles: Dict[str, Any] = field(default_factory=dict)
     last_fill_point_mm: np.ndarray = field(default_factory=lambda: np.array([]))
     # V8 cold-shot meeting enthalpy / temperature / solid fraction

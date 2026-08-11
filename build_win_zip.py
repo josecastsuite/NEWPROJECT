@@ -5,7 +5,7 @@ import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).parent.resolve()
-OUT_ZIP = REPO / "NEWPROJECT-win-py312.zip"
+OUT_ZIP = REPO / "NEWPROJECT-win-py312-cold-shot-v8.zip"
 
 EXCLUDE_DIRS = {".git", ".pytest_cache", "__pycache__", "cpp/build"}
 EXCLUDE_SUFFIXES = {".zip", ".png", ".jpg", ".pkl", ".npz", ".stp", ".pdf"}

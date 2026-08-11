@@ -30,7 +30,7 @@ def render_case(mold_key: str, alloy_key: str, out_dir: Path):
 
     # Cold-shot risk (inferno)
     viewer.show_cold_shot_risk(result)
-    viewer.camera_position = "xz"
+    viewer.camera_position = "xy"
     viewer.reset_camera()
     cs_png = out_dir / f"Deneme_Ring_{mold_key}_{alloy_key}_cold_shot.png"
     viewer.screenshot(str(cs_png))
@@ -39,7 +39,7 @@ def render_case(mold_key: str, alloy_key: str, out_dir: Path):
     # Lap risk (viridis) – toggle cold-shot off first
     viewer.toggle_cold_shot_risk(result, False)
     viewer.show_lap_risk(result)
-    viewer.camera_position = "xz"
+    viewer.camera_position = "xy"
     viewer.reset_camera()
     lap_png = out_dir / f"Deneme_Ring_{mold_key}_{alloy_key}_lap.png"
     viewer.screenshot(str(lap_png))

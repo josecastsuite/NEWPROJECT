@@ -41,7 +41,7 @@ from core.confluence_reeb import (
     find_saddles_sublevel,
     find_saddles_watershed,
 )
-from core.confluence_sfer import compute_sfer_risk
+from core.confluence_sfer import compute_sfer_risk, splat_saddle_risks
 from core.peclet import peclet_front_velocity_m_s
 from core.sphere_lut import get_sphere_64_6
 from core.thermal_solver import _alloy_to_dict, _dscheil_dT, _scheil_fs, solve_3d_thermal
@@ -1395,6 +1395,8 @@ def compute_cold_shot_risk(
                 ft, part_mask, persistence_thresh_s=base_persistence, ft_percentile=80.0, max_saddles=1000
             )
 
+        cold_shot_risk_viz = np.zeros_like(out)
+        lap_risk_viz = np.zeros_like(out)
         if saddles.shape[0] > 0:
             dirs, adj = get_sphere_64_6()
             lut = build_H_T_fs_LUT(alloy, n=1000)
@@ -1420,7 +1422,12 @@ def compute_cold_shot_risk(
             np.copyto(lap_risk, risk_lap_sfer)
             cold_shot_saddles = {"count": len(diagnostics), "saddles": diagnostics}
 
-    return out, lap_risk, cold_shot_saddles, last_fill_point_mm
+            # V8 cold-shot visualisation: splat the saddle-source risk into a
+            # small thickness-aware sphere so the whole part is not painted.
+            splat_saddle_risks(saddles, out, sdf, dx, 0.3, cold_shot_risk_viz)
+            splat_saddle_risks(saddles, risk_lap_sfer, sdf, dx, 0.05, lap_risk_viz)
+
+        return out, lap_risk, cold_shot_saddles, last_fill_point_mm, cold_shot_risk_viz, lap_risk_viz
 
 
 def compute_erosion_risk(
@@ -3789,7 +3796,14 @@ def analyze(
         T_meet = np.full_like(M_mod, alloy.t_pour_c)
         fs_meet = np.zeros_like(M_mod)
 
-    cold_shot_risk, lap_risk, cold_shot_saddles, last_fill_point_mm = compute_cold_shot_risk(
+    (
+        cold_shot_risk,
+        lap_risk,
+        cold_shot_saddles,
+        last_fill_point_mm,
+        cold_shot_risk_viz,
+        lap_risk_viz,
+    ) = compute_cold_shot_risk(
         part_mask,
         fill_time_s,
         velocity_magnitude,
@@ -3950,6 +3964,8 @@ def analyze(
         mold_wall_movement=mold_wall_movement,
         cold_shot_risk=cold_shot_risk,
         lap_risk=lap_risk,
+        cold_shot_risk_viz=cold_shot_risk_viz,
+        lap_risk_viz=lap_risk_viz,
         cold_shot_saddles=cold_shot_saddles,
         last_fill_point_mm=last_fill_point_mm,
         H_field=H_field,

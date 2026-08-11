@@ -74,7 +74,7 @@ BODY_OPACITY = {
 # hotspots, Niyama surfaces and flow fields are visible through the geometry.
 # Part is especially faint so risk isosurfaces stand out.
 BODY_OPACITY_POST = {
-    BodyType.PART: 0.12,
+    BodyType.PART: 0.08,
     BodyType.RISER: 0.35,
     BodyType.INGATE: 0.35,
     BodyType.RUNNER: 0.35,
@@ -245,6 +245,7 @@ class Analyzer3DViewer(QtInteractor):
         self._mold_wall_actor = None
         self._cold_shot_actor = None
         self._cold_shot_scalar_bar_actor = None
+        self._cold_shot_message_actor = None
         self._last_fill_actor = None
         self._lap_risk_actor = None
         self._saddle_actor = None
@@ -393,6 +394,7 @@ class Analyzer3DViewer(QtInteractor):
         self._mold_wall_actor = None
         self._cold_shot_actor = None
         self._cold_shot_scalar_bar_actor = None
+        self._cold_shot_message_actor = None
         self._last_fill_actor = None
         self._lap_risk_actor = None
         self._saddle_actor = None
@@ -489,8 +491,40 @@ class Analyzer3DViewer(QtInteractor):
         except Exception:
             pass
 
-    def _make_grid(self, result: AnalysisResult, scalars: np.ndarray, name: str) -> pv.ImageData:
-        """Build a PyVista ImageData (voxel grid) with point-centered scalars and masks."""
+    def _cell_data_to_point_max(self, grid: pv.ImageData, name: str) -> np.ndarray:
+        """Return point values that are the max of the 8 cells sharing each point.
+
+        This preserves small high-value blobs (e.g. cold-shot risk splats) that
+        would otherwise be averaged away by PyVista's default
+        ``cell_data_to_point_data`` interpolation."""
+        nx, ny, nz = grid.dimensions
+        nx_c, ny_c, nz_c = nx - 1, ny - 1, nz - 1
+        cell_arr = grid.cell_data[name].reshape((nx_c, ny_c, nz_c), order="F")
+        padded = np.zeros((nx_c + 2, ny_c + 2, nz_c + 2), dtype=cell_arr.dtype)
+        padded[1:-1, 1:-1, 1:-1] = cell_arr
+        # 8 corner offsets of the 2x2x2 cell block sharing each point.
+        p000 = padded[:nx_c + 1, :ny_c + 1, :nz_c + 1]
+        p100 = padded[1:nx_c + 2, :ny_c + 1, :nz_c + 1]
+        p010 = padded[:nx_c + 1, 1:ny_c + 2, :nz_c + 1]
+        p110 = padded[1:nx_c + 2, 1:ny_c + 2, :nz_c + 1]
+        p001 = padded[:nx_c + 1, :ny_c + 1, 1:nz_c + 2]
+        p101 = padded[1:nx_c + 2, :ny_c + 1, 1:nz_c + 2]
+        p011 = padded[:nx_c + 1, 1:ny_c + 2, 1:nz_c + 2]
+        p111 = padded[1:nx_c + 2, 1:ny_c + 2, 1:nz_c + 2]
+        point_arr = np.maximum.reduce([p000, p100, p010, p110, p001, p101, p011, p111])
+        return point_arr.ravel(order="F")
+
+    def _make_grid(
+        self,
+        result: AnalysisResult,
+        scalars: np.ndarray,
+        name: str,
+        point_max: bool = False,
+    ) -> pv.ImageData:
+        """Build a PyVista ImageData (voxel grid) with point-centered scalars and masks.
+
+        When ``point_max=True`` only the primary scalar is converted with a
+        max-of-neighbours rule so isolated high-value blobs are not averaged away."""
         grid = pv.ImageData()
         grid.dimensions = np.array(result.grid.shape) + 1
         grid.origin = result.origin_mm
@@ -512,6 +546,11 @@ class Analyzer3DViewer(QtInteractor):
             ],
         )
         grid.cell_data["is_gate"] = gate_mask.ravel(order="F").astype(np.float64)
+        if point_max:
+            point_arr = self._cell_data_to_point_max(grid, name)
+            grid = grid.cell_data_to_point_data()
+            grid.point_data[name] = point_arr
+            return grid
         # Contour / slice filters require point data; convert and keep both scalars.
         return grid.cell_data_to_point_data()
 
@@ -1432,36 +1471,61 @@ class Analyzer3DViewer(QtInteractor):
         if self._last_fill_actor is not None:
             self.remove_actor(self._last_fill_actor)
             self._last_fill_actor = None
+        if self._cold_shot_message_actor is not None:
+            self.remove_actor(self._cold_shot_message_actor)
+            self._cold_shot_message_actor = None
         self._remove_scalar_bar("Soğuk birleşme riski")
 
         if result is None or result.cold_shot_risk is None or result.cold_shot_risk.size == 0:
             return
 
-        grid = self._make_grid(result, result.cold_shot_risk, "cold_shot_risk")
+        # V8: use the sparse, thickness-aware splat field if available.
+        cs_grid = getattr(result, "cold_shot_risk_viz", result.cold_shot_risk)
+        if cs_grid is None or cs_grid.size == 0:
+            cs_grid = result.cold_shot_risk
+
+        if float(cs_grid.max()) < 0.01:
+            self._cold_shot_message_actor = self.add_text(
+                "Risk düşük, isosurface yok",
+                position="lower_left",
+                font_size=12,
+                color="black",
+                name="cold_shot_low_risk_msg",
+            )
+            self._show_saddle_glyphs(result, "cold")
+            return
+
+        cs_masked = np.where(cs_grid >= 0.3, cs_grid, 0.0)
+        grid = self._make_grid(result, cs_masked, "cold_shot_risk", point_max=True)
         part = self._part_only(grid)
         if part.n_cells == 0:
             return
 
         clim = [0.0, 1.0]
 
-        # Closed isosurfaces at risk thresholds; high-risk shells are nested.
-        contours = part.contour(isosurfaces=[0.3, 0.5, 0.7, 0.9], scalars="cold_shot_risk")
-        if contours.n_points > 0 and "cold_shot_risk" not in contours.array_names:
-            contours.cell_data["cold_shot_risk"] = np.zeros(contours.n_cells, dtype=np.float64)
-            contours = contours.cell_data_to_point_data()
-        if contours.n_points > 0:
-            contour_actor = self.add_mesh(
-                contours,
-                scalars="cold_shot_risk",
-                cmap="inferno",
-                opacity=0.85,
-                clim=clim,
-                show_scalar_bar=True,
-                scalar_bar_args=_scalar_bar_args("Soğuk birleşme riski", (0.02, 0.02), clim=clim),
-                smooth_shading=True,
-            )
-        else:
-            contour_actor = None
+        # Small / thin parts: show only saddle glyphs, do not paint the surface.
+        show_as_glyphs_only = False
+        if result.bbox_size_mm is not None and result.bbox_size_mm.size == 3 and result.dx_mm > 0:
+            show_as_glyphs_only = float(result.bbox_size_mm.min()) < 20.0 * float(result.dx_mm)
+
+        contour_actor = None
+        if not show_as_glyphs_only:
+            # Closed isosurfaces at risk thresholds; high-risk shells are nested.
+            contours = part.contour(isosurfaces=[0.3, 0.5, 0.7, 0.9], scalars="cold_shot_risk")
+            if contours.n_points > 0 and "cold_shot_risk" not in contours.array_names:
+                contours.cell_data["cold_shot_risk"] = np.zeros(contours.n_cells, dtype=np.float64)
+                contours = contours.cell_data_to_point_data()
+            if contours.n_points > 0:
+                contour_actor = self.add_mesh(
+                    contours,
+                    scalars="cold_shot_risk",
+                    cmap="inferno",
+                    opacity=0.85,
+                    clim=clim,
+                    show_scalar_bar=True,
+                    scalar_bar_args=_scalar_bar_args("Soğuk birleşme riski", (0.02, 0.02), clim=clim),
+                    smooth_shading=True,
+                )
 
         self._cold_shot_actor = [contour_actor] if contour_actor is not None else []
 
@@ -1497,6 +1561,9 @@ class Analyzer3DViewer(QtInteractor):
             if self._last_fill_actor is not None:
                 self.remove_actor(self._last_fill_actor)
                 self._last_fill_actor = None
+            if self._cold_shot_message_actor is not None:
+                self.remove_actor(self._cold_shot_message_actor)
+                self._cold_shot_message_actor = None
             self._remove_saddle_glyphs()
             self._remove_scalar_bar("Soğuk birleşme riski")
 
@@ -1515,7 +1582,12 @@ class Analyzer3DViewer(QtInteractor):
         if result is None or result.lap_risk is None or result.lap_risk.size == 0:
             return
 
-        grid = self._make_grid(result, result.lap_risk, "lap_risk")
+        lap_grid = getattr(result, "lap_risk_viz", result.lap_risk)
+        if lap_grid is None or lap_grid.size == 0:
+            lap_grid = result.lap_risk
+
+        lap_masked = np.where(lap_grid >= 0.3, lap_grid, 0.0)
+        grid = self._make_grid(result, lap_masked, "lap_risk", point_max=True)
         part = self._part_only(grid)
         if part.n_cells == 0:
             return
