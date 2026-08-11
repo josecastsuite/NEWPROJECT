@@ -520,5 +520,6 @@ class AnalysisResult:
     thermal_stress_pa: np.ndarray = field(default_factory=lambda: np.array([]))
     hot_tear_risk: np.ndarray = field(default_factory=lambda: np.array([]))
     cold_crack_risk: np.ndarray = field(default_factory=lambda: np.array([]))
-    # metadata
+    # debug / metadata
+    fill_time_s: np.ndarray = field(default_factory=lambda: np.array([]))
     bbox_size_mm: np.ndarray = field(default_factory=lambda: np.zeros(3))

@@ -33,7 +33,17 @@ from core.materials import (
     make_effective_mold,
 )
 from core.riser_designer import propose_risers
-from core.enthalpy_lut import compute_H_field
+from core.enthalpy_lut import build_H_T_fs_LUT, compute_H_field
+from core.confluence_reeb import (
+    find_local_maxima,
+    find_saddles_gate_watershed,
+    find_saddles_skeleton,
+    find_saddles_sublevel,
+    find_saddles_watershed,
+)
+from core.confluence_sfer import compute_sfer_risk
+from core.peclet import peclet_front_velocity_m_s
+from core.sphere_lut import get_sphere_64_6
 from core.thermal_solver import _alloy_to_dict, _dscheil_dT, _scheil_fs, solve_3d_thermal
 from core.voxel_arena import VoxelArena
 from core.voxelizer import build_part_grid
@@ -894,7 +904,11 @@ def compute_cold_shot_risk(
     curvature_gauss: Optional[np.ndarray] = None,
     C_field: Optional[np.ndarray] = None,
     e_field: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+    H_field: Optional[np.ndarray] = None,
+    dist_feed: Optional[np.ndarray] = None,
+    grid: Optional[np.ndarray] = None,
+    body_index: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any], np.ndarray]:
     """Estimate per-voxel cold-shut (soğuk birleşme) risk and the last fill point.
 
     The model is built on three physically grounded observations:
@@ -921,8 +935,9 @@ def compute_cold_shot_risk(
                              (effusivity)
         feeder_factor      : feeders keep the surrounding metal hotter
 
-    Returns ``(cold_shot_risk, last_fill_point_mm)``.  ``last_fill_point_mm`` is
-    an empty array when no valid fill data exists.
+    Returns ``(cold_shot_risk, lap_risk, cold_shot_saddles, last_fill_point_mm)``.
+    ``cold_shot_saddles`` is a diagnostics dictionary and ``last_fill_point_mm``
+    is an empty array when no valid fill data exists.
 
     All large per-voxel intermediates are allocated from a ``VoxelArena`` and
     computed in-place, so Windows does not need to hand out a fresh 526 MiB
@@ -931,6 +946,8 @@ def compute_cold_shot_risk(
     if fill_time is None or fill_time.size == 0:
         return (
             np.zeros(part_mask.shape, dtype=np.float64),
+            np.zeros(part_mask.shape, dtype=np.float64),
+            {},
             np.array([], dtype=np.float64),
         )
 
@@ -944,6 +961,8 @@ def compute_cold_shot_risk(
     if not valid_fill.any():
         return (
             np.zeros(part_mask.shape, dtype=np.float64),
+            np.zeros(part_mask.shape, dtype=np.float64),
+            {},
             np.array([], dtype=np.float64),
         )
 
@@ -1301,7 +1320,105 @@ def compute_cold_shot_risk(
     else:
         last_fill_point_mm = np.array([], dtype=np.float64)
 
-    return out, last_fill_point_mm
+    # ---------- V8 SFER (spherical front encounter rate) cold-shot / lap risk ----------
+    lap_risk = np.zeros_like(out)
+    cold_shot_saddles: Dict[str, Any] = {}
+    if (
+        H_field is not None
+        and H_field.shape == shape
+        and C_field is not None
+        and C_field.shape == shape
+        and M_mod is not None
+        and M_mod.shape == shape
+    ):
+        # distance to feeder for the feeder factor inside SFER
+        if dist_feed is not None and dist_feed.shape == shape:
+            dist_feeder = np.asarray(dist_feed, dtype=np.float64)
+        elif feeder_mask is not None and feeder_mask.shape == shape:
+            dist_feeder = ndimage.distance_transform_edt(~feeder_mask, sampling=float(dx))
+            dist_feeder = dist_feeder.astype(np.float64)
+        else:
+            dist_feeder = np.full(shape, 1e6, dtype=np.float64)
+
+        # front velocity from the fill-time gradient (m/s); mask outside valid fill.
+        t_max = float(np.max(ft[valid_fill])) if valid_fill.any() else 1.0
+        ft_for_v = np.where(valid_fill, ft, t_max + 1.0)
+        v_front = peclet_front_velocity_m_s(ft_for_v, dx)
+
+        # velocity vector field for the head-on closing speed
+        if velocity_m_s is not None and velocity_m_s.size == 3 * n:
+            if velocity_m_s.ndim == 4 and velocity_m_s.shape[0] == 3:
+                velocity = velocity_m_s
+            else:
+                velocity = velocity_m_s.reshape((3,) + shape)
+        else:
+            velocity = np.zeros((3,) + shape, dtype=np.float64)
+
+        ft_range = float(np.max(ft[valid_fill])) - float(np.min(ft[valid_fill]))
+        base_persistence = 0.1 if (alloy.material_family or "steel").lower() in ("al", "mg") else 0.3
+        saddles = np.empty((0, 3), dtype=np.int64)
+
+        # 1) Gate-body seeded watershed (multiple ingates give distinct fronts).
+        if grid is not None and body_index is not None and grid.shape == shape and body_index.shape == shape:
+            saddles, _, _ = find_saddles_gate_watershed(
+                ft,
+                part_mask,
+                grid,
+                body_index,
+                persistence_thresh_s=base_persistence,
+                max_saddles=1000,
+                sigma=1.0,
+            )
+
+        # 2) Sublevel-set persistence (merge-tree saddles) on the fill-time field.
+        if saddles.shape[0] < 10:
+            saddles, _, _ = find_saddles_sublevel(
+                ft, part_mask, persistence_thresh_s=base_persistence, max_saddles=1000
+            )
+            if saddles.shape[0] < 10 and ft_range > 0.0:
+                persistence = max(0.001, 0.001 * ft_range)
+                saddles, _, _ = find_saddles_sublevel(
+                    ft, part_mask, persistence_thresh_s=persistence, max_saddles=1000
+                )
+
+        # 3) Persistent local maxima of fill time are closure/confluence points.
+        if saddles.shape[0] < 10:
+            saddles, _, _ = find_local_maxima(
+                ft, part_mask, h_relative=0.05, sigma=2.0, max_candidates=1000
+            )
+
+        # 4) Medial-axis / skeleton ridges capture confluence lines even when
+        #    the fill-time landscape has only one broad closure region.
+        if saddles.shape[0] < 10:
+            saddles, _, _ = find_saddles_skeleton(
+                ft, part_mask, persistence_thresh_s=base_persistence, ft_percentile=80.0, max_saddles=1000
+            )
+
+        if saddles.shape[0] > 0:
+            dirs, adj = get_sphere_64_6()
+            lut = build_H_T_fs_LUT(alloy, n=1000)
+            risk_cs_sfer, risk_lap_sfer, diagnostics = compute_sfer_risk(
+                saddles,
+                ft,
+                H_field,
+                M_mod,
+                sdf if sdf is not None else np.full(shape, 1.0, dtype=np.float64),
+                C_field,
+                v_front,
+                velocity,
+                dist_feeder,
+                part_mask,
+                lut,
+                dirs,
+                adj,
+                dx,
+                alloy,
+            )
+            np.maximum(out, risk_cs_sfer, out=out)
+            np.copyto(lap_risk, risk_lap_sfer)
+            cold_shot_saddles = {"count": len(diagnostics), "saddles": diagnostics}
+
+    return out, lap_risk, cold_shot_saddles, last_fill_point_mm
 
 
 def compute_erosion_risk(
@@ -3670,7 +3787,7 @@ def analyze(
         T_meet = np.full_like(M_mod, alloy.t_pour_c)
         fs_meet = np.zeros_like(M_mod)
 
-    cold_shot_risk, last_fill_point_mm = compute_cold_shot_risk(
+    cold_shot_risk, lap_risk, cold_shot_saddles, last_fill_point_mm = compute_cold_shot_risk(
         part_mask,
         fill_time_s,
         velocity_magnitude,
@@ -3692,6 +3809,10 @@ def analyze(
         curvature_gauss=gauss_curv,
         C_field=C_field,
         e_field=e_field,
+        H_field=H_field,
+        dist_feed=dist_feed,
+        grid=grid,
+        body_index=body_index,
     )
 
     # v10.5: per-voxel mold-sand erosion risk from local metal velocity.
@@ -3826,8 +3947,8 @@ def analyze(
         pore_size_fine_mask=pore_fine_mask,
         mold_wall_movement=mold_wall_movement,
         cold_shot_risk=cold_shot_risk,
-        lap_risk=np.zeros_like(cold_shot_risk),
-        cold_shot_saddles={},
+        lap_risk=lap_risk,
+        cold_shot_saddles=cold_shot_saddles,
         last_fill_point_mm=last_fill_point_mm,
         H_field=H_field,
         T_meet=T_meet,
@@ -3849,6 +3970,7 @@ def analyze(
         thermal_stress_pa=thermal_stress,
         hot_tear_risk=hot_tear_risk,
         cold_crack_risk=cold_crack_risk,
+        fill_time_s=fill_time_s,
     )
 
     result.riser_proposals = propose_risers(
