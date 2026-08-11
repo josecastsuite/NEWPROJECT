@@ -1322,11 +1322,11 @@ class Analyzer3DViewer(QtInteractor):
         """Render trapped-air risk with volume rendering + physical isosurfaces.
 
         A hybrid volume/isosurface display is used: ``add_volume`` shows the
-        translucent low-risk gas cloud with the ``inferno`` colour map and a
-        sigmoid opacity transfer function, while ``contour`` extracts closed
-        surfaces at the physical thresholds 5 %, 20 %, 50 % and 80 % gas
-        volume fraction.  This is the standard used for compressible-gas
-        visualisation in LBM/VOF literature.
+        translucent low-risk gas cloud with the ``coolwarm`` colour map (blue
+        = low risk, red = high risk) and a sigmoid opacity transfer function,
+        while ``contour`` extracts closed surfaces at the physical thresholds
+        5 %, 20 %, 50 % and 80 % gas volume fraction.  This matches the
+        convention used in LBM/VOF compressible-gas visualisation.
         """
         if self._air_entrapment_actor is not None:
             if isinstance(self._air_entrapment_actor, (list, tuple)):
@@ -1373,7 +1373,7 @@ class Analyzer3DViewer(QtInteractor):
         contours = grid.contour(isosurfaces=[0.05, 0.20, 0.50, 0.80], scalars="air")
         contour_actor = self.add_mesh(
             contours,
-            cmap="inferno",
+            cmap="coolwarm",
             clim=[0.0, 1.0],
             smooth_shading=True,
             specular=0.8,
@@ -1396,7 +1396,7 @@ class Analyzer3DViewer(QtInteractor):
         vol_actor = self.add_volume(
             grid,
             scalars="air",
-            cmap="inferno",
+            cmap="coolwarm",
             opacity="sigmoid",
             clim=[0.02, 1.0],
             show_scalar_bar=False,

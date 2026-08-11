@@ -34,7 +34,7 @@ def render_air(result, title: str, out_png: Path):
     if contours.n_points > 0:
         pl.add_mesh(
             contours,
-            cmap="inferno",
+            cmap="coolwarm",
             clim=[0.0, 1.0],
             smooth_shading=True,
             specular=0.8,
@@ -45,7 +45,7 @@ def render_air(result, title: str, out_png: Path):
     pl.add_volume(
         grid,
         scalars="air",
-        cmap="inferno",
+        cmap="coolwarm",
         opacity="sigmoid",
         clim=[0.02, 1.0],
         show_scalar_bar=False,
