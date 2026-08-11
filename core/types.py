@@ -490,6 +490,8 @@ class AnalysisResult:
     mold_wall_movement: np.ndarray = field(default_factory=lambda: np.array([]))
     # v10.4: per-voxel cold-shut (cold shot) risk and the last fill location
     cold_shot_risk: np.ndarray = field(default_factory=lambda: np.array([]))
+    lap_risk: np.ndarray = field(default_factory=lambda: np.array([]))
+    cold_shot_saddles: Dict[str, Any] = field(default_factory=dict)
     last_fill_point_mm: np.ndarray = field(default_factory=lambda: np.array([]))
     # v10.5: per-voxel mold-sand erosion risk from high metal velocity
     erosion_risk: np.ndarray = field(default_factory=lambda: np.array([]))

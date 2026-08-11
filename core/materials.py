@@ -161,6 +161,21 @@ class Alloy:
     # more visible; <1 suppresses them for alloys that are very tolerant.
     cold_shot_gain: float = 1.0
 
+    # V8 cold-shut / confluence physics
+    eutectic_temp_c: float = 0.0
+    eutectic_fraction: float = 0.0
+    pe_flow_factor_c: float = 0.05
+    pe_flow_factor_max: float = 2.0
+    we_crit: float = 0.0
+    dt_crit_s: float = 1.0
+    dt_crit_lap_s: float = 0.5
+    fs_crit: float = 0.5
+    fs_crit_lap: float = 0.35
+    dT_crit_c: float = 20.0
+    oxide_parabolic_rate_Kp: float = 1e-12
+    oxide_young_modulus_pa: float = 200e9
+    oxide_surface_energy_j_m2: float = 1.0
+
     def __post_init__(self):
         if self.density_g_cm3 == 0.0:
             self.density_g_cm3 = self.rho_g_cm3
@@ -232,6 +247,16 @@ class Alloy:
     def diffusivity_mm2_s(self) -> float:
         """Thermal diffusivity α = k / (ρ·c)  [mm²/s]."""
         return (self.k_w_mk / (self.rho_kg_m3 * self.cp_j_kgk)) * 1e6
+
+    @property
+    def thermal_diffusivity_m2_s(self) -> float:
+        """Thermal diffusivity α = k / (ρ·c)  [m²/s]."""
+        return self.k_w_mk / (self.rho_kg_m3 * self.cp_j_kgk + 1e-12)
+
+    @property
+    def t_eutectic_or_solidus_c(self) -> float:
+        """Eutectic temperature if defined, otherwise solidus."""
+        return self.eutectic_temp_c if self.eutectic_temp_c > 0.0 else self.t_solidus_c
 
 
 # ---------------------------------------------------------------------------

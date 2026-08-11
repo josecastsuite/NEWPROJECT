@@ -24,8 +24,11 @@ from sklearn.cluster import DBSCAN
 from core.materials import (
     Alloy,
     MoldMaterial,
+    BODY_PRESETS,
+    MOLDS,
     chvorinov_c_from_properties,
     get_alloy,
+    get_body_preset,
     get_mold,
     make_effective_mold,
 )
@@ -159,6 +162,120 @@ def compute_curvature(sdf: np.ndarray, dx: float) -> Tuple[np.ndarray, np.ndarra
         + hxz * (hxy * hzy - hxz * hyy)
     )
     return mean_curv, gauss
+
+
+def compute_steiner_modulus(
+    sdf: np.ndarray, mean_curv: np.ndarray, gauss_curv: np.ndarray, clip_min: float = 0.1
+) -> np.ndarray:
+    """
+    Steiner shape-corrected local modulus.
+
+    M_mod = SDF / (1 - 2*H*SDF + K*SDF^2)
+    where H is mean curvature and K is Gaussian curvature.
+    The implementation uses the SDF Laplacian (trace of Hessian) as 2*H and
+    the determinant of the Hessian as K, so the expression becomes:
+        shape_factor = 1 - mean_curv*SDF + gauss_curv*SDF^2
+    SDF and M_mod are in the same length units (mm).
+    """
+    shape_factor = 1.0 - mean_curv * sdf + gauss_curv * (sdf ** 2)
+    shape_factor = np.clip(shape_factor, clip_min, None)
+    M_mod = sdf / shape_factor
+    # Guard negative or tiny SDF values.
+    M_mod = np.where(sdf > 0.0, M_mod, 0.0)
+    return M_mod
+
+
+def _body_mold_material(body: Body, mold: MoldMaterial) -> MoldMaterial:
+    """Resolve the mould/contact material represented by a non-metal body."""
+    preset = (getattr(body, "mold_preset", None) or "").strip()
+    if preset:
+        mat = get_body_preset(preset)
+        if mat is None:
+            mat = get_mold(preset)
+        if mat is not None:
+            return mat
+    # Fallback by body type / feeder type
+    if body.body_type in (BodyType.CHILL, BodyType.COOLING_SPRUE):
+        return get_body_preset("steel_chill") or mold
+    if body.body_type == BodyType.FILTER:
+        return get_body_preset("ceramic_foam_filter") or mold
+    if body.body_type == BodyType.SLEEVE:
+        return get_body_preset("insulating_sleeve") or mold
+    if body.body_type == BodyType.RISER:
+        ftype = (getattr(body, "feeder_type", None) or "").lower()
+        if "exothermic" in ftype:
+            return get_body_preset("exothermic_sleeve") or mold
+        if "insulated" in ftype or "insulating" in ftype:
+            return get_body_preset("insulating_sleeve") or mold
+        if "chill" in ftype or "chilled" in ftype:
+            return get_body_preset("steel_chill") or mold
+        # conventional riser: use the main mould
+        return mold
+    return mold
+
+
+def build_local_chvorinov_c_field(
+    grid: np.ndarray,
+    body_index: Optional[np.ndarray],
+    bodies: List[Body],
+    mold: MoldMaterial,
+    alloy: Alloy,
+) -> np.ndarray:
+    """
+    Per-voxel Chvorinov constant C [dk/cm^2].
+
+    Non-metal voxels (mould + inserts) get the C computed from their material.
+    Metal voxels inherit the C of the nearest non-metal voxel, so chills or
+    sleeves correctly accelerate/slow down local solidification.
+    """
+    is_metal = np.isin(grid, BODY_METAL_TYPES)
+    C_base = chvorinov_c_from_properties(alloy, mold)
+    C_grid = np.full(grid.shape, C_base, dtype=np.float64)
+
+    if body_index is not None and bodies:
+        for body in bodies:
+            if body is None:
+                continue
+            mat = _body_mold_material(body, mold)
+            C_mat = chvorinov_c_from_properties(alloy, mat)
+            mask = (body_index == body.index) & (~is_metal)
+            if mask.any():
+                C_grid[mask] = C_mat
+
+    C_field = C_grid.copy()
+    if is_metal.any():
+        # nearest non-metal voxel (is_metal=0 is the feature)
+        _, nearest = ndimage.distance_transform_edt(is_metal, return_indices=True)
+        C_field[is_metal] = C_grid[nearest[0][is_metal], nearest[1][is_metal], nearest[2][is_metal]]
+    return C_field
+
+
+def build_effusivity_field(
+    grid: np.ndarray,
+    body_index: Optional[np.ndarray],
+    bodies: List[Body],
+    mold: MoldMaterial,
+) -> np.ndarray:
+    """Per-voxel thermal effusivity e = sqrt(k * rho * cp) [J/(m^2 K s^0.5)]."""
+    is_metal = np.isin(grid, BODY_METAL_TYPES)
+    e_base = math.sqrt(max(mold.k_w_mk * mold.rho_kg_m3 * mold.cp_j_kgk, 0.0))
+    e_grid = np.full(grid.shape, e_base, dtype=np.float64)
+
+    if body_index is not None and bodies:
+        for body in bodies:
+            if body is None:
+                continue
+            mat = _body_mold_material(body, mold)
+            e_mat = math.sqrt(max(mat.k_w_mk * mat.rho_kg_m3 * mat.cp_j_kgk, 0.0))
+            mask = (body_index == body.index) & (~is_metal)
+            if mask.any():
+                e_grid[mask] = e_mat
+
+    e_field = e_grid.copy()
+    if is_metal.any():
+        _, nearest = ndimage.distance_transform_edt(is_metal, return_indices=True)
+        e_field[is_metal] = e_grid[nearest[0][is_metal], nearest[1][is_metal], nearest[2][is_metal]]
+    return e_field
 
 
 def _marching_cubes_surface(
@@ -771,6 +888,11 @@ def compute_cold_shot_risk(
     feeder_mask: Optional[np.ndarray] = None,
     feed_risk: Optional[np.ndarray] = None,
     velocity_m_s: Optional[np.ndarray] = None,
+    sdf: Optional[np.ndarray] = None,
+    curvature_mean: Optional[np.ndarray] = None,
+    curvature_gauss: Optional[np.ndarray] = None,
+    C_field: Optional[np.ndarray] = None,
+    e_field: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Estimate per-voxel cold-shut (soğuk birleşme) risk and the last fill point.
 
@@ -1592,6 +1714,7 @@ def find_hotspots(
     dx: float,
     origin_mm: np.ndarray,
     curvature: Optional[np.ndarray] = None,
+    gaussian_curvature: Optional[np.ndarray] = None,
     use_skeleton: bool = True,
     min_size_mm: float = 2.0,
     cluster_eps_mm: float = 10.0,
@@ -1613,17 +1736,14 @@ def find_hotspots(
     naturally solidifies earlier and breaks the connection, so the region under
     a riser is not reported as a part hot spot.
     """
-    # Shape-corrected modulus
+    # Shape-corrected modulus (Steiner: M = SDF / (1 - 2H*SDF + K*SDF^2))
     if curvature is not None:
-        # Concave regions (positive curvature) get a smaller shape factor,
-        # increasing the local modulus to reflect heat accumulation at L/T/X
-        # junctions.  f ≈ 0.77 gives up to ~30 % modulus boost.
-        shape_factor_field = np.clip(
-            1.0 - curvature * sdf, 0.77, 3.0
-        )
+        gauss = gaussian_curvature
+        if gauss is None:
+            _, gauss = compute_curvature(sdf, dx)
+        M_mod = compute_steiner_modulus(sdf, curvature, gauss, clip_min=0.1)
     else:
-        shape_factor_field = np.ones_like(sdf)
-    M_mod = sdf / shape_factor_field
+        M_mod = sdf.copy()
 
     if is_metal is None:
         is_metal = part_mask
@@ -2411,11 +2531,8 @@ def _refine_region(
     is_metal = np.isin(grid, BODY_METAL_TYPES)
     sdf = compute_sdf(is_metal, dx)
     C = chvorinov_c_from_properties(alloy, mold)
-    mean_curv, _ = compute_curvature(sdf, dx)
-    shape_factor_field = np.clip(
-        1.0 - mean_curv * sdf, 0.77, 3.0
-    )
-    M_mod = sdf / shape_factor_field
+    mean_curv, gauss_curv = compute_curvature(sdf, dx)
+    M_mod = compute_steiner_modulus(sdf, mean_curv, gauss_curv, clip_min=0.1)
     t_s = compute_chvorinov_t(M_mod, C)
     T, R, fs, _ = compute_thermal_field(
         grid, is_metal, alloy, mold, dx, sdf=sdf, M_mod=M_mod
@@ -2496,11 +2613,8 @@ def _high_res_part_hotspots(
     # that is directly attached to a thick runner/riser gets a larger effective
     # modulus and stays connected longer during the pseudo-thermal CCL.
     part_sdf = compute_subvoxel_sdf(part_is_metal, part_dx, sub=1)
-    mean_curv, _ = compute_curvature(part_sdf, part_dx)
-    shape_factor_field = np.clip(
-        1.0 - mean_curv * part_sdf, 0.77, 3.0
-    )
-    part_M_mod = part_sdf / shape_factor_field
+    mean_curv, gauss_curv = compute_curvature(part_sdf, part_dx)
+    part_M_mod = compute_steiner_modulus(part_sdf, mean_curv, gauss_curv, clip_min=0.1)
 
     # Derive feeder mask directly from the high-res grid.  Only dedicated
     # RISER bodies are true feeders; gates/runners/sprues are not.
@@ -2836,12 +2950,10 @@ def analyze(
         progress_callback(18)
 
     mean_curv, gauss_curv = compute_curvature(sdf, dx)
-    # Shape factor from mean curvature: f=1 for plates, f≈2 for cylinders,
-    # f≈3 for spheres, f<1 for concave L/T/X junctions (heat accumulation).
-    shape_factor_field = np.clip(
-        1.0 - mean_curv * sdf, 0.77, 3.0
-    )
-    M_mod = sdf / shape_factor_field
+    # Steiner shape-corrected modulus: M = SDF / (1 - 2H*SDF + K*SDF^2).
+    # The SDF Laplacian is 2*H and the Hessian determinant is K, so the
+    # formula reduces to 1 - mean_curv*SDF + gauss_curv*SDF^2.
+    M_mod = compute_steiner_modulus(sdf, mean_curv, gauss_curv, clip_min=0.1)
     if progress_callback:
         progress_callback(25)
 
@@ -3071,7 +3183,8 @@ def analyze(
     )
     feeder_time_factor = _weighted_feeder_time_factor(bodies)
     hotspots = find_hotspots(
-        sdf, part_mask, dx, origin_mm, curvature=mean_curv, use_skeleton=True,
+        sdf, part_mask, dx, origin_mm, curvature=mean_curv, gaussian_curvature=gauss_curv,
+        use_skeleton=True,
         min_size_mm=hotspot_min_size_mm,
         cluster_eps_mm=hotspot_cluster_mm,
         is_metal=is_metal,
@@ -3131,6 +3244,7 @@ def analyze(
             dx,
             origin_mm,
             curvature=mean_curv,
+            gaussian_curvature=gauss_curv,
             use_skeleton=True,
             min_size_mm=hotspot_min_size_mm,
             cluster_eps_mm=hotspot_cluster_mm,
@@ -3541,6 +3655,9 @@ def analyze(
     )
 
     # v10.4: per-voxel cold-shut (soğuk birleşme) risk and the last fill point.
+    # V8: local mould-material Chvorinov and effusivity fields.
+    C_field = build_local_chvorinov_c_field(grid, body_index, bodies, mold, alloy)
+    e_field = build_effusivity_field(grid, body_index, bodies, mold)
     cold_shot_risk, last_fill_point_mm = compute_cold_shot_risk(
         part_mask,
         fill_time_s,
@@ -3558,6 +3675,11 @@ def analyze(
         feeder_mask=feeder_mask,
         feed_risk=feed_risk,
         velocity_m_s=velocity_m_s,
+        sdf=sdf,
+        curvature_mean=mean_curv,
+        curvature_gauss=gauss_curv,
+        C_field=C_field,
+        e_field=e_field,
     )
 
     # v10.5: per-voxel mold-sand erosion risk from local metal velocity.
