@@ -493,6 +493,10 @@ class AnalysisResult:
     lap_risk: np.ndarray = field(default_factory=lambda: np.array([]))
     cold_shot_saddles: Dict[str, Any] = field(default_factory=dict)
     last_fill_point_mm: np.ndarray = field(default_factory=lambda: np.array([]))
+    # V8 cold-shot meeting enthalpy / temperature / solid fraction
+    H_field: np.ndarray = field(default_factory=lambda: np.array([]))
+    T_meet: np.ndarray = field(default_factory=lambda: np.array([]))
+    fs_meet: np.ndarray = field(default_factory=lambda: np.array([]))
     # v10.5: per-voxel mold-sand erosion risk from high metal velocity
     erosion_risk: np.ndarray = field(default_factory=lambda: np.array([]))
     # v10.6: per-voxel air entrapment from LBM free-surface solver

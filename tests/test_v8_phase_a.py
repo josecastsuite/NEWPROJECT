@@ -27,34 +27,41 @@ def test_sphere_64_6():
 def test_enthalpy_lut_eutectic_plateau():
     """AlSi7 has f_eut>0; the plateau must give Te over a range of H."""
     alloy = get_alloy("AlSi7")
+    cp = alloy.cp_j_kgk
+    L = alloy.latent_heat_j_kg
+    Tl = alloy.t_liquidus_c
+    Te = alloy.t_eutectic_or_solidus_c
     lut = build_H_T_fs_LUT(alloy, n=500)
-    assert lut.H_table.size == 500
     assert np.all(np.diff(lut.H_table) > 0)
-    # at the liquid end T ~ Tl, fs ~ 0
-    H_liq = lut.H_table[-1]
+    # at the liquidus T ~ Tl, fs ~ 0
+    H_liq = cp * Tl + L
     T, fs = interp_H_LUT(H_liq, lut.H_table, lut.T_table, lut.fs_table)
-    assert abs(T - alloy.t_liquidus_c) < 1.0
+    assert abs(T - Tl) < 1.0
     assert abs(fs) < 0.05
     # at the solid end T ~ Te, fs ~ 1
-    H_sol = lut.H_table[0]
+    H_sol = cp * Te
     T, fs = interp_H_LUT(H_sol, lut.H_table, lut.T_table, lut.fs_table)
-    assert abs(T - alloy.t_eutectic_or_solidus_c) < 1.0
+    assert abs(T - Te) < 1.0
     assert abs(fs - 1.0) < 0.05
     # plateau: many points share Te
-    te_count = np.sum(np.abs(lut.T_table - alloy.t_eutectic_or_solidus_c) < 0.5)
+    te_count = np.sum(np.abs(lut.T_table - Te) < 0.5)
     assert te_count > 10
 
 
 def test_enthalpy_lut_steel_no_plateau():
     alloy = get_alloy("42CrMo4")
-    lut = build_H_T_fs_LUT(alloy, n=500)
-    assert np.all(np.diff(lut.H_table) > 0)
+    cp = alloy.cp_j_kgk
+    L = alloy.latent_heat_j_kg
     Tl = alloy.t_liquidus_c
     Ts = alloy.t_solidus_c
-    T_top, _ = interp_H_LUT(lut.H_table[-1], lut.H_table, lut.T_table, lut.fs_table)
-    T_bot, _ = interp_H_LUT(lut.H_table[0], lut.H_table, lut.T_table, lut.fs_table)
+    lut = build_H_T_fs_LUT(alloy, n=500)
+    assert np.all(np.diff(lut.H_table) > 0)
+    T_top, fs_top = interp_H_LUT(cp * Tl + L, lut.H_table, lut.T_table, lut.fs_table)
+    T_bot, fs_bot = interp_H_LUT(cp * Ts, lut.H_table, lut.T_table, lut.fs_table)
     assert abs(T_top - Tl) < 1.0
+    assert abs(fs_top) < 0.05
     assert abs(T_bot - Ts) < 1.0
+    assert abs(fs_bot - 1.0) < 0.05
 
 
 def test_steiner_modulus():

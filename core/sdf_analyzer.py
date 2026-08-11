@@ -33,6 +33,7 @@ from core.materials import (
     make_effective_mold,
 )
 from core.riser_designer import propose_risers
+from core.enthalpy_lut import compute_H_field
 from core.thermal_solver import _alloy_to_dict, _dscheil_dT, _scheil_fs, solve_3d_thermal
 from core.voxel_arena import VoxelArena
 from core.voxelizer import build_part_grid
@@ -3658,6 +3659,17 @@ def analyze(
     # V8: local mould-material Chvorinov and effusivity fields.
     C_field = build_local_chvorinov_c_field(grid, body_index, bodies, mold, alloy)
     e_field = build_effusivity_field(grid, body_index, bodies, mold)
+
+    # V8: meeting enthalpy field from Chvorinov T(t) + Scheil fs (direct, no LUT).
+    if fill_time_s is not None and fill_time_s.size:
+        H_field, T_meet, fs_meet = compute_H_field(
+            M_mod, C_field, fill_time_s, alloy, t_pour_c=alloy.t_pour_c, t_mold_c=mold.t0_c
+        )
+    else:
+        H_field = np.zeros_like(M_mod)
+        T_meet = np.full_like(M_mod, alloy.t_pour_c)
+        fs_meet = np.zeros_like(M_mod)
+
     cold_shot_risk, last_fill_point_mm = compute_cold_shot_risk(
         part_mask,
         fill_time_s,
@@ -3814,7 +3826,12 @@ def analyze(
         pore_size_fine_mask=pore_fine_mask,
         mold_wall_movement=mold_wall_movement,
         cold_shot_risk=cold_shot_risk,
+        lap_risk=np.zeros_like(cold_shot_risk),
+        cold_shot_saddles={},
         last_fill_point_mm=last_fill_point_mm,
+        H_field=H_field,
+        T_meet=T_meet,
+        fs_meet=fs_meet,
         erosion_risk=erosion_risk,
         air_entrapment=air_entrapment_field,
         trapped_air_volume_m3=trapped_air_volume_m3,
