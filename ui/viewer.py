@@ -1443,16 +1443,22 @@ class Analyzer3DViewer(QtInteractor):
 
         # Closed isosurfaces at risk thresholds; high-risk shells are nested.
         contours = part.contour(isosurfaces=[0.3, 0.5, 0.7, 0.9], scalars="cold_shot_risk")
-        contour_actor = self.add_mesh(
-            contours,
-            scalars="cold_shot_risk",
-            cmap="inferno",
-            opacity=0.85,
-            clim=clim,
-            show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Soğuk birleşme riski", (0.02, 0.02), clim=clim),
-            smooth_shading=True,
-        )
+        if contours.n_points > 0 and "cold_shot_risk" not in contours.array_names:
+            contours.cell_data["cold_shot_risk"] = np.zeros(contours.n_cells, dtype=np.float64)
+            contours = contours.cell_data_to_point_data()
+        if contours.n_points > 0:
+            contour_actor = self.add_mesh(
+                contours,
+                scalars="cold_shot_risk",
+                cmap="inferno",
+                opacity=0.85,
+                clim=clim,
+                show_scalar_bar=True,
+                scalar_bar_args=_scalar_bar_args("Soğuk birleşme riski", (0.02, 0.02), clim=clim),
+                smooth_shading=True,
+            )
+        else:
+            contour_actor = None
 
         # Faint surface heatmap on the part for context (no extra scalar bar).
         surface_actor = self.add_mesh(
@@ -1464,7 +1470,7 @@ class Analyzer3DViewer(QtInteractor):
             show_scalar_bar=False,
             smooth_shading=True,
         )
-        self._cold_shot_actor = [contour_actor, surface_actor]
+        self._cold_shot_actor = [a for a in (contour_actor, surface_actor) if a is not None]
 
         # Last-fill point marker: red sphere at the latest-filled voxel.
         if result.last_fill_point_mm is not None and result.last_fill_point_mm.size == 3:
@@ -1523,16 +1529,22 @@ class Analyzer3DViewer(QtInteractor):
 
         clim = [0.0, 1.0]
         contours = part.contour(isosurfaces=[0.3, 0.5, 0.7, 0.9], scalars="lap_risk")
-        contour_actor = self.add_mesh(
-            contours,
-            scalars="lap_risk",
-            cmap="viridis",
-            opacity=0.85,
-            clim=clim,
-            show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Lap riski", (0.02, 0.02), clim=clim),
-            smooth_shading=True,
-        )
+        if contours.n_points > 0 and "lap_risk" not in contours.array_names:
+            contours.cell_data["lap_risk"] = np.zeros(contours.n_cells, dtype=np.float64)
+            contours = contours.cell_data_to_point_data()
+        if contours.n_points > 0:
+            contour_actor = self.add_mesh(
+                contours,
+                scalars="lap_risk",
+                cmap="viridis",
+                opacity=0.85,
+                clim=clim,
+                show_scalar_bar=True,
+                scalar_bar_args=_scalar_bar_args("Lap riski", (0.02, 0.02), clim=clim),
+                smooth_shading=True,
+            )
+        else:
+            contour_actor = None
 
         surface_actor = self.add_mesh(
             part,
@@ -1543,7 +1555,7 @@ class Analyzer3DViewer(QtInteractor):
             show_scalar_bar=False,
             smooth_shading=True,
         )
-        self._lap_risk_actor = [contour_actor, surface_actor]
+        self._lap_risk_actor = [a for a in (contour_actor, surface_actor) if a is not None]
         self._arrange_scalar_bars()
 
     def toggle_lap_risk(self, result: AnalysisResult, checked: bool):

@@ -3,8 +3,6 @@ import os
 import sys
 from pathlib import Path
 
-os.environ["QT_QPA_PLATFORM"] = "offscreen"
-
 import numpy as np
 from PyQt6.QtWidgets import QApplication
 
@@ -18,6 +16,10 @@ from validation.test_v8_phase_d import run_case
 def render_case(mold_key: str, alloy_key: str, out_dir: Path):
     report, result = run_case(mold_key, alloy_key)
     print(f"[{mold_key}] saddle_count={report['saddle_count']} cs_mean={report['cold_shot_risk_mean']:.3f}")
+
+    # Analyzer3DViewer needs a real X/Windows backend; test_v8_phase_d leaves
+    # QT_QPA_PLATFORM=offscreen, so override it before creating QApplication.
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
 
     app = QApplication.instance() or QApplication(sys.argv)
     viewer = Analyzer3DViewer(off_screen=True)
