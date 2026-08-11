@@ -1,0 +1,20 @@
+# JoseCast Windows Python 3.12 dependencies
+# Run: python -m pip install -r requirements.txt --force-reinstall
+
+numpy>=2.0.0,<2.5.0
+numba>=0.61.0
+scipy>=1.10.0
+pyvista>=0.48.0
+pyvistaqt>=0.12.0
+PyQt6>=6.5.0
+fpdf2>=2.7.0
+pypdf>=4.0.0
+Pillow>=10.0.0
+scikit-learn>=1.5.0
+scikit-image>=0.25.0
+weasyprint>=60.0
+cadquery>=2.7.0
+trimesh>=4.10.0
+gmsh>=4.12.0
+fast-simplification>=0.1.13
+pytest>=7.0.0
