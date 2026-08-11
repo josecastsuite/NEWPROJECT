@@ -1354,7 +1354,7 @@ class Analyzer3DViewer(QtInteractor):
             if t_max - t_min < 1.0:
                 t_min = t_min - 10.0
                 t_max = t_max + 10.0
-            spheres = pv.MultiBlock(sphere_blocks)
+            spheres = pv.merge(sphere_blocks)
             self._saddle_actor = self.add_mesh(
                 spheres,
                 scalars="T_int_c",
@@ -1367,7 +1367,7 @@ class Analyzer3DViewer(QtInteractor):
             )
 
         if arrow_blocks:
-            arrows = pv.MultiBlock(arrow_blocks)
+            arrows = pv.merge(arrow_blocks)
             self._saddle_arrow_actor = self.add_mesh(
                 arrows,
                 scalars="T_int_c",
