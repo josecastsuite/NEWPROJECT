@@ -542,7 +542,10 @@ class Analyzer3DViewer(QtInteractor):
             actor = getattr(self, attr, None)
             if actor is not None:
                 try:
-                    if isinstance(actor, (list, tuple)):
+                    if isinstance(actor, dict):
+                        for a in actor.values():
+                            self.remove_actor(a)
+                    elif isinstance(actor, (list, tuple)):
                         for a in actor:
                             self.remove_actor(a)
                     else:
