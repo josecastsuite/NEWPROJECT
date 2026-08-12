@@ -495,6 +495,7 @@ class AnalysisResult:
     cold_shot_risk_viz: np.ndarray = field(default_factory=lambda: np.array([]))
     lap_risk_viz: np.ndarray = field(default_factory=lambda: np.array([]))
     cold_shot_saddles: Dict[str, Any] = field(default_factory=dict)
+    cold_shot_lines: List[Dict[str, Any]] = field(default_factory=list)
     last_fill_point_mm: np.ndarray = field(default_factory=lambda: np.array([]))
     # V8 cold-shot meeting enthalpy / temperature / solid fraction
     H_field: np.ndarray = field(default_factory=lambda: np.array([]))

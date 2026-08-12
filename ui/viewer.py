@@ -1323,7 +1323,7 @@ class Analyzer3DViewer(QtInteractor):
             self._remove_scalar_bar("Kalıp şişmesi (%)")
 
     def _show_saddle_glyphs(self, result: AnalysisResult, mode: str = "cold"):
-        """Draw sphere + two arrows per saddle, and the Reeb polyline."""
+        """Draw small spheres at high-risk saddle points (confluence markers)."""
         self._remove_saddle_glyphs()
 
         saddles = getattr(result, "cold_shot_saddles", None)
@@ -1333,132 +1333,61 @@ class Analyzer3DViewer(QtInteractor):
         dx = float(result.dx_mm)
         origin = np.asarray(result.origin_mm, dtype=np.float64)
         data = saddles["saddles"]
-        n = len(data)
-        if n == 0 or dx <= 0.0:
+        if not data or dx <= 0.0:
             return
 
         positions = []
-        t_int_vals = []
         risk_vals = []
         sphere_blocks = []
-        arrow_blocks = []
-
         for s in data:
+            risk = float(s.get("risk_cs", 0.0))
+            if risk < 0.3:
+                continue
             i = int(s.get("i", 0))
             j = int(s.get("j", 0))
             k = int(s.get("k", 0))
             pos = origin + (np.array([i, j, k], dtype=np.float64) + 0.5) * dx
             positions.append(pos)
-            t_int = float(s.get("T_int_c", 0.0))
-            risk = float(s.get("risk_cs", 0.0))
-            t_int_vals.append(t_int)
             risk_vals.append(risk)
 
             sphere = pv.Sphere(
-                radius=0.6 * dx,
+                radius=0.25 * dx,
                 center=pos,
-                theta_resolution=16,
-                phi_resolution=16,
+                theta_resolution=12,
+                phi_resolution=12,
             )
-            sphere.cell_data["T_int_c"] = np.full(sphere.n_cells, t_int)
+            sphere.cell_data["risk_cs"] = np.full(sphere.n_cells, risk)
             sphere_blocks.append(sphere)
 
-            # Two incoming-front arrows: -d1 and -d2 point from source to saddle.
-            d1 = np.asarray(s.get("d1", [0.0, 0.0, 1.0]), dtype=np.float64)
-            d2 = np.asarray(s.get("d2", [0.0, 0.0, -1.0]), dtype=np.float64)
-            v_rel = float(s.get("v_rel_m_s", 0.0))
-            We = float(s.get("We", 0.0))
-            length = max(dx, v_rel * 1000.0)
-            thickness = min(5.0, 1.0 + We)
-            shaft_r = 0.04 * dx * thickness / length
-            tip_r = 2.0 * shaft_r
-            tip_len = 0.3
-            for d in (-d1, -d2):
-                if np.linalg.norm(d) < 1e-9:
-                    continue
-                arrow = pv.Arrow(
-                    start=pos,
-                    direction=d,
-                    tip_length=tip_len,
-                    tip_radius=tip_r,
-                    shaft_radius=shaft_r,
-                    scale=length,
-                )
-                arrow.cell_data["T_int_c"] = np.full(arrow.n_cells, t_int)
-                arrow_blocks.append(arrow)
-
         if sphere_blocks:
-            t_min = min(t_int_vals) if t_int_vals else 0.0
-            t_max = max(t_int_vals) if t_int_vals else 1.0
-            if t_max - t_min < 1.0:
-                t_min = t_min - 10.0
-                t_max = t_max + 10.0
             spheres = pv.merge(sphere_blocks)
             self._saddle_actor = self.add_mesh(
                 spheres,
-                scalars="T_int_c",
-                cmap="coolwarm",
-                clim=[t_min, t_max],
+                scalars="risk_cs",
+                cmap="inferno",
+                clim=[0.0, 1.0],
                 opacity=0.9,
-                show_scalar_bar=True,
-                scalar_bar_args=_scalar_bar_args("Sıcaklık (°C)", (0.02, 0.02), clim=[t_min, t_max]),
-                smooth_shading=True,
-            )
-
-        if arrow_blocks:
-            arrows = pv.merge(arrow_blocks)
-            self._saddle_arrow_actor = self.add_mesh(
-                arrows,
-                scalars="T_int_c",
-                cmap="coolwarm",
-                clim=[t_min, t_max],
-                opacity=0.85,
                 show_scalar_bar=False,
                 smooth_shading=True,
             )
 
-        # Reeb polyline: connect saddles ordered by local fill time.
-        if n > 1 and result.fill_time_s is not None and result.fill_time_s.size:
-            ft = result.fill_time_s
-            order = sorted(
-                range(n),
-                key=lambda idx: float(ft[int(data[idx]["i"]), int(data[idx]["j"]), int(data[idx]["k"])]) if idx < len(data) else 0.0,
-            )
-        else:
-            order = list(range(n))
-        ordered_points = np.array([positions[o] for o in order])
-        ordered_risk = np.array([risk_vals[o] for o in order])
-        if len(ordered_points) > 1:
-            line = pv.lines_from_points(ordered_points, close=False)
-            line["risk_cs"] = ordered_risk
-            self._reeb_line_actor = self.add_mesh(
-                line,
-                scalars="risk_cs",
-                cmap="coolwarm",
-                clim=[0.0, 1.0],
-                opacity=0.9,
-                line_width=4,
-                show_scalar_bar=True,
-                scalar_bar_args=_scalar_bar_args("Soğuk birleşme (çoğaltım)", (0.02, 0.02), clim=[0.0, 1.0]),
-            )
-
         self._saddle_positions = np.array(positions, dtype=np.float64)
-        self._saddle_data = data
+        self._saddle_data = [s for s in data if float(s.get("risk_cs", 0.0)) >= 0.3]
         self._saddle_tol_mm = 2.0 * dx
         try:
-            self._saddle_tree = cKDTree(self._saddle_positions)
+            self._saddle_tree = cKDTree(self._saddle_positions) if self._saddle_positions.size else None
         except Exception:
             self._saddle_tree = None
         self._enable_saddle_picker()
 
     def show_cold_shot_risk(self, result: Optional[AnalysisResult]):
-        """Isosurface cold-shut (soğuk birleşme) risk with saddle glyphs.
+        """Render cold-shut risk as 1-D confluence tubes (not volume/surface).
 
-        Closed isosurfaces are extracted at 0.30, 0.50, 0.70 and 0.90 cold-shot
-        risk, coloured with the inferno map on a fixed 0..1 scale.  The part
-        body is kept translucent (BODY_OPACITY_POST) so the risk shells are
-        visible inside the geometry.  Saddle glyphs and the Reeb polyline are
-        added to show the converging-front encounter points.
+        The physical cold shut is a line where two filling fronts meet and fail
+        to weld.  ``cold_shot_lines`` holds ordered polylines extracted from the
+        fill-time field; each line is coloured by its own risk on the
+        ``inferno`` 0..1 scale.  The part body stays translucent so the lines
+        are visible inside the geometry.
         """
         if isinstance(self._cold_shot_actor, (list, tuple)):
             for actor in self._cold_shot_actor:
@@ -1475,16 +1404,13 @@ class Analyzer3DViewer(QtInteractor):
             self.remove_actor(self._cold_shot_message_actor)
             self._cold_shot_message_actor = None
         self._remove_scalar_bar("Soğuk birleşme riski")
+        self._remove_saddle_glyphs()
 
         if result is None or result.cold_shot_risk is None or result.cold_shot_risk.size == 0:
             return
 
-        # V8: use the sparse, thickness-aware splat field if available.
-        cs_grid = getattr(result, "cold_shot_risk_viz", result.cold_shot_risk)
-        if cs_grid is None or cs_grid.size == 0:
-            cs_grid = result.cold_shot_risk
-
-        if float(cs_grid.max()) < 0.01:
+        lines = getattr(result, "cold_shot_lines", None) or []
+        if not lines:
             self._cold_shot_message_actor = self.add_text(
                 "Risk düşük, isosurface yok",
                 position="lower_left",
@@ -1492,46 +1418,46 @@ class Analyzer3DViewer(QtInteractor):
                 color="black",
                 name="cold_shot_low_risk_msg",
             )
-            self._show_saddle_glyphs(result, "cold")
-            return
-
-        cs_masked = np.where(cs_grid >= 0.3, cs_grid, 0.0)
-        grid = self._make_grid(result, cs_masked, "cold_shot_risk", point_max=True)
-        part = self._part_only(grid)
-        if part.n_cells == 0:
             return
 
         clim = [0.0, 1.0]
+        dx = float(result.dx_mm)
+        tube_radius = max(0.15 * dx, 0.1)
+        actors = []
+        scalar_bar_args = _scalar_bar_args("Soğuk birleşme riski", (0.02, 0.02), clim=clim)
 
-        # Small / thin parts: show only saddle glyphs, do not paint the surface.
-        show_as_glyphs_only = False
-        if result.bbox_size_mm is not None and result.bbox_size_mm.size == 3 and result.dx_mm > 0:
-            show_as_glyphs_only = float(result.bbox_size_mm.min()) < 20.0 * float(result.dx_mm)
+        for idx, line in enumerate(lines):
+            pts = np.asarray(line.get("points", []), dtype=np.float64)
+            if pts.shape[0] < 2:
+                continue
+            n = pts.shape[0]
+            poly = pv.PolyData()
+            poly.points = pts
+            poly.lines = np.hstack([[n], np.arange(n)]).astype(np.int64)
+            try:
+                tube = poly.tube(radius=tube_radius, n_sides=8)
+            except Exception:
+                tube = poly
+            risk = float(line.get("risk", 0.0))
+            if tube.n_cells > 0:
+                tube["risk"] = np.full(tube.n_cells, risk)
+            actor = self.add_mesh(
+                tube,
+                scalars="risk",
+                cmap="inferno",
+                opacity=0.9,
+                clim=clim,
+                show_scalar_bar=(idx == 0),
+                scalar_bar_args=scalar_bar_args if idx == 0 else None,
+                smooth_shading=True,
+            )
+            actors.append(actor)
 
-        contour_actor = None
-        if not show_as_glyphs_only:
-            # Closed isosurfaces at risk thresholds; high-risk shells are nested.
-            contours = part.contour(isosurfaces=[0.3, 0.5, 0.7, 0.9], scalars="cold_shot_risk")
-            if contours.n_points > 0 and "cold_shot_risk" not in contours.array_names:
-                contours.cell_data["cold_shot_risk"] = np.zeros(contours.n_cells, dtype=np.float64)
-                contours = contours.cell_data_to_point_data()
-            if contours.n_points > 0:
-                contour_actor = self.add_mesh(
-                    contours,
-                    scalars="cold_shot_risk",
-                    cmap="inferno",
-                    opacity=0.85,
-                    clim=clim,
-                    show_scalar_bar=True,
-                    scalar_bar_args=_scalar_bar_args("Soğuk birleşme riski", (0.02, 0.02), clim=clim),
-                    smooth_shading=True,
-                )
-
-        self._cold_shot_actor = [contour_actor] if contour_actor is not None else []
+        self._cold_shot_actor = actors
 
         # Last-fill point marker: red sphere at the latest-filled voxel.
         if result.last_fill_point_mm is not None and result.last_fill_point_mm.size == 3:
-            radius = max(float(result.dx_mm) * 2.0, 2.0)
+            radius = max(dx * 2.0, 2.0)
             sphere = pv.Sphere(radius=radius, center=result.last_fill_point_mm)
             self._last_fill_actor = self.add_mesh(
                 sphere,
@@ -1540,9 +1466,7 @@ class Analyzer3DViewer(QtInteractor):
                 show_scalar_bar=False,
             )
 
-        # Saddle glyphs and Reeb polyline for the converging-front network.
         self._show_saddle_glyphs(result, "cold")
-
         self._arrange_scalar_bars()
 
     def toggle_cold_shot_risk(self, result: AnalysisResult, checked: bool):

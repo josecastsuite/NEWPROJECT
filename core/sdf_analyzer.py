@@ -42,6 +42,7 @@ from core.confluence_reeb import (
     find_saddles_watershed,
 )
 from core.confluence_sfer import compute_sfer_risk, splat_saddle_risks
+from core.confluence_lines import extract_confluence_lines
 from core.peclet import peclet_front_velocity_m_s
 from core.sphere_lut import get_sphere_64_6
 from core.thermal_solver import _alloy_to_dict, _dscheil_dT, _scheil_fs, solve_3d_thermal
@@ -935,7 +936,8 @@ def compute_cold_shot_risk(
                              (effusivity)
         feeder_factor      : feeders keep the surrounding metal hotter
 
-    Returns ``(cold_shot_risk, lap_risk, cold_shot_saddles, last_fill_point_mm)``.
+    Returns ``(cold_shot_risk, lap_risk, cold_shot_saddles,
+    last_fill_point_mm, cold_shot_risk_viz, lap_risk_viz, cold_shot_lines)``.
     ``cold_shot_saddles`` is a diagnostics dictionary and ``last_fill_point_mm``
     is an empty array when no valid fill data exists.
 
@@ -943,12 +945,16 @@ def compute_cold_shot_risk(
     computed in-place, so Windows does not need to hand out a fresh 526 MiB
     contiguous block for every ``np.where`` / ``np.clip`` call.
     """
+    empty_lines: List[Dict[str, Any]] = []
     if fill_time is None or fill_time.size == 0:
         return (
             np.zeros(part_mask.shape, dtype=np.float64),
             np.zeros(part_mask.shape, dtype=np.float64),
             {},
             np.array([], dtype=np.float64),
+            np.zeros(part_mask.shape, dtype=np.float64),
+            np.zeros(part_mask.shape, dtype=np.float64),
+            empty_lines,
         )
 
     shape = part_mask.shape
@@ -964,6 +970,9 @@ def compute_cold_shot_risk(
             np.zeros(part_mask.shape, dtype=np.float64),
             {},
             np.array([], dtype=np.float64),
+            np.zeros(part_mask.shape, dtype=np.float64),
+            np.zeros(part_mask.shape, dtype=np.float64),
+            empty_lines,
         )
 
     t_max = float(np.max(ft[valid_fill]))
@@ -1323,6 +1332,9 @@ def compute_cold_shot_risk(
     # ---------- V8 SFER (spherical front encounter rate) cold-shot / lap risk ----------
     lap_risk = np.zeros_like(out)
     cold_shot_saddles: Dict[str, Any] = {}
+    cold_shot_risk_viz = np.zeros_like(out)
+    lap_risk_viz = np.zeros_like(out)
+    cold_shot_lines = empty_lines
     if (
         H_field is not None
         and H_field.shape == shape
@@ -1395,8 +1407,6 @@ def compute_cold_shot_risk(
                 ft, part_mask, persistence_thresh_s=base_persistence, ft_percentile=80.0, max_saddles=1000
             )
 
-        cold_shot_risk_viz = np.zeros_like(out)
-        lap_risk_viz = np.zeros_like(out)
         if saddles.shape[0] > 0:
             dirs, adj = get_sphere_64_6()
             lut = build_H_T_fs_LUT(alloy, n=1000)
@@ -1427,7 +1437,20 @@ def compute_cold_shot_risk(
             splat_saddle_risks(saddles, out, sdf, dx, 0.3, cold_shot_risk_viz)
             splat_saddle_risks(saddles, risk_lap_sfer, sdf, dx, 0.05, lap_risk_viz)
 
-        return out, lap_risk, cold_shot_saddles, last_fill_point_mm, cold_shot_risk_viz, lap_risk_viz
+            cold_shot_lines = extract_confluence_lines(
+                ft,
+                part_mask,
+                out,
+                diagnostics,
+                origin_mm,
+                dx,
+                sigma=1.0,
+                risk_threshold=0.3,
+                min_length_mm=max(2.0, 2.0 * dx),
+                max_lines=5,
+            )
+
+    return out, lap_risk, cold_shot_saddles, last_fill_point_mm, cold_shot_risk_viz, lap_risk_viz, cold_shot_lines
 
 
 def compute_erosion_risk(
@@ -3803,6 +3826,7 @@ def analyze(
         last_fill_point_mm,
         cold_shot_risk_viz,
         lap_risk_viz,
+        cold_shot_lines,
     ) = compute_cold_shot_risk(
         part_mask,
         fill_time_s,
@@ -3967,6 +3991,7 @@ def analyze(
         cold_shot_risk_viz=cold_shot_risk_viz,
         lap_risk_viz=lap_risk_viz,
         cold_shot_saddles=cold_shot_saddles,
+        cold_shot_lines=cold_shot_lines,
         last_fill_point_mm=last_fill_point_mm,
         H_field=H_field,
         T_meet=T_meet,
