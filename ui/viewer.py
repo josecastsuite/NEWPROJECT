@@ -3,7 +3,7 @@
 import os
 import shutil
 import subprocess
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pyvista as pv
@@ -711,14 +711,17 @@ class Analyzer3DViewer(QtInteractor):
             self._risk_actor = None
         self._remove_scalar_bar("Risk")
         if result is None:
+            self._show_scalar_bar_no_geometry("Risk", "hot", [0.0, 1.0])
             return
 
         grid = self._make_grid(result, result.risk, "risk")
         part = self._part_only(grid)
         if part.n_cells == 0:
+            self._show_scalar_bar_no_geometry("Risk", "hot", [0.0, 1.0])
             return
         iso = part.contour([0.70, 0.85], scalars="risk")
         if iso.n_points == 0:
+            self._show_scalar_bar_no_geometry("Risk", "hot", [0.0, 1.0])
             return
         self._risk_actor = self.add_mesh(
             iso,
@@ -901,12 +904,14 @@ class Analyzer3DViewer(QtInteractor):
         self._niyama_actors.clear()
         self._remove_scalar_bar("Niyama")
         if result is None:
+            self._show_scalar_bar_no_geometry("Niyama", "jet", [0.0, 1.0])
             return
 
         alloy = get_alloy(result.alloy_key)
         grid = self._make_grid(result, result.niyama, "niyama")
         part = self._part_only(grid)
         if part.n_cells == 0:
+            self._show_scalar_bar_no_geometry("Niyama", "jet", [0.0, 1.0])
             return
 
         iso = part.contour(
@@ -914,6 +919,7 @@ class Analyzer3DViewer(QtInteractor):
             scalars="niyama",
         )
         if iso.n_points == 0:
+            self._show_scalar_bar_no_geometry("Niyama", "jet", [0.0, 1.0])
             return
 
         actor = self.add_mesh(
@@ -1398,6 +1404,26 @@ class Analyzer3DViewer(QtInteractor):
             return None
         return np.asarray(vals, dtype=np.float64)
 
+    def _show_scalar_bar_no_geometry(
+        self,
+        title: str,
+        cmap: str,
+        clim: Sequence[float],
+        position: Tuple[float, float] = (0.02, 0.02),
+    ) -> Any:
+        """Add a scalar bar even when the field has no visible geometry.
+
+        Uses an off-screen dummy mapper so the colour scale is still shown.
+        """
+        dummy = pv.Sphere(radius=1e-6)
+        dummy["__scalar"] = np.full(dummy.n_points, float(clim[0]))
+        lut = pv.LookupTable(cmap=cmap)
+        lut.SetRange(float(clim[0]), float(clim[1]))
+        mapper = pv.DataSetMapper(dataset=dummy)
+        mapper.scalar_map_mode = "point"
+        mapper.lookup_table = lut
+        return self.add_scalar_bar(mapper=mapper, **_scalar_bar_args(title, position, clim))
+
     def show_cold_shot_risk(self, result: Optional[AnalysisResult]):
         """Render cold-shut risk as 1-D confluence tubes (not volume/surface).
 
@@ -1425,16 +1451,22 @@ class Analyzer3DViewer(QtInteractor):
         self._remove_saddle_glyphs()
 
         if result is None or result.cold_shot_risk is None or result.cold_shot_risk.size == 0:
+            self._show_scalar_bar_no_geometry(
+                "Soğuk birleşme riski", "inferno", [0.0, 1.0]
+            )
             return
 
         lines = getattr(result, "cold_shot_lines", None) or []
         if not lines:
             self._cold_shot_message_actor = self.add_text(
                 "Risk düşük, isosurface yok",
-                position="lower_left",
+                position="upper_left",
                 font_size=12,
                 color="black",
                 name="cold_shot_low_risk_msg",
+            )
+            self._show_scalar_bar_no_geometry(
+                "Soğuk birleşme riski", "inferno", [0.0, 1.0]
             )
             return
 
@@ -1519,6 +1551,7 @@ class Analyzer3DViewer(QtInteractor):
         self._remove_scalar_bar("Lap riski")
 
         if result is None or result.lap_risk is None or result.lap_risk.size == 0:
+            self._show_scalar_bar_no_geometry("Lap riski", "viridis", [0.0, 1.0])
             return
 
         lap_grid = getattr(result, "lap_risk_viz", result.lap_risk)
@@ -1529,6 +1562,7 @@ class Analyzer3DViewer(QtInteractor):
         grid = self._make_grid(result, lap_masked, "lap_risk", point_max=True)
         part = self._part_only(grid)
         if part.n_cells == 0:
+            self._show_scalar_bar_no_geometry("Lap riski", "viridis", [0.0, 1.0])
             return
 
         clim = [0.0, 1.0]
@@ -1548,6 +1582,7 @@ class Analyzer3DViewer(QtInteractor):
                 smooth_shading=True,
             )
         else:
+            self._show_scalar_bar_no_geometry("Lap riski", "viridis", [0.0, 1.0])
             contour_actor = None
 
         self._lap_risk_actor = [contour_actor] if contour_actor is not None else []
@@ -1576,15 +1611,24 @@ class Analyzer3DViewer(QtInteractor):
         self._remove_scalar_bar("Kalıp erozyonu riski")
 
         if result is None or result.erosion_risk is None or result.erosion_risk.size == 0:
+            self._show_scalar_bar_no_geometry(
+                "Kalıp erozyonu riski", "YlOrRd", [0.0, 1.0]
+            )
             return
 
         grid = self._make_grid(result, result.erosion_risk, "erosion_risk")
         metal = self._metal_only(grid)
         if metal.n_cells == 0:
+            self._show_scalar_bar_no_geometry(
+                "Kalıp erozyonu riski", "YlOrRd", [0.0, 1.0]
+            )
             return
 
         cells = metal.threshold(1e-6, scalars="erosion_risk", all_scalars=True)
         if cells.n_cells == 0:
+            self._show_scalar_bar_no_geometry(
+                "Kalıp erozyonu riski", "YlOrRd", [0.0, 1.0]
+            )
             return
 
         vmax = float(np.percentile(cells["erosion_risk"], 99))
@@ -1648,6 +1692,9 @@ class Analyzer3DViewer(QtInteractor):
         self._remove_scalar_bar("Hava sıkışması")
 
         if result is None or result.air_entrapment is None or result.air_entrapment.size == 0:
+            self._show_scalar_bar_no_geometry(
+                "Hava sıkışması", "coolwarm", [0.0, 1.0]
+            )
             return
 
         grid = pv.ImageData()
@@ -1701,15 +1748,8 @@ class Analyzer3DViewer(QtInteractor):
         )
         self._air_entrapment_actor = [vol_actor, contour_actor]
 
-        if result.air_entrapment_centroid_mm is not None and result.air_entrapment_centroid_mm.size == 3:
-            radius = max(float(result.dx_mm) * 2.0, 2.0)
-            sphere = pv.Sphere(radius=radius, center=result.air_entrapment_centroid_mm)
-            self._air_entrapment_marker_actor = self.add_mesh(
-                sphere,
-                color="cyan",
-                opacity=0.35,
-                show_scalar_bar=False,
-            )
+        # Air-entrapment centroid marker deliberately omitted; it is not a gas
+        # volume and distracts from the actual trapped-air field.
 
         self._arrange_scalar_bars()
 
