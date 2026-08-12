@@ -560,13 +560,11 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout.setSpacing(8)
         right_layout.setContentsMargins(10, 10, 10, 10)
 
-        rec_group = QtWidgets.QGroupBox("Mühendis Önerileri")
-        rec_inner = QtWidgets.QVBoxLayout(rec_group)
+        # Mühendis Önerileri paneli UI'dan kaldırıldı; rec_text sadece
+        # rapor/arka-plan metni için saklanıyor.
         self.rec_text = QtWidgets.QTextEdit()
         self.rec_text.setReadOnly(True)
-        self.rec_text.setMinimumHeight(160)
-        rec_inner.addWidget(self.rec_text)
-        right_layout.addWidget(rec_group)
+        self.rec_text.hide()
 
         vis_group = QtWidgets.QGroupBox("Görselleştirme")
         vis_layout = QtWidgets.QVBoxLayout(vis_group)
@@ -644,8 +642,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.air_entrapment_toggle.toggled.connect(self.on_toggle_air_entrapment)
         vis_layout.addWidget(self.air_entrapment_toggle)
 
-        anim_group = QtWidgets.QGroupBox("Akış & Katılaşma")
+        anim_group = QtWidgets.QWidget()
         anim_layout = QtWidgets.QVBoxLayout(anim_group)
+        anim_layout.setContentsMargins(0, 0, 0, 0)
 
         self.flow_anim_toggle = QtWidgets.QCheckBox("Dolum + Katılaşma")
         self.flow_anim_toggle.setToolTip("İki fazlı animasyon: önce dolum, sonra katılaşma")
@@ -712,24 +711,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.local_toggle.toggled.connect(self.on_toggle_local)
         vis_layout.addWidget(self.local_toggle)
 
-        slice_layout = QtWidgets.QHBoxLayout()
-        self.slice_toggle = QtWidgets.QCheckBox("Kesit")
-        self.slice_toggle.setToolTip("Kesit düzlemlerini göster/gizle")
-        self.slice_toggle.setChecked(False)
-        self.slice_toggle.toggled.connect(self.on_toggle_slices)
-        slice_layout.addWidget(self.slice_toggle)
-        self.slice_field = QtWidgets.QComboBox()
-        for field, label in [
-            ("sdf", "SDF"),
-            ("risk", "Risk"),
-            ("niyama", "Niyama"),
-            ("mat_id", "Mat ID"),
-        ]:
-            self.slice_field.addItem(label, field)
-        self.slice_field.currentIndexChanged.connect(self.on_slice_field_changed)
-        self.slice_field.setMaximumWidth(130)
-        slice_layout.addWidget(self.slice_field)
-        vis_layout.addLayout(slice_layout)
+        # Kesit/SDF seçicisi UI'dan kaldırıldı; yerel refine için risk kullanılır.
         right_layout.addWidget(vis_group)
 
         export_group = QtWidgets.QGroupBox("Rapor")
@@ -1311,7 +1293,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.path_toggle.isChecked():
             self.viewer.show_feeding_paths(self._analysis)
         if self.local_toggle.isChecked():
-            self.viewer.show_local_regions(self._analysis, self.slice_field.currentData())
+            self.viewer.show_local_regions(self._analysis, "risk")
         self.viewer.show_hotspots(self._analysis)
         self.viewer.show_flow_node_labels(self._analysis)
         self._update_flow_controls()
@@ -1545,26 +1527,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_toggle_local(self, checked: bool):
         if self._analysis:
             if checked:
-                self.viewer.show_local_regions(
-                    self._analysis, self.slice_field.currentData()
-                )
+                self.viewer.show_local_regions(self._analysis, "risk")
             else:
                 self.viewer.show_local_regions(None, "risk")
-
-    def on_toggle_slices(self, checked: bool):
-        if self._analysis:
-            self.viewer.toggle_slices(
-                self._analysis, checked, self.slice_field.currentData()
-            )
-
-    def on_slice_field_changed(self):
-        if self._analysis and self.slice_toggle.isChecked():
-            self.viewer.toggle_slices(self._analysis, False, "sdf")
-            self.viewer.toggle_slices(
-                self._analysis, True, self.slice_field.currentData()
-            )
-        if self._analysis and self.local_toggle.isChecked():
-            self.viewer.show_local_regions(self._analysis, self.slice_field.currentData())
 
     def _generate_report_html(self, path: str):
         """Generate a self-contained HTML report (no PDF conversion)."""
