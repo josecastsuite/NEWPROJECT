@@ -1478,16 +1478,8 @@ class Analyzer3DViewer(QtInteractor):
 
         self._cold_shot_actor = actors
 
-        # Last-fill point marker: red sphere at the latest-filled voxel.
-        if result.last_fill_point_mm is not None and result.last_fill_point_mm.size == 3:
-            radius = max(dx * 2.0, 2.0)
-            sphere = pv.Sphere(radius=radius, center=result.last_fill_point_mm)
-            self._last_fill_actor = self.add_mesh(
-                sphere,
-                color="red",
-                opacity=0.9,
-                show_scalar_bar=False,
-            )
+        # Last-fill point marker deliberately omitted from cold-shot view; it
+        # is not a cold-shut feature and distracts from the confluence lines.
 
         self._show_saddle_glyphs(result, "cold")
         self._arrange_scalar_bars()
