@@ -177,7 +177,7 @@ def compute_curvature(sdf: np.ndarray, dx: float) -> Tuple[np.ndarray, np.ndarra
 
 
 def compute_steiner_modulus(
-    sdf: np.ndarray, mean_curv: np.ndarray, gauss_curv: np.ndarray, clip_min: float = 0.1
+    sdf: np.ndarray, mean_curv: np.ndarray, gauss_curv: np.ndarray, clip_min: float = 0.5
 ) -> np.ndarray:
     """
     Steiner shape-corrected local modulus.
@@ -188,6 +188,9 @@ def compute_steiner_modulus(
     the determinant of the Hessian as K, so the expression becomes:
         shape_factor = 1 - mean_curv*SDF + gauss_curv*SDF^2
     SDF and M_mod are in the same length units (mm).
+
+    clip_min is bounded below by 0.5 to prevent the 10x inflation that
+    occurred with the old 0.1 limit in concave/discretised regions.
     """
     shape_factor = 1.0 - mean_curv * sdf + gauss_curv * (sdf ** 2)
     shape_factor = np.clip(shape_factor, clip_min, None)
@@ -1891,7 +1894,7 @@ def find_hotspots(
         gauss = gaussian_curvature
         if gauss is None:
             _, gauss = compute_curvature(sdf, dx)
-        M_mod = compute_steiner_modulus(sdf, curvature, gauss, clip_min=0.1)
+        M_mod = compute_steiner_modulus(sdf, curvature, gauss, clip_min=0.5)
     else:
         M_mod = sdf.copy()
 
@@ -2019,7 +2022,9 @@ def find_hotspots(
             continue
         cand = np.argwhere(mask)
         vals = comp_iso
-        m_vals = M_mod[cand[:, 0], cand[:, 1], cand[:, 2]]
+        # Use raw SDF (local half wall thickness) for modulus scoring and the
+        # displayed hotspot modulus. M_mod can be inflated by the Steiner clip.
+        m_vals = sdf[cand[:, 0], cand[:, 1], cand[:, 2]]
         # Pick the most critical voxel: late isolating, high modulus, low Niyama.
         iso_score = vals / max(max_iso, 1e-9)
         m_score = m_vals / max(float(m_vals.max()), 1e-9)
@@ -2031,7 +2036,7 @@ def find_hotspots(
             n_score = np.ones_like(iso_score)
         best_idx = int(np.argmax(iso_score + 0.5 * m_score - 0.5 * n_score))
         pos_vox = cand[best_idx]
-        m_value = float(M_mod[pos_vox[0], pos_vox[1], pos_vox[2]])
+        m_value = float(sdf[pos_vox[0], pos_vox[1], pos_vox[2]])
         position_mm = origin_mm + pos_vox * dx
         hotspots.append(
             HotSpot(
@@ -2682,7 +2687,7 @@ def _refine_region(
     sdf = compute_sdf(is_metal, dx)
     C = chvorinov_c_from_properties(alloy, mold)
     mean_curv, gauss_curv = compute_curvature(sdf, dx)
-    M_mod = compute_steiner_modulus(sdf, mean_curv, gauss_curv, clip_min=0.1)
+    M_mod = compute_steiner_modulus(sdf, mean_curv, gauss_curv, clip_min=0.5)
     t_s = compute_chvorinov_t(M_mod, C)
     T, R, fs, _ = compute_thermal_field(
         grid, is_metal, alloy, mold, dx, sdf=sdf, M_mod=M_mod
@@ -2764,7 +2769,7 @@ def _high_res_part_hotspots(
     # modulus and stays connected longer during the pseudo-thermal CCL.
     part_sdf = compute_subvoxel_sdf(part_is_metal, part_dx, sub=1)
     mean_curv, gauss_curv = compute_curvature(part_sdf, part_dx)
-    part_M_mod = compute_steiner_modulus(part_sdf, mean_curv, gauss_curv, clip_min=0.1)
+    part_M_mod = compute_steiner_modulus(part_sdf, mean_curv, gauss_curv, clip_min=0.5)
 
     # Derive feeder mask directly from the high-res grid.  Only dedicated
     # RISER bodies are true feeders; gates/runners/sprues are not.
@@ -3103,7 +3108,23 @@ def analyze(
     # Steiner shape-corrected modulus: M = SDF / (1 - 2H*SDF + K*SDF^2).
     # The SDF Laplacian is 2*H and the Hessian determinant is K, so the
     # formula reduces to 1 - mean_curv*SDF + gauss_curv*SDF^2.
-    M_mod = compute_steiner_modulus(sdf, mean_curv, gauss_curv, clip_min=0.1)
+    M_mod = compute_steiner_modulus(sdf, mean_curv, gauss_curv, clip_min=0.5)
+    # Debug: voxels where the Steiner shape factor is very low indicate
+    # discretised/non-manifold geometry (sharp edges, thin triangles) rather
+    # than a real thick section. Log a few coordinates for inspection.
+    _sf_check = 1.0 - mean_curv * sdf + gauss_curv * (sdf ** 2)
+    _bad_sf = (_sf_check < 0.5) & part_mask
+    if _bad_sf.any():
+        _bad_count = int(_bad_sf.sum())
+        _bad_min = float(_sf_check[_bad_sf].min())
+        _bad_vox = np.argwhere(_bad_sf)
+        _n_sample = min(3, _bad_vox.shape[0])
+        _bad_mm = origin_mm + _bad_vox[:_n_sample] * dx
+        print(
+            f"[ANALYZE] UYARI: {_bad_count} vokselde shape_factor < 0.5 "
+            f"(min {_bad_min:.3f}); örnek koordinatlar (mm): {_bad_mm.tolist()}",
+            flush=True,
+        )
     if progress_callback:
         progress_callback(25)
 
@@ -4074,9 +4095,16 @@ def _build_recommendations(
         if result.chvorinov_c and result.dominant_m_mm > 0.0
         else 0.0
     )
+    M_geo_cm = result.geometric_m_cm
+    t_solid_geo_s = (
+        result.chvorinov_c * (M_geo_cm ** 2) * 60.0
+        if result.chvorinov_c and M_geo_cm > 0.0
+        else 0.0
+    )
     recs.append(
         f"Malzeme: {alloy.name} | Kalıp: {mold.name} | Chvorinov C = {result.chvorinov_c:.4f} dk/cm² | "
         f"Baskın M = {M_cm:.2f} cm (t_s ≈ {t_solid_s:.1f} s / {t_solid_s/60.0:.2f} dk) | "
+        f"Geometrik M (V/A) = {M_geo_cm:.2f} cm (t_s ≈ {t_solid_geo_s:.1f} s / {t_solid_geo_s/60.0:.2f} dk) | "
         f"Duvar kalınlığı t_wall ≈ {result.wall_thickness_mm:.2f} mm | "
         f"Şekil faktörü SF = {result.shape_factor_global:.6f}"
     )
@@ -4126,7 +4154,7 @@ def _build_recommendations(
 
         recs.append(
             f"Hata Bölgesi #{idx} ({pos} mm): Kritik Hotspot. "
-            f"M={hs.m_value_mm:.2f} mm, Niyama={niy:.2f}. "
+            f"M={hs.m_value_mm/10.0:.2f} cm, Niyama={niy:.2f}. "
             f"Durum: {status}. "
             f"Öneri: {suggestion}.{pore_extra}"
         )
@@ -4136,7 +4164,7 @@ def _build_recommendations(
         for idx, fhs in enumerate(result.feeder_hotspots, 1):
             pos = ",".join(f"{v:.1f}" for v in fhs.position_mm)
             recs.append(
-                f"  Riser Bölgesi #{idx} ({pos} mm): M={fhs.m_value_mm:.2f} mm, "
+                f"  Riser Bölgesi #{idx} ({pos} mm): M={fhs.m_value_mm/10.0:.2f} cm, "
                 f"Niyama={fhs.niyama_ensemble:.2f}. Besleyici içindedir."
             )
 

@@ -527,3 +527,14 @@ class AnalysisResult:
     # debug / metadata
     fill_time_s: np.ndarray = field(default_factory=lambda: np.array([]))
     bbox_size_mm: np.ndarray = field(default_factory=lambda: np.zeros(3))
+
+    @property
+    def geometric_m_mm(self) -> float:
+        """Global geometric modulus M = V / A (mm)."""
+        if self.part_surface_area_mm2 <= 0.0:
+            return 0.0
+        return self.part_volume_mm3 / self.part_surface_area_mm2
+
+    @property
+    def geometric_m_cm(self) -> float:
+        return self.geometric_m_mm / 10.0
