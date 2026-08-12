@@ -1445,9 +1445,9 @@ def compute_cold_shot_risk(
                 origin_mm,
                 dx,
                 sigma=1.0,
-                risk_threshold=0.3,
-                min_length_mm=max(2.0, 2.0 * dx),
-                max_lines=5,
+                risk_threshold=0.1,
+                min_length_mm=max(3.0, 1.5 * dx),
+                max_lines=8,
             )
 
     return out, lap_risk, cold_shot_saddles, last_fill_point_mm, cold_shot_risk_viz, lap_risk_viz, cold_shot_lines

@@ -1380,13 +1380,31 @@ class Analyzer3DViewer(QtInteractor):
             self._saddle_tree = None
         self._enable_saddle_picker()
 
+    def _sample_cold_shot_risk(
+        self, points: np.ndarray, result: AnalysisResult
+    ) -> Optional[np.ndarray]:
+        """Interpolate the per-voxel cold-shot risk onto a world-space polyline."""
+        grid = getattr(result, "cold_shot_risk", None)
+        if grid is None or grid.size == 0:
+            return None
+        origin = np.asarray(result.origin_mm, dtype=np.float64)
+        dx = float(result.dx_mm)
+        if dx <= 0.0:
+            return None
+        coords = ((points - origin) / dx - 0.5).T  # (3, N)
+        try:
+            vals = ndimage.map_coordinates(grid, coords, order=1, mode="nearest")
+        except Exception:
+            return None
+        return np.asarray(vals, dtype=np.float64)
+
     def show_cold_shot_risk(self, result: Optional[AnalysisResult]):
         """Render cold-shut risk as 1-D confluence tubes (not volume/surface).
 
         The physical cold shut is a line where two filling fronts meet and fail
         to weld.  ``cold_shot_lines`` holds ordered polylines extracted from the
-        fill-time field; each line is coloured by its own risk on the
-        ``inferno`` 0..1 scale.  The part body stays translucent so the lines
+        fill-time field; each point is coloured by the local cold-shot risk on
+        the ``inferno`` 0..1 scale.  The part body stays translucent so the lines
         are visible inside the geometry.
         """
         if isinstance(self._cold_shot_actor, (list, tuple)):
@@ -1434,13 +1452,18 @@ class Analyzer3DViewer(QtInteractor):
             poly = pv.PolyData()
             poly.points = pts
             poly.lines = np.hstack([[n], np.arange(n)]).astype(np.int64)
+
+            # Colour each point by the local cold-shot risk; this makes the
+            # same confluence line vary from yellow (low risk) to red (high risk).
+            point_risks = self._sample_cold_shot_risk(pts, result)
+            if point_risks is None:
+                point_risks = np.full(n, float(line.get("risk", 0.0)))
+            poly["risk"] = point_risks
+
             try:
                 tube = poly.tube(radius=tube_radius, n_sides=8)
             except Exception:
                 tube = poly
-            risk = float(line.get("risk", 0.0))
-            if tube.n_cells > 0:
-                tube["risk"] = np.full(tube.n_cells, risk)
             actor = self.add_mesh(
                 tube,
                 scalars="risk",
