@@ -3109,6 +3109,9 @@ def analyze(
     # The SDF Laplacian is 2*H and the Hessian determinant is K, so the
     # formula reduces to 1 - mean_curv*SDF + gauss_curv*SDF^2.
     M_mod = compute_steiner_modulus(sdf, mean_curv, gauss_curv, clip_min=0.5)
+    # Porozite/Niyama hesapları için eski davranışı koruyan ayrı modül.
+    # Hotspot/t_section/besleme M_mod'u (clip 0.5) ile karışmaması gerekir.
+    M_mod_porosity = compute_steiner_modulus(sdf, mean_curv, gauss_curv, clip_min=0.1)
     # Debug: voxels where the Steiner shape factor is very low indicate
     # discretised/non-manifold geometry (sharp edges, thin triangles) rather
     # than a real thick section. Log a few coordinates for inspection.
@@ -3308,7 +3311,7 @@ def analyze(
     # Fallback for thick regions that did not reach solidus within max_time_s:
     # use the analytical Chvorinov/Stefan Niyama so hot spots are not reported as 0.
     G_ana, R_ana, niyama_ana = compute_niyama(
-        sdf, M_mod, alloy, mold, dx, is_metal=is_metal
+        sdf, M_mod_porosity, alloy, mold, dx, is_metal=is_metal
     )
     solidified = np.isfinite(t_s) & (t_s > 0.0) & (niyama > 0.0)
     niyama = np.where(solidified, niyama, niyama_ana)
@@ -3810,7 +3813,7 @@ def analyze(
         mold_wall_movement,
     ) = compute_pore_size(
         niyama,
-        M_mod,
+        M_mod_porosity,
         feed_risk,
         alloy,
         part_mask,
