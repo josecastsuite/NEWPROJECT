@@ -177,7 +177,7 @@ def compute_curvature(sdf: np.ndarray, dx: float) -> Tuple[np.ndarray, np.ndarra
 
 
 def compute_steiner_modulus(
-    sdf: np.ndarray, mean_curv: np.ndarray, gauss_curv: np.ndarray, clip_min: float = 0.5
+    sdf: np.ndarray, mean_curv: np.ndarray, gauss_curv: np.ndarray, clip_min: float = 0.1
 ) -> np.ndarray:
     """
     Steiner shape-corrected local modulus.
@@ -188,9 +188,6 @@ def compute_steiner_modulus(
     the determinant of the Hessian as K, so the expression becomes:
         shape_factor = 1 - mean_curv*SDF + gauss_curv*SDF^2
     SDF and M_mod are in the same length units (mm).
-
-    clip_min is bounded below by 0.5 to prevent the 10x inflation that
-    occurred with the old 0.1 limit in concave/discretised regions.
     """
     shape_factor = 1.0 - mean_curv * sdf + gauss_curv * (sdf ** 2)
     shape_factor = np.clip(shape_factor, clip_min, None)
@@ -1894,7 +1891,7 @@ def find_hotspots(
         gauss = gaussian_curvature
         if gauss is None:
             _, gauss = compute_curvature(sdf, dx)
-        M_mod = compute_steiner_modulus(sdf, curvature, gauss, clip_min=0.5)
+        M_mod = compute_steiner_modulus(sdf, curvature, gauss, clip_min=0.1)
     else:
         M_mod = sdf.copy()
 
@@ -2687,7 +2684,7 @@ def _refine_region(
     sdf = compute_sdf(is_metal, dx)
     C = chvorinov_c_from_properties(alloy, mold)
     mean_curv, gauss_curv = compute_curvature(sdf, dx)
-    M_mod = compute_steiner_modulus(sdf, mean_curv, gauss_curv, clip_min=0.5)
+    M_mod = compute_steiner_modulus(sdf, mean_curv, gauss_curv, clip_min=0.1)
     t_s = compute_chvorinov_t(M_mod, C)
     T, R, fs, _ = compute_thermal_field(
         grid, is_metal, alloy, mold, dx, sdf=sdf, M_mod=M_mod
@@ -2769,7 +2766,7 @@ def _high_res_part_hotspots(
     # modulus and stays connected longer during the pseudo-thermal CCL.
     part_sdf = compute_subvoxel_sdf(part_is_metal, part_dx, sub=1)
     mean_curv, gauss_curv = compute_curvature(part_sdf, part_dx)
-    part_M_mod = compute_steiner_modulus(part_sdf, mean_curv, gauss_curv, clip_min=0.5)
+    part_M_mod = compute_steiner_modulus(part_sdf, mean_curv, gauss_curv, clip_min=0.1)
 
     # Derive feeder mask directly from the high-res grid.  Only dedicated
     # RISER bodies are true feeders; gates/runners/sprues are not.
@@ -3108,26 +3105,7 @@ def analyze(
     # Steiner shape-corrected modulus: M = SDF / (1 - 2H*SDF + K*SDF^2).
     # The SDF Laplacian is 2*H and the Hessian determinant is K, so the
     # formula reduces to 1 - mean_curv*SDF + gauss_curv*SDF^2.
-    M_mod = compute_steiner_modulus(sdf, mean_curv, gauss_curv, clip_min=0.5)
-    # Porozite/Niyama hesapları için eski davranışı koruyan ayrı modül.
-    # Hotspot/t_section/besleme M_mod'u (clip 0.5) ile karışmaması gerekir.
-    M_mod_porosity = compute_steiner_modulus(sdf, mean_curv, gauss_curv, clip_min=0.1)
-    # Debug: voxels where the Steiner shape factor is very low indicate
-    # discretised/non-manifold geometry (sharp edges, thin triangles) rather
-    # than a real thick section. Log a few coordinates for inspection.
-    _sf_check = 1.0 - mean_curv * sdf + gauss_curv * (sdf ** 2)
-    _bad_sf = (_sf_check < 0.5) & part_mask
-    if _bad_sf.any():
-        _bad_count = int(_bad_sf.sum())
-        _bad_min = float(_sf_check[_bad_sf].min())
-        _bad_vox = np.argwhere(_bad_sf)
-        _n_sample = min(3, _bad_vox.shape[0])
-        _bad_mm = origin_mm + _bad_vox[:_n_sample] * dx
-        print(
-            f"[ANALYZE] UYARI: {_bad_count} vokselde shape_factor < 0.5 "
-            f"(min {_bad_min:.3f}); örnek koordinatlar (mm): {_bad_mm.tolist()}",
-            flush=True,
-        )
+    M_mod = compute_steiner_modulus(sdf, mean_curv, gauss_curv, clip_min=0.1)
     if progress_callback:
         progress_callback(25)
 
@@ -3311,7 +3289,7 @@ def analyze(
     # Fallback for thick regions that did not reach solidus within max_time_s:
     # use the analytical Chvorinov/Stefan Niyama so hot spots are not reported as 0.
     G_ana, R_ana, niyama_ana = compute_niyama(
-        sdf, M_mod_porosity, alloy, mold, dx, is_metal=is_metal
+        sdf, M_mod, alloy, mold, dx, is_metal=is_metal
     )
     solidified = np.isfinite(t_s) & (t_s > 0.0) & (niyama > 0.0)
     niyama = np.where(solidified, niyama, niyama_ana)
@@ -3486,7 +3464,7 @@ def analyze(
 
             darcy, min_neck_m, t_hs, directional_ok, heuvers_ok, feeding_cost, darcy_ok, feedable_fraction = _path_darcy_and_directional(
                 sdf,
-                M_mod_porosity,
+                M_mod,
                 cost_feed,
                 cost_pred,
                 part_mask,
@@ -3790,11 +3768,9 @@ def analyze(
     nearest_riser_id = riser_factor_map[tuple(nearest_riser)]
     riser_factor_field = np.asarray(factor_by_id, dtype=np.float64)[nearest_riser_id]
 
-    # Feeding risk: porozite çarpanı M_mod_porosity ile; besleyici uzaklığı
-    # hesabı hâlâ aynı kalırken, besleme mesafe faktörü eski (daha az kırpılmış)
-    # modüle göre genişler.
+    # Feeding risk: 0 at the feeder, -> 1 far beyond the effective feeding distance.
     with np.errstate(divide="ignore", invalid="ignore"):
-        FD_field = alloy.feed_k1 * (2.0 * M_mod_porosity) * riser_factor_field
+        FD_field = alloy.feed_k1 * (2.0 * M_mod) * riser_factor_field
         feed_risk = dist_feed / (dist_feed + np.maximum(FD_field, 1.0))
         feed_risk = np.clip(np.nan_to_num(feed_risk, nan=1.0, posinf=1.0, neginf=1.0), 0.0, 1.0)
 
@@ -3815,7 +3791,7 @@ def analyze(
         mold_wall_movement,
     ) = compute_pore_size(
         niyama,
-        M_mod_porosity,
+        M_mod,
         feed_risk,
         alloy,
         part_mask,
