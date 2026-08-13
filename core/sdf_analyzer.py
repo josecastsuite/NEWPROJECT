@@ -3486,7 +3486,7 @@ def analyze(
 
             darcy, min_neck_m, t_hs, directional_ok, heuvers_ok, feeding_cost, darcy_ok, feedable_fraction = _path_darcy_and_directional(
                 sdf,
-                M_mod,
+                M_mod_porosity,
                 cost_feed,
                 cost_pred,
                 part_mask,
@@ -3790,9 +3790,11 @@ def analyze(
     nearest_riser_id = riser_factor_map[tuple(nearest_riser)]
     riser_factor_field = np.asarray(factor_by_id, dtype=np.float64)[nearest_riser_id]
 
-    # Feeding risk: 0 at the feeder, -> 1 far beyond the effective feeding distance.
+    # Feeding risk: porozite çarpanı M_mod_porosity ile; besleyici uzaklığı
+    # hesabı hâlâ aynı kalırken, besleme mesafe faktörü eski (daha az kırpılmış)
+    # modüle göre genişler.
     with np.errstate(divide="ignore", invalid="ignore"):
-        FD_field = alloy.feed_k1 * (2.0 * M_mod) * riser_factor_field
+        FD_field = alloy.feed_k1 * (2.0 * M_mod_porosity) * riser_factor_field
         feed_risk = dist_feed / (dist_feed + np.maximum(FD_field, 1.0))
         feed_risk = np.clip(np.nan_to_num(feed_risk, nan=1.0, posinf=1.0, neginf=1.0), 0.0, 1.0)
 
