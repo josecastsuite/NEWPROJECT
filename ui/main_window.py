@@ -634,6 +634,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.erosion_toggle.setToolTip("Yüksek metal hızına bağlı kum kalıp erozyon riski")
         self.erosion_toggle.setChecked(False)
         self.erosion_toggle.toggled.connect(self.on_toggle_erosion_risk)
+        self.erosion_toggle.setVisible(False)  # geçici olarak gizlendi
         vis_layout.addWidget(self.erosion_toggle)
 
         self.air_entrapment_toggle = QtWidgets.QCheckBox("Hava Sıkışması")

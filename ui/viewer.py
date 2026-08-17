@@ -755,10 +755,12 @@ class Analyzer3DViewer(QtInteractor):
             self._porosity_actor = None
         self._remove_scalar_bar("Pore size (µm)")
         if result is None:
+            self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
             return
 
         part_mask = result.grid == BodyType.PART
         if not part_mask.any():
+            self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
             return
 
         pore_size_filter = (pore_size_filter or "").lower()
@@ -775,6 +777,7 @@ class Analyzer3DViewer(QtInteractor):
                 class_mask = np.zeros_like(part_mask, dtype=bool)
             use_pore_size = class_mask.any()
             if not use_pore_size:
+                self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
                 return
         elif has_pore_size and pore_size_filter in ("", "all"):
             class_mask = part_mask & (pore_size_um > 0.0)
@@ -794,6 +797,7 @@ class Analyzer3DViewer(QtInteractor):
                 field = risk
                 scalar_name = "risk"
             else:
+                self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
                 return
             class_mask = part_mask
 
@@ -805,6 +809,7 @@ class Analyzer3DViewer(QtInteractor):
         if use_pore_size and has_risk and 0.0 <= noise_percent < 100.0:
             risk_values = risk[class_mask & (risk > 0.0)]
             if risk_values.size == 0:
+                self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
                 return
             p = max(0.0, 100.0 - noise_percent)
             risk_threshold = float(np.percentile(risk_values, p))
@@ -814,6 +819,7 @@ class Analyzer3DViewer(QtInteractor):
         values = field[class_mask]
         finite = np.isfinite(values) & (values > 0.0)
         if not finite.any():
+            self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
             return
         finite_max = float(np.max(values[finite]))
         finite_min = float(np.min(values[finite]))
@@ -823,6 +829,7 @@ class Analyzer3DViewer(QtInteractor):
         lo = max(finite_min, 1e-12)
         hi = finite_max
         if hi <= lo:
+            self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
             return
 
         # Mask the field to the selected class so threshold only picks from there.
@@ -832,9 +839,11 @@ class Analyzer3DViewer(QtInteractor):
         grid = self._make_grid(result, clean_field, scalar_name)
         part = self._part_only(grid)
         if part.n_cells == 0:
+            self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
             return
         high = part.threshold([lo, hi], scalars=scalar_name)
         if high.n_cells == 0:
+            self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
             return
 
         # cell_centers() drops arrays; convert point->cell data first and attach it.
@@ -872,6 +881,7 @@ class Analyzer3DViewer(QtInteractor):
                     cloud = kept_cloud
                 elif not inside.any():
                     # Hiçbir nokta içeride değilse gösterme.
+                    self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
                     return
             except Exception:
                 pass
@@ -1249,14 +1259,17 @@ class Analyzer3DViewer(QtInteractor):
             self._mold_wall_actor = None
         self._remove_scalar_bar("Kalıp şişmesi (%)")
         if result is None or result.mold_wall_movement is None or result.mold_wall_movement.size == 0:
+            self._show_scalar_bar_no_geometry("Kalıp şişmesi (%)", "hot", [0.0, 1.0])
             return
 
         grid = self._make_grid(result, result.mold_wall_movement, "mold_wall_movement")
         part = self._part_only(grid)
         if part.n_cells == 0:
+            self._show_scalar_bar_no_geometry("Kalıp şişmesi (%)", "hot", [0.0, 1.0])
             return
         cells = part.threshold(0.05, scalars="mold_wall_movement", all_scalars=True)
         if cells.n_cells == 0:
+            self._show_scalar_bar_no_geometry("Kalıp şişmesi (%)", "hot", [0.0, 1.0])
             return
         vmax = float(np.percentile(cells["mold_wall_movement"], 98))
         if vmax <= 0.05:
@@ -1716,27 +1729,31 @@ class Analyzer3DViewer(QtInteractor):
 
         # Closed isosurfaces at physically meaningful gas-volume fractions.
         contours = grid.contour(isosurfaces=[0.05, 0.20, 0.50, 0.80], scalars="air")
-        contour_actor = self.add_mesh(
-            contours,
-            cmap="coolwarm",
-            clim=[0.0, 1.0],
-            smooth_shading=True,
-            specular=0.8,
-            opacity=0.9,
-            show_scalar_bar=True,
-            scalar_bar_args={
-                "title": "Hava sıkışması",
-                "n_labels": 0,
-                "vertical": False,
-                "position_x": 0.12,
-                "position_y": 0.02,
-                "width": 0.76,
-                "height": 0.06,
-                "title_font_size": 9,
-                "label_font_size": 7,
-                "color": "#334155",
-            },
-        )
+        if contours.n_points > 0:
+            contour_actor = self.add_mesh(
+                contours,
+                cmap="coolwarm",
+                clim=[0.0, 1.0],
+                smooth_shading=True,
+                specular=0.8,
+                opacity=0.9,
+                show_scalar_bar=True,
+                scalar_bar_args={
+                    "title": "Hava sıkışması",
+                    "n_labels": 0,
+                    "vertical": False,
+                    "position_x": 0.12,
+                    "position_y": 0.02,
+                    "width": 0.76,
+                    "height": 0.06,
+                    "title_font_size": 9,
+                    "label_font_size": 7,
+                    "color": "#334155",
+                },
+            )
+        else:
+            contour_actor = None
+            self._show_scalar_bar_no_geometry("Hava sıkışması", "coolwarm", [0.0, 1.0])
 
         vol_actor = self.add_volume(
             grid,
