@@ -252,6 +252,7 @@ class Analyzer3DViewer(QtInteractor):
         self._saddle_arrow_actor = None
         self._reeb_line_actor = None
         self._erosion_actor = None
+        self._erosion_body_opacity_backup: Dict[str, float] = {}
         self._air_entrapment_actor = None
         self._air_entrapment_marker_actor = None
         self.flow_animator = FlowAnimator(self)
@@ -401,6 +402,7 @@ class Analyzer3DViewer(QtInteractor):
         self._saddle_arrow_actor = None
         self._reeb_line_actor = None
         self._erosion_actor = None
+        self._erosion_body_opacity_backup = {}
         self._air_entrapment_actor = None
         self._air_entrapment_marker_actor = None
         self._saddle_tree = None
@@ -422,10 +424,13 @@ class Analyzer3DViewer(QtInteractor):
         selected_body: Optional[Body] = None,
     ):
         """Display original body meshes colored by type."""
+        self._bodies = list(bodies) if bodies is not None else []
         for actor in self._body_actors:
             self.remove_actor(actor)
         self._body_actors.clear()
+        self._body_actor_by_name: Dict[str, Any] = {}
         self._part_mesh_pv = None
+        self._analysis_mode = analysis_mode
 
         opacity_map = BODY_OPACITY_POST if analysis_mode else BODY_OPACITY
         part_vertices: List[np.ndarray] = []
@@ -465,6 +470,8 @@ class Analyzer3DViewer(QtInteractor):
                 specular_power=1,
             )
             self._body_actors.append(actor)
+            if getattr(body, "name", ""):
+                self._body_actor_by_name[body.name] = actor
             if body.body_type == BodyType.PART:
                 part_vertices.append(np.asarray(body.vertices, dtype=np.float64))
                 part_faces.append(np.asarray(body.faces, dtype=np.int64) + offset)
@@ -1638,10 +1645,26 @@ class Analyzer3DViewer(QtInteractor):
             self._remove_scalar_bar("Lap riski")
 
     def show_erosion_risk(self, result: Optional[AnalysisResult]):
-        """Heatmap of mold-sand erosion risk driven by local metal velocity."""
-        if self._erosion_actor is not None:
-            self.remove_actor(self._erosion_actor)
-            self._erosion_actor = None
+        """Smooth mold-sand erosion risk rendered on the original CAD meshes.
+
+        Each gate body is coloured uniformly by its own dynamic throat risk,
+        and the part surface gets smooth spherical impingement patches at the
+        ingate entry points.  The underlying body actors are temporarily
+        hidden for risk-carrying bodies to avoid z-fighting.
+        """
+        self._restore_erosion_body_opacities()
+        if isinstance(self._erosion_actor, (list, tuple)):
+            for actor in self._erosion_actor:
+                try:
+                    self.remove_actor(actor)
+                except Exception:
+                    pass
+        elif self._erosion_actor is not None:
+            try:
+                self.remove_actor(self._erosion_actor)
+            except Exception:
+                pass
+        self._erosion_actor = None
         self._remove_scalar_bar("Kalıp erozyonu riski")
 
         if result is None or result.erosion_risk is None or result.erosion_risk.size == 0:
@@ -1650,44 +1673,112 @@ class Analyzer3DViewer(QtInteractor):
             )
             return
 
-        grid = self._make_grid(result, result.erosion_risk, "erosion_risk")
-        metal = self._metal_only(grid)
-        if metal.n_cells == 0:
+        body_risk = getattr(result, "erosion_body_risk", {}) or {}
+        impingements = getattr(result, "erosion_impingements", []) or []
+        all_risks = list(body_risk.values()) + [r for (_, r, _, _) in impingements]
+        if not all_risks:
             self._show_scalar_bar_no_geometry(
                 "Kalıp erozyonu riski", "YlOrRd", [0.0, 1.0]
             )
             return
 
-        cells = metal.threshold(1e-6, scalars="erosion_risk", all_scalars=False)
-        if cells.n_cells == 0:
-            self._show_scalar_bar_no_geometry(
-                "Kalıp erozyonu riski", "YlOrRd", [0.0, 1.0]
-            )
-            return
-
-        vmax = float(np.nanmax(cells["erosion_risk"]))
-        vmax = max(vmax, 0.3)
+        vmax = float(max(max(all_risks), 0.3))
         clim = [0.0, vmax]
 
-        self._erosion_actor = self.add_mesh(
-            cells,
-            scalars="erosion_risk",
-            cmap="YlOrRd",
-            opacity=0.85,
-            clim=clim,
-            show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Kalıp erozyonu riski", (0.02, 0.02), clim=clim),
-            smooth_shading=True,
-        )
+        actors: List[Any] = []
+        # Render gate bodies on their original smooth meshes.
+        for body in self._bodies:
+            risk = body_risk.get(getattr(body, "name", ""), 0.0)
+            if risk <= 1e-6 or len(body.faces) == 0:
+                continue
+            # Hide the underlying body actor to avoid z-fighting.
+            base_actor = self._body_actor_by_name.get(getattr(body, "name", ""))
+            if base_actor is not None:
+                self._erosion_body_opacity_backup[getattr(body, "name", "")] = float(
+                    base_actor.GetProperty().GetOpacity()
+                )
+                base_actor.GetProperty().SetOpacity(0.0)
+            faces = np.c_[
+                np.full(len(body.faces), 3, dtype=np.int64), body.faces
+            ].ravel()
+            mesh = pv.PolyData(body.vertices, faces)
+            mesh["erosion_risk"] = np.full(len(body.vertices), risk, dtype=np.float64)
+            actors.append(
+                self.add_mesh(
+                    mesh,
+                    scalars="erosion_risk",
+                    cmap="YlOrRd",
+                    opacity=0.85,
+                    clim=clim,
+                    show_scalar_bar=(len(actors) == 0),
+                    scalar_bar_args=_scalar_bar_args(
+                        "Kalıp erozyonu riski", (0.02, 0.02), clim=clim
+                    ) if len(actors) == 0 else None,
+                    smooth_shading=True,
+                )
+            )
+
+        # Render smooth impingement spots on the part surface.
+        for part_name, risk, centroid, radius in impingements:
+            if risk <= 1e-6:
+                continue
+            try:
+                sphere = pv.Sphere(
+                    radius=max(radius, 1e-3),
+                    center=centroid,
+                    theta_resolution=32,
+                    phi_resolution=32,
+                )
+            except Exception:
+                continue
+            sphere["erosion_risk"] = np.full(
+                sphere.n_points, risk, dtype=np.float64
+            )
+            actors.append(
+                self.add_mesh(
+                    sphere,
+                    scalars="erosion_risk",
+                    cmap="YlOrRd",
+                    opacity=0.85,
+                    clim=clim,
+                    show_scalar_bar=False,
+                    smooth_shading=True,
+                )
+            )
+
+        if not actors:
+            self._show_scalar_bar_no_geometry(
+                "Kalıp erozyonu riski", "YlOrRd", [0.0, 1.0]
+            )
+            return
+
+        self._erosion_actor = actors
         self._arrange_scalar_bars()
+
+    def _restore_erosion_body_opacities(self):
+        for name, opacity in self._erosion_body_opacity_backup.items():
+            actor = self._body_actor_by_name.get(name)
+            if actor is not None:
+                actor.GetProperty().SetOpacity(opacity)
+        self._erosion_body_opacity_backup.clear()
 
     def toggle_erosion_risk(self, result: AnalysisResult, checked: bool):
         if checked:
             self.show_erosion_risk(result)
         else:
-            if self._erosion_actor is not None:
-                self.remove_actor(self._erosion_actor)
-                self._erosion_actor = None
+            self._restore_erosion_body_opacities()
+            if isinstance(self._erosion_actor, (list, tuple)):
+                for actor in self._erosion_actor:
+                    try:
+                        self.remove_actor(actor)
+                    except Exception:
+                        pass
+            elif self._erosion_actor is not None:
+                try:
+                    self.remove_actor(self._erosion_actor)
+                except Exception:
+                    pass
+            self._erosion_actor = None
             self._remove_scalar_bar("Kalıp erozyonu riski")
 
     def show_air_entrapment(

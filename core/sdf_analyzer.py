@@ -1464,6 +1464,8 @@ def compute_gate_erosion_risk(
     sdf: Optional[np.ndarray] = None,
     dx_mm: float = 1.0,
     origin_mm: Optional[np.ndarray] = None,
+    body_risk_out: Optional[Dict[str, float]] = None,
+    impingement_out: Optional[List[Tuple[str, float, Tuple[float, float, float], float]]] = None,
 ) -> np.ndarray:
     """Per-gating-element erosion risk using section area, Re, roughness, Cv.
 
@@ -1477,6 +1479,12 @@ def compute_gate_erosion_risk(
     around the contact centroid, because the metal jet exiting the ingate hits
     the mould wall at the entry point.  Non-sand or non-metal downstream
     bodies (PART, RISER) are skipped.
+
+    Optional output containers:
+      * ``body_risk_out`` is populated with ``body_name -> max risk`` for smooth
+        rendering of the original CAD mesh.
+      * ``impingement_out`` receives ``(part_name, risk, centroid_mm, radius_mm)``
+        tuples so the GUI can paint the impingement spots on the part mesh.
     """
     risk = np.zeros_like(is_metal, dtype=np.float64)
     if not gating_nodes or body_index is None or bodies is None:
@@ -1615,6 +1623,10 @@ def compute_gate_erosion_risk(
                 mask = (body_index == body.index) & metal
                 if mask.any():
                     risk[mask] = np.maximum(risk[mask], node_risk)
+            if body_risk_out is not None:
+                body_risk_out[body.name] = max(
+                    body_risk_out.get(body.name, 0.0), float(node_risk)
+                )
 
         # Impingement on the part surface at ingate exits: the metal jet hits
         # the mould wall at the entry point, so paint a local spherical patch.
@@ -1653,6 +1665,15 @@ def compute_gate_erosion_risk(
             )
             if part_mask.any():
                 risk[part_mask] = np.maximum(risk[part_mask], node_risk)
+            if impingement_out is not None and body_down is not None:
+                impingement_out.append(
+                    (
+                        body_down.name,
+                        float(node_risk),
+                        tuple(float(x) for x in n.centroid_mm),
+                        float(radius_mm),
+                    )
+                )
 
     return np.clip(risk, 0.0, 1.0)
 
@@ -1669,6 +1690,8 @@ def compute_erosion_risk(
     body_index: Optional[np.ndarray] = None,
     bodies: Optional[List[Body]] = None,
     origin_mm: Optional[np.ndarray] = None,
+    body_risk_out: Optional[Dict[str, float]] = None,
+    impingement_out: Optional[List[Tuple[str, float, Tuple[float, float, float], float]]] = None,
 ) -> np.ndarray:
     """Physics-based mold-erosion (sand-wash) risk on a per-voxel and per-gate basis.
 
@@ -1684,6 +1707,10 @@ def compute_erosion_risk(
 
     Non-erodible molds (metal, graphite, ceramic) and non-sand bodies return
     zero risk.
+
+    Optional output containers (see ``compute_gate_erosion_risk``):
+      * ``body_risk_out`` -> ``body_name -> max risk`` for smooth mesh rendering.
+      * ``impingement_out`` -> list of ``(part_name, risk, centroid_mm, radius_mm)``.
 
     The model combines four mechanisms that actually detach mold grains from
     the metal-mold interface:
@@ -1840,6 +1867,8 @@ def compute_erosion_risk(
         sdf=sdf,
         dx_mm=dx_mm,
         origin_mm=origin_mm,
+        body_risk_out=body_risk_out,
+        impingement_out=impingement_out,
     )
     risk = np.maximum(field_risk, gate_risk)
     risk = np.where(metal, risk, 0.0)
@@ -4229,6 +4258,8 @@ def analyze(
         if flow_result_for_thermal is not None
         else None
     )
+    erosion_body_risk: Dict[str, float] = {}
+    erosion_impingements: List[Tuple[str, float, Tuple[float, float, float], float]] = []
     erosion_risk = compute_erosion_risk(
         velocity_magnitude,
         is_metal,
@@ -4241,6 +4272,8 @@ def analyze(
         body_index=body_index,
         bodies=bodies,
         origin_mm=origin_mm,
+        body_risk_out=erosion_body_risk,
+        impingement_out=erosion_impingements,
     )
 
     # AŞAMA 9: Risk map aligned with the Carlson-Beckermann porosity volume.
@@ -4377,6 +4410,8 @@ def analyze(
         T_meet=T_meet,
         fs_meet=fs_meet,
         erosion_risk=erosion_risk,
+        erosion_body_risk=erosion_body_risk,
+        erosion_impingements=erosion_impingements,
         air_entrapment=air_entrapment_field,
         trapped_air_volume_m3=trapped_air_volume_m3,
         air_entrapment_centroid_mm=air_entrapment_centroid_mm,

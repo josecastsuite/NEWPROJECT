@@ -2,6 +2,7 @@
 
 import os
 import warnings
+from dataclasses import replace
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -109,6 +110,73 @@ def _bboxes_overlap_or_close(
 ) -> bool:
     """True if two bounding boxes overlap or are within ``tol`` of each other."""
     return bool(np.all((max_a + tol) >= min_b) and np.all((max_b + tol) >= min_a))
+
+
+def _split_disconnected_bodies(bodies: List[Body]) -> List[Body]:
+    """Split bodies whose meshes contain separate connected components.
+
+    If a user loads the whole gating system (or the whole part+gating) as a
+    single solid, trimesh' connected-component split separates the sprue,
+    runner(s) and ingate(s) into distinct ``Body`` objects.  The part is not
+    intentionally split; it is preserved as the largest component of its
+    original body.  Components smaller than 1e-6 cm³ are discarded as debris.
+    """
+    split_bodies: List[Body] = []
+    for body in bodies:
+        if body is None or not len(getattr(body, "faces", [])):
+            continue
+        try:
+            components = list(body.mesh.split(only_watertight=False))
+        except Exception:
+            components = [body.mesh]
+        if not components:
+            components = [body.mesh]
+        # A single connected component is kept as-is.
+        if len(components) == 1:
+            split_bodies.append(body)
+            continue
+        # Preserve the original body name for the largest component and
+        # suffix the smaller pieces so mesh/result labels remain readable.
+        components = sorted(
+            components,
+            key=lambda m: float(m.area) if hasattr(m, "area") else 0.0,
+            reverse=True,
+        )
+        largest_name = body.name
+        for i, m in enumerate(components):
+            if len(m.faces) < 4:
+                continue
+            volume_cm3 = 0.0
+            try:
+                if m.is_watertight:
+                    volume_cm3 = float(m.volume) / 1000.0
+            except Exception:
+                pass
+            surface_area_cm2 = 0.0
+            try:
+                surface_area_cm2 = float(m.area) / 100.0
+            except Exception:
+                pass
+            if volume_cm3 < 1e-6 and surface_area_cm2 < 1e-5:
+                continue
+            if i == 0 and m == components[0]:
+                new_name = largest_name
+            else:
+                new_name = f"{body.name}_c{i}"
+            split_bodies.append(
+                replace(
+                    body,
+                    index=len(split_bodies),
+                    name=new_name,
+                    vertices=m.vertices.copy(),
+                    faces=m.faces.copy(),
+                    mesh=m,
+                    volume_cm3=volume_cm3,
+                    surface_area_cm2=surface_area_cm2,
+                    center=m.center_mass if m.is_watertight else m.centroid,
+                )
+            )
+    return split_bodies
 
 
 def _classify_casting_bodies(
@@ -403,6 +471,8 @@ def _voxelize_at_dim(
 
     repaired_bodies: List[Body] = []
     for idx, body in enumerate(bodies):
+        if body is not None:
+            body.index = idx
         if progress_callback:
             progress_callback(int((idx / len(bodies)) * 50))
 
@@ -603,6 +673,10 @@ def build_voxel_grid(
     if not bodies:
         raise ValueError("Voxelize edilecek body yok.")
 
+    bodies = _split_disconnected_bodies(bodies)
+    for i, b in enumerate(bodies):
+        if b is not None:
+            b.index = i
     _classify_casting_bodies(bodies, gravity_vector=gravity_vector)
 
     bbox_min, bbox_max = _global_bbox(bodies)

@@ -503,6 +503,8 @@ class AnalysisResult:
     fs_meet: np.ndarray = field(default_factory=lambda: np.array([]))
     # v10.5: per-voxel mold-sand erosion risk from high metal velocity
     erosion_risk: np.ndarray = field(default_factory=lambda: np.array([]))
+    erosion_body_risk: Dict[str, float] = field(default_factory=dict)
+    erosion_impingements: List[Tuple[str, float, Tuple[float, float, float], float]] = field(default_factory=list)
     # v10.6: per-voxel air entrapment from LBM free-surface solver
     air_entrapment: np.ndarray = field(default_factory=lambda: np.array([]))
     trapped_air_volume_m3: float = 0.0
