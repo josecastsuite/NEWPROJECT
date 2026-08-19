@@ -11,6 +11,11 @@ import numpy as np
 import pyvista as pv
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+try:
+    import psutil
+except Exception:  # pragma: no cover
+    psutil = None  # type: ignore
+
 from core import (
     MAX_RES,
     ALLOYS,
@@ -24,6 +29,7 @@ from core import (
     get_mold,
     load_step,
 )
+from core.voxelizer import _global_bbox
 from core.materials import chvorinov_c_from_properties, make_effective_mold
 from core.types import Body, BodyType, CastingParameters
 from ui.body_row_widget import BodyRowWidget, FEEDER_TYPE_NAMES
@@ -45,6 +51,7 @@ BODY_TYPE_NAMES = {
     BodyType.SPRUE_THROAT: "D.AĞZI BOĞAZI",
     BodyType.DISTRIBUTOR: "DAĞITICI",
     BodyType.CURUFLUK: "CURUFLUK",
+    BodyType.CHILL: "SOĞUTUCU",
 }
 
 
@@ -55,6 +62,32 @@ def _escape_html(text: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+class AnalyzeThread(QtCore.QThread):
+    """Run the heavy analyze() call in a background thread."""
+
+    progress = QtCore.pyqtSignal(int)
+    finished = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, parent, analyze_fn, args, kwargs):
+        super().__init__(parent)
+        self._analyze_fn = analyze_fn
+        self._args = args
+        self._kwargs = kwargs
+        self._kwargs["progress_callback"] = self.progress.emit
+
+    def run(self):
+        try:
+            result = self._analyze_fn(*self._args, **self._kwargs)
+            self.finished.emit(result)
+        except Exception as exc:
+            import traceback
+            self.error.emit(f"{exc}\n{traceback.format_exc()}")
+
+    def __del__(self):
+        self.wait(100)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -527,13 +560,11 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout.setSpacing(8)
         right_layout.setContentsMargins(10, 10, 10, 10)
 
-        rec_group = QtWidgets.QGroupBox("Mühendis Önerileri")
-        rec_inner = QtWidgets.QVBoxLayout(rec_group)
+        # Mühendis Önerileri paneli UI'dan kaldırıldı; rec_text sadece
+        # rapor/arka-plan metni için saklanıyor.
         self.rec_text = QtWidgets.QTextEdit()
         self.rec_text.setReadOnly(True)
-        self.rec_text.setMinimumHeight(160)
-        rec_inner.addWidget(self.rec_text)
-        right_layout.addWidget(rec_group)
+        self.rec_text.hide()
 
         vis_group = QtWidgets.QGroupBox("Görselleştirme")
         vis_layout = QtWidgets.QVBoxLayout(vis_group)
@@ -593,10 +624,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cold_shot_toggle.toggled.connect(self.on_toggle_cold_shot_risk)
         vis_layout.addWidget(self.cold_shot_toggle)
 
-        self.erosion_toggle = QtWidgets.QCheckBox("Kalıp Erozyonu Riski")
-        self.erosion_toggle.setToolTip("Yüksek metal hızına bağlı kum kalıp erozyon riski")
+        self.lap_risk_toggle = QtWidgets.QCheckBox("Lap Riski")
+        self.lap_risk_toggle.setToolTip("45°–120° arası cephe kapanmasından kaynaklanan lap/doku riski")
+        self.lap_risk_toggle.setChecked(False)
+        self.lap_risk_toggle.toggled.connect(self.on_toggle_lap_risk)
+        vis_layout.addWidget(self.lap_risk_toggle)
+
+        self.erosion_toggle = QtWidgets.QCheckBox("Kümülatif Kalıp Erozyonu Hasarı")
+        self.erosion_toggle.setToolTip("Finnie-Bitter / Darcy-Forchheimer kümülatif erozyon hasarı: hız üssü 2.5, açı faktörü, Re_K türbülansı, bağlayıcı termal degradasyonu")
         self.erosion_toggle.setChecked(False)
         self.erosion_toggle.toggled.connect(self.on_toggle_erosion_risk)
+        self.erosion_toggle.setVisible(True)
         vis_layout.addWidget(self.erosion_toggle)
 
         self.air_entrapment_toggle = QtWidgets.QCheckBox("Hava Sıkışması")
@@ -605,8 +643,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.air_entrapment_toggle.toggled.connect(self.on_toggle_air_entrapment)
         vis_layout.addWidget(self.air_entrapment_toggle)
 
-        anim_group = QtWidgets.QGroupBox("Akış & Katılaşma")
+        anim_group = QtWidgets.QWidget()
         anim_layout = QtWidgets.QVBoxLayout(anim_group)
+        anim_layout.setContentsMargins(0, 0, 0, 0)
 
         self.flow_anim_toggle = QtWidgets.QCheckBox("Dolum + Katılaşma")
         self.flow_anim_toggle.setToolTip("İki fazlı animasyon: önce dolum, sonra katılaşma")
@@ -673,24 +712,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.local_toggle.toggled.connect(self.on_toggle_local)
         vis_layout.addWidget(self.local_toggle)
 
-        slice_layout = QtWidgets.QHBoxLayout()
-        self.slice_toggle = QtWidgets.QCheckBox("Kesit")
-        self.slice_toggle.setToolTip("Kesit düzlemlerini göster/gizle")
-        self.slice_toggle.setChecked(False)
-        self.slice_toggle.toggled.connect(self.on_toggle_slices)
-        slice_layout.addWidget(self.slice_toggle)
-        self.slice_field = QtWidgets.QComboBox()
-        for field, label in [
-            ("sdf", "SDF"),
-            ("risk", "Risk"),
-            ("niyama", "Niyama"),
-            ("mat_id", "Mat ID"),
-        ]:
-            self.slice_field.addItem(label, field)
-        self.slice_field.currentIndexChanged.connect(self.on_slice_field_changed)
-        self.slice_field.setMaximumWidth(130)
-        slice_layout.addWidget(self.slice_field)
-        vis_layout.addLayout(slice_layout)
+        # Kesit/SDF seçicisi UI'dan kaldırıldı; yerel refine için risk kullanılır.
         right_layout.addWidget(vis_group)
 
         export_group = QtWidgets.QGroupBox("Rapor")
@@ -839,6 +861,11 @@ class MainWindow(QtWidgets.QMainWindow):
             gravity_direction=gravity_direction,
             h_eff_m=self.h_eff_spin.value(),
             fast_flow=self.fast_flow_chk.isChecked(),
+            mold_afs_grain_size=self.mold_afs_spin.value(),
+            mold_moisture_percent=self.mold_moisture_spin.value(),
+            mold_binder_percent=self.mold_binder_spin.value(),
+            mold_compactability_percent=self.mold_compactability_spin.value(),
+            mold_rigidity_factor=self.mold_rigidity_spin.value(),
         )
 
     def _gravity_vector_from_ui(self) -> Tuple[float, float, float]:
@@ -882,7 +909,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_progress(self, value: int):
         self.progress.setValue(value)
-        QtCore.QCoreApplication.processEvents()
 
     def _add_body_row(self, body: Body):
         """Add a body row with a dynamic, body-type aware property panel."""
@@ -1058,6 +1084,40 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"{body.name} - {dialog.section_key}: A = {self._user_section_area_cm2:.4f} cm²", "ok"
                 )
 
+    def _memory_aware_max_dim(self, requested_dim: int) -> int:
+        """Limit max_dim to a grid size that fits within available RAM.
+
+        Uses ~200 bytes/cell for the full analysis pipeline.  A 3x safety
+        factor is already implied by the per-cell budget; here we reserve
+        25 % of available memory to leave headroom for the OS / VTK / Qt.
+        """
+        min_dim = 120
+        if not self._bodies:
+            return max(requested_dim, min_dim)
+
+        try:
+            bbox_min, bbox_max = _global_bbox(self._bodies)
+        except Exception:
+            return max(requested_dim, min_dim)
+        bbox_size = bbox_max - bbox_min
+        bbox_volume = float(np.prod(bbox_size))
+        max_size = float(np.max(bbox_size))
+        if bbox_volume <= 0 or max_size <= 0:
+            return max(requested_dim, min_dim)
+
+        if psutil is not None:
+            available = psutil.virtual_memory().available
+            # reserve 25 % and budget 200 bytes/cell for the full pipeline
+            max_cells = int(available * 0.25 / 200.0)
+        else:
+            # conservative fallback: ~30 M cells on machines without psutil
+            max_cells = 30_000_000
+
+        max_dim = int(max_size * (max_cells / bbox_volume) ** (1.0 / 3.0))
+        # also never exceed MAX_RES
+        max_dim = min(max(max_dim, min_dim), MAX_RES)
+        return max(requested_dim, max_dim) if requested_dim < max_dim else max_dim
+
     def on_voxelize(self):
         if not self._bodies:
             return
@@ -1066,12 +1126,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_label.setText("Voxelizasyon yapılıyor...")
             self.aiLog("AŞAMA 1/6: STEP'den çoklu body voxel grid oluşturuluyor...", "info")
             self._set_progress(10)
-            target_dim = self.res_spin.value()
+            requested_dim = self.res_spin.value()
+            memory_max_dim = self._memory_aware_max_dim(requested_dim)
+            if memory_max_dim < requested_dim:
+                self.aiLog(
+                    f"Bellek sınırı: hedef çözünürlük {requested_dim} -> {memory_max_dim} "
+                    f"(güvenli maksimum)",
+                    "warn",
+                )
+            target_dim = min(requested_dim, memory_max_dim)
             grid, body_index, origin, dx, bodies = build_voxel_grid(
                 self._bodies,
                 target_dim=target_dim,
                 progress_callback=self._set_progress,
                 gravity_vector=self._gravity_vector_from_ui(),
+                max_dim=memory_max_dim,
             )
             self._grid = grid
             self._body_index = body_index
@@ -1113,7 +1182,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_label.setText("Titan motoru çalışıyor, 2-3 dk sürebilir...")
             self.aiLog("AŞAMA 2/6: SDF + Chvorinov + eğrilik + iskelet hesaplanıyor...", "info")
             self.progress.setValue(0)
-            t0 = time.time()
+            self._analysis_t0 = time.time()
+            self.analyze_btn.setEnabled(False)
 
             alloy_key = self.alloy_combo.currentData()
             mold_key = self._current_mold_key()
@@ -1132,82 +1202,110 @@ class MainWindow(QtWidgets.QMainWindow):
                 "info",
             )
 
-            self._analysis = analyze(
-                self._bodies,
-                self._grid,
-                self._body_index,
-                self._origin,
-                self._dx,
-                alloy_key=alloy_key,
-                mold_key=mold_key,
-                base_res=160,
-                max_res=max_res,
-                refine_local=refine_local,
-                sub_voxel=sub_voxel,
-                thermal_max_time_s=thermal_max_time_s,
-                thermal_downsample=3,
-                casting_params=casting_params,
-                progress_callback=self._set_progress,
-                user_section_areas_cm2=(
-                    {self._user_section_key: self._user_section_area_cm2}
-                    if self._user_section_area_cm2 > 0.0
-                    else None
+            self._pending_casting_params = casting_params
+            self._analysis_thread = AnalyzeThread(
+                self,
+                analyze,
+                (self._bodies, self._grid, self._body_index, self._origin, self._dx),
+                dict(
+                    alloy_key=alloy_key,
+                    mold_key=mold_key,
+                    base_res=160,
+                    max_res=max_res,
+                    refine_local=refine_local,
+                    sub_voxel=sub_voxel,
+                    thermal_max_time_s=thermal_max_time_s,
+                    thermal_downsample=3,
+                    casting_params=casting_params,
+                    user_section_areas_cm2=(
+                        {self._user_section_key: self._user_section_area_cm2}
+                        if self._user_section_area_cm2 > 0.0
+                        else None
+                    ),
                 ),
             )
-            self._analysis.casting_params = casting_params
-            self._update_porosity_filter_labels(get_alloy(alloy_key))
-
-            gate_result = self._analysis.gate_result
-            if gate_result:
-                self._analysis.recommendations.extend(
-                    self._gating_recommendations(gate_result)
-                )
-
-            elapsed = time.time() - t0
-            self.aiLog(f"AŞAMA 6/6: Analiz tamamlandı ({elapsed:.1f} sn)", "ok")
-
-            self.progress.setValue(100)
-            n_visible = sum(1 for hs in self._analysis.hotspots if not hs.solved)
-            self.status_label.setText(
-                f"Analiz tamamlandı ({elapsed:.1f} sn). {n_visible}/{len(self._analysis.hotspots)} hot spot görünür."
-            )
-            self.export_btn.setEnabled(True)
-            self.html_btn.setEnabled(True)
-            self._update_recommendations()
-            # Post-analysis: all bodies are translucent so internal markers,
-            # porosity, paths, hot-spots and flow/Niyama overlays are visible.
-            self.viewer.show_bodies(self._bodies, reset_camera=True, analysis_mode=True)
-            self.viewer.set_gating_data(self._bodies, self._body_index, self._origin, self._dx)
-            if self.risk_toggle.isChecked():
-                self.viewer.show_risk(self._analysis)
-            if self.porosity_toggle.isChecked():
-                noise, mp, size_filter = self._porosity_cloud_params()
-                self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
-            if self.niyama_toggle.isChecked():
-                self.viewer.show_niyama_isosurfaces(self._analysis)
-            if self.mold_wall_toggle.isChecked():
-                self.viewer.toggle_mold_wall_movement(self._analysis, True)
-            if self.cold_shot_toggle.isChecked():
-                self.viewer.toggle_cold_shot_risk(self._analysis, True)
-            if self.erosion_toggle.isChecked():
-                self.viewer.toggle_erosion_risk(self._analysis, True)
-            if self.air_entrapment_toggle.isChecked():
-                self.viewer.toggle_air_entrapment(self._analysis, True)
-            if self.path_toggle.isChecked():
-                self.viewer.show_feeding_paths(self._analysis)
-            if self.local_toggle.isChecked():
-                self.viewer.show_local_regions(self._analysis, self.slice_field.currentData())
-            self.viewer.show_hotspots(self._analysis)
-            self.viewer.show_flow_node_labels(self._analysis)
-            self._update_flow_controls()
-            if self.flow_anim_toggle.isChecked() and self._analysis.flow_result is not None:
-                self.viewer.toggle_flow_animation(self._analysis, True)
+            self._analysis_thread.progress.connect(self._set_progress)
+            self._analysis_thread.finished.connect(self._on_analysis_finished)
+            self._analysis_thread.error.connect(self._on_analysis_error)
+            self._analysis_thread.finished.connect(self._analysis_thread.deleteLater)
+            self._analysis_thread.error.connect(self._analysis_thread.deleteLater)
+            self._analysis_thread.start()
         except Exception as e:
             import traceback
             self.aiLog(f"Analiz hatası: {e}", "crit")
             QtWidgets.QMessageBox.critical(
                 self, "Analiz Hatası", f"{e}\n{traceback.format_exc()}"
             )
+            self.analyze_btn.setEnabled(True)
+
+    def _on_analysis_finished(self, analysis):
+        casting_params = getattr(self, "_pending_casting_params", None)
+        analysis.casting_params = casting_params
+        self._analysis = analysis
+        # Use the alloy key carried by the analysis result; the UI combo is the
+        # final fallback in case an older result is loaded without one.
+        alloy_key = getattr(analysis, "alloy_key", None)
+        if not alloy_key and casting_params is not None:
+            alloy_key = getattr(casting_params, "alloy_key", None)
+        if not alloy_key:
+            alloy_key = self.alloy_combo.currentData()
+        alloy = get_alloy(alloy_key) if alloy_key else None
+        self._update_porosity_filter_labels(alloy)
+
+        gate_result = self._analysis.gate_result
+        if gate_result:
+            self._analysis.recommendations.extend(
+                self._gating_recommendations(gate_result)
+            )
+
+        elapsed = time.time() - getattr(self, "_analysis_t0", time.time())
+        self.aiLog(f"AŞAMA 6/6: Analiz tamamlandı ({elapsed:.1f} sn)", "ok")
+
+        self.progress.setValue(100)
+        n_visible = sum(1 for hs in self._analysis.hotspots if not hs.solved)
+        self.status_label.setText(
+            f"Analiz tamamlandı ({elapsed:.1f} sn). {n_visible}/{len(self._analysis.hotspots)} hot spot görünür."
+        )
+        self.analyze_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
+        self.html_btn.setEnabled(True)
+        self._update_recommendations()
+        # Post-analysis: all bodies are translucent so internal markers,
+        # porosity, paths, hot-spots and flow/Niyama overlays are visible.
+        self.viewer.show_bodies(self._bodies, reset_camera=True, analysis_mode=True)
+        self.viewer.set_gating_data(self._bodies, self._body_index, self._origin, self._dx)
+        if self.risk_toggle.isChecked():
+            self.viewer.show_risk(self._analysis)
+        if self.porosity_toggle.isChecked():
+            noise, mp, size_filter = self._porosity_cloud_params()
+            self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
+        if self.niyama_toggle.isChecked():
+            self.viewer.show_niyama_isosurfaces(self._analysis)
+        if self.mold_wall_toggle.isChecked():
+            self.viewer.toggle_mold_wall_movement(self._analysis, True)
+        if self.cold_shot_toggle.isChecked():
+            self.viewer.toggle_cold_shot_risk(self._analysis, True)
+        if self.lap_risk_toggle.isChecked():
+            self.viewer.toggle_lap_risk(self._analysis, True)
+        if self.erosion_toggle.isChecked():
+            self.viewer.toggle_erosion_risk(self._analysis, True)
+        if self.air_entrapment_toggle.isChecked():
+            self.viewer.toggle_air_entrapment(self._analysis, True)
+        if self.path_toggle.isChecked():
+            self.viewer.show_feeding_paths(self._analysis)
+        if self.local_toggle.isChecked():
+            self.viewer.show_local_regions(self._analysis, "risk")
+        self.viewer.show_hotspots(self._analysis)
+        self.viewer.show_flow_node_labels(self._analysis)
+        self._update_flow_controls()
+        if self.flow_anim_toggle.isChecked() and self._analysis.flow_result is not None:
+            self.viewer.toggle_flow_animation(self._analysis, True)
+
+    def _on_analysis_error(self, msg):
+        import traceback
+        self.aiLog(f"Analiz hatası: {msg}", "crit")
+        QtWidgets.QMessageBox.critical(self, "Analiz Hatası", msg)
+        self.analyze_btn.setEnabled(True)
 
     def _gating_recommendations(self, gr) -> List[str]:
         if gr is None:
@@ -1311,11 +1409,12 @@ class MainWindow(QtWidgets.QMainWindow):
             noise, mp, size_filter = self._porosity_cloud_params()
             self.viewer.show_porosity_cloud(self._analysis, noise_percent=noise, max_points=mp, pore_size_filter=size_filter)
 
-    def _porosity_cloud_params(self) -> Tuple[float, int, str]:
+    def _porosity_cloud_params(self) -> Tuple[float, Optional[int], str]:
         noise_percent = self.porosity_noise_slider.value() / 100.0  # 0.00 .. 100.00
-        max_points = 5000
+        # max_points is now computed dynamically from part volume and GPU VRAM in the viewer.
+        max_points = None
         size_filter = str(self.porosity_size_filter.currentData() or "all")
-        return float(noise_percent), int(max_points), size_filter
+        return float(noise_percent), max_points, size_filter
 
     def _update_porosity_filter_labels(self, alloy) -> None:
         """Set class combo labels from the alloy's physical micron limits."""
@@ -1337,6 +1436,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_toggle_cold_shot_risk(self, checked: bool):
         if self._analysis:
             self.viewer.toggle_cold_shot_risk(self._analysis, checked)
+
+    def on_toggle_lap_risk(self, checked: bool):
+        if self._analysis:
+            self.viewer.toggle_lap_risk(self._analysis, checked)
 
     def on_toggle_erosion_risk(self, checked: bool):
         if self._analysis:
@@ -1425,26 +1528,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_toggle_local(self, checked: bool):
         if self._analysis:
             if checked:
-                self.viewer.show_local_regions(
-                    self._analysis, self.slice_field.currentData()
-                )
+                self.viewer.show_local_regions(self._analysis, "risk")
             else:
                 self.viewer.show_local_regions(None, "risk")
-
-    def on_toggle_slices(self, checked: bool):
-        if self._analysis:
-            self.viewer.toggle_slices(
-                self._analysis, checked, self.slice_field.currentData()
-            )
-
-    def on_slice_field_changed(self):
-        if self._analysis and self.slice_toggle.isChecked():
-            self.viewer.toggle_slices(self._analysis, False, "sdf")
-            self.viewer.toggle_slices(
-                self._analysis, True, self.slice_field.currentData()
-            )
-        if self._analysis and self.local_toggle.isChecked():
-            self.viewer.show_local_regions(self._analysis, self.slice_field.currentData())
 
     def _generate_report_html(self, path: str):
         """Generate a self-contained HTML report (no PDF conversion)."""

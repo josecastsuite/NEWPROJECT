@@ -1,4 +1,7 @@
 #include "josecast/lbm_solver.h"
+#include "josecast/arena.hpp"
+
+#include <cstddef>
 
 #include <algorithm>
 #include <array>
@@ -6,9 +9,15 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <memory_resource>
 #include <queue>
 #include <utility>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace nb = nanobind;
 
@@ -77,20 +86,36 @@ public:
                double smagorinsky,
                const double* target_velocity = nullptr,
                const double* inlet_distance = nullptr)
-        : nx_(nx), ny_(ny), nz_(nz), dx_(dx), rho0_(rho),
+        : nx_(nx), ny_(ny), nz_(nz),
+          n_(static_cast<size_t>(nx) * ny * nz),
+          dx_(dx), rho0_(rho),
           nu_phys_(nu), inflow_velocity_(inflow_velocity),
           t_max_(t_max), max_steps_(max_steps),
-          cfl_target_(cfl_target), smag_const_(smagorinsky)
+          cfl_target_(cfl_target), smag_const_(smagorinsky),
+          arena_(make_arena(nx, ny, nz)),
+          flags_(arena_.get()), outlet_normal_(arena_.get()),
+          fluid_list_(arena_.get()),
+          f_(arena_.get()), f_new_(arena_.get()),
+          rho_(arena_.get()), ux_(arena_.get()), uy_(arena_.get()), uz_(arena_.get()),
+          phi_(arena_.get()), phi_new_(arena_.get()),
+          fill_time_(arena_.get()), trapped_time_(arena_.get()), nu_t_(arena_.get()),
+          parent_(arena_.get()), root_open_(arena_.get()),
+          target_velocity_owned_(arena_.get()), inlet_distance_owned_(arena_.get())
     {
-        n_ = static_cast<size_t>(nx_) * ny_ * nz_;
 
-        // Preserve the physical gravity magnitude; only normalize the direction.
+        // The UI passes a normalized gravity direction vector.  LBM needs the
+        // physical magnitude of standard gravity (9.81 m/s^2).
         double gnorm = std::sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
-        if (gnorm < 1e-12) gnorm = 9.81;
-        g_mag_ = gnorm;
-        gx_ = g[0] / gnorm;
-        gy_ = g[1] / gnorm;
-        gz_ = g[2] / gnorm;
+        if (gnorm < 1e-12) {
+            gx_ = 0.0;
+            gy_ = 0.0;
+            gz_ = -1.0;
+        } else {
+            gx_ = g[0] / gnorm;
+            gy_ = g[1] / gnorm;
+            gz_ = g[2] / gnorm;
+        }
+        g_mag_ = 9.81;
 
         // Time step: keep the lattice velocity below cfl_target_ for stability.
         double v = std::max(inflow_velocity_, 1e-6);
@@ -140,16 +165,26 @@ public:
         for (size_t i = 0; i < n_; ++i) {
             uint8_t val = grid[i];
             // grid values: 0 = solid mold/outside, 9 = sand core (solid obstacle),
-            // everything else (1..N, excluding 9) is the casting cavity.
-            if (val == 0 || val == 9) {
+            // 11 = cooling sprue (chill insert), 23 = chill insert.
+            // All of these are solid obstacles; everything else (including SLEEVE=25,
+            // which is a feeder metal cavity) is the fluid/gas cavity.
+            if (val == 0 || val == 9 || val == 11 || val == 23) {
                 flags_[i] = 1; // solid
             } else {
                 flags_[i] = 0; // fluid/gas cavity
             }
         }
+        // Inlet and outlet masks may overlap (e.g. the open top of the sprue
+        // throat is both where metal enters and where the open-surface detector
+        // places a vent).  The inlet condition must win: a source cell cannot
+        // also be an outlet, otherwise the pour is never initialised and
+        // filled_frac stays at 0.
         for (size_t i = 0; i < n_; ++i) {
-            if (inlet_mask[i]) flags_[i] = 2;
-            if (outlet_mask[i]) flags_[i] = 3;
+            if (inlet_mask[i]) {
+                flags_[i] = 2;
+            } else if (outlet_mask[i]) {
+                flags_[i] = 3;
+            }
         }
 
         // If the caller did not supply a target velocity and/or inlet-distance
@@ -212,7 +247,11 @@ public:
         phi_new_.assign(n_, 0.0);
         fill_time_.assign(n_, std::numeric_limits<double>::infinity());
         trapped_time_.assign(n_, std::numeric_limits<double>::infinity());
+        nu_t_.assign(n_, 0.0);
 
+        #ifdef _OPENMP
+        omp_set_num_threads(omp_get_max_threads());
+        #endif
         // Inflow lattice velocity and a slight density head to drive the flow.
         double u_in_lb = inflow_velocity_ * dt_ / dx_;
         double u2_in = u_in_lb * u_in_lb;
@@ -244,6 +283,7 @@ public:
 
         cavity_cells_ = 0;
         fluid_list_.clear();
+        fluid_list_.reserve(n_);
         for (size_t i = 0; i < n_; ++i) {
             if (flags_[i] != 1) {
                 // Outlets/vents (flags == 3) remain air and should not count
@@ -278,6 +318,10 @@ public:
 
             collide_and_stream();
 
+            if (callback_every_n_ > 0 && step % callback_every_n_ == 0) {
+                do_callback(step);
+            }
+
             t_ += dt_;
             ++steps_;
         }
@@ -286,10 +330,59 @@ public:
         detect_entrapment();
     }
 
+    void set_step_callback(nb::callable cb, int every_n) {
+        callback_ = cb;
+        callback_every_n_ = every_n;
+    }
+
+    // Invoke the Python callback with (step, dt, dx, cs2, vx, vy, vz, F, nu_t).
+    // Arrays are float32, C-order, shape (nx, ny, nz).  v and nu_t are SI units.
+    void do_callback(int step) {
+        if (!callback_ || callback_every_n_ <= 0) return;
+
+        std::vector<float> vx_buf(n_, 0.0f), vy_buf(n_, 0.0f), vz_buf(n_, 0.0f);
+        std::vector<float> F_buf(n_, 0.0f), nu_buf(n_, 0.0f);
+        const double v_scale = dx_ / dt_;
+        const double nu_scale = dx_ * dx_ / dt_;
+
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
+            if (flags_[i] == 1) continue; // solid
+            vx_buf[i] = static_cast<float>(ux_[i] * v_scale);
+            vy_buf[i] = static_cast<float>(uy_[i] * v_scale);
+            vz_buf[i] = static_cast<float>(uz_[i] * v_scale);
+            F_buf[i] = static_cast<float>(1.0 - phi_[i]);
+            nu_buf[i] = static_cast<float>(nu_t_[i] * nu_scale);
+        }
+
+        auto make_arr = [&](std::vector<float>& buf) -> nb::ndarray<nb::numpy, float, nb::shape<-1, -1, -1>> {
+            auto* owned = new std::vector<float>(std::move(buf));
+            nb::capsule cap(owned, [](void* p) noexcept { delete static_cast<std::vector<float>*>(p); });
+            return nb::ndarray<nb::numpy, float, nb::shape<-1, -1, -1>>(
+                owned->data(),
+                {static_cast<size_t>(nx_), static_cast<size_t>(ny_), static_cast<size_t>(nz_)},
+                cap);
+        };
+
+        const double cs2 = dx_ * dx_ / (3.0 * dt_ * dt_);
+
+        {
+            nb::gil_scoped_acquire acquire;
+            callback_(step, dt_, dx_, cs2,
+                      make_arr(vx_buf), make_arr(vy_buf), make_arr(vz_buf),
+                      make_arr(F_buf), make_arr(nu_buf));
+        }
+    }
+
     double filled_fraction() const {
         if (cavity_cells_ == 0) return 0.0;
-        size_t filled = 0;
-        for (size_t i = 0; i < n_; ++i) {
+        ptrdiff_t filled = 0;
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) reduction(+:filled)
+        #endif
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             // Inlet/source (2) and cavity (0) cells must fill; vents (3) stay empty.
             if (flags_[i] != 1 && flags_[i] != 3 && phi_[i] >= 0.5) ++filled;
         }
@@ -301,7 +394,10 @@ public:
 
     void get_velocity_magnitude(std::vector<double>* out) const {
         out->resize(n_);
-        for (size_t i = 0; i < n_; ++i) {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             double u = ux_[i], v = uy_[i], w = uz_[i];
             (*out)[i] = std::sqrt(u * u + v * v + w * w);
         }
@@ -309,27 +405,42 @@ public:
 
     void get_velocity(std::vector<double>* out) const {
         out->resize(3 * n_);
-        for (size_t i = 0; i < n_; ++i) {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             (*out)[0 * n_ + i] = ux_[i];
             (*out)[1 * n_ + i] = uy_[i];
             (*out)[2 * n_ + i] = uz_[i];
         }
     }
 
-    void get_phi(std::vector<double>* out) const { *out = phi_; }
+    void get_phi(std::vector<double>* out) const {
+        out->resize(n_);
+        std::copy(phi_.begin(), phi_.end(), out->begin());
+    }
 
-    void get_fill_time(std::vector<double>* out) const { *out = fill_time_; }
+    void get_fill_time(std::vector<double>* out) const {
+        out->resize(n_);
+        std::copy(fill_time_.begin(), fill_time_.end(), out->begin());
+    }
 
     void get_entrapment(std::vector<double>* out) const {
         out->resize(n_);
-        for (size_t i = 0; i < n_; ++i) {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             (*out)[i] = (trapped_time_[i] < std::numeric_limits<double>::infinity() / 2.0) ? 1.0 : 0.0;
         }
     }
 
     double total_entrapped_volume() const {
         double vol = 0.0;
-        for (size_t i = 0; i < n_; ++i) {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) reduction(+:vol)
+        #endif
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             if (trapped_time_[i] < std::numeric_limits<double>::infinity() / 2.0) {
                 vol += (1.0 - phi_[i]);
             }
@@ -355,26 +466,42 @@ private:
     bool has_target_ = false;
     double target_scale_ = 0.0;  // (dt/dx) converts physical velocity to lattice velocity.
 
-    std::vector<uint8_t> flags_;
-    std::vector<std::array<double, 3>> outlet_normal_;
-    std::vector<size_t> fluid_list_;
-    std::vector<double> f_;
-    std::vector<double> f_new_;
-    std::vector<double> rho_, ux_, uy_, uz_;
-    std::vector<double> phi_, phi_new_;
-    std::vector<double> fill_time_, trapped_time_;
+    // Chunked virtual-address arena: 256 MiB blocks that grow on demand.  No
+    // single huge contiguous reservation is required.
+    std::unique_ptr<ChunkedArena> arena_;
+    std::pmr::vector<uint8_t> flags_;
+    std::pmr::vector<std::array<double, 3>> outlet_normal_;
+    std::pmr::vector<size_t> fluid_list_;
+    std::pmr::vector<double> f_;
+    std::pmr::vector<double> f_new_;
+    std::pmr::vector<double> rho_, ux_, uy_, uz_;
+    std::pmr::vector<double> phi_, phi_new_;
+    std::pmr::vector<double> fill_time_, trapped_time_;
+    std::pmr::vector<int> parent_;
+    std::pmr::vector<char> root_open_;
     const double* inlet_distance_ = nullptr;
     bool has_inlet_dist_ = false;
     int current_step_ = 0;
+    nb::callable callback_;
+    int callback_every_n_ = 0;
+    std::pmr::vector<double> nu_t_;
 
-    std::vector<double> target_velocity_owned_;
-    std::vector<double> inlet_distance_owned_;
+    std::pmr::vector<double> target_velocity_owned_;
+    std::pmr::vector<double> inlet_distance_owned_;
+
+    static std::unique_ptr<ChunkedArena> make_arena(int nx, int ny, int nz) {
+        (void)nx; (void)ny; (void)nz;
+        return std::make_unique<ChunkedArena>(0);
+    }
 
     void build_geodesic_target() {
         // 26-neighbour Dijkstra from inlet cells within the cavity.
-        std::vector<double> dist(n_, std::numeric_limits<double>::infinity());
+        // Reuse the member inlet_distance_owned_ as the distance buffer so the
+        // data stays in the VirtualArena.
+        inlet_distance_owned_.assign(n_, std::numeric_limits<double>::infinity());
         using PQItem = std::pair<double, size_t>;
-        std::priority_queue<PQItem, std::vector<PQItem>, std::greater<PQItem>> pq;
+        std::priority_queue<PQItem, std::pmr::vector<PQItem>, std::greater<PQItem>> pq(
+            std::greater<PQItem>{}, std::pmr::vector<PQItem>{arena_.get()});
 
         auto linear_to_ijk = [&](size_t idx, int& x, int& y, int& z) {
             x = static_cast<int>(idx / (ny_ * nz_));
@@ -385,7 +512,7 @@ private:
 
         for (size_t i = 0; i < n_; ++i) {
             if (flags_[i] == 2) {
-                dist[i] = 0.0;
+                inlet_distance_owned_[i] = 0.0;
                 pq.emplace(0.0, i);
             }
         }
@@ -393,7 +520,7 @@ private:
         while (!pq.empty()) {
             auto [d, i] = pq.top();
             pq.pop();
-            if (d > dist[i] + 1e-12) continue;
+            if (d > inlet_distance_owned_[i] + 1e-12) continue;
             int x, y, z;
             linear_to_ijk(i, x, y, z);
             for (int dz = -1; dz <= 1; ++dz) {
@@ -406,8 +533,8 @@ private:
                         if (flags_[j] == 1) continue; // solid
                         double w = std::sqrt(static_cast<double>(dx * dx + dy * dy + dz * dz));
                         double nd = d + w;
-                        if (nd + 1e-12 < dist[j]) {
-                            dist[j] = nd;
+                        if (nd + 1e-12 < inlet_distance_owned_[j]) {
+                            inlet_distance_owned_[j] = nd;
                             pq.emplace(nd, j);
                         }
                     }
@@ -415,7 +542,6 @@ private:
             }
         }
 
-        inlet_distance_owned_ = std::move(dist);
         inlet_distance_ = inlet_distance_owned_.data();
         has_inlet_dist_ = true;
 
@@ -497,7 +623,10 @@ private:
     }
 
     void compute_macroscopic() {
-        for (size_t idx = 0; idx < fluid_list_.size(); ++idx) {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(fluid_list_.size()); ++idx) {
             size_t i = fluid_list_[idx];
             double r = 0.0, px = 0.0, py = 0.0, pz = 0.0;
             const double* fp = &f_[i * Q];
@@ -544,7 +673,10 @@ private:
 
     void collide_and_stream() {
         // 1. Collision (BGK) with Guo forcing and Smagorinsky eddy viscosity.
-        for (size_t idx = 0; idx < fluid_list_.size(); ++idx) {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(fluid_list_.size()); ++idx) {
             size_t i = fluid_list_[idx];
             if (flags_[i] == 1) {
                 for (int q = 0; q < Q; ++q) f_new_[i * Q + q] = feq(q, 1.0, 0.0, 0.0, 0.0);
@@ -579,9 +711,12 @@ private:
             if (smag_const_ > 0.0 && q_norm > 0.0) {
                 double s_mag = (3.0 / (2.0 * r * tau0_)) * q_norm;
                 double nu_t = smag_const_ * smag_const_ * s_mag;
+                nu_t_[i] = nu_t;
                 double tau_eff = tau0_ + 3.0 * nu_t;
                 if (tau_eff < tau_min_) tau_eff = tau_min_;
                 tau = tau_eff;
+            } else {
+                nu_t_[i] = 0.0;
             }
 
             double one_minus_half_omega = 1.0 - 0.5 / tau;
@@ -656,10 +791,16 @@ private:
         // would enter a solid cell are returned to the source cell in the
         // opposite direction.  Distributions that leave the domain are discarded;
         // for outlet cells this is the correct open-boundary outflow.
-        for (size_t i = 0; i < n_; ++i) {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             for (int q = 0; q < Q; ++q) f_[i * Q + q] = 0.0;
         }
-        for (size_t idx = 0; idx < fluid_list_.size(); ++idx) {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(fluid_list_.size()); ++idx) {
             size_t s = fluid_list_[idx];
             int x = static_cast<int>(s / (ny_ * nz_));
             int yz = static_cast<int>(s % (ny_ * nz_));
@@ -690,7 +831,10 @@ private:
         }
 
         // 4. Enforce boundary conditions on post-streamed f.
-        for (size_t idx = 0; idx < fluid_list_.size(); ++idx) {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(fluid_list_.size()); ++idx) {
             size_t i = fluid_list_[idx];
             if (flags_[i] == 1) {
                 // Solid wall: no-slip equilibrium.
@@ -750,6 +894,9 @@ private:
         };
 
         // X faces.
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (int x = 1; x < nx_; ++x) {
             for (int y = 0; y < ny_; ++y) {
                 for (int z = 0; z < nz_; ++z) {
@@ -760,11 +907,23 @@ private:
                     double amount;
                     if (uface > 0.0) {
                         amount = uface * phi_[ia];
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ia] -= amount;
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ib] += amount;
                     } else if (uface < 0.0) {
                         amount = -uface * phi_[ib];
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ib] -= amount;
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ia] += amount;
                     }
                 }
@@ -772,6 +931,9 @@ private:
         }
 
         // Y faces.
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (int x = 0; x < nx_; ++x) {
             for (int y = 1; y < ny_; ++y) {
                 for (int z = 0; z < nz_; ++z) {
@@ -782,11 +944,23 @@ private:
                     double amount;
                     if (vface > 0.0) {
                         amount = vface * phi_[ia];
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ia] -= amount;
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ib] += amount;
                     } else if (vface < 0.0) {
                         amount = -vface * phi_[ib];
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ib] -= amount;
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ia] += amount;
                     }
                 }
@@ -794,6 +968,9 @@ private:
         }
 
         // Z faces.
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (int x = 0; x < nx_; ++x) {
             for (int y = 0; y < ny_; ++y) {
                 for (int z = 1; z < nz_; ++z) {
@@ -804,11 +981,23 @@ private:
                     double amount;
                     if (wface > 0.0) {
                         amount = wface * phi_[ia];
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ia] -= amount;
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ib] += amount;
                     } else if (wface < 0.0) {
                         amount = -wface * phi_[ib];
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ib] -= amount;
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[ia] += amount;
                     }
                 }
@@ -824,7 +1013,10 @@ private:
         if (u_in_lb > 1.0) u_in_lb = 1.0;
         if (u_in_lb < 0.01) u_in_lb = 0.01;
 
-        for (size_t i = 0; i < n_; ++i) {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             if (flags_[i] == 1 || flags_[i] == 3) continue;
             if (phi_[i] < 0.5 && flags_[i] != 2) continue;
             int x = static_cast<int>(i / (ny_ * nz_));
@@ -882,8 +1074,10 @@ private:
                 if (in_cell(sx, sy, sz, nx_, ny_, nz_)) {
                     size_t j = cidx(sx, sy, sz, ny_, nz_);
                     if (flags_[j] != 1 && flags_[j] != 3) {
+                        #ifdef _OPENMP
+                        #pragma omp atomic
+                        #endif
                         phi_new_[j] += u_in_lb * best_dot;
-                        if (phi_new_[j] > 1.0) phi_new_[j] = 1.0;
                     }
                 }
             }
@@ -896,7 +1090,10 @@ private:
         // turbulence fields.
         if (has_inlet_dist_) {
             double threshold = (static_cast<double>(current_step_) + 1.0) * u_in_lb;
-            for (size_t i = 0; i < n_; ++i) {
+            #ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+            #endif
+            for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
                 if (flags_[i] == 1 || flags_[i] == 3) continue;
                 if (inlet_distance_[i] >= 0.0 && inlet_distance_[i] <= threshold) {
                     phi_new_[i] = std::max(phi_new_[i], 1.0);
@@ -904,7 +1101,10 @@ private:
             }
         }
 
-        for (size_t i = 0; i < n_; ++i) {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             if (flags_[i] == 1) {
                 phi_new_[i] = 0.0;
             } else {
@@ -916,7 +1116,10 @@ private:
     }
 
     void update_fill_times() {
-        for (size_t i = 0; i < n_; ++i) {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n_); ++i) {
             if (flags_[i] != 1 && phi_[i] >= 0.5 && fill_time_[i] > t_) {
                 fill_time_[i] = t_;
             }
@@ -926,15 +1129,16 @@ private:
     void detect_entrapment() {
         if (n_ == 0) return;
 
-        std::vector<int> parent(n_, -1);
+        // Allocate once from the VirtualArena, then reuse every call.
+        parent_.assign(n_, -1);
         for (size_t i = 0; i < n_; ++i) {
-            if (flags_[i] != 1 && phi_[i] < 0.5) parent[i] = static_cast<int>(i);
+            if (flags_[i] != 1 && phi_[i] < 0.5) parent_[i] = static_cast<int>(i);
         }
 
         auto find = [&](int a) {
-            while (parent[a] >= 0 && parent[a] != a) {
-                parent[a] = parent[parent[a]];
-                a = parent[a];
+            while (parent_[a] >= 0 && parent_[a] != a) {
+                parent_[a] = parent_[parent_[a]];
+                a = parent_[a];
             }
             return a;
         };
@@ -944,36 +1148,36 @@ private:
             int rb = find(b);
             if (ra == rb) return;
             if (ra > rb) std::swap(ra, rb);
-            parent[rb] = ra;
+            parent_[rb] = ra;
         };
 
         for (int x = 0; x < nx_; ++x) {
             for (int y = 0; y < ny_; ++y) {
                 for (int z = 0; z < nz_; ++z) {
                     size_t i = cidx(x, y, z, ny_, nz_);
-                    if (parent[i] < 0) continue;
+                    if (parent_[i] < 0) continue;
                     if (x + 1 < nx_) {
                         size_t j = cidx(x + 1, y, z, ny_, nz_);
-                        if (parent[j] >= 0) unite(static_cast<int>(i), static_cast<int>(j));
+                        if (parent_[j] >= 0) unite(static_cast<int>(i), static_cast<int>(j));
                     }
                     if (y + 1 < ny_) {
                         size_t j = cidx(x, y + 1, z, ny_, nz_);
-                        if (parent[j] >= 0) unite(static_cast<int>(i), static_cast<int>(j));
+                        if (parent_[j] >= 0) unite(static_cast<int>(i), static_cast<int>(j));
                     }
                     if (z + 1 < nz_) {
                         size_t j = cidx(x, y, z + 1, ny_, nz_);
-                        if (parent[j] >= 0) unite(static_cast<int>(i), static_cast<int>(j));
+                        if (parent_[j] >= 0) unite(static_cast<int>(i), static_cast<int>(j));
                     }
                 }
             }
         }
 
-        std::vector<char> root_open(n_, 0);
+        root_open_.assign(n_, 0);
         for (int x = 0; x < nx_; ++x) {
             for (int y = 0; y < ny_; ++y) {
                 for (int z = 0; z < nz_; ++z) {
                     size_t i = cidx(x, y, z, ny_, nz_);
-                    if (parent[i] < 0) continue;
+                    if (parent_[i] < 0) continue;
                     bool open = false;
                     if (x == 0 || x == nx_ - 1 || y == 0 || y == ny_ - 1 || z == 0 || z == nz_ - 1) {
                         open = true;
@@ -981,16 +1185,16 @@ private:
                     if (flags_[i] == 3) open = true;
                     if (open) {
                         int r = find(static_cast<int>(i));
-                        root_open[r] = 1;
+                        root_open_[r] = 1;
                     }
                 }
             }
         }
 
         for (size_t i = 0; i < n_; ++i) {
-            if (parent[i] < 0) continue;
+            if (parent_[i] < 0) continue;
             int r = find(static_cast<int>(i));
-            if (root_open[r]) continue;
+            if (root_open_[r]) continue;
             if (trapped_time_[i] > t_ + dt_ * 0.5) {
                 trapped_time_[i] = t_;
             }
@@ -1041,6 +1245,96 @@ nb::tuple solve_lbm_filling(
                       dx, g, rho, nu, inflow_velocity, t_max, max_steps,
                       cfl_target, smagorinsky, target_ptr, inlet_dist_ptr);
 
+    solver.run();
+
+    std::vector<double> ft, vmag, vel, phi, trap;
+    solver.get_fill_time(&ft);
+    solver.get_velocity_magnitude(&vmag);
+    solver.get_velocity(&vel);
+    solver.get_phi(&phi);
+    solver.get_entrapment(&trap);
+
+    auto* ft_vec = new std::vector<double>(std::move(ft));
+    auto* vmag_vec = new std::vector<double>(std::move(vmag));
+    auto* vel_vec = new std::vector<double>(std::move(vel));
+    auto* phi_vec = new std::vector<double>(std::move(phi));
+    auto* trap_vec = new std::vector<double>(std::move(trap));
+
+    auto cap_ft = nb::capsule(ft_vec, [](void* p) noexcept { delete static_cast<std::vector<double>*>(p); });
+    auto cap_vmag = nb::capsule(vmag_vec, [](void* p) noexcept { delete static_cast<std::vector<double>*>(p); });
+    auto cap_vel = nb::capsule(vel_vec, [](void* p) noexcept { delete static_cast<std::vector<double>*>(p); });
+    auto cap_phi = nb::capsule(phi_vec, [](void* p) noexcept { delete static_cast<std::vector<double>*>(p); });
+    auto cap_trap = nb::capsule(trap_vec, [](void* p) noexcept { delete static_cast<std::vector<double>*>(p); });
+
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> arr_ft(
+        ft_vec->data(), {static_cast<size_t>(nx), static_cast<size_t>(ny), static_cast<size_t>(nz)}, cap_ft);
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> arr_vmag(
+        vmag_vec->data(), {static_cast<size_t>(nx), static_cast<size_t>(ny), static_cast<size_t>(nz)}, cap_vmag);
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> arr_phi(
+        phi_vec->data(), {static_cast<size_t>(nx), static_cast<size_t>(ny), static_cast<size_t>(nz)}, cap_phi);
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> arr_trap(
+        trap_vec->data(), {static_cast<size_t>(nx), static_cast<size_t>(ny), static_cast<size_t>(nz)}, cap_trap);
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> arr_vel(
+        vel_vec->data(), {3, static_cast<size_t>(nx), static_cast<size_t>(ny), static_cast<size_t>(nz)}, cap_vel);
+
+    return nb::make_tuple(
+        arr_ft,
+        arr_vmag,
+        arr_vel,
+        arr_phi,
+        arr_trap,
+        solver.total_entrapped_volume(),
+        solver.filled_fraction() >= 0.9999,
+        solver.current_time(),
+        solver.filled_fraction(),
+        solver.steps()
+    );
+}
+
+nb::tuple solve_lbm_filling_callback(
+    nb::ndarray<nb::numpy, uint8_t, nb::shape<-1, -1, -1>> grid,
+    nb::ndarray<nb::numpy, uint8_t, nb::shape<-1, -1, -1>> inlet_mask,
+    nb::ndarray<nb::numpy, uint8_t, nb::shape<-1, -1, -1>> outlet_mask,
+    double dx,
+    std::array<double, 3> g,
+    double rho,
+    double nu,
+    double inflow_velocity,
+    double t_max,
+    int max_steps,
+    double cfl_target,
+    double smagorinsky,
+    nb::callable callback,
+    int callback_every_n,
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1, -1>> target_velocity,
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> inlet_distance)
+{
+    int nx = static_cast<int>(grid.shape(0));
+    int ny = static_cast<int>(grid.shape(1));
+    int nz = static_cast<int>(grid.shape(2));
+
+    if (inlet_mask.shape(0) != nx || inlet_mask.shape(1) != ny || inlet_mask.shape(2) != nz ||
+        outlet_mask.shape(0) != nx || outlet_mask.shape(1) != ny || outlet_mask.shape(2) != nz) {
+        throw std::runtime_error("solve_lbm_filling_callback: mask shapes do not match grid");
+    }
+
+    const size_t n = static_cast<size_t>(nx) * ny * nz;
+    const double* target_ptr = nullptr;
+    if (target_velocity.ndim() == 4 && target_velocity.shape(0) == 3 &&
+        static_cast<size_t>(target_velocity.size()) == 3 * n) {
+        target_ptr = target_velocity.data();
+    }
+    const double* inlet_dist_ptr = nullptr;
+    if (inlet_distance.ndim() == 3 &&
+        static_cast<size_t>(inlet_distance.size()) == n) {
+        inlet_dist_ptr = inlet_distance.data();
+    }
+
+    LBMFilling solver(nx, ny, nz, grid.data(), inlet_mask.data(), outlet_mask.data(),
+                      dx, g, rho, nu, inflow_velocity, t_max, max_steps,
+                      cfl_target, smagorinsky, target_ptr, inlet_dist_ptr);
+
+    solver.set_step_callback(callback, callback_every_n);
     solver.run();
 
     std::vector<double> ft, vmag, vel, phi, trap;

@@ -32,4 +32,27 @@ nb::tuple solve_lbm_filling(
     nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1, -1>> target_velocity = {},
     nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> inlet_distance = {});
 
+// Transient one-way coupled LBM filling solver that invokes ``callback`` every
+// ``callback_every_n`` steps with (step, dt, dx, cs2, vx, vy, vz, F, nu_t).
+// This exposes the live velocity, free-surface marker and Smagorinsky eddy
+// viscosity fields so that a Python-side D3Q7 gas-transport solver can run in
+// lockstep with the C++ D3Q19 LBM.
+nb::tuple solve_lbm_filling_callback(
+    nb::ndarray<nb::numpy, uint8_t, nb::shape<-1, -1, -1>> grid,
+    nb::ndarray<nb::numpy, uint8_t, nb::shape<-1, -1, -1>> inlet_mask,
+    nb::ndarray<nb::numpy, uint8_t, nb::shape<-1, -1, -1>> outlet_mask,
+    double dx,
+    std::array<double, 3> g,
+    double rho,
+    double nu,
+    double inflow_velocity,
+    double t_max,
+    int max_steps,
+    double cfl_target,
+    double smagorinsky,
+    nb::callable callback,
+    int callback_every_n = 10,
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1, -1>> target_velocity = {},
+    nb::ndarray<nb::numpy, double, nb::shape<-1, -1, -1>> inlet_distance = {});
+
 } // namespace josecast

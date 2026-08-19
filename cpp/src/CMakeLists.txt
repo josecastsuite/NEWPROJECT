@@ -1,4 +1,5 @@
 set(JOSECAST_SOURCES
+    arena.cpp
     bindings.cpp
     cgal_skeleton.cpp
     darcy_solver.cpp
@@ -39,6 +40,8 @@ endif()
 
 if(OpenMP_CXX_FOUND)
     target_link_libraries(josecast_core PRIVATE OpenMP::OpenMP_CXX)
+    target_compile_options(josecast_core PRIVATE ${OpenMP_CXX_FLAGS})
+    target_link_options(josecast_core PRIVATE ${OpenMP_CXX_FLAGS})
 endif()
 
 # Copy the compiled extension module next to the Python package so it can be

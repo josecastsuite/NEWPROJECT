@@ -116,6 +116,8 @@ class GatingDesign:
     froude: float
     turbulent: bool
 
+    gating_ratio: Optional[Tuple[float, float, float]] = None
+
     measured_sprue_base_area_cm2: float = 0.0
     measured_sprue_throat_area_cm2: float = 0.0
     measured_runner_total_area_cm2: float = 0.0
@@ -863,6 +865,7 @@ def calculate_gating_design(inp: GatingEngineInput) -> GatingDesign:
         q_m3_s=Q,
         h_eff_mm=h_eff_m * 1000.0,
         v_choke_m_s=v_choke,
+        gating_ratio=ratio,
         sprue_base_area_cm2=As * 1e4,
         sprue_throat_area_cm2=As * 1e4,
         runner_total_area_cm2=Ar * 1e4,

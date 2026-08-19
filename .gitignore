@@ -16,3 +16,4 @@ cpp/build/
 *.so
 *.dylib
 *.dll
+*.zip

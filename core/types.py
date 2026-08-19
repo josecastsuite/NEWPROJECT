@@ -64,6 +64,8 @@ class BodyType(IntEnum):
     SPRUE_THROAT = 17
     DISTRIBUTOR = 19
     CURUFLUK = 21
+    CHILL = 23
+    SLEEVE = 25
 
 
 BODY_TYPE_LABELS = {
@@ -79,11 +81,13 @@ BODY_TYPE_LABELS = {
     BodyType.SPRUE_THROAT: "D.AĞZI BOĞAZI",
     BodyType.DISTRIBUTOR: "DAĞITICI",
     BodyType.CURUFLUK: "CURUFLUK",
+    BodyType.CHILL: "SOĞUTUCU (CHILL)",
 }
 
 # Body types that contain liquid metal during pouring (part + gating + riser).
-# CORE, FILTER and COOLING_SPRUE are not part of the liquid metal domain: the
-# latter is a chill insert and should be treated as a heat sink, not as metal.
+# SLEEVE is retained as a feeder metal cavity for backwards compatibility.
+# CORE, FILTER and COOLING_SPRUE are not part of the liquid metal domain:
+# the latter is a chill insert and should be treated as a heat sink, not as metal.
 BODY_CASTING_METAL_TYPES = [
     BodyType.PART,
     BodyType.RISER,
@@ -94,6 +98,7 @@ BODY_CASTING_METAL_TYPES = [
     BodyType.POURING_BASIN,
     BodyType.DISTRIBUTOR,
     BodyType.CURUFLUK,
+    BodyType.SLEEVE,
 ]
 
 # Backwards-compatible alias; cooling sprue and filter are excluded from
@@ -109,10 +114,12 @@ BODY_FEEDER_TYPES = [
     BodyType.SPRUE_THROAT,
     BodyType.POURING_BASIN,
     BodyType.DISTRIBUTOR,
+    BodyType.SLEEVE,  # backwards-compatible feeder cavity
 ]
 
 # Inserts that accelerate local cooling and must never be treated as feeders.
-CHILL_BODY_TYPES = [BodyType.COOLING_SPRUE]
+# COOLING_SPRUE is a chill insert, not a gating sprue.
+CHILL_BODY_TYPES = [BodyType.COOLING_SPRUE, BodyType.CHILL]
 
 
 class GatingVelocityError(RuntimeError):
@@ -284,7 +291,7 @@ class FillingResult:
     inlet_area_m2: float = 0.0
     fill_time_s: float = 0.0
     velocity_magnitude: Optional[np.ndarray] = None
-    velocity: Optional[np.ndarray] = None  # (3, nz, ny, nx) vector field (m/s)
+    velocity: Optional[np.ndarray] = None  # (3, nx, ny, nz) vector field (m/s)
     fill_time: Optional[np.ndarray] = None
     solver_grid: Optional[np.ndarray] = None
     solver_dx_mm: float = 0.0
@@ -318,6 +325,9 @@ class FillingResult:
     air_entrapment: Optional[np.ndarray] = None
     trapped_air_volume_m3: float = 0.0
     air_entrapment_centroid_mm: np.ndarray = field(default_factory=lambda: np.array([]))
+    # D3Q7 trapped-gas physical fields (alpha_g already in air_entrapment).
+    air_pressure_pa: Optional[np.ndarray] = None
+    air_density_kg_m3: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -480,13 +490,27 @@ class AnalysisResult:
     mold_wall_movement: np.ndarray = field(default_factory=lambda: np.array([]))
     # v10.4: per-voxel cold-shut (cold shot) risk and the last fill location
     cold_shot_risk: np.ndarray = field(default_factory=lambda: np.array([]))
+    lap_risk: np.ndarray = field(default_factory=lambda: np.array([]))
+    # V8 cold-shot/lap visualisation: sparse, thickness-aware splats around saddles
+    cold_shot_risk_viz: np.ndarray = field(default_factory=lambda: np.array([]))
+    lap_risk_viz: np.ndarray = field(default_factory=lambda: np.array([]))
+    cold_shot_saddles: Dict[str, Any] = field(default_factory=dict)
+    cold_shot_lines: List[Dict[str, Any]] = field(default_factory=list)
     last_fill_point_mm: np.ndarray = field(default_factory=lambda: np.array([]))
+    # V8 cold-shot meeting enthalpy / temperature / solid fraction
+    H_field: np.ndarray = field(default_factory=lambda: np.array([]))
+    T_meet: np.ndarray = field(default_factory=lambda: np.array([]))
+    fs_meet: np.ndarray = field(default_factory=lambda: np.array([]))
     # v10.5: per-voxel mold-sand erosion risk from high metal velocity
     erosion_risk: np.ndarray = field(default_factory=lambda: np.array([]))
+    erosion_body_risk: Dict[str, float] = field(default_factory=dict)
+    erosion_impingements: List[Tuple[str, float, Tuple[float, float, float], float]] = field(default_factory=list)
     # v10.6: per-voxel air entrapment from LBM free-surface solver
     air_entrapment: np.ndarray = field(default_factory=lambda: np.array([]))
     trapped_air_volume_m3: float = 0.0
     air_entrapment_centroid_mm: np.ndarray = field(default_factory=lambda: np.array([]))
+    air_pressure_pa: np.ndarray = field(default_factory=lambda: np.array([]))
+    air_density_kg_m3: np.ndarray = field(default_factory=lambda: np.array([]))
     # v8.9: per-class display filters (top % of computed porosity to display)
     pore_size_noise_percent: float = 3.0
     pore_size_threshold_um: float = 0.0
@@ -502,5 +526,17 @@ class AnalysisResult:
     thermal_stress_pa: np.ndarray = field(default_factory=lambda: np.array([]))
     hot_tear_risk: np.ndarray = field(default_factory=lambda: np.array([]))
     cold_crack_risk: np.ndarray = field(default_factory=lambda: np.array([]))
-    # metadata
+    # debug / metadata
+    fill_time_s: np.ndarray = field(default_factory=lambda: np.array([]))
     bbox_size_mm: np.ndarray = field(default_factory=lambda: np.zeros(3))
+
+    @property
+    def geometric_m_mm(self) -> float:
+        """Global geometric modulus M = V / A (mm)."""
+        if self.part_surface_area_mm2 <= 0.0:
+            return 0.0
+        return self.part_volume_mm3 / self.part_surface_area_mm2
+
+    @property
+    def geometric_m_cm(self) -> float:
+        return self.geometric_m_mm / 10.0

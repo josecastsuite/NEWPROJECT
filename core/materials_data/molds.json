@@ -15,7 +15,10 @@
     "moisture_percent": 3.5,
     "binder_percent": 2.0,
     "compactability_percent": 45.0,
-    "mold_rigidity_factor": 0.5
+    "mold_rigidity_factor": 0.5,
+    "K_inf": 1e-11,
+    "phi_mold": 0.35,
+    "b_klink": 80000.0
   },
   "green_sand": {
     "key": "green_sand",
@@ -33,7 +36,10 @@
     "moisture_percent": 4.5,
     "binder_percent": 3.5,
     "compactability_percent": 45.0,
-    "mold_rigidity_factor": 0.35
+    "mold_rigidity_factor": 0.35,
+    "K_inf": 8e-12,
+    "phi_mold": 0.35,
+    "b_klink": 80000.0
   },
   "silica_sand": {
     "key": "silica_sand",
@@ -51,7 +57,10 @@
     "moisture_percent": 3.0,
     "binder_percent": 2.0,
     "compactability_percent": 45.0,
-    "mold_rigidity_factor": 0.5
+    "mold_rigidity_factor": 0.5,
+    "K_inf": 1e-11,
+    "phi_mold": 0.35,
+    "b_klink": 80000.0
   },
   "chromite_sand": {
     "key": "chromite_sand",
@@ -69,7 +78,10 @@
     "moisture_percent": 3.0,
     "binder_percent": 2.5,
     "compactability_percent": 42.0,
-    "mold_rigidity_factor": 0.6
+    "mold_rigidity_factor": 0.6,
+    "K_inf": 1.2e-11,
+    "phi_mold": 0.38,
+    "b_klink": 80000.0
   },
   "zircon_sand": {
     "key": "zircon_sand",
@@ -87,7 +99,10 @@
     "moisture_percent": 3.0,
     "binder_percent": 2.0,
     "compactability_percent": 40.0,
-    "mold_rigidity_factor": 0.65
+    "mold_rigidity_factor": 0.65,
+    "K_inf": 9e-12,
+    "phi_mold": 0.36,
+    "b_klink": 80000.0
   },
   "metal_mold": {
     "key": "metal_mold",
@@ -105,7 +120,10 @@
     "moisture_percent": 0.0,
     "binder_percent": 0.0,
     "compactability_percent": 0.0,
-    "mold_rigidity_factor": 1.0
+    "mold_rigidity_factor": 1.0,
+    "K_inf": 1e-18,
+    "phi_mold": 0.02,
+    "b_klink": 10000.0
   },
   "ceramic": {
     "key": "ceramic",
@@ -123,7 +141,10 @@
     "moisture_percent": 0.0,
     "binder_percent": 0.0,
     "compactability_percent": 0.0,
-    "mold_rigidity_factor": 0.8
+    "mold_rigidity_factor": 0.8,
+    "K_inf": 1e-14,
+    "phi_mold": 0.25,
+    "b_klink": 50000.0
   },
   "furan_resin_sand": {
     "key": "furan_resin_sand",
@@ -141,7 +162,10 @@
     "moisture_percent": 0.2,
     "binder_percent": 1.2,
     "compactability_percent": 0.0,
-    "mold_rigidity_factor": 0.55
+    "mold_rigidity_factor": 0.55,
+    "K_inf": 9e-12,
+    "phi_mold": 0.34,
+    "b_klink": 80000.0
   },
   "phenolic_resin_sand": {
     "key": "phenolic_resin_sand",
@@ -159,7 +183,10 @@
     "moisture_percent": 0.2,
     "binder_percent": 1.5,
     "compactability_percent": 0.0,
-    "mold_rigidity_factor": 0.55
+    "mold_rigidity_factor": 0.55,
+    "K_inf": 9e-12,
+    "phi_mold": 0.34,
+    "b_klink": 80000.0
   },
   "sodium_silicate_sand": {
     "key": "sodium_silicate_sand",
@@ -177,7 +204,10 @@
     "moisture_percent": 0.2,
     "binder_percent": 3.0,
     "compactability_percent": 0.0,
-    "mold_rigidity_factor": 0.5
+    "mold_rigidity_factor": 0.5,
+    "K_inf": 9e-12,
+    "phi_mold": 0.34,
+    "b_klink": 80000.0
   },
   "shell_mold": {
     "key": "shell_mold",
@@ -195,7 +225,10 @@
     "moisture_percent": 0.0,
     "binder_percent": 3.5,
     "compactability_percent": 0.0,
-    "mold_rigidity_factor": 0.9
+    "mold_rigidity_factor": 0.9,
+    "K_inf": 1e-13,
+    "phi_mold": 0.3,
+    "b_klink": 50000.0
   },
   "investment_ceramic": {
     "key": "investment_ceramic",
@@ -213,7 +246,10 @@
     "moisture_percent": 0.0,
     "binder_percent": 0.0,
     "compactability_percent": 0.0,
-    "mold_rigidity_factor": 0.9
+    "mold_rigidity_factor": 0.9,
+    "K_inf": 1e-15,
+    "phi_mold": 0.2,
+    "b_klink": 30000.0
   },
   "iron_mold": {
     "key": "iron_mold",
@@ -231,7 +267,10 @@
     "moisture_percent": 0.0,
     "binder_percent": 0.0,
     "compactability_percent": 0.0,
-    "mold_rigidity_factor": 1.0
+    "mold_rigidity_factor": 1.0,
+    "K_inf": 1e-18,
+    "phi_mold": 0.02,
+    "b_klink": 10000.0
   },
   "graphite_mold": {
     "key": "graphite_mold",
@@ -249,96 +288,9 @@
     "moisture_percent": 0.0,
     "binder_percent": 0.0,
     "compactability_percent": 0.0,
-    "mold_rigidity_factor": 0.8
-  },
-  "copper_chill": {
-    "key": "copper_chill",
-    "name": "Bakır Soğutucu (Chill)",
-    "k_w_mk": 385.0,
-    "rho_kg_m3": 8960.0,
-    "cp_j_kgk": 385.0,
-    "t0_c": 25.0,
-    "chvorinov_c": 0.15,
-    "particle_size_mm": 0.0,
-    "permeability_proxy": 0.0,
-    "mold_type": "chill",
-    "is_sand": false,
-    "afs_grain_size": 0.0,
-    "moisture_percent": 0.0,
-    "binder_percent": 0.0,
-    "compactability_percent": 0.0,
-    "mold_rigidity_factor": 1.0
-  },
-  "steel_chill": {
-    "key": "steel_chill",
-    "name": "Çelik Soğutucu (Chill)",
-    "k_w_mk": 45.0,
-    "rho_kg_m3": 7850.0,
-    "cp_j_kgk": 460.0,
-    "t0_c": 25.0,
-    "chvorinov_c": 0.3,
-    "particle_size_mm": 0.0,
-    "permeability_proxy": 0.0,
-    "mold_type": "chill",
-    "is_sand": false,
-    "afs_grain_size": 0.0,
-    "moisture_percent": 0.0,
-    "binder_percent": 0.0,
-    "compactability_percent": 0.0,
-    "mold_rigidity_factor": 1.0
-  },
-  "insulating_sleeve": {
-    "key": "insulating_sleeve",
-    "name": "Isı Yalıtkan Yalancı (Sleeve)",
-    "k_w_mk": 0.15,
-    "rho_kg_m3": 600.0,
-    "cp_j_kgk": 1200.0,
-    "t0_c": 25.0,
-    "chvorinov_c": 4.2,
-    "particle_size_mm": 0.0,
-    "permeability_proxy": 0.0,
-    "mold_type": "insulating",
-    "is_sand": false,
-    "afs_grain_size": 0.0,
-    "moisture_percent": 0.0,
-    "binder_percent": 0.0,
-    "compactability_percent": 0.0,
-    "mold_rigidity_factor": 0.3
-  },
-  "exothermic_sleeve": {
-    "key": "exothermic_sleeve",
-    "name": "Egzotermik Yalancı (Sleeve)",
-    "k_w_mk": 0.25,
-    "rho_kg_m3": 800.0,
-    "cp_j_kgk": 1200.0,
-    "t0_c": 25.0,
-    "chvorinov_c": 6.0,
-    "particle_size_mm": 0.0,
-    "permeability_proxy": 0.0,
-    "mold_type": "exothermic",
-    "is_sand": false,
-    "afs_grain_size": 0.0,
-    "moisture_percent": 0.0,
-    "binder_percent": 0.0,
-    "compactability_percent": 0.0,
-    "mold_rigidity_factor": 0.4
-  },
-  "ceramic_foam_filter": {
-    "key": "ceramic_foam_filter",
-    "name": "Seramik Köpük Filtre",
-    "k_w_mk": 1.0,
-    "rho_kg_m3": 600.0,
-    "cp_j_kgk": 1000.0,
-    "t0_c": 25.0,
-    "chvorinov_c": 2.5,
-    "particle_size_mm": 2.5,
-    "permeability_proxy": 12.0,
-    "mold_type": "filter",
-    "is_sand": false,
-    "afs_grain_size": 0.0,
-    "moisture_percent": 0.0,
-    "binder_percent": 0.0,
-    "compactability_percent": 0.0,
-    "mold_rigidity_factor": 0.2
+    "mold_rigidity_factor": 0.8,
+    "K_inf": 1e-17,
+    "phi_mold": 0.1,
+    "b_klink": 20000.0
   }
 }

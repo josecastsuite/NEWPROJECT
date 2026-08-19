@@ -1,12 +1,13 @@
 """Alloy and mould material database for JoseCast v8.0.
 
-The actual material data lives in JSON files under ``data/materials/``:
+The actual material data lives in JSON files under ``core/materials_data/``:
 
-* ``data/materials/alloys.json`` – cast alloy physical properties.
-* ``data/materials/molds.json``  – mould / chill / sleeve properties.
+* ``alloys.json``      – cast alloy physical properties.
+* ``molds.json``       – real mould materials only (sand, metal, ceramic, ...).
+* ``body_presets.json`` – non-mould body inserts (chills, sleeves, filters).
 
 This module loads those JSON files at import time and exposes the same
-``ALLOYS``/``MOLDS`` dictionaries and helper functions as before.  If the JSON
+``ALLOYS``/``MOLDS``/``BODY_PRESETS`` dictionaries and helper functions.  If the JSON
 files are missing or malformed, a small built-in fallback is used so the
 program keeps running.
 """
@@ -44,6 +45,13 @@ class MoldMaterial:
     binder_percent: float = 2.0  # % bentonite / binder
     compactability_percent: float = 45.0  # % compactability
     mold_rigidity_factor: float = 1.0  # 0 = weak green sand, 1 = rigid metal/shell mold
+    # Darcy-Forchheimer air-escape properties (SI).  K_inf is the intrinsic
+    # mould permeability, phi_mold the porosity, and b_klink the Klinkenberg
+    # slip parameter (Pa).  Sand moulds are ~1e-11 m², ceramic ~1e-14 m²,
+    # metal/shell ~1e-18 m² (effectively impermeable).
+    K_inf: float = 1e-11
+    phi_mold: float = 0.35
+    b_klink: float = 1e4
 
     @property
     def diffusivity_mm2_s(self) -> float:
@@ -73,6 +81,7 @@ class Alloy:
     density_g_cm3: float = 0.0
     # Flow / feeding coefficients
     viscosity_pa_s: float = 0.003
+    surface_tension_n_m: float = 0.0
     particle_size_mm: float = 0.30
     # Feeding distance FD = feed_k1 * t_section (t_section = 2 * local modulus)
     # so feed_k1=4.5 gives the classic FD = 4.5 * wall_thickness for a plate.
@@ -146,6 +155,26 @@ class Alloy:
     # characteristic length (max(2*M_mod, SDAS)) scaled by this factor.
     pore_size_length_factor: float = 1.0
     pore_size_cube_root_factor: float = 1.0
+    # Cold-shut (soğuk birleşme) sensitivity.  The base risk is the product of
+    # temperature, fill-delay, low-velocity and thin-section factors; this gain
+    # scales the final value before clipping to [0, 1].  >1 makes cold shuts
+    # more visible; <1 suppresses them for alloys that are very tolerant.
+    cold_shot_gain: float = 1.0
+
+    # V8 cold-shut / confluence physics
+    eutectic_temp_c: float = 0.0
+    eutectic_fraction: float = 0.0
+    pe_flow_factor_c: float = 0.05
+    pe_flow_factor_max: float = 2.0
+    we_crit: float = 0.0
+    dt_crit_s: float = 1.0
+    dt_crit_lap_s: float = 0.5
+    fs_crit: float = 0.5
+    fs_crit_lap: float = 0.35
+    dT_crit_c: float = 20.0
+    oxide_parabolic_rate_Kp: float = 1e-12
+    oxide_young_modulus_pa: float = 200e9
+    oxide_surface_energy_j_m2: float = 1.0
 
     def __post_init__(self):
         if self.density_g_cm3 == 0.0:
@@ -156,6 +185,17 @@ class Alloy:
             self.carbon_equivalent = 0.0
         if self.niyama_star_scale <= 0.0:
             self.niyama_star_scale = self._niyama_star_scale()
+        if self.surface_tension_n_m <= 0.0:
+            family_defaults = {
+                "aluminum": 0.90,
+                "magnesium": 0.55,
+                "cast_iron": 1.40,
+                "steel": 1.70,
+                "copper": 1.15,
+                "superalloy": 1.75,
+            }
+            family = (self.material_family or "steel").lower().strip()
+            self.surface_tension_n_m = family_defaults.get(family, 1.50)
 
     def _niyama_star_scale(self) -> float:
         """Solve the Carlson curve so N=niyama_macro gives the macro size proxy."""
@@ -208,6 +248,16 @@ class Alloy:
         """Thermal diffusivity α = k / (ρ·c)  [mm²/s]."""
         return (self.k_w_mk / (self.rho_kg_m3 * self.cp_j_kgk)) * 1e6
 
+    @property
+    def thermal_diffusivity_m2_s(self) -> float:
+        """Thermal diffusivity α = k / (ρ·c)  [m²/s]."""
+        return self.k_w_mk / (self.rho_kg_m3 * self.cp_j_kgk + 1e-12)
+
+    @property
+    def t_eutectic_or_solidus_c(self) -> float:
+        """Eutectic temperature if defined, otherwise solidus."""
+        return self.eutectic_temp_c if self.eutectic_temp_c > 0.0 else self.t_solidus_c
+
 
 # ---------------------------------------------------------------------------
 # JSON loading
@@ -215,6 +265,7 @@ class Alloy:
 
 ALLOYS: Dict[str, Alloy] = {}
 MOLDS: Dict[str, MoldMaterial] = {}
+BODY_PRESETS: Dict[str, MoldMaterial] = {}
 
 
 def _json_path(name: str) -> Path:
@@ -299,9 +350,10 @@ def _default_molds() -> Dict[str, MoldMaterial]:
 
 
 def _load_materials() -> None:
-    """Populate ALLOYS and MOLDS from JSON, with a tiny fallback."""
+    """Populate ALLOYS, MOLDS and BODY_PRESETS from JSON, with fallbacks."""
     ALLOYS.clear()
     MOLDS.clear()
+    BODY_PRESETS.clear()
 
     alloys_raw = _load_json_dict(_json_path("alloys.json"))
     if alloys_raw:
@@ -323,6 +375,14 @@ def _load_materials() -> None:
     if not MOLDS:
         MOLDS.update(_default_molds())
 
+    body_raw = _load_json_dict(_json_path("body_presets.json"))
+    if body_raw:
+        for k, v in body_raw.items():
+            try:
+                BODY_PRESETS[k] = MoldMaterial(**v)
+            except Exception as exc:
+                print(f"[MATERIALS] skipping invalid body preset {k}: {exc}")
+
 
 _load_materials()
 
@@ -334,9 +394,15 @@ def get_alloy(key: str) -> Alloy:
 
 
 def get_mold(key: str) -> MoldMaterial:
+    """Return a real mould material.  Unknown keys fall back to ``sand``."""
     if key in MOLDS:
         return MOLDS[key]
     return MOLDS.get("sand", next(iter(MOLDS.values())))
+
+
+def get_body_preset(key: str) -> Optional[MoldMaterial]:
+    """Return a non-mould body-insert preset (chill, sleeve, filter) or ``None``."""
+    return BODY_PRESETS.get(key)
 
 
 def save_molds(path: Optional[Path] = None) -> None:
@@ -347,12 +413,83 @@ def save_molds(path: Optional[Path] = None) -> None:
     target.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def save_body_presets(path: Optional[Path] = None) -> None:
+    """Persist the current in-memory ``BODY_PRESETS`` dictionary back to JSON."""
+    target = path or _json_path("body_presets.json")
+    data = {key: asdict(mold) for key, mold in BODY_PRESETS.items()}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _effective_sand_properties(
+    base: MoldMaterial,
+    afs: float,
+    moisture: float,
+    binder: float,
+    compact: float,
+    t_pour_c: float,
+    t0_c: float,
+) -> Dict[str, float]:
+    """
+    Return corrected rho, cp and k for green sand from user-entered parameters.
+
+    The correction is intentionally simple and physically directed:
+    * Moisture and binder increase the heat capacity (water cp is large; water
+      evaporation adds an effective latent-heat term).
+    * Higher compactability means fewer voids -> density and conductivity rise.
+    * Higher AFS (finer grains) means more inter-granular contact -> conductivity
+      rises; coarse grains lower it.
+    """
+    # Reference state embedded in the material preset.
+    COMPACT_REF = 45.0
+    AFS_REF = 50.0
+    CP_WATER = 4184.0
+    CP_BINDER = 1000.0
+    L_VAP_WATER = 2.26e6  # J/kg
+
+    m = max(moisture / 100.0, 0.0)
+    b = max(binder / 100.0, 0.0)
+    s = max(1.0 - m - b, 0.0)
+
+    # Density: compacted sand is denser; added water/binder fill pores.
+    rho = base.rho_kg_m3 * (1.0 + 0.005 * (compact - COMPACT_REF)) * (1.0 + 0.01 * (moisture + binder))
+    rho = float(np.clip(rho, 500.0, 2500.0))
+
+    # Specific heat: mixture + vaporisation enthalpy spread over the useful ΔT.
+    delta_t = max(t_pour_c - t0_c, 50.0)
+    cp = s * base.cp_j_kgk + m * CP_WATER + b * CP_BINDER + m * L_VAP_WATER / delta_t
+    cp = float(np.clip(cp, 500.0, 5000.0))
+
+    # Conductivity: density/compaction dominates; moisture bridges grains;
+    # fine grains (high AFS) increase contact area.
+    density_factor = rho / base.rho_kg_m3
+    moisture_factor = 1.0 + 0.05 * moisture
+    afs_factor = 1.0 + 0.002 * (afs - AFS_REF)
+    k = base.k_w_mk * density_factor * moisture_factor * afs_factor
+    k = float(np.clip(k, 0.05, 20.0))
+
+    # d50 from AFS so the air-entrapment module sees the same grain size.
+    d50 = 15.5 / max(afs, 1.0)
+
+    return {
+        "rho_kg_m3": rho,
+        "cp_j_kgk": cp,
+        "k_w_mk": k,
+        "particle_size_mm": d50,
+    }
+
+
 def make_effective_mold(
     mold: MoldMaterial,
     casting_params: Optional[object] = None,
     body: Optional[object] = None,
 ) -> MoldMaterial:
-    """Return a copy of ``mold`` with GUI / per-body overrides applied."""
+    """Return a copy of ``mold`` with GUI / per-body overrides applied.
+
+    For sand moulds the moisture, binder, compactability and AFS values are
+    converted into corrected thermal properties (rho, cp, k) before the
+    Chvorinov / thermal solver sees them.
+    """
     # Use a per-CORE preset if the body provides one.
     base = mold
     overrides: Dict[str, float] = {}
@@ -360,6 +497,8 @@ def make_effective_mold(
         preset_key = getattr(body, "mold_preset", "")
         if preset_key and preset_key in MOLDS:
             base = MOLDS[preset_key]
+        elif preset_key and preset_key in BODY_PRESETS:
+            base = BODY_PRESETS[preset_key]
         afs = getattr(body, "mold_afs_grain_size", 0.0) or 0.0
         moisture = getattr(body, "mold_moisture_percent", 0.0) or 0.0
         binder = getattr(body, "mold_binder_percent", 0.0) or 0.0
@@ -389,6 +528,20 @@ def make_effective_mold(
         if rigidity >= 0.0:
             overrides["mold_rigidity_factor"] = rigidity
 
+    # For real sand moulds, derive thermal properties from the user parameters.
+    # If the user did not override a value, the preset default is used.
+    if base.is_sand:
+        afs = overrides.get("afs_grain_size") or base.afs_grain_size
+        moisture = overrides.get("moisture_percent") or base.moisture_percent
+        binder = overrides.get("binder_percent") or base.binder_percent
+        compact = overrides.get("compactability_percent") or base.compactability_percent
+        t_pour_c = float(getattr(casting_params, "t_pour_c", 1500.0) or 1500.0)
+        t0_c = float(getattr(casting_params, "t_mold_c", base.t0_c) or base.t0_c)
+        thermal_overrides = _effective_sand_properties(
+            base, afs, moisture, binder, compact, t_pour_c, t0_c
+        )
+        overrides.update(thermal_overrides)
+
     if overrides:
         return replace(base, **overrides)
     return base
@@ -407,17 +560,18 @@ def chvorinov_c_from_properties(alloy: Alloy, mold: MoldMaterial) -> float:
     """
     Return the Chvorinov constant C in dk/cm^2 (minutes per square centimetre).
 
-    The materials database (mold.chvorinov_c) stores the empirical foundry
-    constant, which is the authoritative value.  If it is missing, a physics-
-    based estimate is computed from alloy/mould properties and converted to
-    dk/cm^2.
-    """
-    # Authoritative empirical constant from the materials database.
-    empirical = getattr(mold, "chvorinov_c", 0.0) or 0.0
-    if empirical > 0.0:
-        return float(empirical)
+    Computed from alloy and mould thermal properties:
 
+        C = [ (rho_m * L_eff) / ((T_m - T_0) * sqrt(pi * k_s * rho_s * c_s)) ]^2
+
+    with L_eff = L + cp_m * max(T_pour - T_liq, 0).  The old ampirik
+    ``mold.chvorinov_c`` override is removed so every mould type genuinely
+    changes solidification time, Niyama and porosity.
+    """
     tm = (alloy.t_liquidus_c + alloy.t_solidus_c) / 2.0
+    # If the mould is hotter than the metal, solidification is physically
+    # impossible; clamp to a tiny driving force so the user sees an enormous,
+    # clearly-invalid time instead of division by zero.
     delta_t = max(tm - mold.t0_c, 1.0)
     l_eff = alloy.latent_heat_j_kg + alloy.cp_j_kgk * max(
         alloy.t_pour_c - alloy.t_liquidus_c, 0.0

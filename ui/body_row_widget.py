@@ -26,7 +26,6 @@ FEEDER_TYPE_NAMES = {
     "exothermic": "Ekzotermik",
     "insulated": "İzole",
     "sleeve": "Seramik/Manyetik",
-    "chilled": "Chill",
     "side": "Yan",
     "blind": "Kör",
 }

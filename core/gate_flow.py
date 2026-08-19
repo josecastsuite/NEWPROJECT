@@ -71,12 +71,12 @@ def _pressure_interpolator(
     dx_mm: float,
 ) -> RegularGridInterpolator:
     """Build a trilinear interpolator for the dimensionless Darcy pressure."""
-    nz, ny, nx = p.shape
-    z = float(origin_mm[0]) + np.arange(nz) * float(dx_mm)
+    nx, ny, nz = p.shape
+    x = float(origin_mm[0]) + np.arange(nx) * float(dx_mm)
     y = float(origin_mm[1]) + np.arange(ny) * float(dx_mm)
-    x = float(origin_mm[2]) + np.arange(nx) * float(dx_mm)
+    z = float(origin_mm[2]) + np.arange(nz) * float(dx_mm)
     return RegularGridInterpolator(
-        (z, y, x),
+        (x, y, z),
         p.astype(float),
         bounds_error=False,
         fill_value=0.0,

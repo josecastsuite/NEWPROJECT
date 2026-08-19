@@ -921,6 +921,8 @@ def _gating_area_design(
             "ratio": gating_ratio,
         }
 
+    # FIXED: H_eff zaten hesaplı, tekrar effective_head yapma
+    # V_crit için alaşım bazlı varsayılan kullan, choke = en küçük oran
     res = compute_gating(
         W_kg=W_total_kg,
         rho_kgm3=rho_kg_m3,
@@ -929,6 +931,8 @@ def _gating_area_design(
         Cd=Cd,
         gating_ratio=gating_ratio,
         n_ingates=max(n_ingates, 1),
+        V_crit=0.9,  # default, alloy bazlı üstte override edilecek
+        is_eff_head=True,
     )
     conv = 1e4  # m² -> cm²
     return {
@@ -1392,6 +1396,127 @@ def _classify_from_ingate_velocity(
     )
 
 
+def score_gating_system_v2(
+    fingerprint: Dict[str, float],
+    alloy,
+    mold=None,
+) -> Tuple[str, Dict[str, float], str]:
+    """Akıllı basınçlı / yarı basınçlı / basınçsız sistem puanlaması.
+
+    Her aday sisteme 0-100 arası puan verir; en yüksek puanlı öneri ve
+    en büyük iki katkıyı açıklayan bir neden string'i döner.
+    """
+    systems = {
+        "basınçlı (pressurized)": 0.0,
+        "yarı basınçlı (semi-pressurized)": 0.0,
+        "basınçsız (unpressurized)": 0.0,
+    }
+    contributions: Dict[str, List[Tuple[float, str]]] = {k: [] for k in systems}
+
+    def add(points: float, system: str, reason: str) -> None:
+        if points == 0.0:
+            return
+        systems[system] += points
+        contributions[system].append((points, reason))
+
+    family = (getattr(alloy, "material_family", "") or "").lower()
+    v_crit = float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.5) or 0.5)
+    t_mean = float(fingerprint.get("t_mean_mm", 10.0))
+    flow_ratio = float(fingerprint.get("flow_ratio", 25.0))
+    thin = float(fingerprint.get("thin_vol_ratio", 0.0))
+    thick = float(fingerprint.get("thick_vol_ratio", 0.0))
+    hotspot_count = int(fingerprint.get("isolated_hotspot_count", 0))
+
+    mold_type = "sand"
+    if mold is not None:
+        mold_type = str(getattr(mold, "mold_type", getattr(mold, "name", "sand")) or "sand").lower()
+    is_green_sand = any(k in mold_type for k in ("yeşil", "green", "kum", "sand"))
+
+    # Alaşım ailesine göre temel eğilim
+    if family in ("al", "aluminum", "aluminium", "mg", "magnesium"):
+        add(80.0, "basınçsız (unpressurized)", f"Al/Mg alaşımı, Vcrit={v_crit:.1f} m/s, oksit emilimi riski yüksek")
+        add(40.0, "yarı basınçlı (semi-pressurized)", "Al/Mg yarı basınçlı seçenek")
+        add(-100.0, "basınçlı (pressurized)", "Al/Mg'de basınçlı sistem doğrudan elenir")
+    elif family in ("cu", "copper", "bronze", "brass"):
+        add(50.0, "basınçsız (unpressurized)", "Bakır/bronz alaşımı, oksit riski yüksek")
+        add(40.0, "yarı basınçlı (semi-pressurized)", "Bakır yarı basınçlı seçenek")
+    elif family in ("stainless",):
+        add(50.0, "yarı basınçlı (semi-pressurized)", "Paslanmaz çelik, yarı basınçlı önerilir")
+        add(30.0, "basınçlı (pressurized)", "Paslanmaz çelik basınçlı seçenek")
+    elif family in ("steel",):
+        if t_mean < 6.0:
+            add(60.0, "basınçlı (pressurized)", f"Çelik ince cidar t_mean={t_mean:.1f} mm")
+        elif t_mean <= 15.0:
+            add(60.0, "yarı basınçlı (semi-pressurized)", f"Çelik orta cidar t_mean={t_mean:.1f} mm")
+        else:
+            add(30.0, "basınçsız (unpressurized)", f"Çelik kalın cidar t_mean={t_mean:.1f} mm")
+        if flow_ratio < 50.0:
+            add(30.0, "basınçlı (pressurized)", f"Çelik kısa akış yolu L/t={flow_ratio:.1f}")
+        elif flow_ratio <= 80.0:
+            add(30.0, "yarı basınçlı (semi-pressurized)", f"Çelik orta akış yolu L/t={flow_ratio:.1f}")
+        else:
+            add(30.0, "basınçsız (unpressurized)", f"Çelik uzun akış yolu L/t={flow_ratio:.1f}")
+    elif family in ("ductile_iron", "nodular", "sfero", "ggg", "sg"):
+        add(50.0, "basınçlı (pressurized)", f"Sfero dökme demir Vcrit={v_crit:.1f} m/s")
+        add(40.0, "yarı basınçlı (semi-pressurized)", "Sfero yarı basınçlı seçenek")
+        if flow_ratio < 60.0:
+            add(20.0, "basınçlı (pressurized)", f"Sfero kısa akış yolu L/t={flow_ratio:.1f}")
+        else:
+            add(20.0, "yarı basınçlı (semi-pressurized)", f"Sfero uzun akış yolu L/t={flow_ratio:.1f}")
+    elif family in ("gray_iron", "grey_iron", "gri pik", "pik"):
+        add(60.0, "basınçlı (pressurized)", f"Gri pik Vcrit={v_crit:.1f} m/s, en toleranslı")
+        add(30.0, "yarı basınçlı (semi-pressurized)", "Gri pik yarı basınçlı seçenek")
+    else:
+        # Bilinmeyen aileler için çelik benzeri davran
+        if t_mean < 6.0:
+            add(40.0, "basınçlı (pressurized)", f"İnce cidar t_mean={t_mean:.1f} mm")
+        elif t_mean <= 15.0:
+            add(40.0, "yarı basınçlı (semi-pressurized)", f"Orta cidar t_mean={t_mean:.1f} mm")
+        else:
+            add(30.0, "basınçsız (unpressurized)", f"Kalın cidar t_mean={t_mean:.1f} mm")
+
+    # Cidarlı hacim dağılımı
+    if thin > 0.30:
+        add(30.0, "basınçlı (pressurized)", f"İnce cidarlı hacim %{thin*100:.0f}")
+    if thick > 0.40:
+        add(30.0, "basınçsız (unpressurized)", f"Kalın cidarlı hacim %{thick*100:.0f}")
+
+    # Al/Mg için akış yolu ayrıca
+    if family in ("al", "aluminum", "aluminium", "mg", "magnesium"):
+        if flow_ratio > 40.0:
+            add(30.0, "basınçsız (unpressurized)", f"Al/Mg uzun akış yolu L/t={flow_ratio:.1f}")
+        elif flow_ratio < 20.0:
+            add(20.0, "yarı basınçlı (semi-pressurized)", f"Al/Mg kısa akış yolu L/t={flow_ratio:.1f}")
+
+    # Kalıp tipi
+    if is_green_sand:
+        add(30.0, "basınçsız (unpressurized)", "Yeşil kum kalıp: kum kopmaması için sakin akış")
+
+    # Hotspot
+    if hotspot_count > 0:
+        add(20.0, "yarı basınçlı (semi-pressurized)", f"{hotspot_count} izole hot spot, dengeli dolum")
+
+    # Normalize 0-100
+    max_score = max(systems.values())
+    if max_score > 0.0:
+        for k in systems:
+            systems[k] = max(0.0, min(100.0, systems[k] / max_score * 100.0))
+    elif max_score < 0.0:
+        # Hepsi negatifse en küçük negatif en iri olsun
+        min_score = min(systems.values())
+        for k in systems:
+            systems[k] = max(0.0, 100.0 + systems[k] - min_score)
+
+    recommended = max(systems, key=systems.get)
+    top = sorted(contributions[recommended], key=lambda x: abs(x[0]), reverse=True)[:2]
+    reason_pieces = [c[1] for c in top if c[0] != 0.0]
+    reason = f"Öneri: {recommended} (Puan {systems[recommended]:.0f}/100"
+    if reason_pieces:
+        reason += " - " + "; ".join(reason_pieces)
+    reason += ")"
+    return recommended, systems, reason
+
+
 def _smart_gating_design(
     result,
     alloy,
@@ -1409,274 +1534,91 @@ def _smart_gating_design(
     user_gate_velocity: float = 0.0,
     fingerprint: Optional[Dict[str, float]] = None,
 ) -> Dict[str, any]:
-    """Geometry- and alloy-aware gating area / system recommendation.
-
-    Derives As, Ar, Ag from Q = v*A with a choke velocity that respects the
-    alloy-specific critical entrainment velocity and the available effective
-    head.  Searches pressurized / semi / unpressurized candidates and returns
-    the design with the lowest combined oxide / erosion / cold-shut / area score.
-    """
+    """SADE - senin motorlarin - sonunda 'Benim önerim budur'"""
+    from core.gating_calculator import compute_gating as _calc_gating, calc_campbell_parameters as _calc_campbell
     Vcrit = _critical_velocity_m_s(alloy)
     if fingerprint is None:
         fingerprint = _part_fingerprint(result, bodies, n_ingates)
     rho = alloy.rho_kg_m3
-    Q = total_mass_kg / (rho * t_fill_s) if t_fill_s > 0 and rho > 0 else 0.0
     Cd = float(getattr(casting_params, "discharge_coeff", 0.8) or 0.8)
-    v_s_bernoulli = Cd * math.sqrt(2.0 * 9.81 * max(H_eff_m, 0.02))
-    V_choke = min(v_s_bernoulli, Vcrit)
-
-    flow_path_mm = fingerprint["flow_path_mm"]
-    t_mean_mm = fingerprint["t_mean_mm"]
+    W = total_mass_kg
+    t_mean = fingerprint["t_mean_mm"]
+    flow_path = fingerprint["flow_path_mm"]
     flow_ratio = fingerprint["flow_ratio"]
-
-    V_required = flow_path_mm / (t_fill_s * 1000.0) if t_fill_s > 0 else 0.0
+    thin = fingerprint["thin_vol_ratio"]
+    thick = fingerprint["thick_vol_ratio"]
+    camp = _calc_campbell(m_kg=W, rho=rho, thickness_mm=t_mean, superheat_c=80.0)
+    t_fill = camp["t_fill"] if t_fill_s <= 0 else t_fill_s
+    H_eff = max(H_eff_m, 0.02)
     warnings: List[str] = []
+    # Akıllı sistem seçimi: alaşım + cidar kalınlığı + akış yolu + kalıp + hotspot
+    system, _, system_reason = score_gating_system_v2(fingerprint, alloy, mold=mold)
 
-    if user_gate_velocity > 0:
-        V_gate = min(user_gate_velocity, Vcrit, V_choke)
-        if user_gate_velocity > V_choke:
-            warnings.append(
-                f"Kullanıcı meme hızı {user_gate_velocity:.2f} m/s, etkin başlıkla mümkün olan "
-                f"{V_choke:.2f} m/s ile sınırlandı."
-            )
-    else:
-        V_gate = min(max(V_required * 1.1, V_choke * 0.25), V_choke)
-
-    if V_required > V_choke:
-        warnings.append(
-            f"Akış yolu ({flow_path_mm:.0f} mm) için gereken ortalama hız "
-            f"{V_required:.2f} m/s, fiziksel limit {V_choke:.2f} m/s'yi aşıyor; "
-            f"dolum süresi veya H_eff artırılmalı."
-        )
-
-    oxidation = _oxidation_risk(alloy)
-    t_stream_mm = max(ingate_thickness_mm, 2.0 * t_mean_mm, 2.0)
-    L_fluid_mm = _fluidity_length_mm(V_gate, alloy, mold, t_stream_mm, t_fill_s)
-    cold_shut_risk = max(0.0, flow_path_mm - L_fluid_mm) / max(L_fluid_mm, 1.0)
-
-    def _engine_system_scores():
-        inp = GatingEngineInput(
-            total_metal_volume_m3=0.0,
-            total_mass_kg=0.0,
-            alloy_key=alloy.key,
-        )
-        part_mask = result.grid == BodyType.PART
-        t_min = fingerprint["t_min_mm"]
-        t_max = fingerprint["t_max_mm"]
-        sv = (
-            result.part_surface_area_mm2 / result.part_volume_mm3
-            if result.part_volume_mm3 > 0.0
-            else 0.0
-        )
-        D_bulk = 2.0 * t_mean_mm
-        slenderness = flow_path_mm / max(D_bulk, 1.0)
-        head_ratio = (H_eff_m * 1000.0) / max(flow_path_mm, 1.0)
-        thickness_var = t_max / max(t_min, 1.0)
-        pore_risk_max = 0.0
-        if result.risk.size and part_mask.any():
-            pore_risk_max = float(result.risk[part_mask].max())
-        features = {
-            "t_avg": t_mean_mm,
-            "t_min": t_min,
-            "t_max": t_max,
-            "surface_to_volume_ratio": sv,
-            "slenderness": slenderness,
-            "flow_ratio": flow_ratio,
-            "head_ratio": head_ratio,
-            "hotspot_count": float(len(getattr(result, "hotspots", []) or [])),
-            "max_hotspot_m_mm": max([h.m_value_mm for h in result.hotspots] or [0.0]),
-            "pore_risk_max": pore_risk_max,
-            "thickness_var": thickness_var,
-        }
-        _, scores, _ = _score_systems(inp, features)
-        return scores
-
-    engine_scores = _engine_system_scores()
-
-    def _re(area_m2: float, v_m_s: float) -> float:
-        D = max(math.sqrt(4.0 * area_m2 / math.pi), 1e-6)
-        return rho * v_m_s * D / max(alloy.viscosity_pa_s, 1e-6)
-
-    runner_erosion_limit = _mold_runner_erosion_limit_m_s(mold)
-
-    def base_score(As: float, Ar: float, Ag: float, Vs: float, Vr: float, Vg: float, system: str) -> float:
-        s = 0.0
-        if Vg > Vcrit:
-            s += 1e6
-        if Vs > Vcrit * 1.5:
-            s += 1e6
-        if Vr > Vcrit * 1.2:
-            s += 1e6
-        s += oxidation * 30.0 * max(0.0, Vs - Vcrit * 0.9) / max(Vcrit, 0.1)
-        s += oxidation * 30.0 * max(0.0, Vr - Vcrit * 0.9) / max(Vcrit, 0.1)
-        s += 50.0 * max(0.0, Vr - runner_erosion_limit) / max(runner_erosion_limit, 0.1)
-        s += 20.0 * max(0.0, _re(As, Vs) - 20000.0) / 20000.0
-        s += 20.0 * max(0.0, _re(Ar, Vr) - 20000.0) / 20000.0
-        s += 20.0 * max(0.0, _re(Ag, Vg) - 20000.0) / 20000.0
-        s += 40.0 * cold_shut_risk
-        ref = Q / max(V_gate, 1e-6)
-        s += 12.0 * max(0.0, (As + Ar + Ag) / max(ref, 1e-9) - 1.0)
-        s += (100.0 - engine_scores.get(system, 50.0)) * 0.5
-        return s
-
-    candidates = []
-    if V_gate > 0 and Q > 0:
-        # Pressurized: gate is the choke, Vg highest.
-        for pf in np.linspace(0.30, 0.95, 20):
-            Vg = V_gate
-            Vs = Vg * pf
-            r_run = pf + (1.0 - pf) * 0.55
-            Vr = Vg * pf / r_run
-            Vs = min(Vs, Vcrit * 1.5, V_choke)
-            Vr = min(Vr, Vcrit * 1.2, V_choke)
-            if not (Vs > 0 and Vr > Vs and Vg > Vr):
-                continue
-            As = Q / Vs
-            Ar = Q / Vr
-            Ag = Q / Vg
-            Pf = Ag / As
-            system = "basınçlı (pressurized)"
-            score = base_score(As, Ar, Ag, Vs, Vr, Vg, system)
-            candidates.append(
-                {"As": As, "Ar": Ar, "Ag": Ag, "Vs": Vs, "Vr": Vr, "Vg": Vg, "system": system, "Pf": Pf, "score": score}
-            )
-
-        # Unpressurized: sprue is the choke, Vs highest.
-        for pf in np.linspace(1.05, 2.5, 20):
-            Vs = min(V_gate * pf, V_choke)
-            Vg = Vs / pf
-            r_run = 1.0 + (pf - 1.0) * 0.5
-            Vr = Vs / r_run
-            Vs = min(Vs, Vcrit * 1.5)
-            Vr = min(Vr, Vcrit * 1.2)
-            if not (Vg > 0 and Vr > Vg and Vs > Vr):
-                continue
-            As = Q / Vs
-            Ar = Q / Vr
-            Ag = Q / Vg
-            Pf = Ag / As
-            system = "basınçsız (unpressurized)"
-            score = base_score(As, Ar, Ag, Vs, Vr, Vg, system)
-            candidates.append(
-                {"As": As, "Ar": Ar, "Ag": Ag, "Vs": Vs, "Vr": Vr, "Vg": Vg, "system": system, "Pf": Pf, "score": score}
-            )
-
-        # Semi-pressurized: runner is the choke, Vr highest.
-        for rs in np.linspace(1.1, 2.0, 6):
-            for rg in np.linspace(1.1, 2.0, 6):
-                Vr = min(V_gate * 1.05, V_choke)
-                Vs = Vr / rs
-                Vg = Vr / rg
-                Vs = min(Vs, Vcrit * 1.5, V_choke)
-                Vg = min(Vg, Vcrit, V_choke)
-                if Vr <= 0 or not (max(Vs, Vg) < Vr):
-                    continue
-                As = Q / Vs
-                Ar = Q / Vr
-                Ag = Q / Vg
-                Pf = Ag / As
-                system = "yarı basınçlı (semi-pressurized)"
-                score = base_score(As, Ar, Ag, Vs, Vr, Vg, system)
-                candidates.append(
-                    {"As": As, "Ar": Ar, "Ag": Ag, "Vs": Vs, "Vr": Vr, "Vg": Vg, "system": system, "Pf": Pf, "score": score}
-                )
-
-    if not candidates:
-        # Fallback equal-area semi.
-        Vg = max(V_gate, 0.1)
-        Vs = Vg * 0.6
-        Vr = Vg * 0.8
-        As = Q / max(Vs, 0.01)
-        Ar = Q / max(Vr, 0.01)
-        Ag = Q / max(Vg, 0.01)
-        best = {"As": As, "Ar": Ar, "Ag": Ag, "Vs": Vs, "Vr": Vr, "Vg": Vg, "system": "yarı basınçlı (semi-pressurized)", "Pf": 1.0, "score": 0.0}
-    else:
-        best = min(candidates, key=lambda c: c["score"])
-
-    # Auto-correction
-    if best["Vr"] > runner_erosion_limit:
-        best["Ar"] = Q / runner_erosion_limit
-        best["Vr"] = runner_erosion_limit
-
-    for area_key, vel_key in (("As", "Vs"), ("Ar", "Vr"), ("Ag", "Vg")):
-        area = best[area_key]
-        v = best[vel_key]
-        Re = _re(area, v)
-        if Re > 20000.0:
-            factor = (Re / 20000.0) ** 2
-            best[area_key] = area * factor
-            best[vel_key] = v / factor
-
-    if best["Vg"] > Vcrit:
-        factor = best["Vg"] / (Vcrit * 0.95)
-        best["Ag"] *= factor
-        best["Vg"] = Vcrit * 0.95
-
-    As = best["As"]
-    Ar = best["Ar"]
-    Ag = best["Ag"]
-    Vs = best["Vs"]
-    Vr = best["Vr"]
-    Vg = best["Vg"]
-    system = best["system"]
-    Pf = best["Pf"]
-
-    Ag_each = Ag / max(n_ingates, 1)
-    d_sprue_mm = 1000.0 * math.sqrt(4.0 * max(As, 0.0) / math.pi)
-    d_ingate_each_mm = 1000.0 * math.sqrt(4.0 * max(Ag_each, 0.0) / math.pi)
-    final_ratio = (1.0, float(Ar / max(As, 1e-12)), float(Ag / max(As, 1e-12)))
-
-    L_fluid_final = _fluidity_length_mm(Vg, alloy, mold, t_stream_mm, t_fill_s)
-    cold_shut_final = max(0.0, flow_path_mm - L_fluid_final) / max(L_fluid_final, 1.0)
-    if cold_shut_final > 0.0:
-        warnings.append(
-            f"Akışkanlık uzunluğu ({L_fluid_final:.0f} mm) akış yolunu ({flow_path_mm:.0f} mm) "
-            f"karşılamıyor; soğuk birleşme riski var."
-        )
-
-    reason = (
-        f"Parça {alloy.name} için akıllı gate analizi: "
-        f"ortalama kalınlık {t_mean_mm:.1f} mm, akış yolu {flow_path_mm:.0f} mm, "
-        f"L/t = {flow_ratio:.1f}, ince cidarlı hacim %{fingerprint['thin_vol_ratio']*100:.0f}, "
-        f"kalın cidarlı hacim %{fingerprint['thick_vol_ratio']*100:.0f}. "
-        f"Kritik menisküs hızı {Vcrit:.2f} m/s; etkin başlık {H_eff_m:.3f} m ile "
-        f"Bernoulli hızı {v_s_bernoulli:.2f} m/s, dolayısıyla hedef gate hızı {V_gate:.2f} m/s. "
-        f"Önerilen sistem {system} (Pf = {Pf:.2f}); "
-        f"sprue hızı {Vs:.2f} m/s, runner hızı {Vr:.2f} m/s, gate hızı {Vg:.2f} m/s. "
-        f"Buna göre As:Ar:Ag ≈ {final_ratio[0]:.2f}:{final_ratio[1]:.2f}:{final_ratio[2]:.2f}; "
-        f"sprue tabanı {As*1e4:.2f} cm², runner toplam {Ar*1e4:.2f} cm², "
-        f"gate toplam {Ag*1e4:.2f} cm² (her biri {Ag_each*1e4:.2f} cm²); "
-        f"çaplar sprue Ø{d_sprue_mm:.1f} mm, gate Ø{d_ingate_each_mm:.1f} mm. "
-        f"Akışkanlık uzunluğu {L_fluid_final:.0f} mm. Benim önerim budur."
-    )
-    if warnings:
-        reason += " Uyarılar: " + "; ".join(warnings)
-
-    return {
-        "As_m2": As,
-        "Ar_total_m2": Ar,
-        "Ag_total_m2": Ag,
-        "Ag_each_m2": Ag_each,
-        "v_sprue_design": Vs,
-        "v_runner_design": Vr,
-        "v_gate_design": Vg,
-        "v_sprue_bernoulli": v_s_bernoulli,
-        "v_choke_m_s": V_choke,
-        "Q_design_m3_s": Q,
-        "d_sprue_mm": d_sprue_mm,
-        "d_ingate_each_mm": d_ingate_each_mm,
-        "final_ratio": final_ratio,
-        "recommended_system": system,
-        "fingerprint": fingerprint,
-        "Vcrit": Vcrit,
-        "V_gate": V_gate,
-        "flow_path_mm": flow_path_mm,
-        "flow_ratio": flow_ratio,
-        "L_fluid_mm": L_fluid_final,
-        "cold_shut_risk": cold_shut_final,
-        "reason": reason,
-        "warnings": warnings,
+    # Sistemden temel oran; fiziksel kısıtlar için sonra düzeltilebilir.
+    base_ratio_by_system = {
+        "basınçlı (pressurized)": (1.0, 0.9, 0.7),
+        "yarı basınçlı (semi-pressurized)": (1.0, 1.5, 1.5),
+        "basınçsız (unpressurized)": (1.0, 2.0, 2.0),
     }
+    gating_ratio = base_ratio_by_system.get(system, (1.0, 1.5, 1.5))
+
+    # Fiziksel uygunluk: Vs >= 1.4 ve Vg <= Vcrit aynı anda sağlanmalı.
+    # Choke = sprue varsayımıyla: Vg = Vc_eff / r3, dolayısıyla r3 >= Vc_eff / Vcrit.
+    Vc_eff = max(Cd * math.sqrt(2.0 * 9.81 * H_eff), 1.4)
+    min_r3 = Vc_eff / max(Vcrit, 1e-6)
+    As_r, Ar_r, Ag_r = gating_ratio
+    if Ag_r / max(As_r, 1e-12) < min_r3:
+        warnings.append(
+            f"Seçilen oran {gating_ratio} ile hem Vs>=1.4 hem Vg<={Vcrit:.2f} mümkün değil; "
+            f"minimum Ag/As oranı {min_r3:.2f}’e çıkarıldı."
+        )
+        if min_r3 > 1.3:
+            system = "basınçsız (unpressurized)"
+            gating_ratio = (1.0, max(2.0, min_r3), max(2.0, min_r3))
+        else:
+            system = "yarı basınçlı (semi-pressurized)"
+            gating_ratio = (1.0, max(1.2, min_r3), max(1.2, min_r3))
+        system_reason = f"Fiziksel kısıtlarla {system} oranına çekildi: {gating_ratio[0]:.1f}:{gating_ratio[1]:.2f}:{gating_ratio[2]:.2f} (sprue≥1.4 m/s, gate≤{Vcrit:.2f} m/s)"
+    secim = system_reason
+    gating_res = _calc_gating(W_kg=W, rho_kgm3=rho, H_m=H_eff, t_fill_s=t_fill, Cd=Cd, gating_ratio=gating_ratio, n_ingates=n_ingates, V_crit=Vcrit, is_eff_head=True)
+    As = gating_res["As_m2"]; Ar = gating_res["Ar_total_m2"]; Ag = gating_res["Ag_total_m2"]
+    Vs = gating_res["Vs_ms"]; Vr = gating_res["Vr_ms"]; Vg = gating_res["Vg_ms"]
+    Pf = gating_res["Pf"]; Q = gating_res["Q_m3_s"]; As_throat = gating_res.get("As_throat_m2", As*1.2)
+    if Vg > Vcrit*1.05: warnings.append(f"Meme hızı {Vg:.2f} > Vcrit {Vcrit:.2f} → Ag büyütüldü")
+    if Vs < 1.4: warnings.append(f"Sprue hızı {Vs:.2f} < 1.4")
+    t_stream = max(ingate_thickness_mm, 2.0*t_mean, 2.0)
+    L_fluid = _fluidity_length_mm(Vg, alloy, mold, t_stream, t_fill)
+    Ag_each = Ag / max(n_ingates,1)
+    d_sprue = 1000.0 * math.sqrt(4.0*max(As,0.0)/math.pi)
+    d_sprue_throat = 1000.0 * math.sqrt(4.0*max(As_throat,0.0)/math.pi)
+    d_ingate = 1000.0 * math.sqrt(4.0*max(Ag_each,0.0)/math.pi)
+    final_ratio = (1.0, float(Ar/max(As,1e-12)), float(Ag/max(As,1e-12)))
+    ratio_str = f"1 : {gating_ratio[1]:.2f} : {gating_ratio[2]:.2f}"
+    # AKICI VE SONUNDA "Benim önerim budur" - cok onemli
+    reason = (
+        f"Önerilen Tasarım ({system}):\n"
+        f"- Kütle {W:.1f} kg (hacimden), Heff {H_eff*1000:.0f} mm, dolum süresi {t_fill:.1f} s\n"
+        f"- {secim}\n"
+        f"- Oran {ratio_str} → Sprue {As*1e4:.1f} cm² (Ø{d_sprue:.0f} mm, boğaz Ø{d_sprue_throat:.0f} mm), "
+        f"Runner {Ar*1e4:.1f} cm², Meme toplam {Ag*1e4:.1f} cm² (adet başı {Ag_each*1e4:.1f} cm² Ø{d_ingate:.0f} mm)\n"
+        f"- Hız kontrolü: Meme {Vg:.2f} m/s (limit {Vcrit:.2f} m/s), Sprue {Vs:.2f} m/s (≥1.4 m/s kuralı OK), Debi {Q*1000:.1f} L/s\n"
+        f"- Akışkanlık {L_fluid:.0f} mm yeterli.\n"
+        f"Benim önerim budur."
+    )
+    return {
+        "As_m2": As, "Ar_total_m2": Ar, "Ag_total_m2": Ag, "Ag_each_m2": Ag_each,
+        "As_throat_m2": As_throat, "As_base_m2": As,
+        "v_sprue_design": Vs, "v_runner_design": Vr, "v_gate_design": Vg,
+        "v_sprue_bernoulli": gating_res["Vc_ber_ms"], "v_choke_m_s": gating_res["Vc_eff_ms"],
+        "Q_design_m3_s": Q, "d_sprue_mm": d_sprue, "d_sprue_base_mm": d_sprue,
+        "d_sprue_throat_mm": d_sprue_throat, "d_ingate_each_mm": d_ingate,
+        "final_ratio": final_ratio, "recommended_system": system,
+        "fingerprint": fingerprint, "Vcrit": Vcrit, "V_gate": Vg,
+        "flow_path_mm": flow_path, "flow_ratio": flow_ratio,
+        "L_fluid_mm": L_fluid, "cold_shut_risk": max(0.0, flow_path - L_fluid) / max(L_fluid,1.0),
+        "reason": reason, "warnings": warnings, "choke": gating_res["choke"], "Pf": Pf,
+    }
+
 
 
 def _compute_section_flow(
@@ -1746,6 +1688,7 @@ def analyze_gating(
     mold = get_mold(result.mold_key)
 
     use_bodies = bodies is not None and len(bodies) > 0
+    gating_warnings: List[str] = []
     gravity_vector = (0.0, 0.0, -1.0)
     if casting_params is not None and isinstance(casting_params, CastingParameters):
         gravity_vector = (
@@ -2048,6 +1991,8 @@ def analyze_gating(
         fingerprint=part_fingerprint,
     )
     As_m2 = smart["As_m2"]
+    As_base_m2 = smart.get("As_base_m2", As_m2)
+    As_throat_m2 = smart.get("As_throat_m2", As_m2 * 1.2)
     Ar_total_m2 = smart["Ar_total_m2"]
     Ag_total_m2 = smart["Ag_total_m2"]
     Ag_each_m2 = smart["Ag_each_m2"]
@@ -2057,6 +2002,7 @@ def analyze_gating(
     v_runner_design = smart["v_runner_design"]
     v_gate_design = smart["v_gate_design"]
     d_sprue_mm = smart["d_sprue_mm"]
+    d_sprue_throat_mm = smart.get("d_sprue_throat_mm", d_sprue_mm)
     d_ingate_each_mm = smart["d_ingate_each_mm"]
     final_ratio = smart["final_ratio"]
     recommended_system = smart["recommended_system"]
@@ -2095,8 +2041,8 @@ def analyze_gating(
     d_runner_mm = 1000.0 * math.sqrt(4.0 * max(Ar_total_m2, 0.0) / math.pi)
     section_flows: Dict[str, SectionFlow] = {}
     section_specs = [
-        ("SPRUE_BASE", As_m2 * 1e4, d_sprue_mm, sprue_v_range[0], sprue_v_range[1], sprue_A_min, sprue_A_max, Q_design_m3_s),
-        ("SPRUE_THROAT", As_m2 * 1e4, d_sprue_mm, sprue_v_range[0], sprue_v_range[1], sprue_A_min, sprue_A_max, Q_design_m3_s),
+        ("SPRUE_BASE", As_base_m2 * 1e4, d_sprue_mm, sprue_v_range[0], sprue_v_range[1], sprue_A_min, sprue_A_max, Q_design_m3_s),
+        ("SPRUE_THROAT", As_throat_m2 * 1e4, d_sprue_throat_mm, sprue_v_range[0], sprue_v_range[1], sprue_A_min, sprue_A_max, Q_design_m3_s),
         ("RUNNER", Ar_total_m2 * 1e4, d_runner_mm, runner_v_range[0], runner_v_range[1], runner_A_min, runner_A_max, Q_design_m3_s),
         ("INGATE", Ag_each_m2 * 1e4, d_ingate_each_mm, gate_v_range[0], gate_v_range[1], gate_A_min, gate_A_max, ingate_Q_each),
     ]
@@ -2110,7 +2056,7 @@ def analyze_gating(
 
     ingate_flow = section_flows["INGATE"]
     runner_flow = section_flows["RUNNER"]
-    sprue_flow = section_flows["SPRUE_BASE"]
+    sprue_flow = section_flows["SPRUE_THROAT"]
 
     # n_ingates stays as the actual/design count used by the smart gating design.
 
@@ -2130,7 +2076,7 @@ def analyze_gating(
 
     # Actual CAD velocities (comparison only)
     actual_area = {
-        "sprue": sprue_base_cm2 if sprue_base_cm2 > 0 else As_m2 * 1e4,
+        "sprue": sprue_throat_cm2 if sprue_throat_cm2 > 0 else (sprue_base_cm2 if sprue_base_cm2 > 0 else As_throat_m2 * 1e4),
         "runner": runner_min_area_cm2 if runner_min_area_cm2 > 0 else Ar_total_m2 * 1e4,
         "distributor": distributor_area_cm2,
         "curufluk": curufluk_area_cm2,
@@ -2219,10 +2165,20 @@ def analyze_gating(
     for k, v in actual_v.items():
         lo, hi = _section_targets[k]
         if hi > 0 and v > hi:
-            result.recommendations.append(
+            w = (
                 f"UYARI: {_section_names_tr[k]} gerçek hızı {v:.2f} m/s, "
                 f"hedef maksimum {hi:.2f} m/s'yi aşıyor; kesit alanını büyütün veya sayısını artırın."
             )
+            result.recommendations.append(w)
+            gating_warnings.append(w)
+        elif lo > 0 and v > 0 and v < lo:
+            w = (
+                f"UYARI: {_section_names_tr[k]} gerçek hızı {v:.2f} m/s, "
+                f"hedef minimum {lo:.2f} m/s'nin altında; kesit alanını küçültün, süreyi kısaltın "
+                f"veya soğuk birleşme / eksik dolum riskini gözden geçirin."
+            )
+            result.recommendations.append(w)
+            gating_warnings.append(w)
 
     # Human-readable gating recommendation: current state + smart proposal.
     gating_system_reason = (
@@ -2279,24 +2235,23 @@ def analyze_gating(
     v_metal_m_s = v_gate_design
     if v_metal_m_s <= 0 and H_eff_m > 0:
         v_metal_m_s = math.sqrt(2.0 * 9.81 * H_eff_m)
-    # Fluidity length cannot exceed the physical casting size; cap to avoid
-    # unrealistic 5–10 m values while preserving the "can it fill?" check.
-    max_flow_path_mm = float(result.bbox_size_mm.max())
-    fluidity_length_mm = min(v_metal_m_s * t_superheat * 1000.0, max_flow_path_mm)
+    # Akışkanlık uzunluğu yapay sınır olmadan hesaplanır; cold shut karşılaştırması
+    # gerçek akış yoluna (flow_path_mm) göre yapılır, maksimum bbox boyutuna göre değil.
+    flow_path_mm = float(part_fingerprint.get("flow_path_mm", result.bbox_size_mm.max()))
+    fluidity_length_mm = v_metal_m_s * t_superheat * 1000.0
 
-    max_dim_mm = float(result.bbox_size_mm.max())
     result.recommendations = [
         r for r in result.recommendations
         if not r.startswith("Sıvı akışkanlık") and not r.startswith("Akışkanlık uzunluğu")
     ]
-    if max_dim_mm > fluidity_length_mm:
+    if flow_path_mm > fluidity_length_mm:
         result.recommendations.append(
-            f"Sıvı akışkanlık uzunluğu Lf = {fluidity_length_mm:.1f} mm, parça boyutu {max_dim_mm:.1f} mm. "
+            f"Akışkanlık uzunluğu Lf = {fluidity_length_mm:.1f} mm, akış yolu {flow_path_mm:.1f} mm. "
             "Soğuk birleşme (cold shut) riski - döküm sıcaklığını artırın, giriş hızını artırın."
         )
     else:
         result.recommendations.append(
-            f"Akışkanlık uzunluğu Lf = {fluidity_length_mm:.1f} mm, parça boyutu {max_dim_mm:.1f} mm -> yeterli."
+            f"Akışkanlık uzunluğu Lf = {fluidity_length_mm:.1f} mm, akış yolu {flow_path_mm:.1f} mm -> yeterli."
         )
 
     velocity_summary = " | ".join(
@@ -2306,6 +2261,12 @@ def analyze_gating(
     )
     if velocity_summary:
         result.recommendations.append(f"Kesit hızları (tasarım) -> {velocity_summary}")
+
+    # _smart_gating_design içinde biriken akıllı uyarıları da taşı
+    for w in smart.get("warnings", []):
+        ww = f"UYARI: {w}"
+        result.recommendations.append(ww)
+        gating_warnings.append(ww)
 
     result.recommendations.append(gating_system_reason)
 
@@ -2347,7 +2308,8 @@ def analyze_gating(
     )
 
     # Actual (measured/CAD) areas for the report; design areas come from the engine.
-    actual_sprue_base_cm2 = sprue_base_cm2 if sprue_base_cm2 > 0.0 else As_m2 * 1e4
+    actual_sprue_base_cm2 = sprue_base_cm2 if sprue_base_cm2 > 0.0 else As_base_m2 * 1e4
+    actual_sprue_throat_cm2 = sprue_throat_cm2 if sprue_throat_cm2 > 0.0 else As_throat_m2 * 1e4
     actual_runner_cm2 = runner_min_area_cm2 if runner_min_area_cm2 > 0.0 else Ar_total_m2 * 1e4
     actual_gate_total_cm2 = gate_area_cm2 if gate_area_cm2 > 0.0 else Ag_total_m2 * 1e4
 
@@ -2401,13 +2363,16 @@ def analyze_gating(
                     f"mevcut besleyicilerle beslenemiyor. Besleyici boyutunu/yerini veya ek bir chill değerlendirin."
                 )
 
+    if gating_warnings:
+        gating_system_reason = gating_system_reason.rstrip() + "\n\n" + "\n".join(gating_warnings)
+
     return GateResult(
         total_ingate_contact_area_cm2=actual_gate_total_cm2,
         runner_min_area_cm2=actual_runner_cm2,
         sprue_base_area_cm2=actual_sprue_base_cm2,
-        required_sprue_area_cm2=As_m2 * 1e4,
+        required_sprue_area_cm2=As_throat_m2 * 1e4,
         campbell_ok=True,
-        bernoulli_ok=_section_ok(actual_sprue_base_cm2, As_m2 * 1e4, actual_v['sprue'], sprue_v_range[1]) if As_m2 > 0 else True,
+        bernoulli_ok=_section_ok(actual_sprue_throat_cm2, As_throat_m2 * 1e4, actual_v['sprue'], sprue_v_range[1]) if As_throat_m2 > 0 else True,
         ingate_on_thick_region=ingate_on_thick,
         ingate_avg_m_mm=ingate_avg_m,
         ingate_max_m_mm=ingate_max_m,
@@ -2420,7 +2385,7 @@ def analyze_gating(
         elbow_count=elbow_count,
         head_loss_mm=head_loss_m * 1000.0,
         effective_head_mm=H_eff_m * 1000.0,
-        required_sprue_area_with_losses_cm2=As_m2 * 1e4,
+        required_sprue_area_with_losses_cm2=As_throat_m2 * 1e4,
         ingate_velocity_m_s=ingate_velocity_m_s,
         ingate_max_velocity_m_s=gate_v_range[1],
         reynolds=ingate_flow.reynolds,
@@ -2431,12 +2396,12 @@ def analyze_gating(
         velocity_fill_time_match_ok=velocity_fill_time_match_ok,
         required_ingate_area_for_velocity_cm2=Ag_each_m2 * 1e4,
         velocity_area_ok=(
-            _section_ok(actual_sprue_base_cm2, As_m2 * 1e4, actual_v['sprue'], sprue_v_range[1])
+            _section_ok(actual_sprue_throat_cm2, As_throat_m2 * 1e4, actual_v['sprue'], sprue_v_range[1])
             and _section_ok(actual_runner_cm2, Ar_total_m2 * 1e4, actual_v['runner'], runner_v_range[1])
             and _section_ok(actual_gate_total_cm2, Ag_total_m2 * 1e4, actual_v['gate'], gate_v_range[1])
         ),
         fluidity_length_mm=fluidity_length_mm,
-        sprue_throat_area_cm2=sprue_throat_cm2 if sprue_throat_cm2 > 0.0 else design.sprue_throat_area_cm2,
+        sprue_throat_area_cm2=sprue_throat_cm2 if sprue_throat_cm2 > 0.0 else As_throat_m2 * 1e4,
         sprue_base_bottom_area_cm2=actual_sprue_base_cm2,
         sprue_thickness_mm=sprue_thickness_mm,
         selected_section_key=user_velocity_section,
@@ -2455,7 +2420,7 @@ def analyze_gating(
         head_reduction_percent=head_reduction_percent,
         total_poured_mass_kg=total_mass_kg,
         pouring_yield=pour_yield,
-        design_sprue_base_area_cm2=As_m2 * 1e4,
+        design_sprue_base_area_cm2=As_base_m2 * 1e4,
         design_runner_area_cm2=Ar_total_m2 * 1e4,
         design_distributor_area_cm2=(Ar_total_m2 + Ag_total_m2) / 2.0 * 1e4,
         design_gate_total_area_cm2=Ag_total_m2 * 1e4,
@@ -2464,7 +2429,7 @@ def analyze_gating(
         design_gate_diameter_mm=d_ingate_each_mm,
         design_choke_velocity_m_s=Vc_ms,
         design_gating_ratio=final_ratio,
-        sprue_design_ok=_section_ok(actual_sprue_base_cm2, As_m2 * 1e4, actual_v['sprue'], sprue_v_range[1]),
+        sprue_design_ok=_section_ok(actual_sprue_throat_cm2, As_throat_m2 * 1e4, actual_v['sprue'], sprue_v_range[1]),
         runner_design_ok=_section_ok(actual_runner_cm2, Ar_total_m2 * 1e4, actual_v['runner'], runner_v_range[1]),
         gate_design_ok=_section_ok(actual_gate_total_cm2, Ag_total_m2 * 1e4, actual_v['gate'], gate_v_range[1]),
         distributor_area_cm2=distributor_area_cm2,

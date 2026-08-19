@@ -58,6 +58,17 @@ NB_MODULE(josecast_core, m) {
           nb::arg("inlet_distance") = nb::ndarray<nb::numpy, double>(),
           "Run a 3-D D3Q19 LBM + Smagorinsky + VOF free-surface mold-filling solver.");
 
+    m.def("solve_lbm_filling_callback", &josecast::solve_lbm_filling_callback,
+          nb::arg("grid"), nb::arg("inlet_mask"), nb::arg("outlet_mask"),
+          nb::arg("dx"), nb::arg("g"), nb::arg("rho"), nb::arg("nu"),
+          nb::arg("inflow_velocity"), nb::arg("t_max"), nb::arg("max_steps"),
+          nb::arg("cfl_target") = 0.15, nb::arg("smagorinsky") = 0.18,
+          nb::arg("callback"), nb::arg("callback_every_n") = 10,
+          nb::arg("target_velocity") = nb::ndarray<nb::numpy, double>(),
+          nb::arg("inlet_distance") = nb::ndarray<nb::numpy, double>(),
+          "Run the D3Q19 LBM filling solver and invoke ``callback`` every N steps with "
+          "(step, dt, dx, cs2, vx, vy, vz, F, nu_t) as float32 arrays.");
+
     m.def("compute_sand_permeability", &josecast::compute_sand_permeability,
           nb::arg("sand_mask"), nb::arg("afs_grain_size_mm"),
           nb::arg("moisture_percent") = 4.0, nb::arg("binder_percent") = 2.0,

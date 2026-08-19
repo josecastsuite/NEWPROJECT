@@ -1,10 +1,14 @@
 """PyVistaQt 3D viewer wrapper for JoseCast Analyzer v8.x."""
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+import os
+import shutil
+import subprocess
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pyvista as pv
-from PyQt6 import QtCore, QtWidgets
+import vtk
+from PyQt6 import QtCore, QtGui, QtWidgets
 from pyvistaqt import QtInteractor
 from scipy import ndimage
 from scipy.spatial import cKDTree
@@ -68,8 +72,9 @@ BODY_OPACITY = {
 
 # Post-analysis transparency: all bodies become translucent so internal
 # hotspots, Niyama surfaces and flow fields are visible through the geometry.
+# Part is especially faint so risk isosurfaces stand out.
 BODY_OPACITY_POST = {
-    BodyType.PART: 0.60,
+    BodyType.PART: 0.08,
     BodyType.RISER: 0.35,
     BodyType.INGATE: 0.35,
     BodyType.RUNNER: 0.35,
@@ -82,6 +87,79 @@ BODY_OPACITY_POST = {
     BodyType.DISTRIBUTOR: 0.35,
     BodyType.CURUFLUK: 0.35,
 }
+
+_DEFAULT_GPU_VRAM_MB = 4096  # GTX 1050 Ti gibi kartlar için güvenli varsayılan
+_HARD_POINTS_CAP = 150_000
+_BASE_POINTS = 5_000
+_LOG_COEFF = 30_000
+_POINTS_PER_VRAM_MB = 12.5
+
+
+def _gpu_vram_mb() -> int:
+    """Try to detect total VRAM from nvidia-smi; fall back to env/default."""
+    env = os.environ.get("JOSECAST_GPU_VRAM_MB")
+    if env:
+        try:
+            return max(1024, int(env))
+        except ValueError:
+            pass
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi:
+        try:
+            out = subprocess.check_output(
+                [nvidia_smi, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            first = out.strip().splitlines()[0]
+            return max(1024, int(float(first)))
+        except Exception:
+            pass
+    return _DEFAULT_GPU_VRAM_MB
+
+
+def _dynamic_max_points(volume_m3: float, vram_mb: Optional[int] = None) -> int:
+    """Point-budget that grows log with part volume and is capped by VRAM."""
+    if vram_mb is None:
+        vram_mb = _gpu_vram_mb()
+    volume_term = np.log10(1.0 + max(volume_m3, 0.0) * 10000.0)
+    dynamic = int(_BASE_POINTS + _LOG_COEFF * volume_term)
+    vram_cap = max(_BASE_POINTS, int(vram_mb * _POINTS_PER_VRAM_MB))
+    hard_cap = min(_HARD_POINTS_CAP, vram_cap)
+    return int(max(_BASE_POINTS, min(dynamic, hard_cap)))
+
+
+def _weighted_sample_cloud(cloud: pv.PolyData, target: int, scalar_name: str) -> pv.PolyData:
+    """Return a smaller cloud biased toward high scalar values.
+
+    If ``target`` is not smaller than ``cloud.n_points`` the original is returned.
+    """
+    n = cloud.n_points
+    if n <= target:
+        return cloud
+    if scalar_name in cloud.point_data:
+        weights = np.asarray(cloud.point_data[scalar_name], dtype=np.float64)
+    else:
+        weights = np.ones(n, dtype=np.float64)
+    weights = np.clip(weights, 0.0, None)
+    finite = np.isfinite(weights)
+    if not finite.any() or weights[finite].sum() <= 0.0:
+        probs = None
+    else:
+        weights = np.where(finite, weights, 0.0)
+        # Add a small floor so zero-risk voxels still have a chance to be seen.
+        weights = weights + weights[weights > 0.0].mean() * 0.05
+        probs = weights / weights.sum()
+    rng = np.random.default_rng(0)
+    idx = rng.choice(n, target, replace=False, p=probs)
+    points = cloud.points[idx]
+    sampled = pv.PolyData(points)
+    for name in cloud.array_names:
+        arr = np.asarray(cloud.point_data[name])
+        if arr.shape[0] == n:
+            sampled.point_data[name] = arr[idx]
+    return sampled
 
 
 def _scalar_bar_args(title: str, pos: Tuple[float, float], clim: Optional[Tuple[float, float]] = None) -> dict:
@@ -167,11 +245,22 @@ class Analyzer3DViewer(QtInteractor):
         self._mold_wall_actor = None
         self._cold_shot_actor = None
         self._cold_shot_scalar_bar_actor = None
+        self._cold_shot_message_actor = None
         self._last_fill_actor = None
+        self._lap_risk_actor = None
+        self._saddle_actor = None
+        self._saddle_arrow_actor = None
+        self._reeb_line_actor = None
         self._erosion_actor = None
+        self._erosion_body_opacity_backup: Dict[str, float] = {}
         self._air_entrapment_actor = None
         self._air_entrapment_marker_actor = None
         self.flow_animator = FlowAnimator(self)
+        self._saddle_tree = None
+        self._saddle_data: List[Dict[str, Any]] = []
+        self._saddle_positions: np.ndarray = np.empty((0, 3), dtype=np.float64)
+        self._saddle_tol_mm = 1.0
+        self._mouse_observer = None
         self._body_legend_actors: List[Any] = []
         self._body_legend_frame = QtWidgets.QFrame(self)
         self._body_legend_frame.setObjectName("bodyLegend")
@@ -194,6 +283,16 @@ class Analyzer3DViewer(QtInteractor):
         self._body_index: Optional[np.ndarray] = None
         self._origin_mm: Optional[np.ndarray] = None
         self._dx_mm: float = 0.0
+
+    def _enable_saddle_picker(self):
+        """Attach the mouse-move observer once the interactor is available."""
+        try:
+            if self._mouse_observer is None and self.iren is not None:
+                self._mouse_observer = self.iren.AddObserver(
+                    vtk.vtkCommand.MouseMoveEvent, self._on_mouse_move
+                )
+        except Exception:
+            self._mouse_observer = None
 
     def _remove_body_legend(self) -> None:
         """Clear the Qt-based body legend overlay."""
@@ -296,10 +395,19 @@ class Analyzer3DViewer(QtInteractor):
         self._mold_wall_actor = None
         self._cold_shot_actor = None
         self._cold_shot_scalar_bar_actor = None
+        self._cold_shot_message_actor = None
         self._last_fill_actor = None
+        self._lap_risk_actor = None
+        self._saddle_actor = None
+        self._saddle_arrow_actor = None
+        self._reeb_line_actor = None
         self._erosion_actor = None
+        self._erosion_body_opacity_backup = {}
         self._air_entrapment_actor = None
         self._air_entrapment_marker_actor = None
+        self._saddle_tree = None
+        self._saddle_data.clear()
+        self._saddle_positions = np.empty((0, 3), dtype=np.float64)
         self._body_legend_actors = []
         self._remove_body_legend()
         self._bodies = []
@@ -316,10 +424,13 @@ class Analyzer3DViewer(QtInteractor):
         selected_body: Optional[Body] = None,
     ):
         """Display original body meshes colored by type."""
+        self._bodies = list(bodies) if bodies is not None else []
         for actor in self._body_actors:
             self.remove_actor(actor)
         self._body_actors.clear()
+        self._body_actor_by_name: Dict[str, Any] = {}
         self._part_mesh_pv = None
+        self._analysis_mode = analysis_mode
 
         opacity_map = BODY_OPACITY_POST if analysis_mode else BODY_OPACITY
         part_vertices: List[np.ndarray] = []
@@ -333,10 +444,19 @@ class Analyzer3DViewer(QtInteractor):
             is_selected = selected_body is not None and (
                 body is selected_body or body.name == selected_body.name
             )
-            color = "#ff0000" if is_selected else BODY_COLORS.get(body.body_type, "#F5F5F5")
-            opacity = 1.0 if is_selected else opacity_map.get(body.body_type, 1.0)
-            if selected_body is not None and not is_selected and not analysis_mode:
-                opacity = 0.25
+            if is_selected:
+                color = "#ff0000"
+                opacity = 1.0
+            elif analysis_mode:
+                # When a risk overlay is active, fade all body colours to a
+                # nearly transparent light grey so the result layer dominates.
+                color = "#F5F5F5"
+                opacity = 0.06
+            else:
+                color = BODY_COLORS.get(body.body_type, "#F5F5F5")
+                opacity = opacity_map.get(body.body_type, 1.0)
+                if selected_body is not None and not is_selected:
+                    opacity = 0.25
             actor = self.add_mesh(
                 mesh,
                 color=color,
@@ -350,6 +470,8 @@ class Analyzer3DViewer(QtInteractor):
                 specular_power=1,
             )
             self._body_actors.append(actor)
+            if getattr(body, "name", ""):
+                self._body_actor_by_name[body.name] = actor
             if body.body_type == BodyType.PART:
                 part_vertices.append(np.asarray(body.vertices, dtype=np.float64))
                 part_faces.append(np.asarray(body.faces, dtype=np.int64) + offset)
@@ -385,8 +507,40 @@ class Analyzer3DViewer(QtInteractor):
         except Exception:
             pass
 
-    def _make_grid(self, result: AnalysisResult, scalars: np.ndarray, name: str) -> pv.ImageData:
-        """Build a PyVista ImageData (voxel grid) with point-centered scalars and masks."""
+    def _cell_data_to_point_max(self, grid: pv.ImageData, name: str) -> np.ndarray:
+        """Return point values that are the max of the 8 cells sharing each point.
+
+        This preserves small high-value blobs (e.g. cold-shot risk splats) that
+        would otherwise be averaged away by PyVista's default
+        ``cell_data_to_point_data`` interpolation."""
+        nx, ny, nz = grid.dimensions
+        nx_c, ny_c, nz_c = nx - 1, ny - 1, nz - 1
+        cell_arr = grid.cell_data[name].reshape((nx_c, ny_c, nz_c), order="F")
+        padded = np.zeros((nx_c + 2, ny_c + 2, nz_c + 2), dtype=cell_arr.dtype)
+        padded[1:-1, 1:-1, 1:-1] = cell_arr
+        # 8 corner offsets of the 2x2x2 cell block sharing each point.
+        p000 = padded[:nx_c + 1, :ny_c + 1, :nz_c + 1]
+        p100 = padded[1:nx_c + 2, :ny_c + 1, :nz_c + 1]
+        p010 = padded[:nx_c + 1, 1:ny_c + 2, :nz_c + 1]
+        p110 = padded[1:nx_c + 2, 1:ny_c + 2, :nz_c + 1]
+        p001 = padded[:nx_c + 1, :ny_c + 1, 1:nz_c + 2]
+        p101 = padded[1:nx_c + 2, :ny_c + 1, 1:nz_c + 2]
+        p011 = padded[:nx_c + 1, 1:ny_c + 2, 1:nz_c + 2]
+        p111 = padded[1:nx_c + 2, 1:ny_c + 2, 1:nz_c + 2]
+        point_arr = np.maximum.reduce([p000, p100, p010, p110, p001, p101, p011, p111])
+        return point_arr.ravel(order="F")
+
+    def _make_grid(
+        self,
+        result: AnalysisResult,
+        scalars: np.ndarray,
+        name: str,
+        point_max: bool = False,
+    ) -> pv.ImageData:
+        """Build a PyVista ImageData (voxel grid) with point-centered scalars and masks.
+
+        When ``point_max=True`` only the primary scalar is converted with a
+        max-of-neighbours rule so isolated high-value blobs are not averaged away."""
         grid = pv.ImageData()
         grid.dimensions = np.array(result.grid.shape) + 1
         grid.origin = result.origin_mm
@@ -408,6 +562,11 @@ class Analyzer3DViewer(QtInteractor):
             ],
         )
         grid.cell_data["is_gate"] = gate_mask.ravel(order="F").astype(np.float64)
+        if point_max:
+            point_arr = self._cell_data_to_point_max(grid, name)
+            grid = grid.cell_data_to_point_data()
+            grid.point_data[name] = point_arr
+            return grid
         # Contour / slice filters require point data; convert and keep both scalars.
         return grid.cell_data_to_point_data()
 
@@ -432,6 +591,59 @@ class Analyzer3DViewer(QtInteractor):
                 return grid.extract_surface(algorithm="dataset_surface")
             except Exception:
                 return pv.PolyData()
+
+    def _remove_saddle_glyphs(self):
+        for attr in ("_saddle_actor", "_saddle_arrow_actor", "_reeb_line_actor"):
+            actor = getattr(self, attr, None)
+            if actor is not None:
+                try:
+                    if isinstance(actor, dict):
+                        for a in actor.values():
+                            self.remove_actor(a)
+                    elif isinstance(actor, (list, tuple)):
+                        for a in actor:
+                            self.remove_actor(a)
+                    else:
+                        self.remove_actor(actor)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self._saddle_tree = None
+        self._saddle_data.clear()
+        self._saddle_positions = np.empty((0, 3), dtype=np.float64)
+        self._remove_scalar_bar("Sıcaklık (°C)")
+        self._remove_scalar_bar("Soğuk birleşme (çoğaltım)")
+
+    def _on_mouse_move(self, obj=None, event=None):
+        """Show a tooltip with saddle physics when hovering near a saddle glyph."""
+        if self._saddle_tree is None or self._saddle_positions.shape[0] == 0:
+            return
+        try:
+            pos = self.iren.GetEventPosition()
+            picker = self.iren.GetPicker()
+            if picker is None:
+                return
+            picker.SetTolerance(0.001)
+            if not picker.Pick(pos[0], pos[1], 0.0, self.renderer):
+                return
+            world = np.asarray(picker.GetPickPosition(), dtype=np.float64)
+            if not np.isfinite(world).all():
+                return
+            dist, idx = self._saddle_tree.query(world)
+            if dist > self._saddle_tol_mm:
+                return
+            s = self._saddle_data[idx]
+            text = (
+                f"<b>Saddle ({s['i']},{s['j']},{s['k']})</b><br>"
+                f"θ={s.get('theta_deg', 0):.1f}° | Δt={s.get('dt_s', 0):.3f}s<br>"
+                f"T_int={s.get('T_int_c', 0):.1f}°C | fs={s.get('fs', 0):.3f} | f_eut={s.get('f_eut', 0):.3f}<br>"
+                f"We={s.get('We', 0):.3f} | Pe={s.get('Pe', 0):.3f}<br>"
+                f"M_eff={s.get('M_eff_mm', 0):.2f}mm | h_final={s.get('h_final_m', 0)*1e9:.1f}nm<br>"
+                f"N_front={s.get('N_front', 0)} | persistence={s.get('persistence_s', 0):.3f}s"
+            )
+            QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), text, self)
+        except Exception:
+            pass
 
     def show_hotspots(self, result: Optional[AnalysisResult]):
         for actor in self._hotspot_actors:
@@ -515,14 +727,17 @@ class Analyzer3DViewer(QtInteractor):
             self._risk_actor = None
         self._remove_scalar_bar("Risk")
         if result is None:
+            self._show_scalar_bar_no_geometry("Risk", "hot", [0.0, 1.0])
             return
 
         grid = self._make_grid(result, result.risk, "risk")
         part = self._part_only(grid)
         if part.n_cells == 0:
+            self._show_scalar_bar_no_geometry("Risk", "hot", [0.0, 1.0])
             return
         iso = part.contour([0.70, 0.85], scalars="risk")
         if iso.n_points == 0:
+            self._show_scalar_bar_no_geometry("Risk", "hot", [0.0, 1.0])
             return
         self._risk_actor = self.add_mesh(
             iso,
@@ -540,7 +755,7 @@ class Analyzer3DViewer(QtInteractor):
         self,
         result: Optional[AnalysisResult],
         noise_percent: float = 100.0,
-        max_points: int = 5000,
+        max_points: Optional[int] = None,
         pore_size_filter: Optional[str] = None,
     ):
         """Porosity point cloud colored by estimated pore size.
@@ -556,10 +771,12 @@ class Analyzer3DViewer(QtInteractor):
             self._porosity_actor = None
         self._remove_scalar_bar("Pore size (µm)")
         if result is None:
+            self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
             return
 
         part_mask = result.grid == BodyType.PART
         if not part_mask.any():
+            self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
             return
 
         pore_size_filter = (pore_size_filter or "").lower()
@@ -576,6 +793,7 @@ class Analyzer3DViewer(QtInteractor):
                 class_mask = np.zeros_like(part_mask, dtype=bool)
             use_pore_size = class_mask.any()
             if not use_pore_size:
+                self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
                 return
         elif has_pore_size and pore_size_filter in ("", "all"):
             class_mask = part_mask & (pore_size_um > 0.0)
@@ -595,6 +813,7 @@ class Analyzer3DViewer(QtInteractor):
                 field = risk
                 scalar_name = "risk"
             else:
+                self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
                 return
             class_mask = part_mask
 
@@ -606,6 +825,7 @@ class Analyzer3DViewer(QtInteractor):
         if use_pore_size and has_risk and 0.0 <= noise_percent < 100.0:
             risk_values = risk[class_mask & (risk > 0.0)]
             if risk_values.size == 0:
+                self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
                 return
             p = max(0.0, 100.0 - noise_percent)
             risk_threshold = float(np.percentile(risk_values, p))
@@ -615,6 +835,7 @@ class Analyzer3DViewer(QtInteractor):
         values = field[class_mask]
         finite = np.isfinite(values) & (values > 0.0)
         if not finite.any():
+            self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
             return
         finite_max = float(np.max(values[finite]))
         finite_min = float(np.min(values[finite]))
@@ -624,6 +845,7 @@ class Analyzer3DViewer(QtInteractor):
         lo = max(finite_min, 1e-12)
         hi = finite_max
         if hi <= lo:
+            self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
             return
 
         # Mask the field to the selected class so threshold only picks from there.
@@ -633,9 +855,11 @@ class Analyzer3DViewer(QtInteractor):
         grid = self._make_grid(result, clean_field, scalar_name)
         part = self._part_only(grid)
         if part.n_cells == 0:
+            self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
             return
         high = part.threshold([lo, hi], scalars=scalar_name)
         if high.n_cells == 0:
+            self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
             return
 
         # cell_centers() drops arrays; convert point->cell data first and attach it.
@@ -647,15 +871,13 @@ class Analyzer3DViewer(QtInteractor):
         except Exception:
             cloud = high.cell_centers()
 
-        if cloud.n_points > max_points:
-            idx = np.random.choice(cloud.n_points, max_points, replace=False)
-            points = cloud.points[idx]
-            if scalar_name in cloud.point_data:
-                vals = np.asarray(cloud.point_data[scalar_name])[idx]
-                cloud = pv.PolyData(points)
-                cloud.point_data[scalar_name] = vals
-            else:
-                cloud = pv.PolyData(points)
+        # Decide how many points we can afford: volume-driven log budget capped by VRAM.
+        if max_points is None:
+            part_volume_m3 = float(getattr(result, "part_volume_mm3", 0.0)) / 1e9
+            target = _dynamic_max_points(part_volume_m3)
+        else:
+            target = int(max_points)
+        cloud = _weighted_sample_cloud(cloud, target, scalar_name)
 
         # Porozite noktalarını parça dışına taşanları sil: sadece parça yüzeyi
         # içinde kalan noktaları tut.
@@ -675,6 +897,7 @@ class Analyzer3DViewer(QtInteractor):
                     cloud = kept_cloud
                 elif not inside.any():
                     # Hiçbir nokta içeride değilse gösterme.
+                    self._show_scalar_bar_no_geometry("Pore size (µm)", "plasma", [0.0, 1.0])
                     return
             except Exception:
                 pass
@@ -707,12 +930,14 @@ class Analyzer3DViewer(QtInteractor):
         self._niyama_actors.clear()
         self._remove_scalar_bar("Niyama")
         if result is None:
+            self._show_scalar_bar_no_geometry("Niyama", "jet", [0.0, 1.0])
             return
 
         alloy = get_alloy(result.alloy_key)
         grid = self._make_grid(result, result.niyama, "niyama")
         part = self._part_only(grid)
         if part.n_cells == 0:
+            self._show_scalar_bar_no_geometry("Niyama", "jet", [0.0, 1.0])
             return
 
         iso = part.contour(
@@ -720,6 +945,7 @@ class Analyzer3DViewer(QtInteractor):
             scalars="niyama",
         )
         if iso.n_points == 0:
+            self._show_scalar_bar_no_geometry("Niyama", "jet", [0.0, 1.0])
             return
 
         actor = self.add_mesh(
@@ -952,7 +1178,16 @@ class Analyzer3DViewer(QtInteractor):
         for actor in self._slice_actors:
             self.remove_actor(actor)
         self._slice_actors.clear()
+        title_map = {
+            "sdf": ("SDF (mm)", "viridis"),
+            "risk": ("Risk", "hot"),
+            "niyama": ("Niyama", "plasma"),
+            "mat_id": ("Mat ID", "tab10"),
+            "temperature": ("T (°C)", "coolwarm"),
+        }
+        title, cmap = title_map.get(field, (field, "viridis"))
         if result is None:
+            self._show_scalar_bar_no_geometry(title, cmap, [0.0, 1.0])
             return
 
         field_map = {
@@ -967,11 +1202,13 @@ class Analyzer3DViewer(QtInteractor):
             ),
         }
         if field not in field_map:
+            self._show_scalar_bar_no_geometry(title, cmap, [0.0, 1.0])
             return
         data, title, cmap = field_map[field]
 
         finite_data = data[np.isfinite(data)]
         if finite_data.size == 0:
+            self._show_scalar_bar_no_geometry(title, cmap, [0.0, 1.0])
             return
         dmin = float(finite_data.min())
         dmax = float(finite_data.max())
@@ -987,6 +1224,7 @@ class Analyzer3DViewer(QtInteractor):
         grid = self._make_grid(result, data, field)
         domain = self._part_only(grid) if field in ("risk", "niyama") else self._metal_only(grid)
         if domain.n_cells == 0:
+            self._show_scalar_bar_no_geometry(title, cmap, list(slice_clim))
             return
 
         self._remove_scalar_bar(title)
@@ -1049,14 +1287,17 @@ class Analyzer3DViewer(QtInteractor):
             self._mold_wall_actor = None
         self._remove_scalar_bar("Kalıp şişmesi (%)")
         if result is None or result.mold_wall_movement is None or result.mold_wall_movement.size == 0:
+            self._show_scalar_bar_no_geometry("Kalıp şişmesi (%)", "hot", [0.0, 1.0])
             return
 
         grid = self._make_grid(result, result.mold_wall_movement, "mold_wall_movement")
         part = self._part_only(grid)
         if part.n_cells == 0:
+            self._show_scalar_bar_no_geometry("Kalıp şişmesi (%)", "hot", [0.0, 1.0])
             return
         cells = part.threshold(0.05, scalars="mold_wall_movement", all_scalars=True)
         if cells.n_cells == 0:
+            self._show_scalar_bar_no_geometry("Kalıp şişmesi (%)", "hot", [0.0, 1.0])
             return
         vmax = float(np.percentile(cells["mold_wall_movement"], 98))
         if vmax <= 0.05:
@@ -1095,7 +1336,7 @@ class Analyzer3DViewer(QtInteractor):
                 self.remove_actor(self._hotspot_label_actor)
                 self._hotspot_label_actor = None
 
-    def toggle_porosity(self, result: AnalysisResult, checked: bool, noise_percent: float = 3.0, max_points: int = 5000, pore_size_filter: Optional[str] = None):
+    def toggle_porosity(self, result: AnalysisResult, checked: bool, noise_percent: float = 3.0, max_points: Optional[int] = None, pore_size_filter: Optional[str] = None):
         if checked:
             self.show_porosity_cloud(result, noise_percent=noise_percent, max_points=max_points, pore_size_filter=pore_size_filter)
         else:
@@ -1128,169 +1369,538 @@ class Analyzer3DViewer(QtInteractor):
                 self._mold_wall_actor = None
             self._remove_scalar_bar("Kalıp şişmesi (%)")
 
-    def show_cold_shot_risk(self, result: Optional[AnalysisResult]):
-        """Heatmap of cold-shut (soğuk birleşme) risk on the part surface.
+    def _show_saddle_glyphs(self, result: AnalysisResult, mode: str = "cold"):
+        """Draw small spheres at high-risk saddle points (confluence markers)."""
+        self._remove_saddle_glyphs()
 
-        Risk values below 0.3 are made transparent.  Values between 0.3 and 1.0
-        are shown with a yellow-orange-red heatmap.  The latest-filled voxel is
-        marked with a red sphere so the operator sees where air/oxide is most
-        likely trapped.
+        saddles = getattr(result, "cold_shot_saddles", None)
+        if not saddles or not saddles.get("saddles"):
+            return
+
+        dx = float(result.dx_mm)
+        origin = np.asarray(result.origin_mm, dtype=np.float64)
+        data = saddles["saddles"]
+        if not data or dx <= 0.0:
+            return
+
+        positions = []
+        risk_vals = []
+        sphere_blocks = []
+        for s in data:
+            risk = float(s.get("risk_cs", 0.0))
+            if risk < 0.3:
+                continue
+            i = int(s.get("i", 0))
+            j = int(s.get("j", 0))
+            k = int(s.get("k", 0))
+            pos = origin + (np.array([i, j, k], dtype=np.float64) + 0.5) * dx
+            positions.append(pos)
+            risk_vals.append(risk)
+
+            sphere = pv.Sphere(
+                radius=0.25 * dx,
+                center=pos,
+                theta_resolution=12,
+                phi_resolution=12,
+            )
+            sphere.cell_data["risk_cs"] = np.full(sphere.n_cells, risk)
+            sphere_blocks.append(sphere)
+
+        if sphere_blocks:
+            spheres = pv.merge(sphere_blocks)
+            self._saddle_actor = self.add_mesh(
+                spheres,
+                scalars="risk_cs",
+                cmap="inferno",
+                clim=[0.0, 1.0],
+                opacity=0.9,
+                show_scalar_bar=False,
+                smooth_shading=True,
+            )
+
+        self._saddle_positions = np.array(positions, dtype=np.float64)
+        self._saddle_data = [s for s in data if float(s.get("risk_cs", 0.0)) >= 0.3]
+        self._saddle_tol_mm = 2.0 * dx
+        try:
+            self._saddle_tree = cKDTree(self._saddle_positions) if self._saddle_positions.size else None
+        except Exception:
+            self._saddle_tree = None
+        self._enable_saddle_picker()
+
+    def _sample_cold_shot_risk(
+        self, points: np.ndarray, result: AnalysisResult
+    ) -> Optional[np.ndarray]:
+        """Interpolate the per-voxel cold-shot risk onto a world-space polyline."""
+        grid = getattr(result, "cold_shot_risk", None)
+        if grid is None or grid.size == 0:
+            return None
+        origin = np.asarray(result.origin_mm, dtype=np.float64)
+        dx = float(result.dx_mm)
+        if dx <= 0.0:
+            return None
+        coords = ((points - origin) / dx - 0.5).T  # (3, N)
+        try:
+            vals = ndimage.map_coordinates(grid, coords, order=1, mode="nearest")
+        except Exception:
+            return None
+        return np.asarray(vals, dtype=np.float64)
+
+    def _show_scalar_bar_no_geometry(
+        self,
+        title: str,
+        cmap: str,
+        clim: Sequence[float],
+        position: Tuple[float, float] = (0.02, 0.02),
+    ) -> Any:
+        """Add a scalar bar even when the field has no visible geometry.
+
+        Uses an off-screen dummy mapper so the colour scale is still shown.
         """
-        if self._cold_shot_actor is not None:
+        dummy = pv.Sphere(radius=1e-6)
+        dummy["__scalar"] = np.full(dummy.n_points, float(clim[0]))
+        lut = pv.LookupTable(cmap=cmap)
+        lut.SetRange(float(clim[0]), float(clim[1]))
+        mapper = pv.DataSetMapper(dataset=dummy)
+        mapper.scalar_map_mode = "point"
+        mapper.lookup_table = lut
+        return self.add_scalar_bar(mapper=mapper, **_scalar_bar_args(title, position, clim))
+
+    def show_cold_shot_risk(self, result: Optional[AnalysisResult]):
+        """Render cold-shut risk as 1-D confluence tubes (not volume/surface).
+
+        The physical cold shut is a line where two filling fronts meet and fail
+        to weld.  ``cold_shot_lines`` holds ordered polylines extracted from the
+        fill-time field; each point is coloured by the local cold-shot risk on
+        the ``inferno`` 0..1 scale.  The part body stays translucent so the lines
+        are visible inside the geometry.
+        """
+        if isinstance(self._cold_shot_actor, (list, tuple)):
+            for actor in self._cold_shot_actor:
+                try:
+                    self.remove_actor(actor)
+                except Exception:
+                    pass
+        elif self._cold_shot_actor is not None:
             self.remove_actor(self._cold_shot_actor)
-            self._cold_shot_actor = None
         if self._last_fill_actor is not None:
             self.remove_actor(self._last_fill_actor)
             self._last_fill_actor = None
+        if self._cold_shot_message_actor is not None:
+            self.remove_actor(self._cold_shot_message_actor)
+            self._cold_shot_message_actor = None
         self._remove_scalar_bar("Soğuk birleşme riski")
+        self._remove_saddle_glyphs()
 
         if result is None or result.cold_shot_risk is None or result.cold_shot_risk.size == 0:
-            return
-
-        grid = self._make_grid(result, result.cold_shot_risk, "cold_shot_risk")
-        part = self._part_only(grid)
-        if part.n_cells == 0:
-            return
-
-        # Threshold: only show risk >= 0.3, per protocol.
-        cells = part.threshold(0.3, scalars="cold_shot_risk", all_scalars=True)
-        if cells.n_cells == 0:
-            return
-
-        vmax = float(np.percentile(cells["cold_shot_risk"], 99))
-        if vmax <= 0.3:
-            vmax = 1.0
-        clim = [0.3, vmax]
-
-        self._cold_shot_actor = self.add_mesh(
-            cells,
-            scalars="cold_shot_risk",
-            cmap="YlOrRd",
-            opacity=0.85,
-            clim=clim,
-            show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Soğuk birleşme riski", (0.02, 0.02), clim=clim),
-            smooth_shading=True,
-        )
-
-        # Last-fill point marker: red sphere at the latest-filled voxel.
-        if result.last_fill_point_mm is not None and result.last_fill_point_mm.size == 3:
-            radius = max(float(result.dx_mm) * 2.0, 2.0)
-            sphere = pv.Sphere(radius=radius, center=result.last_fill_point_mm)
-            self._last_fill_actor = self.add_mesh(
-                sphere,
-                color="red",
-                opacity=0.9,
-                show_scalar_bar=False,
+            self._show_scalar_bar_no_geometry(
+                "Soğuk birleşme riski", "inferno", [0.0, 1.0]
             )
+            return
 
+        lines = getattr(result, "cold_shot_lines", None) or []
+        if not lines:
+            self._cold_shot_message_actor = self.add_text(
+                "Risk düşük, isosurface yok",
+                position="upper_left",
+                font_size=12,
+                color="black",
+                name="cold_shot_low_risk_msg",
+            )
+            self._show_scalar_bar_no_geometry(
+                "Soğuk birleşme riski", "inferno", [0.0, 1.0]
+            )
+            return
+
+        clim = [0.0, 1.0]
+        dx = float(result.dx_mm)
+        tube_radius = max(0.15 * dx, 0.1)
+        actors = []
+        scalar_bar_args = _scalar_bar_args("Soğuk birleşme riski", (0.02, 0.02), clim=clim)
+
+        for idx, line in enumerate(lines):
+            pts = np.asarray(line.get("points", []), dtype=np.float64)
+            if pts.shape[0] < 2:
+                continue
+            n = pts.shape[0]
+            poly = pv.PolyData()
+            poly.points = pts
+            poly.lines = np.hstack([[n], np.arange(n)]).astype(np.int64)
+
+            # Colour each point by the local cold-shot risk; this makes the
+            # same confluence line vary from yellow (low risk) to red (high risk).
+            point_risks = self._sample_cold_shot_risk(pts, result)
+            if point_risks is None:
+                point_risks = np.full(n, float(line.get("risk", 0.0)))
+            poly["risk"] = point_risks
+
+            try:
+                tube = poly.tube(radius=tube_radius, n_sides=8)
+            except Exception:
+                tube = poly
+            actor = self.add_mesh(
+                tube,
+                scalars="risk",
+                cmap="inferno",
+                opacity=0.9,
+                clim=clim,
+                show_scalar_bar=(idx == 0),
+                scalar_bar_args=scalar_bar_args if idx == 0 else None,
+                smooth_shading=True,
+            )
+            actors.append(actor)
+
+        self._cold_shot_actor = actors
+
+        # Last-fill point marker deliberately omitted from cold-shot view; it
+        # is not a cold-shut feature and distracts from the confluence lines.
+
+        self._show_saddle_glyphs(result, "cold")
         self._arrange_scalar_bars()
 
     def toggle_cold_shot_risk(self, result: AnalysisResult, checked: bool):
         if checked:
             self.show_cold_shot_risk(result)
         else:
-            if self._cold_shot_actor is not None:
+            if isinstance(self._cold_shot_actor, (list, tuple)):
+                for actor in self._cold_shot_actor:
+                    try:
+                        self.remove_actor(actor)
+                    except Exception:
+                        pass
+            elif self._cold_shot_actor is not None:
                 self.remove_actor(self._cold_shot_actor)
-                self._cold_shot_actor = None
+            self._cold_shot_actor = None
             if self._last_fill_actor is not None:
                 self.remove_actor(self._last_fill_actor)
                 self._last_fill_actor = None
+            if self._cold_shot_message_actor is not None:
+                self.remove_actor(self._cold_shot_message_actor)
+                self._cold_shot_message_actor = None
+            self._remove_saddle_glyphs()
             self._remove_scalar_bar("Soğuk birleşme riski")
 
-    def show_erosion_risk(self, result: Optional[AnalysisResult]):
-        """Heatmap of mold-sand erosion risk driven by local metal velocity."""
-        if self._erosion_actor is not None:
-            self.remove_actor(self._erosion_actor)
-            self._erosion_actor = None
-        self._remove_scalar_bar("Kalıp erozyonu riski")
+    def show_lap_risk(self, result: Optional[AnalysisResult]):
+        """Isosurface lap risk (45°–120° encounter angles) in viridis."""
+        if isinstance(self._lap_risk_actor, (list, tuple)):
+            for actor in self._lap_risk_actor:
+                try:
+                    self.remove_actor(actor)
+                except Exception:
+                    pass
+        elif self._lap_risk_actor is not None:
+            self.remove_actor(self._lap_risk_actor)
+        self._remove_scalar_bar("Lap riski")
 
-        if result is None or result.erosion_risk is None or result.erosion_risk.size == 0:
+        if result is None or result.lap_risk is None or result.lap_risk.size == 0:
+            self._show_scalar_bar_no_geometry("Lap riski", "viridis", [0.0, 1.0])
             return
 
-        grid = self._make_grid(result, result.erosion_risk, "erosion_risk")
-        metal = self._metal_only(grid)
-        if metal.n_cells == 0:
+        lap_grid = getattr(result, "lap_risk_viz", result.lap_risk)
+        if lap_grid is None or lap_grid.size == 0:
+            lap_grid = result.lap_risk
+
+        lap_masked = np.where(lap_grid >= 0.3, lap_grid, 0.0)
+        grid = self._make_grid(result, lap_masked, "lap_risk", point_max=True)
+        part = self._part_only(grid)
+        if part.n_cells == 0:
+            self._show_scalar_bar_no_geometry("Lap riski", "viridis", [0.0, 1.0])
             return
 
-        cells = metal.threshold(1e-6, scalars="erosion_risk", all_scalars=True)
-        if cells.n_cells == 0:
-            return
+        clim = [0.0, 1.0]
+        contours = part.contour(isosurfaces=[0.3, 0.5, 0.7, 0.9], scalars="lap_risk")
+        if contours.n_points > 0 and "lap_risk" not in contours.array_names:
+            contours.cell_data["lap_risk"] = np.zeros(contours.n_cells, dtype=np.float64)
+            contours = contours.cell_data_to_point_data()
+        if contours.n_points > 0:
+            contour_actor = self.add_mesh(
+                contours,
+                scalars="lap_risk",
+                cmap="viridis",
+                opacity=0.85,
+                clim=clim,
+                show_scalar_bar=True,
+                scalar_bar_args=_scalar_bar_args("Lap riski", (0.02, 0.02), clim=clim),
+                smooth_shading=True,
+            )
+        else:
+            self._show_scalar_bar_no_geometry("Lap riski", "viridis", [0.0, 1.0])
+            contour_actor = None
 
-        vmax = float(np.percentile(cells["erosion_risk"], 99))
-        vmax = max(vmax, 0.3)
-        clim = [0.0, vmax]
-
-        self._erosion_actor = self.add_mesh(
-            cells,
-            scalars="erosion_risk",
-            cmap="YlOrRd",
-            opacity=0.85,
-            clim=clim,
-            show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Kalıp erozyonu riski", (0.02, 0.02), clim=clim),
-            smooth_shading=True,
-        )
+        self._lap_risk_actor = [contour_actor] if contour_actor is not None else []
         self._arrange_scalar_bars()
 
+    def toggle_lap_risk(self, result: AnalysisResult, checked: bool):
+        if checked:
+            self.show_lap_risk(result)
+        else:
+            if isinstance(self._lap_risk_actor, (list, tuple)):
+                for actor in self._lap_risk_actor:
+                    try:
+                        self.remove_actor(actor)
+                    except Exception:
+                        pass
+            elif self._lap_risk_actor is not None:
+                self.remove_actor(self._lap_risk_actor)
+            self._lap_risk_actor = None
+            self._remove_scalar_bar("Lap riski")
+
+    def show_erosion_risk(self, result: Optional[AnalysisResult]):
+        """Cumulative mold-erosion damage with turbo + sigmoid opacity + ghost chassis."""
+        title = "Cumulative Mold Erosion Damage (Kalıp Erozyon Hasarı - Kümülatif)"
+
+        self._restore_erosion_body_opacities()
+        if isinstance(self._erosion_actor, (list, tuple)):
+            for actor in self._erosion_actor:
+                try:
+                    self.remove_actor(actor)
+                except Exception:
+                    pass
+        elif self._erosion_actor is not None:
+            try:
+                self.remove_actor(self._erosion_actor)
+            except Exception:
+                pass
+        self._erosion_actor = None
+        self._remove_scalar_bar(title)
+
+        if result is None or result.erosion_risk is None or result.erosion_risk.size == 0:
+            self._show_scalar_bar_no_geometry(title, "turbo", [0.0, 1.0])
+            return
+
+        finite = result.erosion_risk[np.isfinite(result.erosion_risk)]
+        if finite.size == 0 or float(finite.max()) <= 1e-6:
+            self._show_scalar_bar_no_geometry(title, "turbo", [0.0, 1.0])
+            return
+        clim = [0.0, 1.0]
+
+        # Sigmoid opacity transfer function: safe = glass, danger = opaque.
+        # PyVista expects an opacity map as uint8 [0, 255].
+        opacity_tf = pv.opacity_transfer_function(
+            [0.02, 0.08, 0.45, 0.85, 1.0], 256
+        )
+
+        grid = self._make_grid(result, result.erosion_risk, "erosion_risk", point_max=True)
+        point_values = grid.point_data["erosion_risk"]
+        point_values = np.nan_to_num(point_values, nan=0.0)
+        nx, ny, nz = grid.dimensions
+        point_arr = point_values.reshape((nx, ny, nz), order="F")
+        origin = np.asarray(result.origin_mm, dtype=np.float64)
+        dx = float(result.dx_mm)
+
+        scalar_bar_args = _scalar_bar_args(title, (0.02, 0.02), clim=clim)
+
+        actors: List[Any] = []
+        has_risk_mesh = False
+        for body in self._bodies:
+            if len(body.faces) == 0:
+                continue
+            faces = np.c_[np.full(len(body.faces), 3, dtype=np.int64), body.faces].ravel()
+            mesh = pv.PolyData(body.vertices, faces)
+
+            # Ghost chassis: very faint surface so the part form never disappears.
+            try:
+                actors.append(
+                    self.add_mesh(
+                        mesh,
+                        color="#F5F5F5",
+                        opacity=0.01,
+                        lighting=False,
+                        show_scalar_bar=False,
+                    )
+                )
+            except Exception:
+                pass
+            try:
+                edges = mesh.extract_feature_edges(
+                    boundary_edges=True, feature_edges=True, manifold_edges=False
+                )
+                if edges.n_points > 0:
+                    actors.append(
+                        self.add_mesh(
+                            edges,
+                            color="#888888",
+                            opacity=0.04,
+                            line_width=1,
+                            show_scalar_bar=False,
+                        )
+                    )
+            except Exception:
+                pass
+
+            # Continuous trilinear sampling of the cumulative risk field.
+            verts = np.asarray(body.vertices, dtype=np.float64)
+            if verts.size == 0:
+                continue
+            coords = (verts - origin) / dx
+            try:
+                sampled = ndimage.map_coordinates(
+                    point_arr, coords.T, order=1, mode="nearest", cval=0.0
+                )
+            except Exception:
+                continue
+            if float(np.max(sampled)) <= 1e-6:
+                continue
+            risk = np.clip(sampled.astype(np.float64), 0.0, 1.0)
+            mesh["erosion_risk"] = risk
+
+            base_actor = self._body_actor_by_name.get(getattr(body, "name", ""))
+            if base_actor is not None:
+                self._erosion_body_opacity_backup[getattr(body, "name", "")] = float(
+                    base_actor.GetProperty().GetOpacity()
+                )
+                base_actor.GetProperty().SetOpacity(0.0)
+
+            actors.append(
+                self.add_mesh(
+                    mesh,
+                    scalars="erosion_risk",
+                    cmap="turbo",
+                    opacity=opacity_tf,
+                    clim=clim,
+                    nan_opacity=0.0,
+                    show_scalar_bar=not has_risk_mesh,
+                    scalar_bar_args=scalar_bar_args,
+                    smooth_shading=True,
+                    ambient=0.7,
+                    diffuse=0.3,
+                    specular=0.0,
+                    lighting=False,
+                )
+            )
+            has_risk_mesh = True
+
+        if not actors:
+            self._show_scalar_bar_no_geometry(title, "turbo", [0.0, 1.0])
+            return
+
+        self._erosion_actor = actors
+        self._arrange_scalar_bars()
+
+    def _restore_erosion_body_opacities(self):
+        for name, opacity in self._erosion_body_opacity_backup.items():
+            actor = self._body_actor_by_name.get(name)
+            if actor is not None:
+                actor.GetProperty().SetOpacity(opacity)
+        self._erosion_body_opacity_backup.clear()
+
     def toggle_erosion_risk(self, result: AnalysisResult, checked: bool):
+        title = "Cumulative Mold Erosion Damage (Kalıp Erozyon Hasarı - Kümülatif)"
         if checked:
             self.show_erosion_risk(result)
         else:
-            if self._erosion_actor is not None:
-                self.remove_actor(self._erosion_actor)
-                self._erosion_actor = None
-            self._remove_scalar_bar("Kalıp erozyonu riski")
+            self._restore_erosion_body_opacities()
+            if isinstance(self._erosion_actor, (list, tuple)):
+                for actor in self._erosion_actor:
+                    try:
+                        self.remove_actor(actor)
+                    except Exception:
+                        pass
+            elif self._erosion_actor is not None:
+                try:
+                    self.remove_actor(self._erosion_actor)
+                except Exception:
+                    pass
+            self._erosion_actor = None
+            self._remove_scalar_bar(title)
 
-    def show_air_entrapment(self, result: Optional[AnalysisResult]):
-        """Heatmap of trapped-air pockets detected by the LBM/VOF free-surface solver."""
+    def show_air_entrapment(
+        self,
+        result: Optional[AnalysisResult],
+        max_points: Optional[int] = None,
+    ):
+        """Render trapped-air risk with volume rendering + physical isosurfaces.
+
+        A hybrid volume/isosurface display is used: ``add_volume`` shows the
+        translucent low-risk gas cloud with the ``coolwarm`` colour map (blue
+        = low risk, red = high risk) and a sigmoid opacity transfer function,
+        while ``contour`` extracts closed surfaces at the physical thresholds
+        5 %, 20 %, 50 % and 80 % gas volume fraction.  This matches the
+        convention used in LBM/VOF compressible-gas visualisation.
+        """
         if self._air_entrapment_actor is not None:
-            self.remove_actor(self._air_entrapment_actor)
+            if isinstance(self._air_entrapment_actor, (list, tuple)):
+                for actor in self._air_entrapment_actor:
+                    try:
+                        self.remove_actor(actor)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    self.remove_actor(self._air_entrapment_actor)
+                except Exception:
+                    pass
             self._air_entrapment_actor = None
         if self._air_entrapment_marker_actor is not None:
-            self.remove_actor(self._air_entrapment_marker_actor)
+            try:
+                self.remove_actor(self._air_entrapment_marker_actor)
+            except Exception:
+                pass
             self._air_entrapment_marker_actor = None
         self._remove_scalar_bar("Hava sıkışması")
 
         if result is None or result.air_entrapment is None or result.air_entrapment.size == 0:
-            return
-
-        grid = self._make_grid(result, result.air_entrapment, "air_entrapment")
-        part = self._part_only(grid)
-        if part.n_cells == 0:
-            part = self._metal_only(grid)
-        if part.n_cells == 0:
-            return
-
-        cells = part.threshold(0.3, scalars="air_entrapment", all_scalars=True)
-        if cells.n_cells == 0:
-            return
-
-        vmax = max(float(np.percentile(cells["air_entrapment"], 99)), 0.5)
-        if vmax <= 0.3:
-            vmax = 1.0
-        clim = [0.3, vmax]
-
-        self._air_entrapment_actor = self.add_mesh(
-            cells,
-            scalars="air_entrapment",
-            cmap="cool",
-            opacity=0.85,
-            clim=clim,
-            show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("Hava sıkışması", (0.02, 0.02), clim=clim),
-            smooth_shading=True,
-        )
-
-        if result.air_entrapment_centroid_mm is not None and result.air_entrapment_centroid_mm.size == 3:
-            radius = max(float(result.dx_mm) * 2.0, 2.0)
-            sphere = pv.Sphere(radius=radius, center=result.air_entrapment_centroid_mm)
-            self._air_entrapment_marker_actor = self.add_mesh(
-                sphere,
-                color="cyan",
-                opacity=0.9,
-                show_scalar_bar=False,
+            self._show_scalar_bar_no_geometry(
+                "Hava sıkışması", "coolwarm", [0.0, 1.0]
             )
+            return
+
+        grid = pv.ImageData()
+        grid.dimensions = np.array(result.air_entrapment.shape) + 1
+        grid.origin = result.origin_mm
+        grid.spacing = (result.dx_mm, result.dx_mm, result.dx_mm)
+        grid.cell_data["air"] = np.asarray(result.air_entrapment).ravel(order="F").astype(np.float64)
+        if getattr(result, "air_pressure_pa", None) is not None and result.air_pressure_pa.size == result.air_entrapment.size:
+            grid.cell_data["P_gas"] = np.asarray(result.air_pressure_pa).ravel(order="F").astype(np.float64)
+        else:
+            grid.cell_data["P_gas"] = np.zeros_like(grid.cell_data["air"])
+        if getattr(result, "air_density_kg_m3", None) is not None and result.air_density_kg_m3.size == result.air_entrapment.size:
+            grid.cell_data["rho_g"] = np.asarray(result.air_density_kg_m3).ravel(order="F").astype(np.float64)
+        else:
+            grid.cell_data["rho_g"] = np.zeros_like(grid.cell_data["air"])
+
+        # Convert to point data so PyVista volume rendering and isosurfaces work.
+        grid = grid.cell_data_to_point_data()
+
+        # Closed isosurfaces at physically meaningful gas-volume fractions.
+        contours = grid.contour(isosurfaces=[0.05, 0.20, 0.50, 0.80], scalars="air")
+        if contours.n_points > 0:
+            contour_actor = self.add_mesh(
+                contours,
+                cmap="coolwarm",
+                clim=[0.0, 1.0],
+                smooth_shading=True,
+                specular=0.8,
+                opacity=0.9,
+                show_scalar_bar=True,
+                scalar_bar_args={
+                    "title": "Hava sıkışması",
+                    "n_labels": 0,
+                    "vertical": False,
+                    "position_x": 0.12,
+                    "position_y": 0.02,
+                    "width": 0.76,
+                    "height": 0.06,
+                    "title_font_size": 9,
+                    "label_font_size": 7,
+                    "color": "#334155",
+                },
+            )
+        else:
+            contour_actor = None
+            self._show_scalar_bar_no_geometry("Hava sıkışması", "coolwarm", [0.0, 1.0])
+
+        vol_actor = self.add_volume(
+            grid,
+            scalars="air",
+            cmap="coolwarm",
+            opacity="sigmoid",
+            clim=[0.02, 1.0],
+            show_scalar_bar=False,
+        )
+        self._air_entrapment_actor = [vol_actor, contour_actor]
+
+        # Air-entrapment centroid marker deliberately omitted; it is not a gas
+        # volume and distracts from the actual trapped-air field.
 
         self._arrange_scalar_bars()
 
@@ -1299,10 +1909,23 @@ class Analyzer3DViewer(QtInteractor):
             self.show_air_entrapment(result)
         else:
             if self._air_entrapment_actor is not None:
-                self.remove_actor(self._air_entrapment_actor)
+                if isinstance(self._air_entrapment_actor, (list, tuple)):
+                    for actor in self._air_entrapment_actor:
+                        try:
+                            self.remove_actor(actor)
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        self.remove_actor(self._air_entrapment_actor)
+                    except Exception:
+                        pass
                 self._air_entrapment_actor = None
             if self._air_entrapment_marker_actor is not None:
-                self.remove_actor(self._air_entrapment_marker_actor)
+                try:
+                    self.remove_actor(self._air_entrapment_marker_actor)
+                except Exception:
+                    pass
                 self._air_entrapment_marker_actor = None
             self._remove_scalar_bar("Hava sıkışması")
 

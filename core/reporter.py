@@ -520,8 +520,10 @@ def _render_html(result: AnalysisResult, screenshot_path: Optional[str] = None) 
         <tr><td>Grid boyutları</td><td>{result.grid.shape[0]} x {result.grid.shape[1]} x {result.grid.shape[2]}</td></tr>
         <tr><td>Metal voxel sayısı</td><td>{int(result.is_metal.sum())}</td></tr>
         <tr><td>Baskın modül M (cm)</td><td>{result.dominant_m_mm/10.0:.2f}</td></tr>
+        <tr><td>Geometrik modül M (V/A) (cm)</td><td>{result.geometric_m_cm:.2f}</td></tr>
         <tr><td>Baskın duvar kalınlığı t_wall (mm)</td><td>{result.wall_thickness_mm:.2f}</td></tr>
         <tr><td>Baskın katılaşma süresi t_s (s)</td><td>{result.chvorinov_c * (result.dominant_m_mm/10.0)**2 * 60.0:.1f}</td></tr>
+        <tr><td>Geometrik katılaşma süresi t_s (s)</td><td>{result.chvorinov_c * (result.geometric_m_cm**2) * 60.0:.1f}</td></tr>
         <tr><td>SDF ortalama M (cm)</td><td>{result.m_mean_mm/10.0:.2f}</td></tr>
         <tr><td>SDF standart sapma (cm)</td><td>{result.m_std_mm/10.0:.2f}</td></tr>
         <tr><td>SDF çarpıklık</td><td>{result.m_skewness:.2f}</td></tr>
@@ -645,7 +647,7 @@ def _generate_report_fpdf2(
     pdf.cell(0, 6, f"Voxel boyutu (dx): {result.dx_mm:.3f} mm", ln=True)
     pdf.cell(0, 6, f"Grid: {result.grid.shape[0]} x {result.grid.shape[1]} x {result.grid.shape[2]}", ln=True)
     pdf.cell(0, 6, f"Metal voxel: {int(result.is_metal.sum())}", ln=True)
-    pdf.cell(0, 6, f"Baskın M: {result.dominant_m_mm/10.0:.2f} cm | t_wall: {result.wall_thickness_mm:.2f} mm", ln=True)
+    pdf.cell(0, 6, f"Baskın M: {result.dominant_m_mm/10.0:.2f} cm | Geometrik M (V/A): {result.geometric_m_cm:.2f} cm | t_wall: {result.wall_thickness_mm:.2f} mm", ln=True)
     pdf.cell(0, 6, f"SDF ortalama/std/çarpıklık: {result.m_mean_mm:.2f} / {result.m_std_mm:.2f} / {result.m_skewness:.2f}", ln=True)
     pdf.cell(0, 6, f"Şekil faktörü: {result.shape_factor_global:.6f}", ln=True)
     pdf.ln(4)

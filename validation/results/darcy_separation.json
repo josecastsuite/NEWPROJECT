@@ -1,0 +1,26 @@
+{
+  "sand": {
+    "mold": "sand",
+    "elapsed_s": 239.21950483322144,
+    "max": 1.0,
+    "mean": 0.011232382536599507,
+    "trapped_air_volume_m3": 0.0006199941235444774,
+    "cells_gt_0": 376228
+  },
+  "ceramic": {
+    "mold": "ceramic",
+    "elapsed_s": 240.42941117286682,
+    "max": 1.0,
+    "mean": 0.03429704189360671,
+    "trapped_air_volume_m3": 0.0018896351603498725,
+    "cells_gt_0": 376228
+  },
+  "metal_mold": {
+    "mold": "metal_mold",
+    "elapsed_s": 237.38164496421814,
+    "max": 1.0,
+    "mean": 0.03726745834709008,
+    "trapped_air_volume_m3": 0.0020532796765978254,
+    "cells_gt_0": 376228
+  }
+}
