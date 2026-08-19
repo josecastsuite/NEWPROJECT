@@ -1458,27 +1458,158 @@ def compute_erosion_risk(
     is_metal: np.ndarray,
     alloy,
     mold,
+    velocity_m_s: Optional[np.ndarray] = None,
+    sdf: Optional[np.ndarray] = None,
+    dx_mm: float = 1.0,
 ) -> np.ndarray:
-    """Per-voxel mold-sand erosion risk driven by local metal velocity.
+    """Physics-based mold-erosion (sand-wash) risk on a per-voxel basis.
 
-    Erosion becomes significant when the local metal speed exceeds the
-    material-specific threshold (based on Campbell's critical entrainment
-    velocity) and is amplified for low-rigidity green-sand molds.  Risk is
-    clipped to [0, 1] and zero outside the metal domain.
+    The model combines four mechanisms that actually detach mold grains from
+    the metal-mold interface:
+
+    1. Darcy-Forchheimer wall shear stress: the pressure gradient needed to
+       push metal through the porous mold skin creates a drag force on the
+       surface grains.  tau_drag = (|dp/dx|_viscous + |dp/dx|_inertial) * d_p / 6.
+    2. Stagnation / dynamic-pressure impact: the normal component of the
+       metal velocity at the wall produces p_dyn = 0.5 * rho * v_n^2.  If
+       p_dyn exceeds the capillary pressure 4*sigma/d_p, metal penetrates
+       the pores and displaces grains.
+    3. Campbell's critical entrainment velocity: a hard speed limit for the
+       alloy, lowered for weak green sand and raised for rigid molds.
+    4. Pore Reynolds number Re_K = rho*v*sqrt(K)/mu; Re_K > ~5 marks the
+       Darcy-Forchheimer transition where inertial channeling intensifies erosion.
+
+    The critical shear strength of the mold is derived from the Shields
+    submerged-weight criterion plus a cohesive-strength term that depends on
+    binder content, moisture, compactability and rigidity.  Risk is attenuated
+    exponentially with distance from the wall, because sand-wash is a surface
+    phenomenon.  Non-erodible molds (metal, graphite) return zero risk.
     """
+    risk = np.zeros_like(is_metal, dtype=np.float64)
     if velocity_magnitude is None or velocity_magnitude.size == 0:
-        return np.zeros_like(is_metal, dtype=np.float64)
-    v = np.asarray(velocity_magnitude, dtype=np.float64)
-    v_thresh = float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.5))
-    # Low-rigidity molds (green sand) erode at lower velocities.
-    rigidity = float(getattr(mold, "mold_rigidity_factor", 1.0))
-    v_thresh = v_thresh * max(0.3, rigidity)
-    v_max = v_thresh * 3.0
+        return risk
+
+    mold_type = str(getattr(mold, "mold_type", "sand")).lower()
+    is_sand = bool(getattr(mold, "is_sand", True))
+    if not (is_sand or mold_type in ("ceramic", "investment", "shell")):
+        return risk
+
+    shape = is_metal.shape
+    v_mag = np.asarray(velocity_magnitude, dtype=np.float64).reshape(shape)
+    v_mag = np.nan_to_num(v_mag, nan=0.0, posinf=0.0, neginf=0.0)
+    metal = is_metal.astype(bool)
+
+    # Metal properties
+    rho_m = float(getattr(alloy, "rho_kg_m3", 7000.0))
+    mu = float(getattr(alloy, "viscosity_pa_s", 0.005))
+    sigma = float(getattr(alloy, "surface_tension_n_m", 1.0))
+    if sigma <= 0.0:
+        sigma = 1.0
+
+    # Sand / mold particle properties
+    afs = float(getattr(mold, "afs_grain_size", 0.0))
+    d_p_mm = float(getattr(mold, "particle_size_mm", 0.0))
+    if d_p_mm <= 0.0 and afs > 0.0:
+        d_p_mm = 6.45 / math.sqrt(afs)
+    if d_p_mm <= 0.0:
+        d_p_mm = 0.25 if is_sand else 0.10
+    d_p_m = d_p_mm / 1000.0
+
+    phi = float(getattr(mold, "phi_mold", 0.35))
+    phi = min(max(phi, 0.01), 0.99)
+    K = float(getattr(mold, "K_inf", 1e-11))
+    K = max(K, 1e-18)
+
+    rigidity = float(getattr(mold, "mold_rigidity_factor", 0.5))
+    rigidity = min(max(rigidity, 0.0), 1.0)
+    binder = float(getattr(mold, "binder_percent", 0.0))
+    moisture = float(getattr(mold, "moisture_percent", 0.0))
+    compact = float(getattr(mold, "compactability_percent", 0.0))
+
+    # Wall proximity: erosion decays exponentially with distance from the interface.
+    wall_factor = np.ones_like(v_mag)
+    sdf_a = None
+    if sdf is not None and sdf.shape == shape and dx_mm > 0.0:
+        sdf_a = np.asarray(sdf, dtype=np.float64).reshape(shape)
+        decay = max(2.0 * d_p_mm, 0.5 * dx_mm) if d_p_mm > 0.0 else dx_mm
+        # Erosion is active within ~2 grain diameters of the wall; plateau then exponential decay.
+        wall_factor = np.where(
+            sdf_a <= 2.0 * d_p_mm,
+            1.0,
+            np.exp(-(sdf_a - 2.0 * d_p_mm) / max(decay, 1e-3)),
+        )
+        wall_factor = np.clip(np.nan_to_num(wall_factor), 0.0, 1.0)
+
+    # Cell-centered velocity at the wall is artificially low (no-slip).
+    # For erosion use the free-stream velocity in the wall-adjacent metal.
+    v_eff = v_mag.copy()
+    if sdf_a is not None:
+        wall_layer = sdf_a <= max(2.0 * d_p_mm, 0.5 * dx_mm)
+        if wall_layer.any():
+            v_max_neigh = ndimage.maximum_filter(v_mag, size=3)
+            v_eff = np.where(wall_layer & (v_max_neigh > v_mag), v_max_neigh, v_mag)
+
+    # Normal velocity component for stagnation impact
+    v_n = v_eff.copy()
+    if velocity_m_s is not None and sdf_a is not None and dx_mm > 0.0:
+        vel = np.asarray(velocity_m_s, dtype=np.float64)
+        if vel.size == 3 * np.prod(shape):
+            if vel.ndim == 1:
+                vel = vel.reshape((3,) + shape)
+            if vel.ndim == 4 and vel.shape[0] == 3 and vel.shape[1:] == shape:
+                grads = np.gradient(sdf_a, dx_mm)
+                grad = np.stack(grads, axis=0)
+                grad_norm = np.linalg.norm(grad, axis=0)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    n = -grad / np.where(grad_norm > 1e-12, grad_norm, 1.0)
+                n = n.reshape(3, -1)
+                vel_flat = vel.reshape(3, -1)
+                v_dot_n = np.einsum("ij,ij->j", vel_flat, n).reshape(shape)
+                v_n = np.abs(v_dot_n)
+                v_n = np.nan_to_num(v_n, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Capillary resistance to pore penetration
+    p_cap = 4.0 * sigma / max(d_p_m, 1e-7)
+    p_dyn = 0.5 * rho_m * v_n * v_n
+    risk_pen = np.maximum(0.0, p_dyn / max(p_cap, 1e-6) - 1.0)
+
+    # Darcy-Forchheimer wall shear stress (Pa)
+    v_pore = v_eff / phi
     with np.errstate(divide="ignore", invalid="ignore"):
-        risk = (v - v_thresh) / max(v_max - v_thresh, 1e-9)
-    risk = np.clip(np.nan_to_num(risk, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 1.0)
-    risk = np.where(is_metal, risk, 0.0)
-    return risk
+        dpdx_visc = mu * v_eff / K
+    dpdx_inertial = (1.75 * rho_m * (1.0 - phi) / (phi ** 3 * d_p_m)) * (v_pore ** 2)
+    tau_df = (dpdx_visc + dpdx_inertial) * d_p_m / 6.0
+    tau_df = np.nan_to_num(tau_df, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Critical shear strength of the mold
+    rho_sand = 2650.0
+    g = 9.81
+    theta_c = 0.03
+    tau_gravity = theta_c * abs(rho_sand - rho_m) * g * d_p_m
+
+    binder_factor = max(binder / 2.0, 0.5) if binder > 0.0 else 1.0
+    compact_factor = compact / 45.0 if compact > 0.0 else 1.0
+    moisture_factor = 1.0 if moisture < 0.5 else max(0.3, min(4.0 / moisture, 2.0))
+    tau_cohesion = 20e3 * binder_factor * compact_factor * moisture_factor * (0.3 + 0.7 * rigidity)
+    tau_crit = max(tau_gravity, tau_cohesion, 50e3 * rigidity)
+    tau_crit = max(tau_crit, 1e3)
+
+    risk_shear = np.maximum(0.0, tau_df / tau_crit - 1.0)
+
+    # Campbell entrainment velocity, adjusted by mold rigidity
+    v_crit = float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.5))
+    v_crit_eff = max(v_crit * (0.6 + 0.4 * rigidity), 0.1)
+    risk_vel = np.maximum(0.0, v_eff / v_crit_eff - 1.0)
+
+    # Pore Reynolds number for Darcy-Forchheimer transition
+    with np.errstate(divide="ignore", invalid="ignore"):
+        Re_K = rho_m * v_eff * np.sqrt(K) / max(mu, 1e-12)
+    risk_turb = np.maximum(0.0, Re_K / 5.0 - 1.0)
+
+    combined = np.maximum.reduce([risk_shear, risk_pen, risk_vel, risk_turb])
+    risk = (1.0 - np.exp(-combined)) * wall_factor
+    risk = np.where(metal, risk, 0.0)
+    return np.clip(risk, 0.0, 1.0)
 
 
 def directional_feed_efficiency(
@@ -3864,6 +3995,9 @@ def analyze(
         is_metal,
         alloy,
         mold,
+        velocity_m_s=velocity_m_s,
+        sdf=sdf,
+        dx_mm=dx,
     )
 
     # AŞAMA 9: Risk map aligned with the Carlson-Beckermann porosity volume.
