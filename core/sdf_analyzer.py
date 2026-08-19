@@ -1472,16 +1472,18 @@ def compute_gate_erosion_risk(
     Each gating node carries its own throat velocity and cross-sectional area.
     From those we compute a pipe/channel wall shear stress (Darcy-Weisbach),
     a sudden contraction/expansion loss coefficient (Cv), a turbulence
-    intensity and the usual capillary / entrainment limits.  The resulting
-    risk is mapped onto all metal voxels of the upstream gate body so the
-    element is uniformly coloured by its own dynamic risk.  In addition,
-    INGATE→PART nodes paint a local impingement zone on the part surface
-    around the contact centroid, because the metal jet exiting the ingate hits
-    the mould wall at the entry point.  Non-sand or non-metal downstream
-    bodies (PART, RISER) are skipped.
+    intensity and the usual capillary / entrainment limits.  The per-node
+    risk is written to the voxel grid as a local throat/impingement hotspot.
+
+    In addition, a body-averaged risk is computed for every gate body using
+    the body's own characteristic cross-sectional area and the flow rate
+    passing through it, so each gate element (sprue, runner, ingate) gets
+    its own distinct colour in the viewer.  INGATE→PART nodes also paint a
+    local impingement zone on the part surface around the contact centroid.
+    Non-sand or non-metal downstream bodies (PART, RISER) are skipped.
 
     Optional output containers:
-      * ``body_risk_out`` is populated with ``body_name -> max risk`` for smooth
+      * ``body_risk_out`` is populated with ``body_name -> risk`` for smooth
         rendering of the original CAD mesh.
       * ``impingement_out`` receives ``(part_name, risk, centroid_mm, radius_mm)``
         tuples so the GUI can paint the impingement spots on the part mesh.
@@ -1535,16 +1537,28 @@ def compute_gate_erosion_risk(
     v_crit_eff = max(v_crit * (0.6 + 0.4 * rigidity), 0.1)
     p_cap = 4.0 * sigma / max(d_p_m, 1e-7)
 
-    # Build downstream-name -> area lookup and parse node names.
+    # Parse node names and collect per-body flow / connection data.
     down_areas: Dict[str, float] = {}
     parsed: List[Tuple[GatingNode, str, str]] = []
+    up_Q: Dict[str, float] = {}
+    down_Q: Dict[str, float] = {}
+    up_A: Dict[str, float] = {}
+    down_A: Dict[str, List[float]] = {}
     for n in gating_nodes:
         if "→" in n.name:
             up, down = [s.strip() for s in n.name.split("→", 1)]
         else:
             up, down = "", n.name.strip()
         parsed.append((n, up, down))
-        down_areas[down] = max(down_areas.get(down, 0.0), float(n.section_area_cm2))
+        A_cm2 = float(n.section_area_cm2)
+        Q = float(n.flow_rate_m3_s)
+        down_areas[down] = max(down_areas.get(down, 0.0), A_cm2)
+        if up:
+            up_Q[up] = up_Q.get(up, 0.0) + Q
+            up_A[up] = max(up_A.get(up, 0.0), A_cm2)
+        if down:
+            down_Q[down] = down_Q.get(down, 0.0) + Q
+            down_A.setdefault(down, []).append(A_cm2)
 
     body_by_name = {b.name: b for b in bodies if b is not None and getattr(b, "name", "")}
     part_body = max(
@@ -1554,28 +1568,47 @@ def compute_gate_erosion_risk(
     )
     shape = is_metal.shape
 
-    for n, up_name, down_name in parsed:
-        v = max(float(n.velocity_m_s), float(getattr(n, "max_velocity_m_s", 0.0)))
-        if v <= 1e-9:
-            continue
-        A_cm2 = float(n.section_area_cm2)
-        if A_cm2 <= 0.0:
-            continue
-        A = A_cm2 * 1e-4
+    # ------------------------------------------------------------------
+    # Per-body risk using each gate body's own cross-section and flow rate.
+    # ------------------------------------------------------------------
+    gate_types = frozenset(
+        [
+            BodyType.SPRUE_THROAT,
+            BodyType.SPRUE,
+            BodyType.RUNNER,
+            BodyType.DISTRIBUTOR,
+            BodyType.INGATE,
+            BodyType.POURING_BASIN,
+            BodyType.COOLING_SPRUE,
+            BodyType.FILTER,
+            BodyType.CURUFLUK,
+        ]
+    )
+    try:
+        from core.gating import _flow_axis, _characteristic_cross_section_area
+    except Exception:
+        _flow_axis = None
+        _characteristic_cross_section_area = None
 
-        # Hydraulic diameter of the section
-        D_h = math.sqrt(4.0 * A / math.pi) if A > 0.0 else d_p_m
+    def _body_area_cm2(body: Body) -> float:
+        user = float(getattr(body, "section_area_cm2", 0.0))
+        if user > 0.0:
+            return user
+        if _flow_axis is None or _characteristic_cross_section_area is None:
+            return 0.0
+        axis = _flow_axis(body.mesh)
+        return float(_characteristic_cross_section_area(body.mesh, axis, n=10)) / 100.0
 
-        # Upstream area for contraction/expansion loss coefficient
-        A_up_cm2 = down_areas.get(up_name, 0.0) if up_name and up_name in down_areas else A_cm2
-        A_up = A_up_cm2 * 1e-4
-        if A_up > A:
-            K_loss = 0.5 * (1.0 - A / A_up)
-        elif A > A_up:
-            K_loss = (1.0 - A_up / A) ** 2
+    def _section_risk(v: float, A_m2: float, A_up_m2: float) -> float:
+        if v <= 1e-9 or A_m2 <= 1e-12:
+            return 0.0
+        D_h = math.sqrt(4.0 * A_m2 / math.pi) if A_m2 > 0.0 else d_p_m
+        if A_up_m2 > A_m2:
+            K_loss = 0.5 * (1.0 - A_m2 / A_up_m2)
+        elif A_m2 > A_up_m2:
+            K_loss = (1.0 - A_up_m2 / A_m2) ** 2
         else:
             K_loss = 0.0
-
         Re = rho_m * v * D_h / mu
         eps = d_p_m
         if Re < 2300.0:
@@ -1587,49 +1620,82 @@ def compute_gate_erosion_risk(
             else:
                 f = 0.02
         f = min(max(f, 0.0001), 0.5)
-
         tau_w = (f / 8.0) * rho_m * v * v
         p_dyn = 0.5 * rho_m * v * v
-
         risk_shear = max(0.0, tau_w / tau_crit - 1.0)
         risk_pen = max(0.0, p_dyn / max(p_cap, 1e-6) - 1.0)
         risk_vel = max(0.0, v / v_crit_eff - 1.0)
         risk_loss = K_loss * ((v / v_crit_eff) ** 2) if v_crit_eff > 0.0 else 0.0
         risk_Re = 0.1 * max(0.0, Re / 2300.0 - 1.0)
-
-        # Empirical turbulence intensity for fully-developed pipe flow
         Tu = 0.0
         if Re > 4000.0:
             Tu = 0.16 * (Re ** -0.125)
             Tu = min(Tu, 0.5)
         turb_factor = 1.0 + 5.0 * Tu
-
         combined = max(risk_shear, risk_pen, risk_vel, risk_loss, risk_Re)
-        node_risk = 1.0 - math.exp(-turb_factor * combined)
+        return float(1.0 - math.exp(-turb_factor * combined))
+
+    if body_risk_out is not None:
+        for b in bodies:
+            if b is None or b.body_type not in gate_types:
+                continue
+            Q_total = max(up_Q.get(b.name, 0.0), down_Q.get(b.name, 0.0))
+            if Q_total <= 1e-12:
+                continue
+            A_body_cm2 = _body_area_cm2(b)
+            connected = down_A.get(b.name, [])
+            if connected:
+                A_body_cm2 = max(A_body_cm2, min(connected))
+            A_body_m2 = max(A_body_cm2, 1e-6) * 1e-4
+            v_body = Q_total / A_body_m2
+            A_up_cm2 = up_A.get(b.name, A_body_cm2)
+            A_up_m2 = max(A_up_cm2, 1e-6) * 1e-4
+            br = _section_risk(v_body, A_body_m2, A_up_m2)
+            if br > 1e-6:
+                body_risk_out[b.name] = max(body_risk_out.get(b.name, 0.0), br)
+
+    # ------------------------------------------------------------------
+    # Per-node hotspots: throat regions on gate bodies and impingement on part.
+    # ------------------------------------------------------------------
+    for n, up_name, down_name in parsed:
+        v = max(float(n.velocity_m_s), float(getattr(n, "max_velocity_m_s", 0.0)))
+        if v <= 1e-9:
+            continue
+        A_cm2 = float(n.section_area_cm2)
+        if A_cm2 <= 0.0:
+            continue
+        A = A_cm2 * 1e-4
+
+        A_up_cm2 = down_areas.get(up_name, 0.0) if up_name and up_name in down_areas else A_cm2
+        A_up = A_up_cm2 * 1e-4
+        node_risk = _section_risk(v, A, A_up)
         if node_risk <= 1e-6:
             continue
 
-        # Attach the risk to the upstream gate body; if upstream is not a body
-        # (source node), use the downstream body.
+        # Local throat hotspot on the upstream gate body.
         target_name = up_name if up_name in body_by_name else down_name
         body = body_by_name.get(target_name)
-        if body is not None and body.body_type not in (
-            BodyType.PART,
-            BodyType.RISER,
-            BodyType.SLEEVE,
-            BodyType.CURUFLUK,
-        ):
-            if body_index.shape == shape:
-                mask = (body_index == body.index) & metal
-                if mask.any():
-                    risk[mask] = np.maximum(risk[mask], node_risk)
-            if body_risk_out is not None:
-                body_risk_out[body.name] = max(
-                    body_risk_out.get(body.name, 0.0), float(node_risk)
+        if body is not None and body.body_type in gate_types:
+            if body_index.shape == shape and origin_mm is not None and dx_mm > 0.0:
+                if "coords_mm" not in locals():
+                    idx = np.indices(shape)
+                    coords_mm = np.stack(
+                        [idx[i] * dx_mm + float(origin_mm[i]) for i in range(3)],
+                        axis=0,
+                    )
+                centroid = np.asarray(n.centroid_mm, dtype=np.float64).reshape(3, 1, 1, 1)
+                dist2 = np.sum((coords_mm - centroid) ** 2, axis=0)
+                jet_diam_mm = math.sqrt(4.0 * A_cm2 / math.pi)
+                radius_mm = max(4.0 * jet_diam_mm, 4.0 * dx_mm)
+                throat_mask = (
+                    (body_index == body.index)
+                    & metal
+                    & (dist2 <= radius_mm * radius_mm)
                 )
+                if throat_mask.any():
+                    risk[throat_mask] = np.maximum(risk[throat_mask], node_risk)
 
-        # Impingement on the part surface at ingate exits: the metal jet hits
-        # the mould wall at the entry point, so paint a local spherical patch.
+        # Impingement on the part surface at ingate exits.
         down_type = n.body_type.split("→")[-1] if "→" in n.body_type else ""
         if down_name in ("Parça", "PART") or down_type == "PART":
             body_down = part_body
@@ -1642,7 +1708,6 @@ def compute_gate_erosion_risk(
             and dx_mm > 0.0
             and origin_mm is not None
         ):
-            # Pre-compute coordinate grid once if needed.
             if "coords_mm" not in locals():
                 idx = np.indices(shape)
                 coords_mm = np.stack(
@@ -1651,9 +1716,6 @@ def compute_gate_erosion_risk(
                 )
             centroid = np.asarray(n.centroid_mm, dtype=np.float64).reshape(3, 1, 1, 1)
             dist2 = np.sum((coords_mm - centroid) ** 2, axis=0)
-            # Jet radius from throat area; impingement zone ~4 jet diameters
-            # so it is visible at the contact, and wall-layer uses a slightly
-            # deeper tolerance so a few surface voxels are captured.
             jet_diam_mm = math.sqrt(4.0 * A_cm2 / math.pi)
             radius_mm = max(4.0 * jet_diam_mm, 4.0 * dx_mm)
             wall_layer = sdf <= max(4.0 * d_p_mm, 1.5 * dx_mm)

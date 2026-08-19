@@ -1645,12 +1645,13 @@ class Analyzer3DViewer(QtInteractor):
             self._remove_scalar_bar("Lap riski")
 
     def show_erosion_risk(self, result: Optional[AnalysisResult]):
-        """Smooth mold-sand erosion risk rendered on the original CAD meshes.
+        """Mold-sand erosion risk.
 
-        Each gate body is coloured uniformly by its own dynamic throat risk,
-        and the part surface gets smooth spherical impingement patches at the
-        ingate entry points.  The underlying body actors are temporarily
-        hidden for risk-carrying bodies to avoid z-fighting.
+        Gate bodies are coloured uniformly by their body-averaged dynamic risk
+        (section area, Re, Cv, turbulence), so the sprue, runner and each
+        ingate can have a different colour.  The part surface shows only the
+        local impingement hotspots sampled from the voxel field; low-risk
+        regions are transparent and no floating spheres are used.
         """
         self._restore_erosion_body_opacities()
         if isinstance(self._erosion_actor, (list, tuple)):
@@ -1673,36 +1674,37 @@ class Analyzer3DViewer(QtInteractor):
             )
             return
 
+        finite = result.erosion_risk[np.isfinite(result.erosion_risk)]
+        field_max = float(finite.max()) if finite.size > 0 else 0.0
         body_risk = getattr(result, "erosion_body_risk", {}) or {}
-        impingements = getattr(result, "erosion_impingements", []) or []
-        all_risks = list(body_risk.values()) + [r for (_, r, _, _) in impingements]
-        if not all_risks:
+        body_max = float(max(body_risk.values())) if body_risk else 0.0
+        vmax = max(0.3, field_max, body_max)
+        if vmax <= 1e-6:
             self._show_scalar_bar_no_geometry(
                 "Kalıp erozyonu riski", "YlOrRd", [0.0, 1.0]
             )
             return
-
-        vmax = float(max(max(all_risks), 0.3))
         clim = [0.0, vmax]
 
-        actors: List[Any] = []
-        # Render gate bodies on their original smooth meshes.
-        for body in self._bodies:
-            risk = body_risk.get(getattr(body, "name", ""), 0.0)
-            if risk <= 1e-6 or len(body.faces) == 0:
-                continue
-            # Hide the underlying body actor to avoid z-fighting.
+        # Prepare the voxel field once for bodies that need it (part impingement).
+        grid = self._make_grid(
+            result, result.erosion_risk, "erosion_risk", point_max=True
+        )
+        point_values = grid.point_data["erosion_risk"]
+        point_values = np.nan_to_num(point_values, nan=0.0)
+        nx, ny, nz = grid.dimensions
+        point_arr = point_values.reshape((nx, ny, nz), order="F")
+        origin = np.asarray(result.origin_mm, dtype=np.float64)
+        dx = float(result.dx_mm)
+
+        def _add_mesh_with_risk(mesh: pv.PolyData, risk_arr: np.ndarray) -> None:
+            mesh["erosion_risk"] = risk_arr
             base_actor = self._body_actor_by_name.get(getattr(body, "name", ""))
             if base_actor is not None:
                 self._erosion_body_opacity_backup[getattr(body, "name", "")] = float(
                     base_actor.GetProperty().GetOpacity()
                 )
                 base_actor.GetProperty().SetOpacity(0.0)
-            faces = np.c_[
-                np.full(len(body.faces), 3, dtype=np.int64), body.faces
-            ].ravel()
-            mesh = pv.PolyData(body.vertices, faces)
-            mesh["erosion_risk"] = np.full(len(body.vertices), risk, dtype=np.float64)
             actors.append(
                 self.add_mesh(
                     mesh,
@@ -1710,41 +1712,59 @@ class Analyzer3DViewer(QtInteractor):
                     cmap="YlOrRd",
                     opacity=0.85,
                     clim=clim,
+                    nan_opacity=0.0,
                     show_scalar_bar=(len(actors) == 0),
                     scalar_bar_args=_scalar_bar_args(
                         "Kalıp erozyonu riski", (0.02, 0.02), clim=clim
                     ) if len(actors) == 0 else None,
                     smooth_shading=True,
+                    ambient=0.7,
+                    diffuse=0.3,
+                    specular=0.0,
+                    lighting=False,
                 )
             )
 
-        # Render smooth impingement spots on the part surface.
-        for part_name, risk, centroid, radius in impingements:
-            if risk <= 1e-6:
+        actors: List[Any] = []
+        for body in self._bodies:
+            if len(body.faces) == 0:
                 continue
+            faces = np.c_[
+                np.full(len(body.faces), 3, dtype=np.int64), body.faces
+            ].ravel()
+            mesh = pv.PolyData(body.vertices, faces)
+
+            # Gate bodies: uniform dynamic body risk -> different element colours.
+            if body.name in body_risk:
+                risk_val = float(body_risk[body.name])
+                if risk_val <= 1e-6:
+                    continue
+                _add_mesh_with_risk(
+                    mesh, np.full(len(body.vertices), risk_val, dtype=np.float64)
+                )
+                continue
+
+            # Other bodies (part, risers, etc.): local field, hide low risk.
+            verts = np.asarray(body.vertices, dtype=np.float64)
+            if verts.size == 0:
+                continue
+            coords = (verts - origin) / dx
             try:
-                sphere = pv.Sphere(
-                    radius=max(radius, 1e-3),
-                    center=centroid,
-                    theta_resolution=32,
-                    phi_resolution=32,
+                sampled = ndimage.map_coordinates(
+                    point_arr,
+                    coords.T,
+                    order=1,
+                    mode="nearest",
+                    cval=0.0,
                 )
             except Exception:
                 continue
-            sphere["erosion_risk"] = np.full(
-                sphere.n_points, risk, dtype=np.float64
-            )
-            actors.append(
-                self.add_mesh(
-                    sphere,
-                    scalars="erosion_risk",
-                    cmap="YlOrRd",
-                    opacity=0.85,
-                    clim=clim,
-                    show_scalar_bar=False,
-                    smooth_shading=True,
-                )
-            )
+            if sampled.max() <= 1e-6:
+                continue
+            risk = sampled.astype(np.float64)
+            threshold = max(0.15 * vmax, 0.05)
+            risk[risk < threshold] = np.nan
+            _add_mesh_with_risk(mesh, risk)
 
         if not actors:
             self._show_scalar_bar_no_geometry(
