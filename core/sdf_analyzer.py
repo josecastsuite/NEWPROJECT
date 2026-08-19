@@ -1489,9 +1489,8 @@ def compute_erosion_risk(
     if velocity_magnitude is None or velocity_magnitude.size == 0:
         return risk
 
-    mold_type = str(getattr(mold, "mold_type", "sand")).lower()
     is_sand = bool(getattr(mold, "is_sand", True))
-    if not (is_sand or mold_type in ("ceramic", "investment", "shell")):
+    if not is_sand:
         return risk
 
     shape = is_metal.shape
