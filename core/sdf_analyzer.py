@@ -93,6 +93,7 @@ from core.types import (
     Body,
     BodyType,
     CastingParameters,
+    GatingNode,
     GatingVelocityError,
     HotSpot,
     RefinementRegion,
@@ -1453,6 +1454,159 @@ def compute_cold_shot_risk(
     return out, lap_risk, cold_shot_saddles, last_fill_point_mm, cold_shot_risk_viz, lap_risk_viz, cold_shot_lines
 
 
+def compute_gate_erosion_risk(
+    gating_nodes: Optional[List[GatingNode]],
+    is_metal: np.ndarray,
+    alloy,
+    mold,
+    body_index: Optional[np.ndarray] = None,
+    bodies: Optional[List[Body]] = None,
+) -> np.ndarray:
+    """Per-gating-element erosion risk using section area, Re, roughness, Cv.
+
+    Each gating node carries its own throat velocity and cross-sectional area.
+    From those we compute a pipe/channel wall shear stress (Darcy-Weisbach),
+    a sudden contraction/expansion loss coefficient (Cv), a turbulence
+    intensity and the usual capillary / entrainment limits.  The resulting
+    risk is mapped onto all metal voxels of the upstream gate body so the
+    element is uniformly coloured by its own dynamic risk.  Non-sand or
+    non-metal downstream bodies (PART, RISER) are skipped.
+    """
+    risk = np.zeros_like(is_metal, dtype=np.float64)
+    if not gating_nodes or body_index is None or bodies is None:
+        return risk
+
+    is_sand = bool(getattr(mold, "is_sand", True))
+    if not is_sand:
+        return risk
+
+    metal = is_metal.astype(bool)
+    if not metal.any():
+        return risk
+
+    # Metal properties
+    rho_m = float(getattr(alloy, "rho_kg_m3", 7000.0))
+    mu = max(float(getattr(alloy, "viscosity_pa_s", 0.005)), 1e-12)
+    sigma = float(getattr(alloy, "surface_tension_n_m", 1.0))
+    if sigma <= 0.0:
+        sigma = 1.0
+    v_crit = float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.5))
+
+    # Sand / mold particle properties
+    afs = float(getattr(mold, "afs_grain_size", 0.0))
+    d_p_mm = float(getattr(mold, "particle_size_mm", 0.0))
+    if d_p_mm <= 0.0 and afs > 0.0:
+        d_p_mm = 6.45 / math.sqrt(afs)
+    if d_p_mm <= 0.0:
+        d_p_mm = 0.25
+    d_p_m = d_p_mm / 1000.0
+
+    rigidity = float(getattr(mold, "mold_rigidity_factor", 0.5))
+    rigidity = min(max(rigidity, 0.0), 1.0)
+    binder = float(getattr(mold, "binder_percent", 0.0))
+    moisture = float(getattr(mold, "moisture_percent", 0.0))
+    compact = float(getattr(mold, "compactability_percent", 0.0))
+
+    # Critical shear strength of the mold (same physics as per-voxel function)
+    rho_sand = 2650.0
+    g = 9.81
+    theta_c = 0.03
+    tau_gravity = theta_c * abs(rho_sand - rho_m) * g * d_p_m
+    binder_factor = max(binder / 2.0, 0.5) if binder > 0.0 else 1.0
+    compact_factor = compact / 45.0 if compact > 0.0 else 1.0
+    moisture_factor = 1.0 if moisture < 0.5 else max(0.3, min(4.0 / moisture, 2.0))
+    tau_cohesion = 20e3 * binder_factor * compact_factor * moisture_factor * (0.3 + 0.7 * rigidity)
+    tau_crit = max(tau_gravity, tau_cohesion, 50e3 * rigidity)
+    tau_crit = max(tau_crit, 1e3)
+    v_crit_eff = max(v_crit * (0.6 + 0.4 * rigidity), 0.1)
+    p_cap = 4.0 * sigma / max(d_p_m, 1e-7)
+
+    # Build downstream-name -> area lookup and parse node names.
+    down_areas: Dict[str, float] = {}
+    parsed: List[Tuple[GatingNode, str, str]] = []
+    for n in gating_nodes:
+        if "→" in n.name:
+            up, down = [s.strip() for s in n.name.split("→", 1)]
+        else:
+            up, down = "", n.name.strip()
+        parsed.append((n, up, down))
+        down_areas[down] = max(down_areas.get(down, 0.0), float(n.section_area_cm2))
+
+    body_by_name = {b.name: b for b in bodies if b is not None and getattr(b, "name", "")}
+    shape = is_metal.shape
+
+    for n, up_name, down_name in parsed:
+        v = max(float(n.velocity_m_s), float(getattr(n, "max_velocity_m_s", 0.0)))
+        if v <= 1e-9:
+            continue
+        A_cm2 = float(n.section_area_cm2)
+        if A_cm2 <= 0.0:
+            continue
+        A = A_cm2 * 1e-4
+
+        # Hydraulic diameter of the section
+        D_h = math.sqrt(4.0 * A / math.pi) if A > 0.0 else d_p_m
+
+        # Upstream area for contraction/expansion loss coefficient
+        A_up_cm2 = down_areas.get(up_name, 0.0) if up_name and up_name in down_areas else A_cm2
+        A_up = A_up_cm2 * 1e-4
+        if A_up > A:
+            K_loss = 0.5 * (1.0 - A / A_up)
+        elif A > A_up:
+            K_loss = (1.0 - A_up / A) ** 2
+        else:
+            K_loss = 0.0
+
+        Re = rho_m * v * D_h / mu
+        eps = d_p_m
+        if Re < 2300.0:
+            f = 64.0 / max(Re, 1e-9)
+        else:
+            rough = eps / (3.7 * D_h) + 5.74 / (Re ** 0.9)
+            if rough > 0.0 and math.log10(rough) != 0.0:
+                f = 0.25 / (math.log10(rough) ** 2)
+            else:
+                f = 0.02
+        f = min(max(f, 0.0001), 0.5)
+
+        tau_w = (f / 8.0) * rho_m * v * v
+        p_dyn = 0.5 * rho_m * v * v
+
+        risk_shear = max(0.0, tau_w / tau_crit - 1.0)
+        risk_pen = max(0.0, p_dyn / max(p_cap, 1e-6) - 1.0)
+        risk_vel = max(0.0, v / v_crit_eff - 1.0)
+        risk_loss = K_loss * ((v / v_crit_eff) ** 2) if v_crit_eff > 0.0 else 0.0
+        risk_Re = 0.1 * max(0.0, Re / 2300.0 - 1.0)
+
+        # Empirical turbulence intensity for fully-developed pipe flow
+        Tu = 0.0
+        if Re > 4000.0:
+            Tu = 0.16 * (Re ** -0.125)
+            Tu = min(Tu, 0.5)
+        turb_factor = 1.0 + 5.0 * Tu
+
+        combined = max(risk_shear, risk_pen, risk_vel, risk_loss, risk_Re)
+        node_risk = 1.0 - math.exp(-turb_factor * combined)
+        if node_risk <= 1e-6:
+            continue
+
+        # Attach the risk to the upstream gate body; if upstream is not a body
+        # (source node), use the downstream body.
+        target_name = up_name if up_name in body_by_name else down_name
+        body = body_by_name.get(target_name)
+        if body is None:
+            continue
+        if body.body_type in (BodyType.PART, BodyType.RISER, BodyType.SLEEVE, BodyType.CURUFLUK):
+            continue
+        if body_index.shape != shape:
+            continue
+        mask = (body_index == body.index) & metal
+        if mask.any():
+            risk[mask] = np.maximum(risk[mask], node_risk)
+
+    return np.clip(risk, 0.0, 1.0)
+
+
 def compute_erosion_risk(
     velocity_magnitude: Optional[np.ndarray],
     is_metal: np.ndarray,
@@ -1461,8 +1615,24 @@ def compute_erosion_risk(
     velocity_m_s: Optional[np.ndarray] = None,
     sdf: Optional[np.ndarray] = None,
     dx_mm: float = 1.0,
+    gating_nodes: Optional[List[GatingNode]] = None,
+    body_index: Optional[np.ndarray] = None,
+    bodies: Optional[List[Body]] = None,
 ) -> np.ndarray:
-    """Physics-based mold-erosion (sand-wash) risk on a per-voxel basis.
+    """Physics-based mold-erosion (sand-wash) risk on a per-voxel and per-gate basis.
+
+    Combines two calculations:
+
+    1. Per-voxel Darcy-Forchheimer wall shear / capillary / Re_K / Campbell
+       field risk, localised to the metal-mold interface.
+    2. Per-gating-element pipe/channel risk using each node's throat velocity,
+       cross-sectional area, Reynolds-dependent friction factor, sudden
+       contraction/expansion (Cv) loss and turbulence intensity.  The result is
+       mapped back to the upstream gate body so each gating element has its
+       own uniform erosion colour.
+
+    Non-erodible molds (metal, graphite, ceramic) and non-sand bodies return
+    zero risk.
 
     The model combines four mechanisms that actually detach mold grains from
     the metal-mold interface:
@@ -1606,7 +1776,13 @@ def compute_erosion_risk(
     risk_turb = np.maximum(0.0, Re_K / 5.0 - 1.0)
 
     combined = np.maximum.reduce([risk_shear, risk_pen, risk_vel, risk_turb])
-    risk = (1.0 - np.exp(-combined)) * wall_factor
+    field_risk = (1.0 - np.exp(-combined)) * wall_factor
+
+    # Add per-gating-element section risk (area, Re, Cv, turbulence).
+    gate_risk = compute_gate_erosion_risk(
+        gating_nodes, is_metal, alloy, mold, body_index, bodies
+    )
+    risk = np.maximum(field_risk, gate_risk)
     risk = np.where(metal, risk, 0.0)
     return np.clip(risk, 0.0, 1.0)
 
@@ -3988,7 +4164,12 @@ def analyze(
         body_index=body_index,
     )
 
-    # v10.5: per-voxel mold-sand erosion risk from local metal velocity.
+    # v10.5: per-voxel + per-gating-element mold-erosion risk.
+    gating_nodes = (
+        getattr(flow_result_for_thermal, "gating_nodes", None)
+        if flow_result_for_thermal is not None
+        else None
+    )
     erosion_risk = compute_erosion_risk(
         velocity_magnitude,
         is_metal,
@@ -3997,6 +4178,9 @@ def analyze(
         velocity_m_s=velocity_m_s,
         sdf=sdf,
         dx_mm=dx,
+        gating_nodes=gating_nodes,
+        body_index=body_index,
+        bodies=bodies,
     )
 
     # AŞAMA 9: Risk map aligned with the Carlson-Beckermann porosity volume.
