@@ -630,11 +630,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lap_risk_toggle.toggled.connect(self.on_toggle_lap_risk)
         vis_layout.addWidget(self.lap_risk_toggle)
 
-        self.erosion_toggle = QtWidgets.QCheckBox("Kalıp Erozyonu Riski")
-        self.erosion_toggle.setToolTip("Darcy-Forchheimer kayma gerilmesi, dinamik basınç ve Re_K'ye dayalı kum kalıp aşınması riski")
+        self.erosion_toggle = QtWidgets.QCheckBox("Kümülatif Kalıp Erozyonu Hasarı")
+        self.erosion_toggle.setToolTip("Finnie-Bitter / Darcy-Forchheimer kümülatif erozyon hasarı: hız üssü 2.5, açı faktörü, Re_K türbülansı, bağlayıcı termal degradasyonu")
         self.erosion_toggle.setChecked(False)
         self.erosion_toggle.toggled.connect(self.on_toggle_erosion_risk)
-        self.erosion_toggle.setVisible(False)
+        self.erosion_toggle.setVisible(True)
         vis_layout.addWidget(self.erosion_toggle)
 
         self.air_entrapment_toggle = QtWidgets.QCheckBox("Hava Sıkışması")

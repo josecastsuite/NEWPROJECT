@@ -45,6 +45,7 @@ from core.confluence_sfer import compute_sfer_risk, splat_saddle_risks
 from core.confluence_lines import extract_confluence_lines
 from core.peclet import peclet_front_velocity_m_s
 from core.sphere_lut import get_sphere_64_6
+from core import erosion_model
 from core.thermal_solver import _alloy_to_dict, _dscheil_dT, _scheil_fs, solve_3d_thermal
 from core.voxel_arena import VoxelArena
 from core.voxelizer import build_part_grid
@@ -1464,282 +1465,29 @@ def compute_gate_erosion_risk(
     sdf: Optional[np.ndarray] = None,
     dx_mm: float = 1.0,
     origin_mm: Optional[np.ndarray] = None,
+    velocity_m_s: Optional[np.ndarray] = None,
+    fill_time: Optional[np.ndarray] = None,
+    temperature: Optional[np.ndarray] = None,
     body_risk_out: Optional[Dict[str, float]] = None,
     impingement_out: Optional[List[Tuple[str, float, Tuple[float, float, float], float]]] = None,
 ) -> np.ndarray:
-    """Per-gating-element erosion risk using section area, Re, roughness, Cv.
-
-    Each gating node carries its own throat velocity and cross-sectional area.
-    From those we compute a pipe/channel wall shear stress (Darcy-Weisbach),
-    a sudden contraction/expansion loss coefficient (Cv), a turbulence
-    intensity and the usual capillary / entrainment limits.  The per-node
-    risk is written to the voxel grid as a local throat/impingement hotspot.
-
-    In addition, a body-averaged risk is computed for every gate body using
-    the body's own characteristic cross-sectional area and the flow rate
-    passing through it, so each gate element (sprue, runner, ingate) gets
-    its own distinct colour in the viewer.  INGATE→PART nodes also paint a
-    local impingement zone on the part surface around the contact centroid.
-    Non-sand or non-metal downstream bodies (PART, RISER) are skipped.
-
-    Optional output containers:
-      * ``body_risk_out`` is populated with ``body_name -> risk`` for smooth
-        rendering of the original CAD mesh.
-      * ``impingement_out`` receives ``(part_name, risk, centroid_mm, radius_mm)``
-        tuples so the GUI can paint the impingement spots on the part mesh.
-    """
-    risk = np.zeros_like(is_metal, dtype=np.float64)
-    if not gating_nodes or body_index is None or bodies is None:
-        return risk
-
-    is_sand = bool(getattr(mold, "is_sand", True))
-    if not is_sand:
-        return risk
-
-    metal = is_metal.astype(bool)
-    if not metal.any():
-        return risk
-
-    # Metal properties
-    rho_m = float(getattr(alloy, "rho_kg_m3", 7000.0))
-    mu = max(float(getattr(alloy, "viscosity_pa_s", 0.005)), 1e-12)
-    sigma = float(getattr(alloy, "surface_tension_n_m", 1.0))
-    if sigma <= 0.0:
-        sigma = 1.0
-    v_crit = float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.5))
-
-    # Sand / mold particle properties
-    afs = float(getattr(mold, "afs_grain_size", 0.0))
-    d_p_mm = float(getattr(mold, "particle_size_mm", 0.0))
-    if d_p_mm <= 0.0 and afs > 0.0:
-        d_p_mm = 6.45 / math.sqrt(afs)
-    if d_p_mm <= 0.0:
-        d_p_mm = 0.25
-    d_p_m = d_p_mm / 1000.0
-
-    rigidity = float(getattr(mold, "mold_rigidity_factor", 0.5))
-    rigidity = min(max(rigidity, 0.0), 1.0)
-    binder = float(getattr(mold, "binder_percent", 0.0))
-    moisture = float(getattr(mold, "moisture_percent", 0.0))
-    compact = float(getattr(mold, "compactability_percent", 0.0))
-
-    # Critical shear strength of the mold (same physics as per-voxel function)
-    rho_sand = 2650.0
-    g = 9.81
-    theta_c = 0.03
-    tau_gravity = theta_c * abs(rho_sand - rho_m) * g * d_p_m
-    binder_factor = max(binder / 2.0, 0.5) if binder > 0.0 else 1.0
-    compact_factor = compact / 45.0 if compact > 0.0 else 1.0
-    moisture_factor = 1.0 if moisture < 0.5 else max(0.3, min(4.0 / moisture, 2.0))
-    tau_cohesion = 20e3 * binder_factor * compact_factor * moisture_factor * (0.3 + 0.7 * rigidity)
-    tau_crit = max(tau_gravity, tau_cohesion, 50e3 * rigidity)
-    tau_crit = max(tau_crit, 1e3)
-    v_crit_eff = max(v_crit * (0.6 + 0.4 * rigidity), 0.1)
-    p_cap = 4.0 * sigma / max(d_p_m, 1e-7)
-
-    # Parse node names and collect per-body flow / connection data.
-    down_areas: Dict[str, float] = {}
-    parsed: List[Tuple[GatingNode, str, str]] = []
-    up_Q: Dict[str, float] = {}
-    down_Q: Dict[str, float] = {}
-    up_A: Dict[str, float] = {}
-    down_A: Dict[str, List[float]] = {}
-    for n in gating_nodes:
-        if "→" in n.name:
-            up, down = [s.strip() for s in n.name.split("→", 1)]
-        else:
-            up, down = "", n.name.strip()
-        parsed.append((n, up, down))
-        A_cm2 = float(n.section_area_cm2)
-        Q = float(n.flow_rate_m3_s)
-        down_areas[down] = max(down_areas.get(down, 0.0), A_cm2)
-        if up:
-            up_Q[up] = up_Q.get(up, 0.0) + Q
-            up_A[up] = max(up_A.get(up, 0.0), A_cm2)
-        if down:
-            down_Q[down] = down_Q.get(down, 0.0) + Q
-            down_A.setdefault(down, []).append(A_cm2)
-
-    body_by_name = {b.name: b for b in bodies if b is not None and getattr(b, "name", "")}
-    part_body = max(
-        (b for b in bodies if b is not None and getattr(b, "body_type", None) == BodyType.PART),
-        key=lambda b: float(getattr(b, "volume_cm3", 0.0) or 0.0),
-        default=None,
+    """Per-gating-element cumulative erosion risk (wrapper)."""
+    return erosion_model.compute_gate_erosion_risk_v2(
+        gating_nodes=gating_nodes,
+        is_metal=is_metal,
+        alloy=alloy,
+        mold=mold,
+        body_index=body_index,
+        bodies=bodies,
+        sdf=sdf,
+        dx_mm=dx_mm,
+        origin_mm=origin_mm,
+        velocity_m_s=velocity_m_s,
+        fill_time=fill_time,
+        temperature=temperature,
+        body_risk_out=body_risk_out,
+        impingement_out=impingement_out,
     )
-    shape = is_metal.shape
-
-    # ------------------------------------------------------------------
-    # Per-body risk using each gate body's own cross-section and flow rate.
-    # ------------------------------------------------------------------
-    gate_types = frozenset(
-        [
-            BodyType.SPRUE_THROAT,
-            BodyType.SPRUE,
-            BodyType.RUNNER,
-            BodyType.DISTRIBUTOR,
-            BodyType.INGATE,
-            BodyType.POURING_BASIN,
-            BodyType.COOLING_SPRUE,
-            BodyType.FILTER,
-            BodyType.CURUFLUK,
-        ]
-    )
-    try:
-        from core.gating import _flow_axis, _characteristic_cross_section_area
-    except Exception:
-        _flow_axis = None
-        _characteristic_cross_section_area = None
-
-    def _body_area_cm2(body: Body) -> float:
-        user = float(getattr(body, "section_area_cm2", 0.0))
-        if user > 0.0:
-            return user
-        if _flow_axis is None or _characteristic_cross_section_area is None:
-            return 0.0
-        axis = _flow_axis(body.mesh)
-        return float(_characteristic_cross_section_area(body.mesh, axis, n=10)) / 100.0
-
-    def _section_risk(v: float, A_m2: float, A_up_m2: float) -> float:
-        if v <= 1e-9 or A_m2 <= 1e-12:
-            return 0.0
-        D_h = math.sqrt(4.0 * A_m2 / math.pi) if A_m2 > 0.0 else d_p_m
-        if A_up_m2 > A_m2:
-            K_loss = 0.5 * (1.0 - A_m2 / A_up_m2)
-        elif A_m2 > A_up_m2:
-            K_loss = (1.0 - A_up_m2 / A_m2) ** 2
-        else:
-            K_loss = 0.0
-        Re = rho_m * v * D_h / mu
-        eps = d_p_m
-        if Re < 2300.0:
-            f = 64.0 / max(Re, 1e-9)
-        else:
-            rough = eps / (3.7 * D_h) + 5.74 / (Re ** 0.9)
-            if rough > 0.0 and math.log10(rough) != 0.0:
-                f = 0.25 / (math.log10(rough) ** 2)
-            else:
-                f = 0.02
-        f = min(max(f, 0.0001), 0.5)
-        tau_w = (f / 8.0) * rho_m * v * v
-        p_dyn = 0.5 * rho_m * v * v
-        risk_shear = max(0.0, tau_w / tau_crit - 1.0)
-        risk_pen = max(0.0, p_dyn / max(p_cap, 1e-6) - 1.0)
-        risk_vel = max(0.0, v / v_crit_eff - 1.0)
-        risk_loss = K_loss * ((v / v_crit_eff) ** 2) if v_crit_eff > 0.0 else 0.0
-        risk_Re = 0.1 * max(0.0, Re / 2300.0 - 1.0)
-        Tu = 0.0
-        if Re > 4000.0:
-            Tu = 0.16 * (Re ** -0.125)
-            Tu = min(Tu, 0.5)
-        turb_factor = 1.0 + 5.0 * Tu
-        combined = max(risk_shear, risk_pen, risk_vel, risk_loss, risk_Re)
-        return float(1.0 - math.exp(-turb_factor * combined))
-
-    if body_risk_out is not None:
-        for b in bodies:
-            if b is None or b.body_type not in gate_types:
-                continue
-            Q_total = max(up_Q.get(b.name, 0.0), down_Q.get(b.name, 0.0))
-            if Q_total <= 1e-12:
-                continue
-            A_body_cm2 = _body_area_cm2(b)
-            connected = down_A.get(b.name, [])
-            if connected:
-                A_body_cm2 = max(A_body_cm2, min(connected))
-            A_body_m2 = max(A_body_cm2, 1e-6) * 1e-4
-            v_body = Q_total / A_body_m2
-            A_up_cm2 = up_A.get(b.name, A_body_cm2)
-            A_up_m2 = max(A_up_cm2, 1e-6) * 1e-4
-            br = _section_risk(v_body, A_body_m2, A_up_m2)
-            if br > 1e-6:
-                body_risk_out[b.name] = max(body_risk_out.get(b.name, 0.0), br)
-
-    # ------------------------------------------------------------------
-    # Per-node hotspots: throat regions on gate bodies and impingement on part.
-    # ------------------------------------------------------------------
-    for n, up_name, down_name in parsed:
-        v = max(float(n.velocity_m_s), float(getattr(n, "max_velocity_m_s", 0.0)))
-        if v <= 1e-9:
-            continue
-        A_cm2 = float(n.section_area_cm2)
-        if A_cm2 <= 0.0:
-            continue
-        A = A_cm2 * 1e-4
-
-        A_up_cm2 = down_areas.get(up_name, 0.0) if up_name and up_name in down_areas else A_cm2
-        A_up = A_up_cm2 * 1e-4
-        node_risk = _section_risk(v, A, A_up)
-        if node_risk <= 1e-6:
-            continue
-
-        # Local throat hotspot on the upstream gate body.
-        target_name = up_name if up_name in body_by_name else down_name
-        body = body_by_name.get(target_name)
-        if body is not None and body.body_type in gate_types:
-            if body_index.shape == shape and origin_mm is not None and dx_mm > 0.0:
-                if "coords_mm" not in locals():
-                    idx = np.indices(shape)
-                    coords_mm = np.stack(
-                        [idx[i] * dx_mm + float(origin_mm[i]) for i in range(3)],
-                        axis=0,
-                    )
-                centroid = np.asarray(n.centroid_mm, dtype=np.float64).reshape(3, 1, 1, 1)
-                dist2 = np.sum((coords_mm - centroid) ** 2, axis=0)
-                jet_diam_mm = math.sqrt(4.0 * A_cm2 / math.pi)
-                radius_mm = max(4.0 * jet_diam_mm, 4.0 * dx_mm)
-                throat_mask = (
-                    (body_index == body.index)
-                    & metal
-                    & (dist2 <= radius_mm * radius_mm)
-                )
-                if throat_mask.any():
-                    risk[throat_mask] = np.maximum(risk[throat_mask], node_risk)
-
-        # Impingement on the part surface at ingate exits.
-        down_type = n.body_type.split("→")[-1] if "→" in n.body_type else ""
-        if down_name in ("Parça", "PART") or down_type == "PART":
-            body_down = part_body
-        else:
-            body_down = body_by_name.get(down_name)
-        if (
-            body_down is not None
-            and body_down.body_type == BodyType.PART
-            and sdf is not None
-            and dx_mm > 0.0
-            and origin_mm is not None
-        ):
-            if "coords_mm" not in locals():
-                idx = np.indices(shape)
-                coords_mm = np.stack(
-                    [idx[i] * dx_mm + float(origin_mm[i]) for i in range(3)],
-                    axis=0,
-                )
-            centroid = np.asarray(n.centroid_mm, dtype=np.float64).reshape(3, 1, 1, 1)
-            dist2 = np.sum((coords_mm - centroid) ** 2, axis=0)
-            jet_diam_mm = math.sqrt(4.0 * A_cm2 / math.pi)
-            radius_mm = max(4.0 * jet_diam_mm, 4.0 * dx_mm)
-            wall_layer = sdf <= max(4.0 * d_p_mm, 1.5 * dx_mm)
-            part_mask = (
-                (body_index == body_down.index)
-                & metal
-                & wall_layer
-                & (dist2 <= radius_mm * radius_mm)
-            )
-            if part_mask.any():
-                risk[part_mask] = np.maximum(risk[part_mask], node_risk)
-            if impingement_out is not None and body_down is not None:
-                impingement_out.append(
-                    (
-                        body_down.name,
-                        float(node_risk),
-                        tuple(float(x) for x in n.centroid_mm),
-                        float(radius_mm),
-                    )
-                )
-
-    return np.clip(risk, 0.0, 1.0)
-
-
 def compute_erosion_risk(
     velocity_magnitude: Optional[np.ndarray],
     is_metal: np.ndarray,
@@ -1752,191 +1500,29 @@ def compute_erosion_risk(
     body_index: Optional[np.ndarray] = None,
     bodies: Optional[List[Body]] = None,
     origin_mm: Optional[np.ndarray] = None,
+    fill_time: Optional[np.ndarray] = None,
+    temperature: Optional[np.ndarray] = None,
     body_risk_out: Optional[Dict[str, float]] = None,
     impingement_out: Optional[List[Tuple[str, float, Tuple[float, float, float], float]]] = None,
 ) -> np.ndarray:
-    """Physics-based mold-erosion (sand-wash) risk on a per-voxel and per-gate basis.
-
-    Combines two calculations:
-
-    1. Per-voxel Darcy-Forchheimer wall shear / capillary / Re_K / Campbell
-       field risk, localised to the metal-mold interface.
-    2. Per-gating-element pipe/channel risk using each node's throat velocity,
-       cross-sectional area, Reynolds-dependent friction factor, sudden
-       contraction/expansion (Cv) loss and turbulence intensity.  The result is
-       mapped back to the upstream gate body so each gating element has its
-       own uniform erosion colour.
-
-    Non-erodible molds (metal, graphite, ceramic) and non-sand bodies return
-    zero risk.
-
-    Optional output containers (see ``compute_gate_erosion_risk``):
-      * ``body_risk_out`` -> ``body_name -> max risk`` for smooth mesh rendering.
-      * ``impingement_out`` -> list of ``(part_name, risk, centroid_mm, radius_mm)``.
-
-    The model combines four mechanisms that actually detach mold grains from
-    the metal-mold interface:
-
-    1. Darcy-Forchheimer wall shear stress: the pressure gradient needed to
-       push metal through the porous mold skin creates a drag force on the
-       surface grains.  tau_drag = (|dp/dx|_viscous + |dp/dx|_inertial) * d_p / 6.
-    2. Stagnation / dynamic-pressure impact: the normal component of the
-       metal velocity at the wall produces p_dyn = 0.5 * rho * v_n^2.  If
-       p_dyn exceeds the capillary pressure 4*sigma/d_p, metal penetrates
-       the pores and displaces grains.
-    3. Campbell's critical entrainment velocity: a hard speed limit for the
-       alloy, lowered for weak green sand and raised for rigid molds.
-    4. Pore Reynolds number Re_K = rho*v*sqrt(K)/mu; Re_K > ~5 marks the
-       Darcy-Forchheimer transition where inertial channeling intensifies erosion.
-
-    The critical shear strength of the mold is derived from the Shields
-    submerged-weight criterion plus a cohesive-strength term that depends on
-    binder content, moisture, compactability and rigidity.  Risk is attenuated
-    exponentially with distance from the wall, because sand-wash is a surface
-    phenomenon.  Non-erodible molds (metal, graphite) return zero risk.
-    """
-    risk = np.zeros_like(is_metal, dtype=np.float64)
-    if velocity_magnitude is None or velocity_magnitude.size == 0:
-        return risk
-
-    is_sand = bool(getattr(mold, "is_sand", True))
-    if not is_sand:
-        return risk
-
-    shape = is_metal.shape
-    v_mag = np.asarray(velocity_magnitude, dtype=np.float64).reshape(shape)
-    v_mag = np.nan_to_num(v_mag, nan=0.0, posinf=0.0, neginf=0.0)
-    metal = is_metal.astype(bool)
-
-    # Metal properties
-    rho_m = float(getattr(alloy, "rho_kg_m3", 7000.0))
-    mu = float(getattr(alloy, "viscosity_pa_s", 0.005))
-    sigma = float(getattr(alloy, "surface_tension_n_m", 1.0))
-    if sigma <= 0.0:
-        sigma = 1.0
-
-    # Sand / mold particle properties
-    afs = float(getattr(mold, "afs_grain_size", 0.0))
-    d_p_mm = float(getattr(mold, "particle_size_mm", 0.0))
-    if d_p_mm <= 0.0 and afs > 0.0:
-        d_p_mm = 6.45 / math.sqrt(afs)
-    if d_p_mm <= 0.0:
-        d_p_mm = 0.25 if is_sand else 0.10
-    d_p_m = d_p_mm / 1000.0
-
-    phi = float(getattr(mold, "phi_mold", 0.35))
-    phi = min(max(phi, 0.01), 0.99)
-    K = float(getattr(mold, "K_inf", 1e-11))
-    K = max(K, 1e-18)
-
-    rigidity = float(getattr(mold, "mold_rigidity_factor", 0.5))
-    rigidity = min(max(rigidity, 0.0), 1.0)
-    binder = float(getattr(mold, "binder_percent", 0.0))
-    moisture = float(getattr(mold, "moisture_percent", 0.0))
-    compact = float(getattr(mold, "compactability_percent", 0.0))
-
-    # Wall proximity: erosion decays exponentially with distance from the interface.
-    wall_factor = np.ones_like(v_mag)
-    sdf_a = None
-    if sdf is not None and sdf.shape == shape and dx_mm > 0.0:
-        sdf_a = np.asarray(sdf, dtype=np.float64).reshape(shape)
-        decay = max(2.0 * d_p_mm, 0.5 * dx_mm) if d_p_mm > 0.0 else dx_mm
-        # Erosion is active within ~2 grain diameters of the wall; plateau then exponential decay.
-        wall_factor = np.where(
-            sdf_a <= 2.0 * d_p_mm,
-            1.0,
-            np.exp(-(sdf_a - 2.0 * d_p_mm) / max(decay, 1e-3)),
-        )
-        wall_factor = np.clip(np.nan_to_num(wall_factor), 0.0, 1.0)
-
-    # Cell-centered velocity at the wall is artificially low (no-slip).
-    # For erosion use the free-stream velocity in the wall-adjacent metal.
-    v_eff = v_mag.copy()
-    if sdf_a is not None:
-        wall_layer = sdf_a <= max(2.0 * d_p_mm, 0.5 * dx_mm)
-        if wall_layer.any():
-            v_max_neigh = ndimage.maximum_filter(v_mag, size=3)
-            v_eff = np.where(wall_layer & (v_max_neigh > v_mag), v_max_neigh, v_mag)
-
-    # Normal velocity component for stagnation impact
-    v_n = v_eff.copy()
-    if velocity_m_s is not None and sdf_a is not None and dx_mm > 0.0:
-        vel = np.asarray(velocity_m_s, dtype=np.float64)
-        if vel.size == 3 * np.prod(shape):
-            if vel.ndim == 1:
-                vel = vel.reshape((3,) + shape)
-            if vel.ndim == 4 and vel.shape[0] == 3 and vel.shape[1:] == shape:
-                grads = np.gradient(sdf_a, dx_mm)
-                grad = np.stack(grads, axis=0)
-                grad_norm = np.linalg.norm(grad, axis=0)
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    n = -grad / np.where(grad_norm > 1e-12, grad_norm, 1.0)
-                n = n.reshape(3, -1)
-                vel_flat = vel.reshape(3, -1)
-                v_dot_n = np.einsum("ij,ij->j", vel_flat, n).reshape(shape)
-                v_n = np.abs(v_dot_n)
-                v_n = np.nan_to_num(v_n, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # Capillary resistance to pore penetration
-    p_cap = 4.0 * sigma / max(d_p_m, 1e-7)
-    p_dyn = 0.5 * rho_m * v_n * v_n
-    risk_pen = np.maximum(0.0, p_dyn / max(p_cap, 1e-6) - 1.0)
-
-    # Darcy-Forchheimer wall shear stress (Pa)
-    v_pore = v_eff / phi
-    with np.errstate(divide="ignore", invalid="ignore"):
-        dpdx_visc = mu * v_eff / K
-    dpdx_inertial = (1.75 * rho_m * (1.0 - phi) / (phi ** 3 * d_p_m)) * (v_pore ** 2)
-    tau_df = (dpdx_visc + dpdx_inertial) * d_p_m / 6.0
-    tau_df = np.nan_to_num(tau_df, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # Critical shear strength of the mold
-    rho_sand = 2650.0
-    g = 9.81
-    theta_c = 0.03
-    tau_gravity = theta_c * abs(rho_sand - rho_m) * g * d_p_m
-
-    binder_factor = max(binder / 2.0, 0.5) if binder > 0.0 else 1.0
-    compact_factor = compact / 45.0 if compact > 0.0 else 1.0
-    moisture_factor = 1.0 if moisture < 0.5 else max(0.3, min(4.0 / moisture, 2.0))
-    tau_cohesion = 20e3 * binder_factor * compact_factor * moisture_factor * (0.3 + 0.7 * rigidity)
-    tau_crit = max(tau_gravity, tau_cohesion, 50e3 * rigidity)
-    tau_crit = max(tau_crit, 1e3)
-
-    risk_shear = np.maximum(0.0, tau_df / tau_crit - 1.0)
-
-    # Campbell entrainment velocity, adjusted by mold rigidity
-    v_crit = float(getattr(alloy, "critical_entrainment_velocity_m_s", 0.5))
-    v_crit_eff = max(v_crit * (0.6 + 0.4 * rigidity), 0.1)
-    risk_vel = np.maximum(0.0, v_eff / v_crit_eff - 1.0)
-
-    # Pore Reynolds number for Darcy-Forchheimer transition
-    with np.errstate(divide="ignore", invalid="ignore"):
-        Re_K = rho_m * v_eff * np.sqrt(K) / max(mu, 1e-12)
-    risk_turb = np.maximum(0.0, Re_K / 5.0 - 1.0)
-
-    combined = np.maximum.reduce([risk_shear, risk_pen, risk_vel, risk_turb])
-    field_risk = (1.0 - np.exp(-combined)) * wall_factor
-
-    # Add per-gating-element section risk (area, Re, Cv, turbulence).
-    gate_risk = compute_gate_erosion_risk(
-        gating_nodes,
-        is_metal,
-        alloy,
-        mold,
-        body_index,
-        bodies,
+    """Cumulative Finnie-Bitter/Darcy-Forchheimer mold erosion risk (wrapper)."""
+    return erosion_model.compute_erosion_risk_v2(
+        velocity_magnitude=velocity_magnitude,
+        is_metal=is_metal,
+        alloy=alloy,
+        mold=mold,
+        velocity_m_s=velocity_m_s,
         sdf=sdf,
         dx_mm=dx_mm,
+        gating_nodes=gating_nodes,
+        body_index=body_index,
+        bodies=bodies,
         origin_mm=origin_mm,
+        fill_time=fill_time,
+        temperature=temperature,
         body_risk_out=body_risk_out,
         impingement_out=impingement_out,
     )
-    risk = np.maximum(field_risk, gate_risk)
-    risk = np.where(metal, risk, 0.0)
-    return np.clip(risk, 0.0, 1.0)
-
-
 def directional_feed_efficiency(
     t_s: np.ndarray,
     feeder_mask: np.ndarray,
@@ -4334,6 +3920,8 @@ def analyze(
         body_index=body_index,
         bodies=bodies,
         origin_mm=origin_mm,
+        fill_time=fill_time_s,
+        temperature=temperature,
         body_risk_out=erosion_body_risk,
         impingement_out=erosion_impingements,
     )

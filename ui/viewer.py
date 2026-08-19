@@ -1645,14 +1645,9 @@ class Analyzer3DViewer(QtInteractor):
             self._remove_scalar_bar("Lap riski")
 
     def show_erosion_risk(self, result: Optional[AnalysisResult]):
-        """Mold-sand erosion risk.
+        """Cumulative mold-erosion damage with turbo + sigmoid opacity + ghost chassis."""
+        title = "Cumulative Mold Erosion Damage (Kalıp Erozyon Hasarı - Kümülatif)"
 
-        Gate bodies are coloured uniformly by their body-averaged dynamic risk
-        (section area, Re, Cv, turbulence), so the sprue, runner and each
-        ingate can have a different colour.  The part surface shows only the
-        local impingement hotspots sampled from the voxel field; low-risk
-        regions are transparent and no floating spheres are used.
-        """
         self._restore_erosion_body_opacities()
         if isinstance(self._erosion_actor, (list, tuple)):
             for actor in self._erosion_actor:
@@ -1666,30 +1661,25 @@ class Analyzer3DViewer(QtInteractor):
             except Exception:
                 pass
         self._erosion_actor = None
-        self._remove_scalar_bar("Kalıp erozyonu riski")
+        self._remove_scalar_bar(title)
 
         if result is None or result.erosion_risk is None or result.erosion_risk.size == 0:
-            self._show_scalar_bar_no_geometry(
-                "Kalıp erozyonu riski", "YlOrRd", [0.0, 1.0]
-            )
+            self._show_scalar_bar_no_geometry(title, "turbo", [0.0, 1.0])
             return
 
         finite = result.erosion_risk[np.isfinite(result.erosion_risk)]
-        field_max = float(finite.max()) if finite.size > 0 else 0.0
-        body_risk = getattr(result, "erosion_body_risk", {}) or {}
-        body_max = float(max(body_risk.values())) if body_risk else 0.0
-        vmax = max(0.3, field_max, body_max)
-        if vmax <= 1e-6:
-            self._show_scalar_bar_no_geometry(
-                "Kalıp erozyonu riski", "YlOrRd", [0.0, 1.0]
-            )
+        if finite.size == 0 or float(finite.max()) <= 1e-6:
+            self._show_scalar_bar_no_geometry(title, "turbo", [0.0, 1.0])
             return
-        clim = [0.0, vmax]
+        clim = [0.0, 1.0]
 
-        # Prepare the voxel field once for bodies that need it (part impingement).
-        grid = self._make_grid(
-            result, result.erosion_risk, "erosion_risk", point_max=True
+        # Sigmoid opacity transfer function: safe = glass, danger = opaque.
+        # PyVista expects an opacity map as uint8 [0, 255].
+        opacity_tf = pv.opacity_transfer_function(
+            [0.02, 0.08, 0.45, 0.85, 1.0], 256
         )
+
+        grid = self._make_grid(result, result.erosion_risk, "erosion_risk", point_max=True)
         point_values = grid.point_data["erosion_risk"]
         point_values = np.nan_to_num(point_values, nan=0.0)
         nx, ny, nz = grid.dimensions
@@ -1697,26 +1687,79 @@ class Analyzer3DViewer(QtInteractor):
         origin = np.asarray(result.origin_mm, dtype=np.float64)
         dx = float(result.dx_mm)
 
-        def _add_mesh_with_risk(mesh: pv.PolyData, risk_arr: np.ndarray) -> None:
-            mesh["erosion_risk"] = risk_arr
+        scalar_bar_args = _scalar_bar_args(title, (0.02, 0.02), clim=clim)
+
+        actors: List[Any] = []
+        has_risk_mesh = False
+        for body in self._bodies:
+            if len(body.faces) == 0:
+                continue
+            faces = np.c_[np.full(len(body.faces), 3, dtype=np.int64), body.faces].ravel()
+            mesh = pv.PolyData(body.vertices, faces)
+
+            # Ghost chassis: very faint surface so the part form never disappears.
+            try:
+                actors.append(
+                    self.add_mesh(
+                        mesh,
+                        color="#F5F5F5",
+                        opacity=0.01,
+                        lighting=False,
+                        show_scalar_bar=False,
+                    )
+                )
+            except Exception:
+                pass
+            try:
+                edges = mesh.extract_feature_edges(
+                    boundary_edges=True, feature_edges=True, manifold_edges=False
+                )
+                if edges.n_points > 0:
+                    actors.append(
+                        self.add_mesh(
+                            edges,
+                            color="#888888",
+                            opacity=0.04,
+                            line_width=1,
+                            show_scalar_bar=False,
+                        )
+                    )
+            except Exception:
+                pass
+
+            # Continuous trilinear sampling of the cumulative risk field.
+            verts = np.asarray(body.vertices, dtype=np.float64)
+            if verts.size == 0:
+                continue
+            coords = (verts - origin) / dx
+            try:
+                sampled = ndimage.map_coordinates(
+                    point_arr, coords.T, order=1, mode="nearest", cval=0.0
+                )
+            except Exception:
+                continue
+            if float(np.max(sampled)) <= 1e-6:
+                continue
+            risk = np.clip(sampled.astype(np.float64), 0.0, 1.0)
+            mesh["erosion_risk"] = risk
+
             base_actor = self._body_actor_by_name.get(getattr(body, "name", ""))
             if base_actor is not None:
                 self._erosion_body_opacity_backup[getattr(body, "name", "")] = float(
                     base_actor.GetProperty().GetOpacity()
                 )
                 base_actor.GetProperty().SetOpacity(0.0)
+
             actors.append(
                 self.add_mesh(
                     mesh,
                     scalars="erosion_risk",
-                    cmap="YlOrRd",
-                    opacity=0.85,
+                    cmap="turbo",
+                    opacity=opacity_tf,
                     clim=clim,
                     nan_opacity=0.0,
-                    show_scalar_bar=(len(actors) == 0),
-                    scalar_bar_args=_scalar_bar_args(
-                        "Kalıp erozyonu riski", (0.02, 0.02), clim=clim
-                    ) if len(actors) == 0 else None,
+                    show_scalar_bar=not has_risk_mesh,
+                    scalar_bar_args=scalar_bar_args,
                     smooth_shading=True,
                     ambient=0.7,
                     diffuse=0.3,
@@ -1724,52 +1767,10 @@ class Analyzer3DViewer(QtInteractor):
                     lighting=False,
                 )
             )
-
-        actors: List[Any] = []
-        for body in self._bodies:
-            if len(body.faces) == 0:
-                continue
-            faces = np.c_[
-                np.full(len(body.faces), 3, dtype=np.int64), body.faces
-            ].ravel()
-            mesh = pv.PolyData(body.vertices, faces)
-
-            # Gate bodies: uniform dynamic body risk -> different element colours.
-            if body.name in body_risk:
-                risk_val = float(body_risk[body.name])
-                if risk_val <= 1e-6:
-                    continue
-                _add_mesh_with_risk(
-                    mesh, np.full(len(body.vertices), risk_val, dtype=np.float64)
-                )
-                continue
-
-            # Other bodies (part, risers, etc.): local field, hide low risk.
-            verts = np.asarray(body.vertices, dtype=np.float64)
-            if verts.size == 0:
-                continue
-            coords = (verts - origin) / dx
-            try:
-                sampled = ndimage.map_coordinates(
-                    point_arr,
-                    coords.T,
-                    order=1,
-                    mode="nearest",
-                    cval=0.0,
-                )
-            except Exception:
-                continue
-            if sampled.max() <= 1e-6:
-                continue
-            risk = sampled.astype(np.float64)
-            threshold = max(0.15 * vmax, 0.05)
-            risk[risk < threshold] = np.nan
-            _add_mesh_with_risk(mesh, risk)
+            has_risk_mesh = True
 
         if not actors:
-            self._show_scalar_bar_no_geometry(
-                "Kalıp erozyonu riski", "YlOrRd", [0.0, 1.0]
-            )
+            self._show_scalar_bar_no_geometry(title, "turbo", [0.0, 1.0])
             return
 
         self._erosion_actor = actors
@@ -1783,6 +1784,7 @@ class Analyzer3DViewer(QtInteractor):
         self._erosion_body_opacity_backup.clear()
 
     def toggle_erosion_risk(self, result: AnalysisResult, checked: bool):
+        title = "Cumulative Mold Erosion Damage (Kalıp Erozyon Hasarı - Kümülatif)"
         if checked:
             self.show_erosion_risk(result)
         else:
@@ -1799,7 +1801,7 @@ class Analyzer3DViewer(QtInteractor):
                 except Exception:
                     pass
             self._erosion_actor = None
-            self._remove_scalar_bar("Kalıp erozyonu riski")
+            self._remove_scalar_bar(title)
 
     def show_air_entrapment(
         self,
