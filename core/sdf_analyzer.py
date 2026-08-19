@@ -1461,6 +1461,9 @@ def compute_gate_erosion_risk(
     mold,
     body_index: Optional[np.ndarray] = None,
     bodies: Optional[List[Body]] = None,
+    sdf: Optional[np.ndarray] = None,
+    dx_mm: float = 1.0,
+    origin_mm: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Per-gating-element erosion risk using section area, Re, roughness, Cv.
 
@@ -1469,8 +1472,11 @@ def compute_gate_erosion_risk(
     a sudden contraction/expansion loss coefficient (Cv), a turbulence
     intensity and the usual capillary / entrainment limits.  The resulting
     risk is mapped onto all metal voxels of the upstream gate body so the
-    element is uniformly coloured by its own dynamic risk.  Non-sand or
-    non-metal downstream bodies (PART, RISER) are skipped.
+    element is uniformly coloured by its own dynamic risk.  In addition,
+    INGATE→PART nodes paint a local impingement zone on the part surface
+    around the contact centroid, because the metal jet exiting the ingate hits
+    the mould wall at the entry point.  Non-sand or non-metal downstream
+    bodies (PART, RISER) are skipped.
     """
     risk = np.zeros_like(is_metal, dtype=np.float64)
     if not gating_nodes or body_index is None or bodies is None:
@@ -1533,6 +1539,11 @@ def compute_gate_erosion_risk(
         down_areas[down] = max(down_areas.get(down, 0.0), float(n.section_area_cm2))
 
     body_by_name = {b.name: b for b in bodies if b is not None and getattr(b, "name", "")}
+    part_body = max(
+        (b for b in bodies if b is not None and getattr(b, "body_type", None) == BodyType.PART),
+        key=lambda b: float(getattr(b, "volume_cm3", 0.0) or 0.0),
+        default=None,
+    )
     shape = is_metal.shape
 
     for n, up_name, down_name in parsed:
@@ -1594,15 +1605,54 @@ def compute_gate_erosion_risk(
         # (source node), use the downstream body.
         target_name = up_name if up_name in body_by_name else down_name
         body = body_by_name.get(target_name)
-        if body is None:
-            continue
-        if body.body_type in (BodyType.PART, BodyType.RISER, BodyType.SLEEVE, BodyType.CURUFLUK):
-            continue
-        if body_index.shape != shape:
-            continue
-        mask = (body_index == body.index) & metal
-        if mask.any():
-            risk[mask] = np.maximum(risk[mask], node_risk)
+        if body is not None and body.body_type not in (
+            BodyType.PART,
+            BodyType.RISER,
+            BodyType.SLEEVE,
+            BodyType.CURUFLUK,
+        ):
+            if body_index.shape == shape:
+                mask = (body_index == body.index) & metal
+                if mask.any():
+                    risk[mask] = np.maximum(risk[mask], node_risk)
+
+        # Impingement on the part surface at ingate exits: the metal jet hits
+        # the mould wall at the entry point, so paint a local spherical patch.
+        down_type = n.body_type.split("→")[-1] if "→" in n.body_type else ""
+        if down_name in ("Parça", "PART") or down_type == "PART":
+            body_down = part_body
+        else:
+            body_down = body_by_name.get(down_name)
+        if (
+            body_down is not None
+            and body_down.body_type == BodyType.PART
+            and sdf is not None
+            and dx_mm > 0.0
+            and origin_mm is not None
+        ):
+            # Pre-compute coordinate grid once if needed.
+            if "coords_mm" not in locals():
+                idx = np.indices(shape)
+                coords_mm = np.stack(
+                    [idx[i] * dx_mm + float(origin_mm[i]) for i in range(3)],
+                    axis=0,
+                )
+            centroid = np.asarray(n.centroid_mm, dtype=np.float64).reshape(3, 1, 1, 1)
+            dist2 = np.sum((coords_mm - centroid) ** 2, axis=0)
+            # Jet radius from throat area; impingement zone ~4 jet diameters
+            # so it is visible at the contact, and wall-layer uses a slightly
+            # deeper tolerance so a few surface voxels are captured.
+            jet_diam_mm = math.sqrt(4.0 * A_cm2 / math.pi)
+            radius_mm = max(4.0 * jet_diam_mm, 4.0 * dx_mm)
+            wall_layer = sdf <= max(4.0 * d_p_mm, 1.5 * dx_mm)
+            part_mask = (
+                (body_index == body_down.index)
+                & metal
+                & wall_layer
+                & (dist2 <= radius_mm * radius_mm)
+            )
+            if part_mask.any():
+                risk[part_mask] = np.maximum(risk[part_mask], node_risk)
 
     return np.clip(risk, 0.0, 1.0)
 
@@ -1618,6 +1668,7 @@ def compute_erosion_risk(
     gating_nodes: Optional[List[GatingNode]] = None,
     body_index: Optional[np.ndarray] = None,
     bodies: Optional[List[Body]] = None,
+    origin_mm: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Physics-based mold-erosion (sand-wash) risk on a per-voxel and per-gate basis.
 
@@ -1780,7 +1831,15 @@ def compute_erosion_risk(
 
     # Add per-gating-element section risk (area, Re, Cv, turbulence).
     gate_risk = compute_gate_erosion_risk(
-        gating_nodes, is_metal, alloy, mold, body_index, bodies
+        gating_nodes,
+        is_metal,
+        alloy,
+        mold,
+        body_index,
+        bodies,
+        sdf=sdf,
+        dx_mm=dx_mm,
+        origin_mm=origin_mm,
     )
     risk = np.maximum(field_risk, gate_risk)
     risk = np.where(metal, risk, 0.0)
@@ -4181,6 +4240,7 @@ def analyze(
         gating_nodes=gating_nodes,
         body_index=body_index,
         bodies=bodies,
+        origin_mm=origin_mm,
     )
 
     # AŞAMA 9: Risk map aligned with the Carlson-Beckermann porosity volume.

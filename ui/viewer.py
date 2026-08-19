@@ -439,10 +439,19 @@ class Analyzer3DViewer(QtInteractor):
             is_selected = selected_body is not None and (
                 body is selected_body or body.name == selected_body.name
             )
-            color = "#ff0000" if is_selected else BODY_COLORS.get(body.body_type, "#F5F5F5")
-            opacity = 1.0 if is_selected else opacity_map.get(body.body_type, 1.0)
-            if selected_body is not None and not is_selected and not analysis_mode:
-                opacity = 0.25
+            if is_selected:
+                color = "#ff0000"
+                opacity = 1.0
+            elif analysis_mode:
+                # When a risk overlay is active, fade all body colours to a
+                # nearly transparent light grey so the result layer dominates.
+                color = "#F5F5F5"
+                opacity = 0.06
+            else:
+                color = BODY_COLORS.get(body.body_type, "#F5F5F5")
+                opacity = opacity_map.get(body.body_type, 1.0)
+                if selected_body is not None and not is_selected:
+                    opacity = 0.25
             actor = self.add_mesh(
                 mesh,
                 color=color,
@@ -1162,7 +1171,16 @@ class Analyzer3DViewer(QtInteractor):
         for actor in self._slice_actors:
             self.remove_actor(actor)
         self._slice_actors.clear()
+        title_map = {
+            "sdf": ("SDF (mm)", "viridis"),
+            "risk": ("Risk", "hot"),
+            "niyama": ("Niyama", "plasma"),
+            "mat_id": ("Mat ID", "tab10"),
+            "temperature": ("T (°C)", "coolwarm"),
+        }
+        title, cmap = title_map.get(field, (field, "viridis"))
         if result is None:
+            self._show_scalar_bar_no_geometry(title, cmap, [0.0, 1.0])
             return
 
         field_map = {
@@ -1177,11 +1195,13 @@ class Analyzer3DViewer(QtInteractor):
             ),
         }
         if field not in field_map:
+            self._show_scalar_bar_no_geometry(title, cmap, [0.0, 1.0])
             return
         data, title, cmap = field_map[field]
 
         finite_data = data[np.isfinite(data)]
         if finite_data.size == 0:
+            self._show_scalar_bar_no_geometry(title, cmap, [0.0, 1.0])
             return
         dmin = float(finite_data.min())
         dmax = float(finite_data.max())
@@ -1197,6 +1217,7 @@ class Analyzer3DViewer(QtInteractor):
         grid = self._make_grid(result, data, field)
         domain = self._part_only(grid) if field in ("risk", "niyama") else self._metal_only(grid)
         if domain.n_cells == 0:
+            self._show_scalar_bar_no_geometry(title, cmap, list(slice_clim))
             return
 
         self._remove_scalar_bar(title)
@@ -1637,14 +1658,14 @@ class Analyzer3DViewer(QtInteractor):
             )
             return
 
-        cells = metal.threshold(1e-6, scalars="erosion_risk", all_scalars=True)
+        cells = metal.threshold(1e-6, scalars="erosion_risk", all_scalars=False)
         if cells.n_cells == 0:
             self._show_scalar_bar_no_geometry(
                 "Kalıp erozyonu riski", "YlOrRd", [0.0, 1.0]
             )
             return
 
-        vmax = float(np.percentile(cells["erosion_risk"], 99))
+        vmax = float(np.nanmax(cells["erosion_risk"]))
         vmax = max(vmax, 0.3)
         clim = [0.0, vmax]
 

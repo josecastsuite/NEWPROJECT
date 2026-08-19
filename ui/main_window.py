@@ -634,7 +634,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.erosion_toggle.setToolTip("Darcy-Forchheimer kayma gerilmesi, dinamik basınç ve Re_K'ye dayalı kum kalıp aşınması riski")
         self.erosion_toggle.setChecked(False)
         self.erosion_toggle.toggled.connect(self.on_toggle_erosion_risk)
-        self.erosion_toggle.setVisible(True)
+        self.erosion_toggle.setVisible(False)
         vis_layout.addWidget(self.erosion_toggle)
 
         self.air_entrapment_toggle = QtWidgets.QCheckBox("Hava Sıkışması")
